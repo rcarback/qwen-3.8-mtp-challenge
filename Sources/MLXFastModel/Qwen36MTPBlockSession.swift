@@ -412,6 +412,29 @@ public final class Qwen36MTPBlockSession {
                 cache: historyWarmCache)
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+        // Flush-fold widths 3...maxDepth+1. A live round's first head step
+        // folds acceptedCount+1 rows through this exact expression, so every
+        // width beyond 2 otherwise JIT-compiles its appendHistoryKV /
+        // folded-rows attention / M-row head projections inside a scored
+        // round the first time a streak reaches it. Values are zeros on the
+        // same throwaway cache; only shape and dtype select kernels. The
+        // cache grows by at most maxDepth rows past the folded state.
+        if maxDepth >= 2 {
+            for foldWidth in 3 ... (maxDepth + 1) {
+                let flushHidden = MLXArray.zeros(
+                    [1, foldWidth, hDim], dtype: row.dtype)
+                let flushTokens = MLXArray(
+                    Array(repeating: Int32(0), count: foldWidth)).reshaped([1, foldWidth])
+                let flushFolded = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                    hidden: flushHidden, nextTokenIds: flushTokens,
+                    cache: historyWarmCache)
+                    ?? model.mtpHeadHiddenForward(
+                        hidden: flushHidden, nextTokenIds: flushTokens,
+                        cache: historyWarmCache)
+                eval(model.draftTokenID(
+                    flushFolded[0..., (flushFolded.dim(1) - 1) ..< flushFolded.dim(1), 0...]))
+            }
+        }
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
