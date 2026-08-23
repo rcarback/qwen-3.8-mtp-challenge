@@ -3638,7 +3638,7 @@ public class Qwen35TextModelInner: Module {
         _ inputs: MLXArray,
         cache: [KVCache?]? = nil,
         nConfirmed: Int = 0
-    ) -> MLXArray {
+    ) -> (hidden: MLXArray, fusedNormed: MLXArray?) {
         var hiddenStates = embedTokens(inputs)
 
         var cacheArray = cache
@@ -3693,6 +3693,18 @@ public class Qwen35TextModelInner: Module {
                     }
                 }
             }
+            if let delta, Qwen35XSumsSidecar.wants(base) {
+                // The wide-QMV sidecar makes this boundary different from the
+                // previously rejected all-width final-norm fuse. At table-paying
+                // decode widths only, one already-promoted kernel now replaces
+                // the final add, final RMSNorm, and lm-head xsums fill. Prefill
+                // and widths 1...3 retain the incumbent path byte for byte.
+                let fused = qwen35FusedResidualRMSNorm(
+                    x: base, r: delta,
+                    weight: norm.weight,
+                    eps: norm.eps)
+                return (hidden: fused.residual, fusedNormed: fused.normed)
+            }
             hiddenStates = delta.map { base + $0 } ?? base
         } else {
             for (i, layer) in layers.enumerated() {
@@ -3715,8 +3727,9 @@ public class Qwen35TextModelInner: Module {
             }
         }
 
-        // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
-        return hiddenStates
+        // Return pre-norm hidden states. Norm is applied by Qwen35TextModel
+        // unless the table-paying final boundary already produced it.
+        return (hidden: hiddenStates, fusedNormed: nil)
     }
 
     /// Atomically rebuild every linear-attention layer at the same committed
@@ -5214,8 +5227,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         // Inner model now returns pre-norm hidden; apply norm + lm_head here.
         // omlx: TextModel.__call__ (normed = self.model.norm(hidden); out = lm_head(normed))
-        let hidden = model(inputs, cache: cache)
-        var out = model.norm(hidden)
+        let inner = model(inputs, cache: cache)
+        let hidden = inner.hidden
+        var out = inner.fusedNormed ?? model.norm(hidden)
         if let lmHead {
             out = lmHead(out)
         } else {
@@ -5385,8 +5399,9 @@ extension Qwen35TextModel: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
-        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
+        let inner = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let hidden = inner.hidden
+        let normed = inner.fusedNormed ?? model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
             logits = routedLMHead(lmHead, normed)
@@ -5405,8 +5420,9 @@ extension Qwen35TextModel: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray, MLXArray?) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
-        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
+        let inner = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let hidden = inner.hidden
+        let normed = inner.fusedNormed ?? model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
             logits = routedLMHead(lmHead, normed)
