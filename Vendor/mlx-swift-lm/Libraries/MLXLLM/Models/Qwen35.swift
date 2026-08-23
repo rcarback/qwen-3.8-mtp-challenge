@@ -1564,7 +1564,11 @@ private let qwen35E120QMVHeader = """
 private func qwen35E120QMVSource(table: Bool) -> String {
     let sums = table ? "xsums" : "qmv_null_sums"
     let flag = table ? "USE_TABLE" : "false"
-    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3)]
+    // E125: M=8 takes IPG=8 (one X-group) instead of the library IPG=4
+    // (two X-groups). Every X-group re-reads the whole 4-bit weight matrix;
+    // M=8 is the hottest official width (29 rounds) so this halves that
+    // stream. M=6 stays library IPG=3 — that cell is a rival leftover.
+    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 8), (9, 3)]
         .map { m, ipg in
             """
                     case \(m):
@@ -1721,7 +1725,7 @@ public enum Qwen35CustomQMV {
         case 5: inputsPerGroup = 5
         case 6: inputsPerGroup = 3
         case 7: inputsPerGroup = 4
-        case 8: inputsPerGroup = 4
+        case 8: inputsPerGroup = 8
         case 9: inputsPerGroup = 3
         default: preconditionFailure("Qwen wide QMV has no width plan for \(m)")
         }
