@@ -4331,6 +4331,9 @@ let qwen35RowTop32Resolved: (enabled: Bool, source: String) = {
 public nonisolated(unsafe) var qwen35RowTop32FusedDrafts: Int = 0
 public nonisolated(unsafe) var qwen35RowTop32ArgPartitionDrafts: Int = 0
 
+/// Trace-only marker for the compiled proposal tail.
+public nonisolated(unsafe) var qwen35DraftTailPath: String = "unused"
+
 /// `unset`, `0` or `1`, for the same trace line.
 public var qwen35RowTop32GateSource: String { qwen35RowTop32Resolved.source }
 
@@ -5168,6 +5171,51 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     // ModuleInfo because it is derived during warmup, not checkpoint state.
     private var _compactDraftHead: Linear?
 
+    // COMPILED PROPOSAL TAIL. `draftTokenIDWithDeclaredRerank` is a pure
+    // function of one `[1, 1, hiddenSize]` hidden row plus weight-derived
+    // constants (the compact head, the cluster index, the shortlist and
+    // rerank kernels' template constants). Nothing in it depends on request
+    // state or on mutable cache arrays, which makes the whole per-step tail —
+    // coarse centroid scoring, probe selection, row shortlist, exact rerank,
+    // id mapping — a fixed-shape graph that MLX can trace once and replay.
+    // The eager form rebuilds that graph on the host for EVERY drafted token
+    // (~1.5-2.5 ms of CPU per step); the compiled form replays it for tens of
+    // microseconds, so deep draft chains stop starving the GPU between
+    // rounds. Bound lazily on the second call: the FIRST call runs eagerly
+    // so every lazily-built constant (derived cluster index, compact head,
+    // kernel factories) is materialised BEFORE the trace closes over them.
+    // Proposal side only: a different draft changes acceptance statistics,
+    // never an emitted token, and the compiled replay executes the same
+    // kernels in the same order, so the proposals are identical anyway.
+    //
+    // Enabled by default after an exact 256-token coordinator validation.
+    // MLX_QWEN_MTP_TAIL_COMPILE=off restores the eager dispatch for A/B work.
+    //
+    // OX-004 AUDIT SUMMARY (source-level; no GPU executed):
+    // - Purity: every ivar the tail reads is a load-time constant. The only
+    //   mutations (cluster index build, kernel factories, compact head)
+    //   complete during the first EAGER pass, which strictly precedes bind.
+    //   No eval/item/synchronisation exists inside the tail.
+    // - Trace semantics: MLX executes the closure once against tracers and
+    //   replays the recorded graph; host branches are resolved and baked at
+    //   trace time. Hence the closure asserts instead of falling back, and
+    //   bind happens only after the full eager pass (ordering load-bearing).
+    // - Shape specialisation: one signature `[1, 1, hiddenSize]`; other
+    //   shapes never reach the compiled path, so no re-trace churn.
+    // - Constants lifetime: captured arrays are retained by `self` ivars and
+    //   by the closure itself for process lifetime; the strong `[self]`
+    //   capture forms a retain cycle, accepted because the factory caches one
+    //   model per worker process anyway.
+    // - Telemetry caveat: the qwen35RowTop32* counters increment at TRACE
+    //   time only; under replay they freeze. Trace-only observability.
+    // - Thread contract: single-threaded session/warm usage; no locking added.
+    private var _compiledDraftTail: (@Sendable (MLXArray) -> MLXArray)?
+    /// Sticky: once the bind-time equivalence probe fails, never retry —
+    /// decode stays on the shipped eager dispatch for this instance.
+    private var _tailCompileRejected = false
+    private static let tailCompileEnabled =
+        ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TAIL_COMPILE"] != "off"
+
     // Prefix 98_304, the promoted trim. A 49_152 halving was measured on the
     // public longcopy gate and REGRESSED: three of its committed argmax ids
     // live in [49_152, 248_044), the head could no longer propose them, and
@@ -5572,6 +5620,24 @@ extension Qwen35TextModel: MTPCapable {
     /// and the untimed warm.
     public func draftTokenID(_ x: MLXArray) -> MLXArray {
         if _draftHeadW != nil {
+            // Compiled-tail fast path. Only the exact fixed shape the rerank
+            // tail accepts is routed here; anything else keeps the eager
+            // path so the trace never sees a shape it was not bound with.
+            // The binding call itself runs eagerly first (below), so the
+            // trace closes over fully materialised constants.
+            if Self.tailCompileEnabled, !_tailCompileRejected,
+                x.shape == [1, 1, configuration.hiddenSize]
+            {
+                if let compiled = _compiledDraftTail {
+                    qwen35DraftTailPath = "compiled"
+                    return compiled(x)
+                }
+                if let reranked = draftTokenIDWithDeclaredRerank(x) {
+                    bindCompiledDraftTail(validating: x, expect: reranked)
+                    qwen35DraftTailPath = "eager"
+                    return reranked
+                }
+            }
             if let reranked = draftTokenIDWithDeclaredRerank(x) {
                 return reranked
             }
@@ -5804,6 +5870,100 @@ extension Qwen35TextModel: MTPCapable {
             * width + MLX.remainder(local, width)
         // uint32 to match what `qwen35DraftTop32` hands the shared exact stage.
         return MLX.take(perm, permutedRow, axis: 0).asType(.uint32)
+    }
+
+    /// Bind and SELF-VALIDATE the compiled proposal tail. Called at most
+    /// once per instance, only while `tailCompileEnabled`, and only AFTER a
+    /// full successful eager `draftTokenIDWithDeclaredRerank` pass on this
+    /// instance — that ordering is load-bearing twice over:
+    ///
+    /// 1. Every lazily-created piece of tail state (derived cluster index,
+    ///    compact head, probe-select / row-top32 kernel factories) must be
+    ///    materialised BEFORE the trace closes over them, because MLX
+    ///    compiles by executing the closure ONCE against tracer arrays and
+    ///    then replaying the recorded graph without re-running host code.
+    ///    Host branches and lazy initialisation inside the closure are
+    ///    resolved at trace time and BAKED.
+    /// 2. The same semantics are why the closure contains no silent
+    ///    fallback: a branch not taken at trace time could never run at
+    ///    replay. The outer `draftTokenID` guard pins the input to the one
+    ///    supported shape and this bind site proves rerankability, so the
+    ///    closure asserts instead of falling back.
+    ///
+    /// The validation half evaluates the freshly bound closure ONCE on the
+    /// same input that produced `eagerIDs` and requires an exact id match.
+    /// This runs inside the untimed warm, costs one extra tiny sync there,
+    /// and closes both known residual risks: a mis-compiled custom-kernel
+    /// chain (caught by value comparison) and the single-array overload's
+    /// empty-result placeholder mapping (a `[1, 1]` shape check catches it).
+    /// Any mismatch permanently rejects the compiled path for this instance
+    /// (`_tailCompileRejected`) and decode stays on the shipped eager
+    /// dispatch, which is byte-for-byte what an explicit `off` run uses.
+    ///
+    /// OX-005 CONTAINMENT AUDIT. MLX-level failures during the probe (trace,
+    /// apply, eval) are genuinely containable here, not disguised: the
+    /// vendored `ErrorHandler.dispatch` routes C++ errors to the task-local
+    /// handler `withError` installs on THIS thread, and `CompiledFunction.
+    /// innerCall` maps non-zero compile/apply statuses to an empty result
+    /// expressly so that `withError` throws instead of the process dying
+    /// ("inside withError — error is stored in the ErrorBox"). Every array
+    /// produced by a failed attempt is discarded — none outlives this scope —
+    /// so the documented "arrays produced after an error will likely produce
+    /// further errors" hazard cannot reach decode. The boundary is explicit:
+    /// only the bind probe is contained. A failure AFTER a successful probe
+    /// (a replay of a proven-good graph) is outside containment and remains a
+    /// loud worker crash; it is not papered over as a fallback.
+    private func bindCompiledDraftTail(
+        validating input: MLXArray, expect eagerIDs: MLXArray
+    ) {
+        guard _compiledDraftTail == nil, Self.tailCompileEnabled,
+            !_tailCompileRejected
+        else { return }
+        let compiled = compile { [self] (tailInput: MLXArray) -> MLXArray in
+            // Unreachable on any path that reaches here: the outer call site
+            // admits only `[1, 1, hiddenSize]`, and the successful eager pass
+            // plus load-time-constant tail state make rerankability static.
+            // Loudly better than a silently-baked alternate branch.
+            precondition(
+                tailInput.shape == [1, 1, configuration.hiddenSize],
+                "compiled Qwen MTP proposal tail traced with unexpected shape "
+                    + "\(tailInput.shape)")
+            guard let reranked = draftTokenIDWithDeclaredRerank(tailInput)
+            else {
+                fatalError(
+                    "compiled Qwen MTP proposal tail traced while its inputs "
+                        + "are not rerankable; this contradicts the eager bind "
+                        + "precedent and would bake a dead graph")
+            }
+            return reranked
+        }
+        // One untimed equivalence probe before the tail is trusted, wrapped
+        // so MLX-level failures become a sticky rejection instead of a crash.
+        let accepted: Bool
+        do {
+            let matched = try withError { () -> Bool in
+                let probed = compiled(input)
+                eval(probed)
+                let want = eagerIDs
+                eval(want)
+                guard probed.shape == want.shape, probed.dtype == want.dtype
+                else { return false }
+                return probed.asArray(Int32.self) == want.asArray(Int32.self)
+            }
+            accepted = matched
+        } catch {
+            // Trace/apply/eval failure surfaced as MLXError.caught at block
+            // exit (or the empty-result placeholder failed the shape gate).
+            // Reject the compiled path for this instance; nothing from the
+            // failed attempt escapes this scope.
+            _tailCompileRejected = true
+            accepted = false
+        }
+        if accepted {
+            _compiledDraftTail = compiled
+        } else {
+            _tailCompileRejected = true
+        }
     }
 
     private func draftTokenIDWithDeclaredRerank(_ x: MLXArray) -> MLXArray? {
