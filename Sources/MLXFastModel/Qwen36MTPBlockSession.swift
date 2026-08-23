@@ -149,6 +149,12 @@ public final class Qwen36MTPBlockSession {
     /// token at t+1). Flushed as leading rows of the next draft forward.
     private var headHistoryBacklogHidden: [MLXArray] = []
     private var headHistoryBacklogTokens: [Int] = []
+    /// Fast-path view of `accepted rows + next pending row` from one verify
+    /// output. Those rows are adjacent in `verifyNormed`, so an immediately
+    /// following drafting round can feed this view straight to the head instead
+    /// of materialising the same rows with `concatenated`. Any intervening
+    /// non-drafting round, repair path, or shape mismatch clears/falls back.
+    private var headHistoryBacklogAndPendingHidden: MLXArray?
     /// Seed rows retained for lazy priming; released at the first flush.
     private var seedHiddenForPriming: MLXArray?
     private var seedTokensForPriming: [Int] = []
@@ -1309,6 +1315,10 @@ public final class Qwen36MTPBlockSession {
         // accepted = rejected = 0, tail = 1 -- and `rows_per_round(0) = 1` in the
         // box wrapper agrees without any special case there.
         if depth == Qwen36MTPLimits.serialControlDepth || draftCount == 0 {
+            // The saved adjacent view ends at THIS round's `hidden`. Once a
+            // serial/adaptive-skip forward produces a new pending row, the next
+            // flush is no longer one contiguous slice of the prior verify.
+            headHistoryBacklogAndPendingHidden = nil
             // Keep the committed-history ledger complete across non-drafting
             // rounds: this round's transition is (old pending hidden, primary).
             // Pure array retention — no GPU work, so the serial control's
@@ -1384,14 +1394,35 @@ public final class Qwen36MTPBlockSession {
             seedHiddenForPriming = nil
             seedTokensForPriming = []
         }
-        if !headHistoryBacklogHidden.isEmpty {
-            flushHidden.append(contentsOf: headHistoryBacklogHidden)
+        let adjacentCarry = headHistoryBacklogAndPendingHidden
+        headHistoryBacklogAndPendingHidden = nil
+        if let adjacentCarry,
+           flushHidden.isEmpty,
+           headHistoryBacklogHidden.count == 1,
+           adjacentCarry.ndim == 3,
+           adjacentCarry.dim(0) == hidden.dim(0),
+           adjacentCarry.dim(1) == headHistoryBacklogTokens.count + 1,
+           adjacentCarry.dim(2) == hidden.dim(2),
+           adjacentCarry.dtype == hidden.dtype
+        {
+            // `adjacentCarry` is exactly
+            // [accepted backlog rows..., current pending row]. Token order is
+            // still assembled independently as [accepted tokens..., primary].
+            flushHidden.append(adjacentCarry)
             flushTokens.append(contentsOf: headHistoryBacklogTokens)
+            flushTokens.append(primary)
             headHistoryBacklogHidden.removeAll(keepingCapacity: true)
             headHistoryBacklogTokens.removeAll(keepingCapacity: true)
+        } else {
+            if !headHistoryBacklogHidden.isEmpty {
+                flushHidden.append(contentsOf: headHistoryBacklogHidden)
+                flushTokens.append(contentsOf: headHistoryBacklogTokens)
+                headHistoryBacklogHidden.removeAll(keepingCapacity: true)
+                headHistoryBacklogTokens.removeAll(keepingCapacity: true)
+            }
+            flushHidden.append(hidden)
+            flushTokens.append(primary)
         }
-        flushHidden.append(hidden)
-        flushTokens.append(primary)
 
         let draftBase = headCache.first?.offset ?? 0
         // Every flushed position is committed history plus the (pendingHidden,
@@ -1401,7 +1432,8 @@ public final class Qwen36MTPBlockSession {
         // `_rollback_mtp_cache(cycle_offset + 1)`).
         let validHistoryOffset = draftBase + flushTokens.count
         let draftInputHidden =
-            flushHidden.count == 1 ? hidden : concatenated(flushHidden, axis: 1)
+            flushHidden.count == 1
+                ? flushHidden[0] : concatenated(flushHidden, axis: 1)
         let draftInputTokens = MLXArray(flushTokens.map(Int32.init))
             .reshaped([1, flushTokens.count])
 
@@ -1529,6 +1561,7 @@ public final class Qwen36MTPBlockSession {
 
         if Self.traceRounds { tReadDone = DispatchTime.now().uptimeNanoseconds }
 
+        var pendingHiddenUsesVerifyRow = false
         if acceptedCount == drafts.count {
             // FULL ACCEPTANCE: the verify state IS the committed state. No
             // rollback, no repair forward; the bonus row carries the next primary
@@ -1539,6 +1572,7 @@ public final class Qwen36MTPBlockSession {
             pendingPrimary = verifyArgmax[drafts.count]
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
+            pendingHiddenUsesVerifyRow = true
             let base = drafts.count * 2
             let ids = Array(flatTop2IDs[base ..< (base + 2)])
             let values = Array(flatTop2Values[base ..< (base + 2)])
@@ -1565,6 +1599,7 @@ public final class Qwen36MTPBlockSession {
                 pendingPrimary = verifyArgmax[acceptedCount]
                 pendingHidden = hiddenRow(
                     verifyHidden, verifyNormed, acceptedCount)
+                pendingHiddenUsesVerifyRow = true
                 pendingTop2 = (
                     perRowTop2Tokens[acceptedCount],
                     perRowTop2Logits[acceptedCount]
@@ -1606,6 +1641,7 @@ public final class Qwen36MTPBlockSession {
         // committed pair. The rejecting round queues nothing — the next
         // round's own (pendingHidden, primary) row covers that transition.
         Self.trimTrimmable(headCache, to: validHistoryOffset)
+        headHistoryBacklogAndPendingHidden = nil
         if acceptedCount > 0 {
             // Keep accepted post-norm rows as one contiguous block. The backlog
             // already supports multi-row blocks (seed priming uses one), while
@@ -1614,6 +1650,10 @@ public final class Qwen36MTPBlockSession {
                 verifyHidden, verifyNormed, 0 ..< acceptedCount)
             {
                 headHistoryBacklogHidden.append(block)
+                if pendingHiddenUsesVerifyRow {
+                    headHistoryBacklogAndPendingHidden = normedRows(
+                        verifyHidden, verifyNormed, 0 ..< (acceptedCount + 1))
+                }
             } else {
                 // Preserve the exact pre-existing per-row normalization path
                 // whenever no matching published block is available.
