@@ -827,6 +827,84 @@ public final class Qwen36MTPBlockSession {
         return pendingPrimary!
     }
 
+    // MARK: - extend
+
+    /// Continue an existing session with more input tokens.
+    ///
+    /// WHY THIS IS EXTENSION-ONLY AND WILL NOT REWIND. The 48 gated-delta layers
+    /// carry recurrent state that `trim()` cannot roll back, so the only
+    /// position this session can resume from is the one it is already at. The
+    /// caller is responsible for having established that `tokens` are exactly
+    /// the ones that follow the session's existing history; a caller that
+    /// guesses wrong corrupts its own output and nothing here can detect it.
+    ///
+    /// The outstanding pending primary is dropped on purpose. The round-top
+    /// invariant is "every emitted token is in the trimmable caches and the
+    /// pending primary is not", so discarding it leaves the caches at exactly
+    /// `seedTokenCount + committedTokenCount` -- where `tokens` belongs.
+    ///
+    /// LOCAL INTERACTIVE TOOLING ONLY. No scored verb reaches this method: the
+    /// measured window is one `begin` and one decode pass. It is defined here
+    /// rather than beside the server because only this class can touch the KV
+    /// state it continues.
+    @discardableResult
+    public func extend(tokens: [Int]) throws -> Int {
+        guard began else { throw Qwen36MTPSessionError.notBegun }
+        guard !tokens.isEmpty else { throw Qwen36MTPSessionError.emptySeed }
+        let base = trimmableOffset()
+        let expected = seedTokenCount + committedTokenCount
+        guard base == expected else {
+            throw Qwen36MTPSessionError.cacheOffsetInvariant(
+                expected: expected, actual: base, round: roundCount)
+        }
+
+        let (extendLogits, hidden) = model.callWithHidden(
+            input: LMInput.Text(
+                tokens: MLXArray(tokens).reshaped([1, tokens.count])),
+            cache: cache, nConfirmed: 0)
+        // Same dead-graph trim as `begin`: only the last row is ever read, and
+        // it is projected directly from the post-norm hidden below.
+        _ = extendLogits
+        pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
+        let lastLogits = model.applyLMHead(pendingHidden!)
+        let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
+        eval(cache.flatMap { $0.state } + [tailIDs, tailValues,
+                                           pendingHidden!, hidden])
+        let readTail = (
+            tailIDs.asArray(Int32.self).map { Int($0) },
+            tailValues.asArray(Float.self).map { Double($0) }
+        )
+        if let sampling {
+            let selection = Self.buildSampledSelection(
+                lastLogits.reshaped([1, 1, lastLogits.dim(-1)]),
+                draftIDs: [], sampling: sampling,
+                acceptKey: nextKey(), drawKey: nextKey())
+            eval(selection.corrected)
+            pendingPrimary = Int(selection.corrected.asArray(Int32.self)[0])
+        } else {
+            pendingPrimary = readTail.0[0]
+        }
+        pendingTop2 = readTail
+        // The extension tokens are input, not emitted output, so they belong to
+        // the seed count. Keeping `committedTokenCount` as the emitted total is
+        // what lets the worker's decode ceiling stay a cap on OUTPUT.
+        seedTokenCount += tokens.count
+        // Head history from before the extension no longer describes a
+        // contiguous trunk: the head cache's rows stop at the previous end and
+        // the backlog rows are separated from the new tail by every extension
+        // token. Rebuild it. Dropping the persistent cache (rather than only
+        // the backlog) is what makes the LAZY re-prime below actually run --
+        // priming is only consumed when the cache is absent -- so the head
+        // re-reads the extension instead of drafting from a stale prefix. The
+        // head only proposes, so this costs accept rate and nothing else.
+        headHistoryCache = nil
+        headHistoryBacklogHidden.removeAll()
+        headHistoryBacklogTokens.removeAll()
+        seedHiddenForPriming = hidden
+        seedTokensForPriming = tokens
+        return pendingPrimary!
+    }
+
     // MARK: - draft schedule (EDITABLE POLICY)
 
     /// How many tokens to draft this round, given the parent's offer.

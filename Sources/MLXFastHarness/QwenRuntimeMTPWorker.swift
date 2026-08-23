@@ -404,6 +404,54 @@ extension QwenRuntime {
                 throw error
             }
 
+        case "mtp_decode_extend":
+            // LOCAL INTERACTIVE TOOLING ONLY -- no scored verb issues this.
+            //
+            // Continue the live session with more input instead of paying a
+            // fresh prefill. `state.decodedTokenCount` is deliberately NOT
+            // reset: the ceiling caps EMITTED tokens over the whole
+            // conversation, so a caller that extends forever still hits it.
+            // `state.seedTokenCount` grows by the extension so the round
+            // handler's `seed + decoded == targetCacheOffset` check keeps
+            // holding.
+            guard state.began,
+                  request.id > 0,
+                  let extendTokens = request.seedTokens,
+                  !extendTokens.isEmpty,
+                  request.promptTokens == nil,
+                  request.token == nil,
+                  request.steps == nil,
+                  request.maxBlockSize == nil,
+                  request.topK == nil,
+                  request.expectedToken == nil,
+                  request.temperature == nil,
+                  request.topP == nil,
+                  request.samplingSeed == nil
+            else {
+                throw MLXFastError.invalidInput(
+                    "MTP extend request arrived before begin or is malformed")
+            }
+            do {
+                let seedToken = try session.extend(tokens: extendTokens)
+                let (nextSeedCount, seedOverflow) =
+                    state.seedTokenCount.addingReportingOverflow(
+                        extendTokens.count)
+                guard !seedOverflow else {
+                    throw MLXFastError.invalidInput(
+                        "MTP extend overflowed the session seed count")
+                }
+                state.seedTokenCount = nextSeedCount
+                return RuntimeWorkerResponse(
+                    id: request.id,
+                    nonce: sessionNonce,
+                    ok: true,
+                    seedToken: seedToken
+                )
+            } catch {
+                state.poisoned = true
+                throw error
+            }
+
         case "mtp_decode_round":
             guard state.began else {
                 throw MLXFastError.invalidInput(

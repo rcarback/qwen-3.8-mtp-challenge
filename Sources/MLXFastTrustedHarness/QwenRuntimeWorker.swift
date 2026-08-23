@@ -2398,6 +2398,17 @@ final class RuntimeWorkerClient {
         try send(kind: "mtp_decode_reset")
     }
 
+    /// Continue the live decode session with more input tokens.
+    ///
+    /// LOCAL INTERACTIVE TOOLING ONLY, and EXTENSION-ONLY: `tokens` must be
+    /// exactly the tokens that follow everything the session has already
+    /// processed. The session's recurrent layers cannot rewind, so anything
+    /// else is a `resetMTPDecode` plus a fresh `beginMTPDecode`. See
+    /// `ServePrefixDecision`, which is where that judgement is made.
+    func extendMTPDecode(tokens: [Int]) throws -> RuntimeWorkerResponse {
+        try send(kind: "mtp_decode_extend", seedTokens: tokens)
+    }
+
     /// One accept/verify/rollback round at the parent-chosen draft depth.
     ///
     /// No previous-token argument, unlike the DFlash block request: the next
