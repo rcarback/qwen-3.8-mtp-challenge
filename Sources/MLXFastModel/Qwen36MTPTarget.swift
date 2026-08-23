@@ -59,6 +59,17 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray, MLXArray?)
 
+    /// Optional producer/consumer shortcut for verify readout. Conformers that
+    /// can reduce an exact lm-head projection while producing it return top-2
+    /// arrays and no logits. Every other conformer returns full logits and nil
+    /// top-2 arrays through the default implementation below.
+    func callWithHiddenAndNormedTopTwo(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (
+        logits: MLXArray?, hidden: MLXArray, normed: MLXArray?,
+        top2IDs: MLXArray?, top2Values: MLXArray?
+    )
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.
@@ -124,6 +135,17 @@ extension Qwen36MTPTarget {
         let (logits, hidden) = callWithHidden(
             input: input, cache: cache, nConfirmed: nConfirmed)
         return (logits, hidden, nil)
+    }
+
+    public func callWithHiddenAndNormedTopTwo(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (
+        logits: MLXArray?, hidden: MLXArray, normed: MLXArray?,
+        top2IDs: MLXArray?, top2Values: MLXArray?
+    ) {
+        let (logits, hidden, normed) = callWithHiddenAndNormed(
+            input: input, cache: cache, nConfirmed: nConfirmed)
+        return (logits, hidden, normed, nil, nil)
     }
 }
 

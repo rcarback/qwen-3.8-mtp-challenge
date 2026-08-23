@@ -1651,6 +1651,379 @@ private let qwen35CustomAffine4XSumsKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+// MARK: - streaming exact target top-2
+
+/// Total ordering used by the existing target top-2 reducer: larger value,
+/// lower vocabulary id on an exact tie, and every finite value before NaN.
+/// Keeping it here lets the lm-head QMV emit small per-chunk summaries without
+/// ever writing the full `[M, 248320]` logits array.
+private let qwen35StreamingTopTwoHeader = qwen35E120QMVHeader + """
+    struct qwen_lm_top2_state {
+        float first_value;
+        float second_value;
+        uint first_id;
+        uint second_id;
+        uint count;
+    };
+
+    inline qwen_lm_top2_state qwen_lm_top2_empty() {
+        qwen_lm_top2_state state;
+        state.first_value = 0.0f;
+        state.second_value = 0.0f;
+        state.first_id = 0;
+        state.second_id = 0;
+        state.count = 0;
+        return state;
+    }
+
+    inline bool qwen_lm_top2_better(
+        float candidate_value,
+        uint candidate_id,
+        float current_value,
+        uint current_id
+    ) {
+        bool candidate_nan = isnan(candidate_value);
+        bool current_nan = isnan(current_value);
+        if (candidate_nan != current_nan) {
+            return !candidate_nan;
+        }
+        if (candidate_value > current_value) {
+            return true;
+        }
+        if (candidate_value < current_value) {
+            return false;
+        }
+        return candidate_id < current_id;
+    }
+
+    inline void qwen_lm_top2_insert(
+        thread qwen_lm_top2_state &state,
+        float value,
+        uint id
+    ) {
+        if (state.count > 0 && state.first_id == id) {
+            return;
+        }
+        if (state.count > 1 && state.second_id == id) {
+            return;
+        }
+        if (state.count == 0
+            || qwen_lm_top2_better(
+                value, id, state.first_value, state.first_id)) {
+            if (state.count > 0) {
+                state.second_value = state.first_value;
+                state.second_id = state.first_id;
+            }
+            state.first_value = value;
+            state.first_id = id;
+            state.count = min(state.count + 1, 2u);
+            return;
+        }
+        if (state.count == 1
+            || qwen_lm_top2_better(
+                value, id, state.second_value, state.second_id)) {
+            state.second_value = value;
+            state.second_id = id;
+            state.count = 2;
+        }
+    }
+
+    template <int NA, bool USE_TABLE>
+    inline void qwen_e120_qmv_top2_wide(
+        const device uint32_t* w,
+        const device bfloat16_t* scales,
+        const device bfloat16_t* biases,
+        const device bfloat16_t* x,
+        const device float* xsums,
+        device int* partial_ids,
+        device float* partial_values,
+        threadgroup qwen_lm_top2_state* shared,
+        const int in_vec_size,
+        const int out_vec_size,
+        const int sums_stride,
+        const int chunks,
+        int first_m,
+        int chunk,
+        uint simd_group,
+        uint simd_lid
+    ) {
+        typedef vec<float, NA> VF;
+        constexpr int rows_per_simd = 4;
+        constexpr int values_per_thread = 16;
+        constexpr int block_size = values_per_thread * 32;
+        constexpr int bytes_per_lane = 8;
+        constexpr int output_blocks_per_chunk = 32;
+        constexpr int shared_row_stride = 5;
+        const int in_vec_size_w = in_vec_size / 2;
+        const int in_vec_size_g = in_vec_size / 64;
+
+        qwen_lm_top2_state local[NA];
+        for (int m = 0; m < NA; m++) {
+            local[m] = qwen_lm_top2_empty();
+        }
+
+        for (int output_block = 0;
+             output_block < output_blocks_per_chunk;
+             output_block++) {
+            const int out_row =
+                chunk * 256 + output_block * 8 + int(simd_group) * 4;
+            VF acc[rows_per_simd];
+            for (int r = 0; r < rows_per_simd; r++) {
+                acc[r] = VF(0.0f);
+            }
+
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                thread uint16_t packed[rows_per_simd][4];
+                thread float scale_local[rows_per_simd];
+                thread float bias_local[rows_per_simd];
+                for (int r = 0; r < rows_per_simd; r++) {
+                    const int row = out_row + r;
+                    const device uint16_t* ws =
+                        reinterpret_cast<const device uint16_t*>(
+                            reinterpret_cast<const device uint8_t*>(w) +
+                            row * in_vec_size_w + k / 2 +
+                            simd_lid * bytes_per_lane);
+                    for (int i = 0; i < 4; i++) {
+                        packed[r][i] = ws[i];
+                    }
+                    const int group_index =
+                        row * in_vec_size_g + k / 64 + int(simd_lid) / 4;
+                    scale_local[r] = scales[group_index];
+                    bias_local[r] = biases[group_index];
+                }
+
+                VF sums = VF(0.0f);
+                if (USE_TABLE) {
+                    const device float* st =
+                        xsums + ((k / block_size) * 32 + int(simd_lid)) *
+                        sums_stride + first_m;
+                    for (int m = 0; m < NA; m++) {
+                        sums[m] = st[m];
+                    }
+                }
+                VF partial[rows_per_simd];
+                for (int r = 0; r < rows_per_simd; r++) {
+                    partial[r] = VF(0.0f);
+                }
+                for (int i = 0; i < 4; i++) {
+                    VF a0, a1, a2, a3;
+                    for (int m = 0; m < NA; m++) {
+                        const device bfloat16_t* xm =
+                            x + (first_m + m) * in_vec_size + k +
+                            simd_lid * values_per_thread + 4 * i;
+                        const vec<bfloat16_t, 4> xv =
+                            *reinterpret_cast<
+                                const device vec<bfloat16_t, 4>*>(xm);
+                        a0[m] = static_cast<float>(xv[0]);
+                        a1[m] = static_cast<float>(xv[1]);
+                        a2[m] = static_cast<float>(xv[2]);
+                        a3[m] = static_cast<float>(xv[3]);
+                        if (!USE_TABLE) {
+                            sums[m] += xv[0] + xv[1] + xv[2] + xv[3];
+                        }
+                    }
+                    for (int r = 0; r < rows_per_simd; r++) {
+                        partial[r] +=
+                            (a0 * (packed[r][i] & 0x000f) +
+                             a1 * ((packed[r][i] >> 4) & 0x000f) +
+                             a2 * ((packed[r][i] >> 8) & 0x000f) +
+                             a3 * ((packed[r][i] >> 12) & 0x000f));
+                    }
+                }
+                for (int r = 0; r < rows_per_simd; r++) {
+                    acc[r] +=
+                        scale_local[r] * partial[r] + sums * bias_local[r];
+                }
+            }
+
+            for (int r = 0; r < rows_per_simd; r++) {
+                for (int m = 0; m < NA; m++) {
+                    const float reduced = simd_sum(acc[r][m]);
+                    if (simd_lid == 0) {
+                        const bfloat16_t rounded =
+                            static_cast<bfloat16_t>(reduced);
+                        qwen_lm_top2_insert(
+                            local[m], static_cast<float>(rounded),
+                            uint(out_row + r));
+                    }
+                }
+            }
+        }
+
+        if (simd_lid == 0) {
+            for (int m = 0; m < NA; m++) {
+                shared[int(simd_group) * shared_row_stride + m] = local[m];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0 && simd_lid == 0) {
+            for (int m = 0; m < NA; m++) {
+                qwen_lm_top2_state merged = shared[m];
+                const qwen_lm_top2_state other =
+                    shared[shared_row_stride + m];
+                if (other.count > 0) {
+                    qwen_lm_top2_insert(
+                        merged, other.first_value, other.first_id);
+                }
+                if (other.count > 1) {
+                    qwen_lm_top2_insert(
+                        merged, other.second_value, other.second_id);
+                }
+                const int base = ((first_m + m) * chunks + chunk) * 2;
+                partial_ids[base] = int(merged.first_id);
+                partial_ids[base + 1] = int(merged.second_id);
+                partial_values[base] = merged.first_value;
+                partial_values[base + 1] = merged.second_value;
+            }
+        }
+    }
+
+    template <int M, int IPG, bool USE_TABLE>
+    inline void qwen_e120_qmv_top2_m(
+        const device uint32_t* w,
+        const device bfloat16_t* scales,
+        const device bfloat16_t* biases,
+        const device bfloat16_t* x,
+        const device float* xsums,
+        device int* partial_ids,
+        device float* partial_values,
+        threadgroup qwen_lm_top2_state* shared,
+        const int in_vec_size,
+        const int out_vec_size,
+        const int sums_stride,
+        const int chunks,
+        int group_x,
+        int chunk,
+        uint simd_group,
+        uint simd_lid
+    ) {
+        static_assert(M % IPG != 1, "a one-input tail group is not built");
+        constexpr int TAIL = M % IPG;
+        const int first_m = group_x * IPG;
+        if (first_m >= M) {
+            return;
+        }
+        if (TAIL == 0 || M - first_m >= IPG) {
+            qwen_e120_qmv_top2_wide<IPG, USE_TABLE>(
+                w, scales, biases, x, xsums, partial_ids, partial_values,
+                shared, in_vec_size, out_vec_size, sums_stride, chunks,
+                first_m, chunk, simd_group, simd_lid);
+        } else {
+            qwen_e120_qmv_top2_wide<(TAIL >= 2 ? TAIL : 2), USE_TABLE>(
+                w, scales, biases, x, xsums, partial_ids, partial_values,
+                shared, in_vec_size, out_vec_size, sums_stride, chunks,
+                first_m, chunk, simd_group, simd_lid);
+        }
+    }
+    """
+
+private func qwen35StreamingTopTwoSource(table: Bool) -> String {
+    let sums = table ? "xsums" : "qmv_null_sums"
+    let flag = table ? "USE_TABLE" : "false"
+    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3)]
+        .map { m, ipg in
+            """
+                    case \(m):
+                        qwen_e120_qmv_top2_m<\(m), \(ipg), \(flag)>(
+                            w, scales, biases, x, \(sums),
+                            partial_ids, partial_values, qmv_shared,
+                            qmv_k, qmv_n, qmv_stride, qmv_chunks,
+                            qmv_gx, qmv_chunk, qmv_sgid, qmv_lid);
+                        break;
+            """
+        }
+        .joined(separator: "\n")
+    let nullDecl = table ? "" : "\n        const device float* qmv_null_sums = nullptr;"
+    return """
+            const int qmv_m = x_shape[x_ndim - 2];
+            const int qmv_k = x_shape[x_ndim - 1];
+            const int qmv_n = w_shape[0];
+            const int qmv_stride = qmv_m <= 8 ? 8 : 16;
+            const int qmv_chunks = qmv_n / 256;
+            const uint3 qmv_tid = threadgroup_position_in_grid;
+            const uint qmv_lid = thread_index_in_simdgroup;
+            const uint qmv_sgid = simdgroup_index_in_threadgroup;
+            const int qmv_gx = int(qmv_tid.x);
+            const int qmv_chunk = int(qmv_tid.y);
+            threadgroup qwen_lm_top2_state qmv_shared[10];\(nullDecl)
+            switch (qmv_m) {
+        \(cases)
+                default:
+                    break;
+            }
+        """
+}
+
+private let qwen35StreamingTopTwoKernel = MLXFast.metalKernel(
+    name: "qwen35_streaming_lmhead_top2_v1",
+    inputNames: ["w", "scales", "biases", "x"],
+    outputNames: ["partial_ids", "partial_values"],
+    source: qwen35StreamingTopTwoSource(table: false),
+    header: qwen35StreamingTopTwoHeader,
+    ensureRowContiguous: true
+)
+
+private let qwen35StreamingTopTwoTableKernel = MLXFast.metalKernel(
+    name: "qwen35_streaming_lmhead_top2_sums_v1",
+    inputNames: ["w", "scales", "biases", "x", "xsums"],
+    outputNames: ["partial_ids", "partial_values"],
+    source: qwen35StreamingTopTwoSource(table: true),
+    header: qwen35StreamingTopTwoHeader,
+    ensureRowContiguous: true
+)
+
+private let qwen35StreamingTopTwoFinalizeKernel = MLXFast.metalKernel(
+    name: "qwen35_streaming_lmhead_top2_finalize_v1",
+    inputNames: ["partial_ids", "partial_values"],
+    outputNames: ["top_ids", "top_values"],
+    source: """
+        const uint lane = thread_position_in_threadgroup.x;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint chunks = uint(partial_ids_shape[1]);
+        qwen_lm_top2_state local = qwen_lm_top2_empty();
+
+        for (uint chunk = lane; chunk < chunks; chunk += 256) {
+            const uint base = (row * chunks + chunk) * 2;
+            qwen_lm_top2_insert(
+                local, partial_values[base], uint(partial_ids[base]));
+            qwen_lm_top2_insert(
+                local, partial_values[base + 1],
+                uint(partial_ids[base + 1]));
+        }
+
+        threadgroup qwen_lm_top2_state scratch[256];
+        scratch[lane] = local;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                qwen_lm_top2_state merged = scratch[lane];
+                const qwen_lm_top2_state other = scratch[lane + stride];
+                if (other.count > 0) {
+                    qwen_lm_top2_insert(
+                        merged, other.first_value, other.first_id);
+                }
+                if (other.count > 1) {
+                    qwen_lm_top2_insert(
+                        merged, other.second_value, other.second_id);
+                }
+                scratch[lane] = merged;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0) {
+            const uint base = row * 2;
+            top_ids[base] = int(scratch[0].first_id);
+            top_ids[base + 1] = int(scratch[0].second_id);
+            top_values[base] = scratch[0].first_value;
+            top_values[base + 1] = scratch[0].second_value;
+        }
+        """,
+    header: qwen35StreamingTopTwoHeader,
+    ensureRowContiguous: false
+)
+
 /// Candidate-owned entry point for the wide affine-4/group-64 QMV.
 ///
 /// `matmul` returns `nil` for every cell the incumbent must keep, so a routed
@@ -1805,6 +2178,63 @@ public enum Qwen35CustomQMV {
             outputShapes: [[kBlocks * 32 * sumsStride(m)]],
             outputDTypes: [.float32]
         )[0]
+    }
+
+    /// Exact target top-2 without a full logits tensor. Each first-stage
+    /// threadgroup evaluates 256 adjacent lm-head rows with the incumbent QMV
+    /// expression, rounds every scalar to bf16 at the incumbent store boundary,
+    /// and retains only that chunk's ordered pair. One 256-threadgroup merge per
+    /// input row then applies the same total ordering as the session reducer.
+    public static func streamingTopTwo(
+        _ layer: Linear, _ x: MLXArray
+    ) -> (ids: MLXArray, values: MLXArray)? {
+        guard arm == .sumTable,
+              let q = layer as? QuantizedLinear,
+              q.bias == nil,
+              let z = q.biases,
+              let cell = routable(
+                x, q.weight, scales: q.scales, biases: z,
+                groupSize: q.groupSize, bits: q.bits, mode: q.mode),
+              cell.k == 5120,
+              cell.n == 248_320,
+              cell.n % 256 == 0
+        else { return nil }
+
+        let chunks = cell.n / 256
+        let outputShapes = [
+            [cell.m, chunks, 2],
+            [cell.m, chunks, 2],
+        ]
+        let partials: [MLXArray]
+        if tablePays(m: cell.m) {
+            let table = Qwen35XSumsSidecar.take(
+                x, k: cell.k, m: cell.m) ?? xsumsTable(x)
+            partials = qwen35StreamingTopTwoTableKernel(
+                [q.weight, q.scales, z, x, table],
+                template: [("USE_TABLE", true)],
+                grid: (activeInputGroups(cell.m) * 32, chunks * 2, 1),
+                threadGroup: (32, 2, 1),
+                outputShapes: outputShapes,
+                outputDTypes: [.int32, .float32]
+            )
+        } else {
+            partials = qwen35StreamingTopTwoKernel(
+                [q.weight, q.scales, z, x],
+                grid: (activeInputGroups(cell.m) * 32, chunks * 2, 1),
+                threadGroup: (32, 2, 1),
+                outputShapes: outputShapes,
+                outputDTypes: [.int32, .float32]
+            )
+        }
+
+        let outputs = qwen35StreamingTopTwoFinalizeKernel(
+            partials,
+            grid: (cell.m * 256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[cell.m, 2], [cell.m, 2]],
+            outputDTypes: [.int32, .float32]
+        )
+        return (outputs[0], outputs[1])
     }
 
     /// The wide QMV against a caller-supplied chunk-sum table. Exposed so the
@@ -5416,6 +5846,32 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden, normed)
     }
 
+    /// Verify-forward readout that lets the exact affine-4 lm head stream its
+    /// top-2 consumer. A failed route still returns the incumbent full logits,
+    /// so the backbone and cache mutate exactly once on every path.
+    public func callWithHiddenAndNormedTopTwo(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (
+        logits: MLXArray?, hidden: MLXArray, normed: MLXArray?,
+        top2IDs: MLXArray?, top2Values: MLXArray?
+    ) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = model.norm(hidden)
+        if let lmHead,
+           let topTwo = Qwen35CustomQMV.streamingTopTwo(lmHead, normed)
+        {
+            return (nil, hidden, normed, topTwo.ids, topTwo.values)
+        }
+        let logits: MLXArray
+        if let lmHead {
+            logits = routedLMHead(lmHead, normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, hidden, normed, nil, nil)
+    }
+
     /// Rebuild the target's recurrent cache after an accepted verify prefix.
     public func replayRecurrentPrefix(
         cache: [any KVCache], committedRows: Int
@@ -6015,6 +6471,17 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray, MLXArray?) {
         languageModel.callWithHiddenAndNormed(
+            input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.callWithHiddenAndNormedTopTwo`.
+    public func callWithHiddenAndNormedTopTwo(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (
+        logits: MLXArray?, hidden: MLXArray, normed: MLXArray?,
+        top2IDs: MLXArray?, top2Values: MLXArray?
+    ) {
+        languageModel.callWithHiddenAndNormedTopTwo(
             input: input, cache: cache, nConfirmed: nConfirmed)
     }
 

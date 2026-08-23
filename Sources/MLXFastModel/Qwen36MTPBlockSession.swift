@@ -1477,10 +1477,11 @@ public final class Qwen36MTPBlockSession {
         // accepted head-history rows do not each repeat the same row-local
         // RMSNorm through applyFinalNorm. Conformers that return nil retain the
         // old path through the guarded hiddenRow overload below.
-        let (verifyLogits, verifyHidden, verifyNormed) =
-            model.callWithHiddenAndNormed(
+        let verifyReadout = model.callWithHiddenAndNormedTopTwo(
                 input: LMInput.Text(tokens: verifyTokens),
                 cache: cache, nConfirmed: 1)
+        let verifyHidden = verifyReadout.hidden
+        let verifyNormed = verifyReadout.normed
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
@@ -1490,7 +1491,19 @@ public final class Qwen36MTPBlockSession {
         // in ONE eval. The `.item()`/`.asArray` calls below then copy from
         // materialised buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
-        let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
+        let top2IDs: MLXArray
+        let top2Values: MLXArray
+        if let streamedIDs = verifyReadout.top2IDs,
+           let streamedValues = verifyReadout.top2Values
+        {
+            top2IDs = streamedIDs
+            top2Values = streamedValues
+        } else if let verifyLogits = verifyReadout.logits {
+            (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
+        } else {
+            fatalError(
+                "Qwen verify readout returned neither logits nor exact top-2")
+        }
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
         eval(cache.flatMap { $0.state } + bundle)
