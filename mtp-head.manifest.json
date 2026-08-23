@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:Frosty40/qwen38-mtp-head-qat-keepisl-v1@6a92d2419e0cd204484df9c7df7b57d328ebe1a6",
+  "sha256": "1b9a5de2a57ab03d597f0af67efc8a8457797b76d643e82935a8472b98349213",
+  "bytes": 383177704,
   "max_bytes": 2147483648,
-  "note": "xsums fill fusion on eb5eadc: the fused residual+RMSNorm kernel gains an emitSums variant whose epilogue is the BODY of qwen35_custom_affine4_g64_xsums_v1 verbatim, run over the normed bytes it has just stored (device barrier, same vec<bfloat16_t,4> loads, same three BF16 adds per group of four, same ascending float accumulation onto 0.0f, same (k_block*32+lane)*stride+row address), so the table is the standalone fill's bit pattern by construction. A weak-identity sidecar hands that table to Qwen35CustomQMV.matmul, deleting 127 of the 257 standalone xsums fill dispatches per verify round (mlp.gate_up 64, gdn.in_proj 47, fa.qkv 16); the other 130 keep xsumsTable unchanged. Only the sumtable arm at M=4...9 publishes, so M=1 (the serial leg) and prefill run the shipped kernel byte for byte. Widths 2...9, IPG table, tablePays>=4, 0.15, skip-probesort kept. Head tensors remain pinned. No remote code. resample-2 (54d42a3 diagnose: 6/7 active prompts faster, schedule identical, reprice 3.72612 > frontier 3.71960)"
+  "note": "KEEP-ISLANDS QAT shrink of mlp.gate_proj/up_proj only. Ticket 1bfb8ae failed in 0.9s at worker startup after dropping all six precision_islands.{q,k,v}.{weight,indices} tensors; this declaration restores those six tensors byte-identical to the scoring incumbent (40 tensors, islands present as a complete set) and keeps the QAT-trained affine-2/g64 gate/up pack from that ticket (those two packed matrices are byte-identical to qwen38-mtp-head-qat-shrink-v1). Net -44,564,896 bytes (-10.42%) off every draft step versus the 427,742,600 incumbent. Head traffic is candidate-exclusive (serial control runs zero head steps). Fusion guards intact: q=k=v=4 so the fused QKV pack and the island-completeness K/V fast path survive; gate=up=2 so the fused gate/up product survives; down_proj/fc/o_proj stay affine-4; compact draft readout remains byte-identical at [98336,320]/[98336,80]. Loader shape matches the scoring head: bare names, complete island set, fc/norm/pre_fc_norm_hidden present, single model.safetensors, bits in {2,4,8}. Anonymous fetch of the declared revision matches. Manifest-only: Swift tree byte-identical to parent 0863b06."
 }
