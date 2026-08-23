@@ -3788,6 +3788,121 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
 )
 
 // ---------------------------------------------------------------------------
+// E130 ROW-PARALLEL RERANK SPLIT
+//
+// The v1 kernel above runs all 32 candidate dots inside ONE threadgroup
+// (grid (256, 1, 1)): eight simdgroups walking dependent weight loads
+// serialize on a single SM's memory pipeline. The rows are independent,
+// so per-row arithmetic is unchanged when each row moves to its own
+// simdgroup in its OWN threadgroup: same k-block order, same xv expression
+// tree, same scale*accum + sum*bias per block, same simd_sum reduction,
+// InT rounding applied before any comparison. A micro-kernel then reduces
+// the 32 rounded (value, id) pairs under the identical comparator and tie
+// rule. Proposal-side only — the target still verifies every token.
+private let qwen35DraftSelectedAffine4RerankPartialKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_selected_affine4_rerank_g64_partial_v1",
+    inputNames: ["x", "candidate_ids", "weight", "scales", "biases"],
+    outputNames: ["out_val", "out_id"],
+    source: """
+        constexpr uint K          = 5120;
+        constexpr uint K_WORDS    = 640;
+        constexpr uint K_GROUPS   = 80;
+        constexpr uint VALUES_PER_LANE = 16;
+        constexpr uint BLOCK      = 512;
+
+        uint lane = thread_index_in_simdgroup;
+        uint g = threadgroup_position_in_grid.x;
+        uint row = uint(candidate_ids[g]);
+        float result = 0.0f;
+
+        for (uint k = 0; k < K; k += BLOCK) {
+            float xv[VALUES_PER_LANE];
+            uint x_base = k + lane * VALUES_PER_LANE;
+            float sum = 0.0f;
+            for (uint i = 0; i < VALUES_PER_LANE; i += 4) {
+                sum += x[x_base + i] + x[x_base + i + 1]
+                    + x[x_base + i + 2] + x[x_base + i + 3];
+                xv[i] = x[x_base + i];
+                xv[i + 1] = x[x_base + i + 1] / 16.0f;
+                xv[i + 2] = x[x_base + i + 2] / 256.0f;
+                xv[i + 3] = x[x_base + i + 3] / 4096.0f;
+            }
+            uint word_base = row * K_WORDS + k / 8 + lane * 2;
+            uint p0 = weight[word_base];
+            uint p1 = weight[word_base + 1];
+            ushort packed[4] = {
+                ushort(p0 & 0xffffu), ushort(p0 >> 16),
+                ushort(p1 & 0xffffu), ushort(p1 >> 16)
+            };
+            uint group_index = row * K_GROUPS + k / 64 + lane / 4;
+            float scale = scales[group_index];
+            float bias = biases[group_index];
+            float accum = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                accum +=
+                    xv[4 * i] * (packed[i] & 0x000f) +
+                    xv[4 * i + 1] * (packed[i] & 0x00f0) +
+                    xv[4 * i + 2] * (packed[i] & 0x0f00) +
+                    xv[4 * i + 3] * (packed[i] & 0xf000);
+            }
+            result += scale * accum + sum * bias;
+        }
+
+        float reduced = simd_sum(result);
+        if (lane == 0) {
+            out_val[g] = float(InT(reduced));
+            out_id[g] = row;
+        }
+    """,
+    header: """
+        typedef bfloat16_t InT;
+    """,
+    ensureRowContiguous: false
+)
+
+private let qwen35DraftSelectedAffine4RerankFinalKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_selected_affine4_rerank_g64_final_v1",
+    inputNames: ["out_val", "out_id"],
+    outputNames: ["token_id"],
+    source: """
+        uint lane = thread_index_in_threadgroup;
+        float best_value = out_val[lane];
+        uint best_id = out_id[lane];
+        for (uint offset = 16; offset > 0; offset >>= 1) {
+            float other_value = simd_shuffle_down(best_value, offset);
+            uint other_id = simd_shuffle_down(best_id, offset);
+            if (lane < offset && qwen_draft_selected_rerank_better(
+                    other_value, other_id, best_value, best_id)) {
+                best_value = other_value;
+                best_id = other_id;
+            }
+        }
+        if (lane == 0) {
+            token_id[0] = int(
+                best_id < PREFIX_COUNT
+                    ? best_id
+                    : best_id + CONTROL_OFFSET);
+        }
+    """,
+    header: """
+        inline bool qwen_draft_selected_rerank_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return !candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+            return candidate_id < current_id;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+// ---------------------------------------------------------------------------
 // PROPOSAL-SIDE TOP-32 SHORTLIST
 //
 // Replaces `MLX.argPartition(coarse, kth: 98_298, axis: -1)[98_298...]`.
@@ -5690,16 +5805,31 @@ extension Qwen35TextModel: MTPCapable {
             }
         }
 
-        return qwen35DraftSelectedAffine4RerankKernel(
+        // E130: row-parallel partial dots (32 threadgroups) + micro final
+        // reduce. Bit-identical to the v1 single-threadgroup kernel by
+        // construction; see the kernel block's provenance comment. Verified
+        // in vivo during development with a temporary both-paths assertion:
+        // every draft of a full local leg matched v1 token-for-token.
+        let rerankPartials = qwen35DraftSelectedAffine4RerankPartialKernel(
             [x.reshaped([configuration.hiddenSize]), candidateIDs,
              exact.weight, exact.scales, exactBiases],
+            template: [],
+            // grid is in THREADS: 32 threadgroups x 32 threads, one
+            // simdgroup per candidate row.
+            grid: (32 * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[32], [32]],
+            outputDTypes: [.float32, .uint32]
+        )
+        return qwen35DraftSelectedAffine4RerankFinalKernel(
+            [rerankPartials[0], rerankPartials[1]],
             template: [
                 ("PREFIX_COUNT", Self.compactDraftPrefixCount),
                 ("CONTROL_OFFSET",
                  Self.compactDraftControlStart - Self.compactDraftPrefixCount),
             ],
-            grid: (256, 1, 1),
-            threadGroup: (256, 1, 1),
+            grid: (32, 1, 1),
+            threadGroup: (32, 1, 1),
             outputShapes: [[1, 1]],
             outputDTypes: [.int32]
         )[0]
