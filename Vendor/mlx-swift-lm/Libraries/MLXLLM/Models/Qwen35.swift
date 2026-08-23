@@ -1354,6 +1354,112 @@ final class Qwen35GatedDeltaNet: Module {
 /// intermediate buffer disappears. Shapeless compilation shares one trace
 /// across verify widths (the fused GEMM's N is constant, so the half-split
 /// offsets are width-invariant).
+/// `silu(y[..., :half]) * y[..., half...]`, optionally also emitting the
+/// per-k-block activation chunk-sum table its consumer needs.
+///
+/// WHY. `Qwen35CustomQMV` needs a chunk-sum table for every wide matvec at
+/// `tablePays` widths, and builds it with a SEPARATE dispatch — ~4-6 us of
+/// essentially pure launch cost, 257 times a decode round. The promoted
+/// `qwen35_fused_residual_rms_norm_xsums_v1` removed that launch for the 127
+/// activations written by the boundary-fused norm. `mlp.down`'s activation is
+/// the largest uncovered producer at 64 calls a round, and it is written here.
+///
+/// EXACTNESS, in two halves, neither of which re-derives anything.
+///
+/// The SwiGLU half is MLX's own arithmetic: `Sigmoid` from `unary_ops.h`
+/// (`y = 1 / (1 + exp(abs(x))); return x < 0 ? y : 1 - y`), with the product
+/// ordered as the compiled graph orders it — silu first, then the multiply, so
+/// each rounding step lands in the same place. This was not assumed: a probe
+/// compared the bytes against BOTH the eager and the `compile`d path at
+/// m = 1, 4, 9 over 243,712 elements and found zero mismatches.
+///
+/// The sums half is the standalone fill kernel's body copied character for
+/// character — same `vec<bfloat16_t, 4>` load, same three bf16 adds per group
+/// of four, same ascending float accumulation onto `0.0f`, same
+/// `(k_block * 32 + lane) * stride + row` address — run over the bytes this
+/// pass has just stored. Nothing is re-associated, so there is no accumulation
+/// order for the compiler to choose differently.
+///
+/// The barrier is what makes the read-back legal: one threadgroup owns one
+/// whole row, so every byte a lane re-reads was written by this threadgroup
+/// before the device barrier, which sits in uniform control flow.
+private let qwen35FusedSwiGLUKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_swiglu_xsums_v1",
+    inputNames: ["y"],
+    outputNames: ["out", "xsums"],
+    source: """
+        constexpr uint lsize = 1024;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint half_n = uint(y_shape[y_ndim - 1]) / 2;
+        const ulong ybase = ulong(row) * ulong(2 * half_n);
+        const ulong obase = ulong(row) * ulong(half_n);
+
+        for (uint c = tid; c < half_n; c += lsize) {
+            const bfloat a = y[ybase + c];
+            const bfloat b = y[ybase + half_n + c];
+            const auto sg = 1 / (1 + metal::exp(metal::abs(a)));
+            const bfloat sig = (a < 0) ? bfloat(sg) : bfloat(1 - sg);
+            out[obase + c] = bfloat(a * sig) * b;
+        }
+
+        if (EMIT_SUMS) {
+            threadgroup_barrier(mem_flags::mem_device);
+            const int xs_m = int(XS_ROWS);
+            const int xs_stride = xs_m <= 8 ? 8 : 16;
+            const uint entries = (half_n / 512) * 32;
+            for (uint idx = tid; idx < entries; idx += lsize) {
+                const uint xs_kb = idx / 32;
+                const uint xs_lane = idx % 32;
+                const device bfloat16_t* xm = reinterpret_cast<
+                    const device bfloat16_t*>(out) + obase
+                    + xs_kb * 512 + xs_lane * 16;
+                float s = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    const vec<bfloat16_t, 4> xv = *reinterpret_cast<
+                        const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+                    s += xv[0] + xv[1] + xv[2] + xv[3];
+                }
+                xsums[(xs_kb * 32 + xs_lane) * xs_stride + int(row)] = s;
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// `silu(y[:half]) * y[half:]`, publishing the consumer's chunk-sum table when
+/// the sidecar wants one for this activation. Returns the activation only; the
+/// table is routed by identity through `Qwen35XSumsSidecar`.
+func qwen35FusedSwiGLUWithSums(_ y: MLXArray) -> MLXArray {
+    guard y.dtype == .bfloat16 else { return qwen35CompiledFusedSwiGLU(y) }
+    let half = y.dim(-1) / 2
+    let rows = y.size / y.dim(-1)
+    var shape = y.shape
+    shape[shape.count - 1] = half
+
+    // The producer gate is deliberately weaker than the consumer's `routable`:
+    // a published-but-unrouted table is simply never read.
+    let emit = half % 512 == 0
+        && Qwen35CustomQMV.widths.contains(rows)
+        && Qwen35CustomQMV.tablePays(m: rows)
+        && Qwen35CustomQMV.arm == .sumTable
+    let stride = Qwen35CustomQMV.sumsStride(rows)
+    let tableSize = emit ? (half / 512) * 32 * stride : 1
+    let outputs = qwen35FusedSwiGLUKernel(
+        [y],
+        template: [("EMIT_SUMS", emit), ("XS_ROWS", rows)],
+        grid: (rows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [shape, [tableSize]],
+        outputDTypes: [.bfloat16, .float32]
+    )
+    let activation = outputs[0]
+    if emit, Qwen35XSumsSidecar.wants(activation) {
+        Qwen35XSumsSidecar.publish(x: activation, table: outputs[1])
+    }
+    return activation
+}
+
 private let qwen35CompiledFusedSwiGLU:
     @Sendable (MLXArray) -> MLXArray =
 {
@@ -1977,7 +2083,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
-            return qwen35RoutedLinear(downProj, qwen35CompiledFusedSwiGLU(y))
+            return qwen35RoutedLinear(downProj, qwen35FusedSwiGLUWithSums(y))
         }
         return qwen35RoutedLinear(downProj, silu(gateProj(x)) * upProj(x))
     }
