@@ -886,6 +886,13 @@ struct RuntimeWorkerRequest: Codable {
     // the emitted context stops describing the verify input at the first
     // rejection, so without this the tail is compared to nothing.
     let verifyBlockTokens: [Int]?
+    // Qwen 3.6 native-MTP `mtp_decode_begin` sampling policy. Absent or
+    // non-positive temperature means greedy, which is the ranked path; the
+    // worker calls `setSampling(nil)` explicitly in that case rather than
+    // leaving a reused session's previous policy in place.
+    let temperature: Double?
+    let topP: Double?
+    let samplingSeed: UInt64?
 
     init(
         id: Int,
@@ -902,7 +909,10 @@ struct RuntimeWorkerRequest: Codable {
         rowCount: Int? = nil,
         declaredBlockWidth: Int? = nil,
         seedTokenCount: Int? = nil,
-        verifyBlockTokens: [Int]? = nil
+        verifyBlockTokens: [Int]? = nil,
+        temperature: Double? = nil,
+        topP: Double? = nil,
+        samplingSeed: UInt64? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -919,6 +929,9 @@ struct RuntimeWorkerRequest: Codable {
         self.declaredBlockWidth = declaredBlockWidth
         self.seedTokenCount = seedTokenCount
         self.verifyBlockTokens = verifyBlockTokens
+        self.temperature = temperature
+        self.topP = topP
+        self.samplingSeed = samplingSeed
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -978,6 +991,15 @@ struct RuntimeWorkerRequest: Codable {
             [Int].self,
             forKey: .verifyBlockTokens
         )
+        temperature = try container.decodeIfPresent(
+            Double.self,
+            forKey: .temperature
+        )
+        topP = try container.decodeIfPresent(Double.self, forKey: .topP)
+        samplingSeed = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .samplingSeed
+        )
     }
 
     func encode(to encoder: Swift.Encoder) throws {
@@ -1003,6 +1025,9 @@ struct RuntimeWorkerRequest: Codable {
             verifyBlockTokens,
             forKey: .verifyBlockTokens
         )
+        try container.encodeIfPresent(temperature, forKey: .temperature)
+        try container.encodeIfPresent(topP, forKey: .topP)
+        try container.encodeIfPresent(samplingSeed, forKey: .samplingSeed)
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -1025,6 +1050,9 @@ struct RuntimeWorkerRequest: Codable {
         case declaredBlockWidth = "declared_block_width"
         case seedTokenCount = "seed_token_count"
         case verifyBlockTokens = "verify_block_tokens"
+        case temperature
+        case topP = "top_p"
+        case samplingSeed = "sampling_seed"
     }
 }
 

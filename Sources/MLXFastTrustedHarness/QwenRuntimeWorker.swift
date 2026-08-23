@@ -892,6 +892,13 @@ struct RuntimeWorkerRequest: Codable {
     // the emitted context stops describing the verify input at the first
     // rejection, so without this the tail is compared to nothing.
     let verifyBlockTokens: [Int]?
+    // Qwen 3.6 native-MTP `mtp_decode_begin` sampling policy. Absent or
+    // non-positive temperature means greedy, which is the ranked path; the
+    // worker calls `setSampling(nil)` explicitly in that case rather than
+    // leaving a reused session's previous policy in place.
+    let temperature: Double?
+    let topP: Double?
+    let samplingSeed: UInt64?
 
     init(
         id: Int,
@@ -908,7 +915,10 @@ struct RuntimeWorkerRequest: Codable {
         rowCount: Int? = nil,
         declaredBlockWidth: Int? = nil,
         seedTokenCount: Int? = nil,
-        verifyBlockTokens: [Int]? = nil
+        verifyBlockTokens: [Int]? = nil,
+        temperature: Double? = nil,
+        topP: Double? = nil,
+        samplingSeed: UInt64? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -925,6 +935,9 @@ struct RuntimeWorkerRequest: Codable {
         self.declaredBlockWidth = declaredBlockWidth
         self.seedTokenCount = seedTokenCount
         self.verifyBlockTokens = verifyBlockTokens
+        self.temperature = temperature
+        self.topP = topP
+        self.samplingSeed = samplingSeed
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -984,6 +997,15 @@ struct RuntimeWorkerRequest: Codable {
             [Int].self,
             forKey: .verifyBlockTokens
         )
+        temperature = try container.decodeIfPresent(
+            Double.self,
+            forKey: .temperature
+        )
+        topP = try container.decodeIfPresent(Double.self, forKey: .topP)
+        samplingSeed = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .samplingSeed
+        )
     }
 
     func encode(to encoder: Swift.Encoder) throws {
@@ -1009,6 +1031,9 @@ struct RuntimeWorkerRequest: Codable {
             verifyBlockTokens,
             forKey: .verifyBlockTokens
         )
+        try container.encodeIfPresent(temperature, forKey: .temperature)
+        try container.encodeIfPresent(topP, forKey: .topP)
+        try container.encodeIfPresent(samplingSeed, forKey: .samplingSeed)
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -1031,6 +1056,9 @@ struct RuntimeWorkerRequest: Codable {
         case declaredBlockWidth = "declared_block_width"
         case seedTokenCount = "seed_token_count"
         case verifyBlockTokens = "verify_block_tokens"
+        case temperature
+        case topP = "top_p"
+        case samplingSeed = "sampling_seed"
     }
 }
 
@@ -2345,8 +2373,29 @@ final class RuntimeWorkerClient {
         try send(kind: "mtp_decode_warm")
     }
 
-    func beginMTPDecode(seedTokens: [Int]) throws -> RuntimeWorkerResponse {
-        try send(kind: "mtp_decode_begin", seedTokens: seedTokens)
+    func beginMTPDecode(
+        seedTokens: [Int],
+        temperature: Double? = nil,
+        topP: Double? = nil,
+        seed: UInt64? = nil
+    ) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "mtp_decode_begin",
+            seedTokens: seedTokens,
+            temperature: temperature,
+            topP: topP,
+            samplingSeed: seed
+        )
+    }
+
+    /// Discard the decode session so a further `beginMTPDecode` is legal.
+    ///
+    /// LOCAL INTERACTIVE TOOLING ONLY. No scored verb issues this: a measured
+    /// window is one seed and one decode pass, and re-beginning inside one
+    /// would reset state the row ledger is closed against. The chat REPL needs
+    /// a fresh session per turn without paying the model load again.
+    func resetMTPDecode() throws -> RuntimeWorkerResponse {
+        try send(kind: "mtp_decode_reset")
     }
 
     /// One accept/verify/rollback round at the parent-chosen draft depth.
@@ -2452,7 +2501,10 @@ final class RuntimeWorkerClient {
         rowCount: Int? = nil,
         declaredBlockWidth: Int? = nil,
         seedTokenCount: Int? = nil,
-        verifyBlockTokens: [Int]? = nil
+        verifyBlockTokens: [Int]? = nil,
+        temperature: Double? = nil,
+        topP: Double? = nil,
+        samplingSeed: UInt64? = nil
     ) throws -> RuntimeWorkerResponse {
         guard process.isRunning else {
             throw MLXFastError.invalidInput("runtime worker exited before request \(kind): \(workerExitDiagnostic())")
@@ -2474,7 +2526,10 @@ final class RuntimeWorkerClient {
             rowCount: rowCount,
             declaredBlockWidth: declaredBlockWidth,
             seedTokenCount: seedTokenCount,
-            verifyBlockTokens: verifyBlockTokens
+            verifyBlockTokens: verifyBlockTokens,
+            temperature: temperature,
+            topP: topP,
+            samplingSeed: samplingSeed
         )
         var data = try encoder.encode(request)
         guard data.count <= BufferedFileLineReader.defaultMaximumLineByteCount else {

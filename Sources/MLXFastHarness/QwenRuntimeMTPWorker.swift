@@ -7,6 +7,21 @@ import MLXLLM
 import MLXLMCommon
 import Tokenizers  // required for #huggingFaceTokenizerLoader() macro expansion
 
+/// The worker's per-session output ceiling.
+///
+/// Defaults to the pinned constant, which is what every ranked and benchmark
+/// path uses because none of them set the variable. `serve` raises it so an
+/// agent turn is not truncated at 1,536 tokens. Input length is NOT capped here
+/// or anywhere else: the 16 full-attention layers use an unbounded
+/// `KVCacheSimple` and the other 48 carry constant-size recurrent state.
+private let qwenMTPDecodeCeiling: Int = {
+    guard let raw = ProcessInfo.processInfo
+            .environment["MLXFAST_QWEN_MTP_DECODE_CEILING"],
+          let value = Int(raw), value > 0
+    else { return MLXFastConstants.experimentalDFlashMaxConfiguredTotalTokens }
+    return value
+}()
+
 /// Validated `mtp_decode_round` request.
 struct QwenMTPRoundRequest: Equatable {
     let depth: Int
@@ -57,6 +72,9 @@ func validateQwenMTPRoundRequest(
           request.declaredBlockWidth == nil,
           request.seedTokenCount == nil,
           request.verifyBlockTokens == nil,
+          request.temperature == nil,
+          request.topP == nil,
+          request.samplingSeed == nil,
           let depth = request.maxBlockSize,
           // 0 is legal and is the TRUE SERIAL CONTROL the paired score divides
           // by -- MTP off, one token per target forward -- served by the same
@@ -77,8 +95,7 @@ func validateQwenMTPRoundRequest(
     let (requestedTotal, overflow) =
         decodedTokenCount.addingReportingOverflow(Swift.max(depth + 1, 1))
     guard !overflow,
-          requestedTotal
-              <= MLXFastConstants.experimentalDFlashMaxConfiguredTotalTokens
+          requestedTotal <= qwenMTPDecodeCeiling
     else {
         throw MLXFastError.invalidInput(
             "MTP round request exceeds the configured decode ceiling")
@@ -197,7 +214,7 @@ extension QwenRuntime {
         let warmup = try Qwen36MTPBlockSession(
             model: model, stopTokens: stopTokens)
         try warmup.warmAllDepths(maxDepth: Qwen36MTPLimits.maxDepth)
-        let session = try Qwen36MTPBlockSession(
+        var session = try Qwen36MTPBlockSession(
             model: model, stopTokens: stopTokens)
 
         let decoder = JSONDecoder()
@@ -226,6 +243,51 @@ extension QwenRuntime {
                             + "\(expectedRequestID), got \(request.id)")
                 }
                 expectedRequestID += 1
+                // LOCAL INTERACTIVE TOOLING ONLY -- no scored verb issues this.
+                //
+                // `mtp_decode_begin` is one-shot by design: a measured window is
+                // exactly one seed and one decode pass, and a parent able to
+                // re-begin mid-window could reset KV state the row ledger is
+                // closed against. A chat turn needs precisely that, so the reset
+                // is handled HERE, in the read loop that owns `session`, rather
+                // than inside `handleQwenMTPWorkerRequest`, which receives the
+                // session by value and so can mutate it but never replace it.
+                //
+                // Rebuilding the session drops all KV state; the next begin
+                // re-prefills. The ~14 GiB `model` is untouched, so a turn costs
+                // a prefill, not a reload.
+                if request.kind == "mtp_decode_reset" {
+                    // A separate binding rather than the loop's `response`:
+                    // this branch answers and `continue`s, and Swift cannot
+                    // prove the single-assignment of a `let` across that jump.
+                    let resetResponse: RuntimeWorkerResponse
+                    do {
+                        session = try Qwen36MTPBlockSession(
+                            model: model, stopTokens: stopTokens)
+                        // `warmed` is carried, not cleared. Leaving it false
+                        // makes the next begin re-run the allocator clear and
+                        // `warmAllDepths`, measured at 14.8s against a 0.37s
+                        // warmed prefill -- i.e. the warm, not the model, would
+                        // dominate every turn after the first. The warm is
+                        // input-independent (it compiles round shapes; it never
+                        // sees the seed), so skipping it changes what the turn
+                        // COSTS, never what it decodes.
+                        state = QwenMTPWorkerState()
+                        state.warmed = true
+                        resetResponse = RuntimeWorkerResponse(
+                            id: request.id, nonce: sessionNonce, ok: true)
+                    } catch {
+                        state.poisoned = true
+                        resetResponse = RuntimeWorkerResponse(
+                            id: request.id,
+                            nonce: sessionNonce,
+                            ok: false,
+                            error: "\(error)"
+                        )
+                    }
+                    try protocolIO.writeLine(try encoder.encode(resetResponse))
+                    continue
+                }
                 do {
                     response = try handleQwenMTPWorkerRequest(
                         request,
@@ -276,7 +338,10 @@ extension QwenRuntime {
                   request.steps == nil,
                   request.maxBlockSize == nil,
                   request.topK == nil,
-                  request.expectedToken == nil
+                  request.expectedToken == nil,
+                  request.temperature == nil,
+                  request.topP == nil,
+                  request.samplingSeed == nil
             else {
                 throw MLXFastError.invalidInput(
                     "MTP warm request is malformed or arrived after begin")
@@ -312,6 +377,17 @@ extension QwenRuntime {
                 try session.warmAllDepths(maxDepth: Qwen36MTPLimits.maxDepth)
                 state.warmed = true
             }
+            // Temperature is opt-in and absent means greedy, which is the
+            // ranked path: `setSampling(nil)` restores it explicitly so a
+            // reused worker cannot inherit a previous request's policy.
+            if let temperature = request.temperature, temperature > 0 {
+                session.setSampling(Qwen36MTPSampling(
+                    temperature: Float(temperature),
+                    topP: Float(request.topP ?? 1.0),
+                    seed: request.samplingSeed ?? UInt64.random(in: 0 ... .max)))
+            } else {
+                session.setSampling(nil)
+            }
             do {
                 let seedToken = try session.begin(seedTokens: seedTokens)
                 state.began = true
@@ -344,9 +420,7 @@ extension QwenRuntime {
                     state.seedTokenCount.addingReportingOverflow(nextCount)
                 guard !overflow,
                       !offsetOverflow,
-                      nextCount
-                          <= MLXFastConstants
-                              .experimentalDFlashMaxConfiguredTotalTokens,
+                      nextCount <= qwenMTPDecodeCeiling,
                       result.targetCacheOffset == expectedOffset,
                       // The ledger the parent audits has to close inside the
                       // worker too, so a broken round is caught at the boundary
