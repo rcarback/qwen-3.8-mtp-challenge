@@ -3683,7 +3683,7 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
 // reduce the exact BF16 values in one dispatch. This replaces gather_qmm plus
 // the separate value/id reducer without changing shortlist identity or order.
 private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_draft_selected_affine4_rerank_g64_v1",
+    name: "qwen_mtp_draft_selected_affine4_rerank_g64_v1_l32",
     inputNames: ["x", "candidate_ids", "weight", "scales", "biases"],
     outputNames: ["token_id"],
     source: """
@@ -3694,9 +3694,10 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
         constexpr uint K          = 5120;
         constexpr uint K_WORDS    = 640;
         constexpr uint K_GROUPS   = 80;
-        constexpr uint VALUES_PER_LANE = 16;
-        constexpr uint BLOCK      = 512;
+        constexpr uint VALUES_PER_LANE = 32;
+        constexpr uint BLOCK      = 1024;
         static_assert(NSIMD * 4 == TOPK, "one four-row dot tile per SIMDgroup");
+        static_assert(VALUES_PER_LANE * SIMD_SIZE == BLOCK, "one K-block per simd");
 
         uint lane = thread_index_in_simdgroup;
         uint sg = simdgroup_index_in_threadgroup;
@@ -3717,18 +3718,22 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
             }
             for (uint r = 0; r < 4; ++r) {
                 uint row = uint(candidate_ids[candidate_base + r]);
-                uint word_base = row * K_WORDS + k / 8 + lane * 2;
+                uint word_base = row * K_WORDS + k / 8 + lane * 4;
                 uint p0 = weight[word_base];
                 uint p1 = weight[word_base + 1];
-                ushort packed[4] = {
+                uint p2 = weight[word_base + 2];
+                uint p3 = weight[word_base + 3];
+                ushort packed[8] = {
                     ushort(p0 & 0xffffu), ushort(p0 >> 16),
-                    ushort(p1 & 0xffffu), ushort(p1 >> 16)
+                    ushort(p1 & 0xffffu), ushort(p1 >> 16),
+                    ushort(p2 & 0xffffu), ushort(p2 >> 16),
+                    ushort(p3 & 0xffffu), ushort(p3 >> 16)
                 };
-                uint group_index = row * K_GROUPS + k / 64 + lane / 4;
+                uint group_index = row * K_GROUPS + k / 64 + lane / 2;
                 float scale = scales[group_index];
                 float bias = biases[group_index];
                 float accum = 0.0f;
-                for (uint i = 0; i < 4; ++i) {
+                for (uint i = 0; i < 8; ++i) {
                     accum +=
                         xv[4 * i] * (packed[i] & 0x000f) +
                         xv[4 * i + 1] * (packed[i] & 0x00f0) +
