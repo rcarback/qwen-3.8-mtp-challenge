@@ -67,6 +67,33 @@ public struct Qwen36MTPRoundResult {
     public let targetCacheOffset: Int
 }
 
+/// Sampling policy for a session. Absent means greedy, and greedy must remain
+/// byte-identical to the pre-sampling code path -- it is what the ranked run
+/// executes. Nothing in this file may add an MLX op, an eval, or a host
+/// readback while `sampling` is nil.
+///
+/// WHY THIS IS EXACT AND NOT AN APPROXIMATION. The MTP head is run greedily, so
+/// its proposal distribution is a point mass at the token it proposed. Standard
+/// speculative sampling accepts a draft `d` with probability `min(1, p(d)/q(d))`
+/// and resamples from `norm(max(p - q, 0))` on rejection; with `q` a point mass
+/// at `d` those reduce to "accept with probability `p(d)`" and "resample from
+/// `p` with `d` removed". The emitted stream is therefore distributed exactly as
+/// if the target had been sampled one token at a time.
+public struct Qwen36MTPSampling: Sendable {
+    /// Strictly greater than zero. Temperature 0 is expressed by passing no
+    /// sampling policy at all, so there is no divide-by-zero branch to guard.
+    public let temperature: Float
+    /// Nucleus mass to keep, in `(0, 1]`. 1 disables the filter entirely.
+    public let topP: Float
+    public let seed: UInt64
+
+    public init(temperature: Float, topP: Float, seed: UInt64) {
+        self.temperature = temperature
+        self.topP = topP
+        self.seed = seed
+    }
+}
+
 /// Errors the session raises. Every one of these is a broken invariant, not a
 /// recoverable condition: the worker poisons its session on any of them.
 public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
@@ -160,6 +187,121 @@ public final class Qwen36MTPBlockSession {
     public private(set) var rejectedDraftTotal = 0
     public private(set) var rollbackRoundCount = 0
     public private(set) var began = false
+
+    // MARK: - sampling policy (nil == greedy == the ranked path)
+
+    /// nil == greedy == the ranked path. See `Qwen36MTPSampling`. Every read of
+    /// this property below is a `nil`-guarded branch whose greedy arm is the
+    /// pre-sampling expression, unchanged.
+    private var sampling: Qwen36MTPSampling?
+    /// Split forward on every use so a round never reuses a draw. Only ever
+    /// non-nil when `sampling` is non-nil.
+    private var rngKey: MLXArray?
+
+    /// Install (or clear) the session's sampling policy. Passing nil restores
+    /// the greedy path exactly.
+    public func setSampling(_ sampling: Qwen36MTPSampling?) {
+        self.sampling = sampling
+        rngKey = sampling.map { MLXRandom.key($0.seed) }
+    }
+
+    /// Take one key and advance the stream. Never call this outside an
+    /// `if let sampling` branch: it mutates state the greedy path must not have.
+    private func nextKey() -> MLXArray {
+        guard let key = rngKey else { return MLXRandom.key(0) }
+        let split = MLXRandom.split(key: key, into: 2)
+        rngKey = split[0]
+        return split[1]
+    }
+
+    /// One row's worth of sampled selection, computed on the GPU so it can join
+    /// the round's single blocking eval.
+    ///
+    /// `logits` is `[1, rows, vocab]`. `draftIDs`, when non-empty, holds one
+    /// scalar array per draft row, in verify-input order; row `i < draftIDs.count`
+    /// is scored against `draftIDs[i]` and every row also produces a corrected
+    /// token drawn from that row's residual (or, for the tail row, from the
+    /// row's own distribution).
+    ///
+    /// Returns lazy arrays. The caller adds them to its existing eval bundle;
+    /// this function never evals.
+    private static func buildSampledSelection(
+        _ logits: MLXArray,
+        draftIDs: [MLXArray],
+        sampling: Qwen36MTPSampling,
+        acceptKey: MLXArray,
+        drawKey: MLXArray
+    ) -> (accept: MLXArray?, corrected: MLXArray) {
+        var probs = softmax(
+            logits.asType(.float32) / sampling.temperature, axis: -1)
+
+        if sampling.topP < 1 {
+            // Nucleus filter without scattering back into the vocabulary: find
+            // the smallest probability still inside the nucleus and threshold
+            // the unsorted row against it. `sorted` is ascending, so the tail
+            // mass strictly below each element is the exclusive cumulative sum;
+            // an element is kept when the INCLUSIVE cumulative sum exceeds the
+            // discarded mass `1 - topP`.
+            let ascending = sorted(probs, axis: -1)
+            let cumulative = ascending.cumsum(axis: -1)
+            let keep = cumulative .> (1 - sampling.topP)
+            let threshold = which(keep, ascending, Float.infinity)
+                .min(axis: -1, keepDims: true)
+            let filtered = which(probs .>= threshold, probs, Float(0))
+            probs = filtered / filtered.sum(axis: -1, keepDims: true)
+        }
+
+        var accept: MLXArray?
+        var residual = probs
+
+        if !draftIDs.isEmpty {
+            let draftCount = draftIDs.count
+            let draftIndex = concatenated(draftIDs)
+                .reshaped([1, draftCount, 1])
+                .asType(.int32)
+            let draftRows = probs[0..., 0 ..< draftCount, 0...]
+            // p(d) under the (possibly filtered) target distribution IS the
+            // acceptance probability, because the drafter is deterministic.
+            let draftProbability = takeAlong(draftRows, draftIndex, axis: -1)
+            let draw = MLXRandom.uniform(
+                Float(0) ..< Float(1), [1, draftCount, 1], key: acceptKey)
+            accept = (draw .< draftProbability).reshaped([draftCount])
+
+            // Residual: the same distribution with the rejected draft's mass
+            // removed. Built as a mask rather than a scatter so it stays one
+            // fused elementwise pass.
+            let vocabulary = MLXArray.arange(probs.dim(-1), dtype: .int32)
+                .reshaped([1, 1, probs.dim(-1)])
+            let withoutDraft = which(
+                vocabulary .!= draftIndex, draftRows, Float(0))
+            // The tail row keeps its full distribution: nothing was drafted at
+            // that position, so there is nothing to remove.
+            residual = concatenated(
+                [withoutDraft, probs[0..., draftCount..., 0...]], axis: 1)
+        }
+
+        // `categorical` wants unnormalized log-probabilities. The epsilon keeps
+        // log(0) out of the graph for the masked draft entry; it is far below
+        // any representable probability that could be drawn.
+        let corrected = MLXRandom.categorical(
+            log(residual + 1e-30), axis: -1, key: drawKey)
+        return (accept, corrected.reshaped([residual.dim(1)]).asType(.int32))
+    }
+
+    /// Test seam. Draws one token from a `[1, 1, vocab]` logit row under the
+    /// given policy. Not used on any decode path.
+    static func sampledTokenForTesting(
+        _ logits: MLXArray, temperature: Float, topP: Float, seed: UInt64
+    ) -> Int {
+        let policy = Qwen36MTPSampling(
+            temperature: temperature, topP: topP, seed: seed)
+        let split = MLXRandom.split(key: MLXRandom.key(seed), into: 2)
+        let selection = buildSampledSelection(
+            logits, draftIDs: [], sampling: policy,
+            acceptKey: split[0], drawKey: split[1])
+        eval(selection.corrected)
+        return Int(selection.corrected.asArray(Int32.self)[0])
+    }
 
     public init(
         model: any Qwen36MTPTarget,
@@ -664,8 +806,20 @@ public final class Qwen36MTPBlockSession {
             tailIDs.asArray(Int32.self).map { Int($0) },
             tailValues.asArray(Float.self).map { Double($0) }
         )
-        // Top-2 first ID == row argmax (same ordering); no separate argMax.
-        pendingPrimary = readTail.0[0]
+        // Greedy: top-2 first ID == row argmax (same ordering); no separate
+        // argMax launch. Sampled: one categorical draw from the same row. The
+        // extra eval lives INSIDE the sampled branch, so the greedy path still
+        // has exactly one blocking boundary and exactly the ops it had before.
+        if let sampling {
+            let selection = Self.buildSampledSelection(
+                lastLogits.reshaped([1, 1, lastLogits.dim(-1)]),
+                draftIDs: [], sampling: sampling,
+                acceptKey: nextKey(), drawKey: nextKey())
+            eval(selection.corrected)
+            pendingPrimary = Int(selection.corrected.asArray(Int32.self)[0])
+        } else {
+            pendingPrimary = readTail.0[0]
+        }
         pendingTop2 = readTail
         seedTokenCount = seedTokens.count
         committedTokenCount = 0
@@ -1333,8 +1487,17 @@ public final class Qwen36MTPBlockSession {
                 tailIDs.asArray(Int32.self).map { Int($0) },
                 tailValues.asArray(Float.self).map { Double($0) }
             )
-            // Top-2 first ID == row argmax (same ordering); no separate argMax.
-            pendingPrimary = readTail.0[0]
+            // Greedy: top-2 first ID == row argmax; no separate argMax launch.
+            // Sampled: one categorical draw from the same single row.
+            if let sampling {
+                let selection = Self.buildSampledSelection(
+                    serialLastRow, draftIDs: [], sampling: sampling,
+                    acceptKey: nextKey(), drawKey: nextKey())
+                eval(selection.corrected)
+                pendingPrimary = Int(selection.corrected.asArray(Int32.self)[0])
+            } else {
+                pendingPrimary = readTail.0[0]
+            }
             pendingTop2 = readTail
             let (tailTokens, tailLogits) = readTail
             Self.traceRow(
@@ -1490,9 +1653,22 @@ public final class Qwen36MTPBlockSession {
         // in ONE eval. The `.item()`/`.asArray` calls below then copy from
         // materialised buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
+        // Sampled selection joins the SAME bundle, so a sampled round keeps
+        // the one-eval budget too. `sampling.map` yields nil without running
+        // the closure on the greedy path, so no op enters the graph there.
+        let sampledSelection: (accept: MLXArray?, corrected: MLXArray)? =
+            sampling.map { policy in
+                Self.buildSampledSelection(
+                    verifyLogits, draftIDs: draftIdArrays, sampling: policy,
+                    acceptKey: nextKey(), drawKey: nextKey())
+            }
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
+        if let sampledSelection {
+            bundle.append(sampledSelection.corrected)
+            if let accept = sampledSelection.accept { bundle.append(accept) }
+        }
         eval(cache.flatMap { $0.state } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
@@ -1505,6 +1681,11 @@ public final class Qwen36MTPBlockSession {
         // redundant (credit GPT-5.6 Sol, promoted b71bb35, 1.37645).
         let verifyArgmax = stride(
             from: 0, to: flatTop2IDs.count, by: 2).map { flatTop2IDs[$0] }
+        // Both nil on the greedy path: optional chaining off a nil optional
+        // performs no work at all.
+        let sampledAccept = sampledSelection?.accept?.asArray(Bool.self)
+        let sampledCorrected = sampledSelection?.corrected
+            .asArray(Int32.self).map { Int($0) }
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
         //    is the target's greedy continuation of verify input i, i.e. the
@@ -1512,7 +1693,14 @@ public final class Qwen36MTPBlockSession {
         //    used on full acceptance.
         var acceptedCount = 0
         for index in 0 ..< drafts.count {
-            guard verifyArgmax[index] == drafts[index] else { break }
+            // Greedy: a draft is right when it IS the target's argmax. Sampled:
+            // a draft is accepted with probability p(draft), drawn on the GPU
+            // above. Both stop at the first failure -- acceptance is a prefix
+            // property either way, because a rejected row invalidates every row
+            // computed after it.
+            let accepted = sampledAccept.map { $0[index] }
+                ?? (verifyArgmax[index] == drafts[index])
+            guard accepted else { break }
             acceptedCount += 1
             if stopTokens.contains(drafts[index]) { break }
         }
@@ -1536,7 +1724,8 @@ public final class Qwen36MTPBlockSession {
             Self.clearRecurrentRollback(cache)
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
-            pendingPrimary = verifyArgmax[drafts.count]
+            pendingPrimary = sampledCorrected?[drafts.count]
+                ?? verifyArgmax[drafts.count]
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
@@ -1562,7 +1751,8 @@ public final class Qwen36MTPBlockSession {
                 acceptedCount: acceptedCount, draftCount: draftCount,
                 to: committedOffset)
             {
-                pendingPrimary = verifyArgmax[acceptedCount]
+                pendingPrimary = sampledCorrected?[acceptedCount]
+                    ?? verifyArgmax[acceptedCount]
                 pendingHidden = hiddenRow(
                     verifyHidden, verifyNormed, acceptedCount)
                 pendingTop2 = (
@@ -1589,8 +1779,18 @@ public final class Qwen36MTPBlockSession {
                 eval(cache.flatMap { $0.state } + [tailIDs, tailValues])
                 let ids = tailIDs.asArray(Int32.self).map { Int($0) }
                 let values = tailValues.asArray(Float.self).map { Double($0) }
-                // Top-2 first ID == row argmax; no separate argMax launch.
-                pendingPrimary = ids[0]
+                // Greedy: top-2 first ID == row argmax; no separate argMax
+                // launch. Sampled: draw from this fresh row's distribution.
+                if let sampling {
+                    let selection = Self.buildSampledSelection(
+                        repairLastRow, draftIDs: [], sampling: sampling,
+                        acceptKey: nextKey(), drawKey: nextKey())
+                    eval(selection.corrected)
+                    pendingPrimary = Int(
+                        selection.corrected.asArray(Int32.self)[0])
+                } else {
+                    pendingPrimary = ids[0]
+                }
                 pendingTop2 = (ids, values)
                 perRowTop2Tokens.append(ids)
                 perRowTop2Logits.append(values)
