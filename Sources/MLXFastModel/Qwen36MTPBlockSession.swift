@@ -412,6 +412,95 @@ public final class Qwen36MTPBlockSession {
                 cache: historyWarmCache)
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+        // H019 DENSE FOLD SWEEP (union piece P1). The crown's warm folds only
+        // two head-forward totals: the direct [1, 512] prime above and the
+        // [1, 2] accept fold below. Every live flush builds concatenated
+        // uniform [1, 1, h] pieces at the round's total backlog width, so any
+        // other width paid its head-forward + concat JIT inside a scored
+        // streak. Sweep every contiguous total 3...40 through the EXACT live
+        // call pattern. Bound justification: post-full-accept next-round
+        // widths are <= maxDepth + 1 == 9 and realistic backlog sums reach
+        // the mid-teens; 40 covers long serial-stretch accumulations with
+        // headroom while each extra iteration is a small zeros-only head
+        // forward on a throwaway cache (sub-millisecond after the first),
+        // keeping added warm well under the ~10 s budget — cheap enough that
+        // the tighter fallback bound 2*maxDepth+2 == 18 buys nothing. Totals
+        // 1...2 are already compiled by the crown's shapes above.
+        for foldWidth in 3 ... 40 {
+            let pieces = Array(
+                repeating: MLXArray.zeros([1, 1, hDim], dtype: row.dtype),
+                count: foldWidth)
+            let sweepHidden = concatenated(pieces, axis: 1)
+            let sweepTokens = MLXArray(
+                Array(repeating: Int32(0), count: foldWidth)
+            ).reshaped([1, foldWidth])
+            let sweptFold = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                hidden: sweepHidden, nextTokenIds: sweepTokens,
+                cache: historyWarmCache)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: sweepHidden, nextTokenIds: sweepTokens,
+                    cache: historyWarmCache)
+            eval(model.draftTokenID(
+                sweptFold[
+                    0...,
+                    (sweptFold.dim(1) - 1) ..< sweptFold.dim(1),
+                    0...]))
+        }
+        // H019 FIRST-ROUND MIXED-FLUSH WARM (union piece P2). The first
+        // drafting round after a serial/skip stretch flushes the 511-row
+        // final-normed seed slice plus k backlog [1, 1, h] rows plus the
+        // pending row through ONE mixed-piece concat: live first-round totals
+        // are 512 + k for k in 0...8, which NO uniform-piece fold above (and
+        // neither crown shape) compiles. Note E65 rung 1 (:334-341 of this
+        // file) already proved the norm-over-slice and float concat are NOT
+        // the round-1 cost — it measured 22.4 ms building this block through
+        // the live expression, inside the base range. P2 therefore targets
+        // the HEAD-FORWARD SHAPES at totals 513..520, which remain unwarmed:
+        // mtpHeadLastHiddenWithKVOnlyHistory ?? mtpHeadHiddenForward JIT-
+        // specializes by sequence length, so each new total is a cold compile
+        // inside scored round 1 until warmed here.
+        for extraBacklogRows in 0 ... 8 {
+            var mixedPieces: [MLXArray] = [
+                model.applyFinalNorm(
+                    MLXArray.zeros([1, 511, hDim], dtype: row.dtype)),
+            ]
+            mixedPieces.append(
+                contentsOf: Array(
+                    repeating: MLXArray.zeros([1, 1, hDim], dtype: row.dtype),
+                    count: extraBacklogRows))
+            mixedPieces.append(MLXArray.zeros([1, 1, hDim], dtype: row.dtype))
+            let mixedFlushHidden = concatenated(mixedPieces, axis: 1)
+            let mixedFlushTokens = MLXArray(
+                Array(repeating: Int32(0), count: 512 + extraBacklogRows)
+            ).reshaped([1, 512 + extraBacklogRows])
+            let mixedFlushed = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                hidden: mixedFlushHidden, nextTokenIds: mixedFlushTokens,
+                cache: historyWarmCache)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: mixedFlushHidden, nextTokenIds: mixedFlushTokens,
+                    cache: historyWarmCache)
+            eval(model.draftTokenID(
+                mixedFlushed[
+                    0...,
+                    (mixedFlushed.dim(1) - 1) ..< mixedFlushed.dim(1),
+                    0...]))
+        }
+        // H019 INPUT-COUNT-2 CONCAT FAMILY (union piece P3). MLX concat JIT-
+        // specializes by input count, so uniform-piece sweeps (input count ==
+        // total width) leave the two-piece decomposition cold. Live backlogs
+        // present 2...S+2 non-uniform pieces; compile the dominant
+        // input-count-2 hidden concat ([1, T-1, h] + [1, 1, h]) for T in
+        // 2...9. Head forwards at these totals are covered by the sweep
+        // above; only the concat kernel shape is new here.
+        for mixedTotal in 2 ... 9 {
+            eval(concatenated(
+                [
+                    MLXArray.zeros(
+                        [1, mixedTotal - 1, hDim], dtype: row.dtype),
+                    MLXArray.zeros([1, 1, hDim], dtype: row.dtype),
+                ],
+                axis: 1))
+        }
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
@@ -478,6 +567,32 @@ public final class Qwen36MTPBlockSession {
         precondition(model.replayRecurrentPrefix(
             cache: oneRowReplayCache, committedRows: 1))
         eval(oneRowReplayCache.flatMap { $0.state })
+        // H019 REPAIR-PATH INSURANCE (union piece P4). The generic K>1 /
+        // defensive fallback undoes the whole verify window and re-forwards
+        // the committed block through callWithHidden([1, L], nConfirmed: 0)
+        // at L in 2...8, reading its tail row through linearTopTwoRows. No
+        // warm above compiles those backbone shapes: the width ladder
+        // dispatches callWithHiddenAndNormed / nConfirmed: 1 at width >= 2,
+        // and the seed warm is L = 512 — so a preflight failure would pay a
+        // ~100 ms+ JIT class inside a scored round. Warm each width once on
+        // a throwaway cache; values are zeros, nothing is read out.
+        let repairWarmCache = model.newCache(parameters: nil)
+        for repairWidth in [2, 4, 8] {
+            let (repairWarmLogits, repairWarmHidden) = model.callWithHidden(
+                input: LMInput.Text(
+                    tokens: MLXArray(
+                        Array(repeating: 0, count: repairWidth)
+                    ).reshaped([1, repairWidth])),
+                cache: repairWarmCache, nConfirmed: 0)
+            let repairWarmLastRow = repairWarmLogits[
+                0...,
+                (repairWarmLogits.dim(1) - 1) ..< repairWarmLogits.dim(1),
+                0...]
+            let (repairWarmIDs, repairWarmValues) =
+                Self.linearTopTwoRows(repairWarmLastRow)
+            eval(repairWarmCache.flatMap { $0.state }
+                + [repairWarmIDs, repairWarmValues, repairWarmHidden])
+        }
 
         // SEED-PREFILL SHAPE WARM (M=512 backbone). Keep this as the final
         // warm so the promoted allocator/pipeline end state is preserved.
