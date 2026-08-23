@@ -1439,7 +1439,7 @@ private let qwen35E120QMVHeader = """
         uint simd_lid
     ) {
         typedef vec<float, NA> VF;
-        constexpr int rows_per_simd = 4;
+        constexpr int rows_per_simd = \(qwen35QMVRowsPerSimd);
         constexpr int values_per_thread = 16;
         constexpr int block_size = values_per_thread * 32;
         constexpr int bytes_per_lane = 8;
@@ -1561,6 +1561,17 @@ private let qwen35E120QMVHeader = """
 /// whether the chunk-sum table is a bound buffer at all: the four-input
 /// pipeline has no such buffer and passes a null pointer that `USE_TABLE =
 /// false` never reads.
+
+/// Output rows each simdgroup owns in the wide QMV. LOCAL SWEEP KNOB.
+/// The kernel source, the `qmv_out_row` mapping and the launch grid all
+/// derive from this, so it can only be changed here.
+let qwen35QMVRowsPerSimd: Int = {
+    if let raw = ProcessInfo.processInfo.environment["MLX_QMV_ROWS_PER_SIMD"],
+       let v = Int(raw), v == 1 || v == 2 || v == 4 || v == 8
+    { return v }
+    return 2
+}()
+
 private func qwen35E120QMVSource(table: Bool) -> String {
     let sums = table ? "xsums" : "qmv_null_sums"
     let flag = table ? "USE_TABLE" : "false"
@@ -1585,7 +1596,7 @@ private func qwen35E120QMVSource(table: Bool) -> String {
             const uint3 qmv_tid = threadgroup_position_in_grid;
             const uint qmv_lid = thread_index_in_simdgroup;
             const uint qmv_sgid = simdgroup_index_in_threadgroup;
-            const int qmv_out_row = int(qmv_tid.y) * 8 + int(qmv_sgid) * 4;
+            const int qmv_out_row = int(qmv_tid.y) * \(qwen35QMVRowsPerSimd * 2) + int(qmv_sgid) * \(qwen35QMVRowsPerSimd);
             const int qmv_gx = int(qmv_tid.x);\(nullDecl)
             switch (qmv_m) {
         \(cases)
@@ -1831,7 +1842,7 @@ public enum Qwen35CustomQMV {
         return qwen35CustomAffine4QMVTableKernel(
             [w, scales, biases, x, xsums],
             template: [("USE_TABLE", consume)],
-            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / 8) * 2, 1),
+            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / (qwen35QMVRowsPerSimd * 2)) * 2, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [outShape],
             outputDTypes: [.bfloat16]
@@ -1875,7 +1886,7 @@ public enum Qwen35CustomQMV {
         outShape[outShape.count - 1] = cell.n
         return qwen35CustomAffine4QMVKernel(
             [w, scales, biases, x],
-            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / 8) * 2, 1),
+            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / (qwen35QMVRowsPerSimd * 2)) * 2, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [outShape],
             outputDTypes: [.bfloat16]
