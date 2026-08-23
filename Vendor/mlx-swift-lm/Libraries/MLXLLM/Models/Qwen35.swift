@@ -1140,7 +1140,10 @@ final class Qwen35GatedDeltaNet: Module {
         let z: MLXArray
         let b: MLXArray
         let a: MLXArray
-        if S <= 9, let fused = fusedInProjections(inputs) {
+        // The fused [qkv|z|b|a] pack is a concat-on-N GEMM: bit-exact with
+        // four separate launches at any S. The old S<=9 gate left the 512-row
+        // seed on four library QMMs. Decode S=1..9 already used this path.
+        if let fused = fusedInProjections(inputs) {
             qkv = fused.0
             z = fused.1.reshaped(B, S, numVHeads, headVDim)
             b = fused.2
