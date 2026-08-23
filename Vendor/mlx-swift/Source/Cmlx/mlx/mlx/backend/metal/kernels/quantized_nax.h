@@ -934,7 +934,9 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    const int kHostBM = BM,
+    const int kHostBN = BN>
 METAL_FUNC void qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -972,19 +974,18 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
-  const int y_row = tid.y * BM;
-  const int y_col = tid.x * BN;
 
-  auto wl = (const device uint8_t*)w;
+  // A retiled arm keeps the host launch geometry and re-derives every tile
+  // origin, so the arm tile must cover the same area as the host tile and
+  // must divide the host tile along N.
+  constexpr bool kRetiled = (BM != kHostBM) || (BN != kHostBN);
+  static_assert(
+      BM * BN == kHostBM * kHostBN, "a retiled tile must cover the host tile");
+  static_assert(kHostBN % BN == 0, "the host tile must split along N");
 
-  x += y_row * static_cast<int64_t>(K);
-  wl += y_col * K_w;
-  scales += y_col * K_g;
-  biases += y_col * K_g;
-  y += y_row * static_cast<int64_t>(N) + y_col;
-
-  // Make the weight loader
-  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  const device uint8_t* wl0 = (const device uint8_t*)w;
+  const device T* x0 = x;
+  device T* y0 = y;
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -994,80 +995,121 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
 
+  // RULE 145. `tile_matmad_nax` (steel/gemm/nax.h:847 and :864) has exactly two
+  // `if constexpr` branches and no `else`. A tile shape that matches neither
+  // compiles clean, issues no `mma`, and leaves the destination tile holding
+  // the zeros it was cleared with. The condition below is the disjunction of
+  // those two branch predicates, copied from them, so a tile change that falls
+  // between them stops the build instead of returning zeros. Note that
+  // `TN % 2 == 0 || TM % 2 == 0` is NOT the correct guard: it admits
+  // (TM, TN) = (2, 3), which matches neither branch.
+  static_assert(
+      (TN == 1 && TM % 2 == 0) || (TN % 2 == 0),
+      "tile shape matches no tile_matmad_nax branch and would multiply nothing");
+
   const short tm = SM * (simd_gid / WN);
   const short tn = SN * (simd_gid % WN);
 
   constexpr bool transpose_a = false;
   constexpr bool transpose_b = true;
 
-  const short sgp_sm = min(int(SM), M - (y_row + tm));
-  const bool is_unaligned_sm = (sgp_sm != SM);
-
-  const short sgp_sn = aligned_N ? SN : min(int(SN), N - (y_col + tn));
-
-  const short tgp_bn = aligned_N ? BN : min(BN, int(N - (y_col)));
-  const bool is_unaligned_bn = aligned_N ? false : (tgp_bn != BN);
-
   using AccumType = float;
 
-  NAXTile<AccumType, TM, TN> Dtile;
-  Dtile.clear();
+  auto compute_tile = [&](const int y_row, const int y_col) {
+    const device T* xt = x0 + y_row * static_cast<int64_t>(K);
+    const device uint8_t* wlt = wl0 + y_col * K_w;
+    const device T* st = scales + y_col * K_g;
+    const device T* bt = biases + y_col * K_g;
+    device T* yt = y0 + y_row * static_cast<int64_t>(N) + y_col;
 
-  x += tm * K;
+    // Make the weight loader
+    loader_w_t loader_w(wlt, st, bt, K, Ws, simd_gid, simd_lid);
 
-  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
-    dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if constexpr (kAlignedN.value) {
-          loader_w.load_unsafe();
-        } else {
-          loader_w.load_safe(short2(BK, tgp_bn));
-        }
+    const short sgp_sm = min(int(SM), M - (y_row + tm));
+    const bool is_unaligned_sm = (sgp_sm != SM);
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    const short sgp_sn = aligned_N ? SN : min(int(SN), N - (y_col + tn));
 
-        STEEL_PRAGMA_NO_UNROLL
-        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-          NAXTile<T, TM, TK> Atile;
-          NAXTile<T, TN, TK> Btile;
+    const short tgp_bn = aligned_N ? BN : min(BN, int(N - (y_col)));
+    const bool is_unaligned_bn = aligned_N ? false : (tgp_bn != BN);
 
-          volatile int compiler_barrier;
+    NAXTile<AccumType, TM, TN> Dtile;
+    Dtile.clear();
 
-          if constexpr (kAlignedM.value) {
-            Atile.load(x + kk1, K);
+    xt += tm * K;
+
+    dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
+      dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if constexpr (kAlignedN.value) {
+            loader_w.load_unsafe();
           } else {
-            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            loader_w.load_safe(short2(BK, tgp_bn));
           }
 
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<transpose_a>{},
-              Btile,
-              metal::bool_constant<transpose_b>{});
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
 
-          (void)compiler_barrier;
+            volatile int compiler_barrier;
+
+            if constexpr (kAlignedM.value) {
+              Atile.load(xt + kk1, K);
+            } else {
+              Atile.load_safe(xt + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+
+            (void)compiler_barrier;
+          }
+
+          xt += BK;
+          loader_w.next();
         }
 
-        x += BK;
-        loader_w.next();
-      }
+        // Store results to device memory
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-      // Store results to device memory
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-
-      if constexpr (kAlignedM.value && kAlignedN.value) {
-        Dtile.store(y + tm * N + tn, N);
-      } else if (kAlignedM.value && sgp_sn == SN) {
-        Dtile.store(y + tm * N + tn, N);
-      } else {
-        Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
-      }
+        if constexpr (kAlignedM.value && kAlignedN.value) {
+          Dtile.store(yt + tm * N + tn, N);
+        } else if (kAlignedM.value && sgp_sn == SN) {
+          Dtile.store(yt + tm * N + tn, N);
+        } else {
+          Dtile.store_safe(yt + tm * N + tn, N, short2(sgp_sn, sgp_sm));
+        }
+      });
     });
-  });
+  };
+
+  if constexpr (kRetiled) {
+    const int tiles_x_host = (N + kHostBN - 1) / kHostBN;
+    const int tiles_x = (N + BN - 1) / BN;
+    const int tiles_y = (M + BM - 1) / BM;
+    const int launched = ((M + kHostBM - 1) / kHostBM) * tiles_x_host;
+    const int required = tiles_y * tiles_x;
+    /* tid.y * tiles_x_host + tid.x is a bijection onto [0, launched), so
+       striding by launched visits every t in [0, required) exactly once.
+       Two threadgroup barriers separate the last Ws read of one tile from
+       the first Ws write of the next, so the staged tile is never torn. */
+    for (int t = int(tid.y) * tiles_x_host + int(tid.x); t < required;
+         t += launched) {
+      compute_tile((t / tiles_x) * BM, (t % tiles_x) * BN);
+    }
+  } else {
+    compute_tile(int(tid.y) * BM, int(tid.x) * BN);
+  }
 }
 
 template <
@@ -1140,6 +1182,18 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
+
+  // RULE 145. `tile_matmad_nax` (steel/gemm/nax.h:847 and :864) has exactly two
+  // `if constexpr` branches and no `else`. A tile shape that matches neither
+  // compiles clean, issues no `mma`, and leaves the destination tile holding
+  // the zeros it was cleared with. The condition below is the disjunction of
+  // those two branch predicates, copied from them, so a tile change that falls
+  // between them stops the build instead of returning zeros. Note that
+  // `TN % 2 == 0 || TM % 2 == 0` is NOT the correct guard: it admits
+  // (TM, TN) = (2, 3), which matches neither branch.
+  static_assert(
+      (TN == 1 && TM % 2 == 0) || (TN % 2 == 0),
+      "tile shape matches no tile_matmad_nax branch and would multiply nothing");
 
   const short tm = SM * (simd_gid / WN);
   const short tn = SN * (simd_gid % WN);
@@ -1227,7 +1281,19 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  // E147 rung E-1c. The ranked seed prefill runs this entry point at
+  // (BM, BN) = (64, 64). The arm keeps that launch geometry and re-tiles it
+  // into (128, 32), which is the published 5cdc9c17 geometry, so the same
+  // threadgroup count covers the same output with a taller, narrower tile.
+  // The arm is off in the submitted default and the flag is the whole switch.
+  constexpr bool kE147NaxRetileOn = false;
+  constexpr int kE147NaxRetileBM = kE147NaxRetileOn ? 128 : BM;
+  constexpr int kE147NaxRetileBN = kE147NaxRetileOn ? 32 : BN;
+  constexpr bool kE147NaxRetiled =
+      (kE147NaxRetileBM != BM) || (kE147NaxRetileBN != BN);
+  constexpr int kTgBN = kE147NaxRetileBN > BN ? kE147NaxRetileBN : BN;
+
+  threadgroup T Ws[kTgBN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1246,6 +1312,22 @@ template <
         s_strides,
         b_strides,
         tid);
+  }
+  if constexpr (kE147NaxRetiled) {
+    qmm_t_nax_tgp_impl<
+        T,
+        group_size,
+        bits,
+        aligned_N,
+        kE147NaxRetileBM,
+        BK,
+        kE147NaxRetileBN,
+        WM,
+        WN,
+        BM,
+        BN>(
+        w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+    return;
   }
   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
@@ -1525,6 +1607,18 @@ template <
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
+
+  // RULE 145. `tile_matmad_nax` (steel/gemm/nax.h:847 and :864) has exactly two
+  // `if constexpr` branches and no `else`. A tile shape that matches neither
+  // compiles clean, issues no `mma`, and leaves the destination tile holding
+  // the zeros it was cleared with. The condition below is the disjunction of
+  // those two branch predicates, copied from them, so a tile change that falls
+  // between them stops the build instead of returning zeros. Note that
+  // `TN % 2 == 0 || TM % 2 == 0` is NOT the correct guard: it admits
+  // (TM, TN) = (2, 3), which matches neither branch.
+  static_assert(
+      (TN == 1 && TM % 2 == 0) || (TN % 2 == 0),
+      "tile shape matches no tile_matmad_nax branch and would multiply nothing");
 
   const short tm = SM * (simd_group_id / WN);
   const short tn = SN * (simd_group_id % WN);
