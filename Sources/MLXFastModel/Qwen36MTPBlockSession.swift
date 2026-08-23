@@ -713,6 +713,18 @@ public final class Qwen36MTPBlockSession {
     /// EMAs, not this.
     private var fullAcceptStreak = 0
 
+    /// H030: the realized-EV skip gate, one per session (value type; the
+    /// struct's doc carries the seam contract). Priced at the draftPolicy
+    /// seam every round; fed at the round tail on drafting rounds only.
+    private var evGate = RealizedEVSkipGate()
+
+    /// H030 kill switch. Default ON; `DARKBLOOM_QWEN_MTP_EV_SKIP=0`
+    /// disables the gate entirely -- the session then behaves exactly as it
+    /// did before this policy (no gate reads, no round timing, no trace
+    /// field), which is also the ranked-run escape hatch.
+    private static let evSkipEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_QWEN_MTP_EV_SKIP"] != "0"
+
     /// The last row of a head-chain hidden block. Every step after the first
     /// feeds ONE row in and gets ONE row back, and `lastHiddenWithKVOnlyHistory`
     /// already returns only the final row — so the trailing-row slice those
@@ -1068,7 +1080,218 @@ public final class Qwen36MTPBlockSession {
     /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
     private static let segmentedStreakGate = 2
 
-    /// The greedy marginal-depth rule described at the policy's assignment.
+    /// The offered-depth policy. Default ON: the wave 4b P4-DP exact-argmax
+    /// controller (`dpDraftLength`) picks the arm; setting
+    /// DARKBLOOM_QWEN_MTP_DP_POLICY=0 restores the greedy marginal walk
+    /// (`greedyDraftLength`) bit-for-bit. Both consume the SAME beliefs — the
+    /// per-position acceptance EMAs, the top-2 margin confidence gates and
+    /// the shipped `depthPrice` curve — so the switch changes only which
+    /// decision rule reads them.
+    internal static let dpPolicyEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_QWEN_MTP_DP_POLICY"] != "0"
+// MARK: - H030 realized-EV skip gate (EDITABLE POLICY STATE)
+
+/// One drafting round's realized-economics sample, in session units.
+///
+/// `committedTokens` counts EVERY token the round committed (the primary plus
+/// the accepted drafts); production folds the integer `1 + acceptedCount`.
+/// Tests fold fractional expectations so a synthetic trace realizes a target
+/// ratio exactly -- the gate consumes rates, so the field carries a Double.
+internal struct RealizedEVSample {
+    var committedTokens: Double
+    var roundMicroseconds: Double
+    /// Drafts the round proposed; >= 1. Depth-0 (serial/skip) rounds never
+    /// produce a sample -- the gate is frozen while it skips.
+    var draftedDepth: Int
+}
+
+/// H030 -- per-prompt adaptive economics: detect NEGATIVE-EV drafting from
+/// the session's own realized history and skip to serial until a probe proves
+/// the regime changed (hypothesis/H030-adaptive-ev-skip.md, DESIGN COMPLETE).
+///
+/// VALUE-TYPE, SESSION-OWNED: `Qwen36MTPBlockSession` holds one instance and
+/// drives it from two seams --
+///
+///   * `costModelDepth` (the draftPolicy seam) calls `priceDepth` once per
+///     round BEFORE proposing. A tripped gate returns 0 drafts (the warmed
+///     skip path: declaredRows = 1, identical to a serial-equivalent round)
+///     with a single-draft probe every `probeEvery` rounds.
+///   * the round tail feeds `observe` ONLY on drafting rounds (d >= 1); skip
+///     rounds feed nothing, so the gate freezes while it skips except for the
+///     probe cadence, which `priceDepth` advances once per round.
+///
+/// SERIAL REFERENCE -- analytic, W-based (the ONE choice, per the design's
+/// "pick ONE"): every observed drafting round at depth d is normalized by the
+/// shipped `depthPrice.cumulative[d]` factor,
+///
+///     serialEquivalentUs = roundUs / cumulative[d]   (T(d) = V * cumulative[d])
+///
+/// and `serialRateRef` is the EMA (alpha 0.15) of 1e6 / serialEquivalentUs --
+/// the tokens-per-second of the depth-0 round this stack's own cost model
+/// says the same forward budget buys. The trailing-low-depth-mean alternative
+/// was rejected: a cold prompt may never draft at low depth before the first
+/// decision, and the shipped price table is already the measured
+/// width-dependence of the round time.
+///
+/// TRIP RULE -- `margin` 0.90 across M = 3 windows of windowLen = 8. A sample
+/// is "below" when draftRateEMA < margin * serialRateRef; `consecutiveBelow`
+/// counts consecutive below samples (an at-or-above sample resets it); the
+/// gate trips at 3 * 8 = 24 consecutive below samples once
+/// `minSamplesBeforeDecisions` (16) samples exist. For a constant-ratio trace
+/// this is exactly the design's three consecutive below windows, which puts
+/// the botany-class trip (0.8467) at round 24 -- inside the Lean proof's
+/// "trips by round 32" bound -- while the measured dead zone (drama 0.9587
+/// and above, against the 0.90 margin) never trips.
+///
+/// HYSTERESIS -- while tripped, `priceDepth` schedules a single-draft probe
+/// every `probeEvery` = 8 rounds, the first immediately after the trip. The
+/// cadence is deliberately co-sized with the depth envelope: each skipped
+/// round appends one backlog row, so probing every 8 skips keeps every probe
+/// flush total <= 9 - inside the crown-warmed width ladder - instead of
+/// paying cold sequence-specialized head JIT inside scored windows.
+/// Probes ARE drafting rounds, so their outcomes feed the same EMAs. The gate
+/// untrips only when `windowLen` consecutive probe samples hold
+/// draftRateEMA >= resumeMargin (0.97) * serialRateRef -- a full probe window
+/// above the resume margin. Between 0.90 and 0.97 the gate stays skipped: no
+/// flapping.
+///
+/// LEGALITY -- policy-only. A skip round executes the warmed depth-0 path
+/// (declaredRows = 1, accepted = rejected = 0) whose emitted token is the
+/// serial argmax, so emitted tokens change nowhere drafting stays
+/// positive-EV; the parent derives the ledger from ACTUAL counts. The gate
+/// reads only session-internal timing and acceptance history -- no
+/// input-keyed caching. Skips never touch `fullAcceptStreak` (the skip early
+/// return precedes the streak update; pinned by comment at the update site
+/// and by test in QwenMTPRealizedEVSkipTests).
+internal struct RealizedEVSkipGate {
+    /// Trace encoding, `evSkip=<0|1|2>` in the schedule snapshot.
+    internal enum Phase: Int {
+        /// Drafting normally.
+        case off = 0
+        /// Tripped: this round declines the offer (0 drafts).
+        case trippedSkip = 1
+        /// Tripped: this round is a single-draft probe.
+        case probe = 2
+    }
+
+    /// Skip only when realized EV falls BELOW 0.9x the serial reference: the
+    /// measured dead zone (drama 0.9587 .. medicine 1.0726) must never trip.
+    internal static let margin = 0.90
+    /// Resume only at 0.97x -- hysteresis; no flapping between the margins.
+    internal static let resumeMargin = 0.97
+    /// Three consecutive windows of 8 below-margin samples.
+    internal static let windows = 3
+    internal static let windowLen = 8
+    /// Single-draft reprobe cadence while tripped, in rounds.
+    internal static let probeEvery = 8
+    /// Damping: small alpha ignores draw variance (design: "alpha small").
+    internal static let emaAlpha = 0.15
+    /// No trip decision before this many drafting-rate samples exist.
+    internal static let minSamplesBeforeDecisions = 16
+
+    /// Realized drafting rate, tokens per second, EMA over drafting rounds.
+    internal private(set) var draftRateEMA: Double = 0
+    /// Serial reference rate, tokens per second (analytic, W-based; above).
+    internal private(set) var serialRateRef: Double = 0
+    /// Consecutive below-margin drafting-rate samples.
+    internal private(set) var consecutiveBelow = 0
+    /// Rounds until the next single-draft probe (while tripped).
+    internal private(set) var probeCooldown = 0
+    internal private(set) var phase: Phase = .off
+    /// Drafting-rate samples folded since session start.
+    internal private(set) var samples = 0
+    /// 1-based round index of the most recent trip / resume, for traces.
+    internal private(set) var tripRound: Int?
+    internal private(set) var resumeRound: Int?
+
+    /// Consecutive probe samples at or above the resume margin.
+    private var probesAboveResume = 0
+    /// Set by `priceDepth` when THIS round is a probe; consumed by `observe`.
+    private var probingThisRound = false
+
+    internal init() {}
+
+    /// The draftPolicy seam. Returns nil when the gate has nothing to say
+    /// (the marginal walk below decides), 0 for an adaptive skip, 1 for a
+    /// single-draft probe. Called once per round -- including the rounds it
+    /// skips -- so the probe cadence counts ROUNDS, exactly as designed.
+    internal mutating func priceDepth(cap: Int) -> Int? {
+        // A probe round is a one-round phase; after its price call it is an
+        // ordinary tripped round again until the next probe comes due.
+        if phase == .probe { phase = .trippedSkip }
+        guard phase == .trippedSkip else { return nil }
+        if probeCooldown <= 1 {
+            probeCooldown = Self.probeEvery
+            probingThisRound = true
+            phase = .probe
+            return Swift.min(1, cap)
+        }
+        probeCooldown -= 1
+        return 0
+    }
+
+    /// The round-tail seam. Drafting rounds only (d >= 1): fold the rate
+    /// sample, then advance the trip / resume state machines. Skip and true
+    /// serial rounds feed NOTHING -- the gate is frozen while it skips.
+    internal mutating func observe(_ sample: RealizedEVSample, round: Int) {
+        let wasProbe = probingThisRound
+        probingThisRound = false
+        guard sample.draftedDepth >= 1, sample.roundMicroseconds > 0 else {
+            return
+        }
+        if phase == .probe { phase = .trippedSkip }
+
+        let rate = sample.committedTokens
+            / (sample.roundMicroseconds / 1_000_000)
+        let depth = Swift.max(
+            1, Swift.min(sample.draftedDepth, Qwen36MTPLimits.maxDepth))
+        let serialEquivalentUs = sample.roundMicroseconds /
+            Qwen36MTPBlockSession.depthPrice.cumulative[depth]
+        let serialSample = 1_000_000 / serialEquivalentUs
+        if samples == 0 {
+            draftRateEMA = rate
+            serialRateRef = serialSample
+        } else {
+            let alpha = Self.emaAlpha
+            draftRateEMA += alpha * (rate - draftRateEMA)
+            serialRateRef += alpha * (serialSample - serialRateRef)
+        }
+        samples += 1
+
+        if wasProbe {
+            // HYSTERESIS: a full window of probes at or above 0.97x resumes.
+            if draftRateEMA >= Self.resumeMargin * serialRateRef {
+                probesAboveResume += 1
+                if probesAboveResume >= Self.windowLen {
+                    phase = .off
+                    consecutiveBelow = 0
+                    probesAboveResume = 0
+                    probeCooldown = 0
+                    resumeRound = round
+                }
+            } else {
+                probesAboveResume = 0
+            }
+        } else if phase == .off {
+            if draftRateEMA < Self.margin * serialRateRef {
+                consecutiveBelow += 1
+            } else {
+                consecutiveBelow = 0
+            }
+            // Trip = windows(3) * windowLen(8) consecutive below-margin
+            // samples, and no decision before minSamplesBeforeDecisions.
+            if samples >= Self.minSamplesBeforeDecisions,
+               consecutiveBelow >= Self.windows * Self.windowLen
+            {
+                phase = .trippedSkip
+                probeCooldown = 1
+                probesAboveResume = 0
+                tripRound = round
+            }
+        }
+    }
+}
+
     private func costModelDepth(offeredDepth: Int) -> Int {
         // The width wall binds the SINGLE-CALL verify; a qualifying
         // full-accept streak opens the segmented cap (the round then feeds
@@ -1108,32 +1331,84 @@ public final class Qwen36MTPBlockSession {
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
+        // H030 DECISION POINT: the realized-EV gate prices the round before
+        // the marginal walk. Tripped -> 0 drafts this round (the skip path is
+        // pre-warmed: declaredRows = 1, identical to a serial-equivalent
+        // round), with a single-draft probe every probeEvery rounds; nil ->
+        // the walk below decides as before.
+        let evSkipOverride = Self.evSkipEnabled
+            ? evGate.priceDepth(cap: cap) : nil
         // Snapshot BEFORE the walk and before any drafting: by the time the
         // round's trace line is emitted, the EMAs, the streak and `pendingTop2`
         // have all been advanced by this round's own outcome, so reading them
         // there would describe the next round's inputs, not this one's.
-        if Self.traceRounds { snapshotScheduleSignal(widthCap: widthCap) }
+        if Self.traceRounds {
+            snapshotScheduleSignal(widthCap: widthCap, evSkip: evSkipOverride)
+        }
+        if let evSkipOverride { return evSkipOverride }
         guard cap > 0 else { return 0 }
-        let price = Self.depthPrice
+        // The top-2 margin confidence gates veto BEFORE either walk: both
+        // policies consume the same gated per-position acceptance
+        // probabilities, exactly as the shipped greedy rule computed them.
+        let top2Margin: Double? = pendingTop2.flatMap { tail in
+            tail.1.count >= 2 ? tail.1[0] - tail.1[1] : nil
+        }
+        if Self.dpPolicyEnabled {
+            let depth = Self.dpDraftLength(
+                cap: cap,
+                prices: Self.depthPrice.marginal,
+                cumulative: Self.depthPrice.cumulative,
+                positionAcceptEMAs: positionAcceptEMA,
+                top2Margin: top2Margin)
+            if Self.traceRounds {
+                scheduleTrace += String(format: "dpChoice=%d;", depth)
+            }
+            return depth
+        }
+        return Self.greedyDraftLength(
+            cap: cap,
+            prices: Self.depthPrice.marginal,
+            cumulative: Self.depthPrice.cumulative,
+            positionAcceptEMAs: positionAcceptEMA,
+            top2Margin: top2Margin,
+            traceRounds: Self.traceRounds,
+            into: &scheduleTrace)
+    }
+
+    /// The greedy marginal-depth rule, extracted VERBATIM from the walk the
+    /// promoted c6af1e24 schedule shipped so the DP kill switch and the unit
+    /// tests compare against the real reference implementation, not a copy.
+    /// Arithmetic and evaluation order are unchanged; `cap` is the caller's
+    /// min(offeredDepth, maxDepth, widthCap) as before.
+    internal static func greedyDraftLength(
+        cap: Int,
+        prices marginal: [Double],
+        cumulative: [Double],
+        positionAcceptEMAs: [Double],
+        top2Margin: Double?,
+        traceRounds: Bool,
+        into trace: inout String
+    ) -> Int {
         var reach = 1.0
         var expected = 0.0
         var depth = 0
-        while depth < cap {
-            var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
+        while depth < Swift.min(
+            cap,
+            Swift.min(marginal.count, cumulative.count - 1),
+            positionAcceptEMAs.count) {
+            var p = positionAcceptEMAs[depth]
+            if depth == 0, let margin = top2Margin {
                 let conf = 1.0 / (1.0 + exp(-margin / 2.0))
                 p = Swift.min(p, conf)
-            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
+            } else if depth == 1, let margin = top2Margin {
                 let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
                 p = Swift.min(p, conf2)
             }
             reach *= p
-            let threshold = price.marginal[depth] * (1.0 + expected) /
-                price.cumulative[depth]
-            if Self.traceRounds {
-                scheduleTrace += String(
+            let threshold = marginal[depth] * (1.0 + expected) /
+                cumulative[depth]
+            if traceRounds {
+                trace += String(
                     format: "%d:%.6f/%.6f/%.6f;", depth, p, reach, threshold)
             }
             guard reach > threshold else { break }
@@ -1141,6 +1416,72 @@ public final class Qwen36MTPBlockSession {
             depth += 1
         }
         return depth
+    }
+
+    /// Wave 4b P4-DP: the exact-argmax draft-length controller. Evaluates
+    /// EVERY arm d in 0...cap of expected committed tokens per unit time,
+    ///
+    ///     argmax_d  N(d) / T(d)
+    ///     N(d) = sum_{k=0..d} prod_{i<k} p_i   (primary + expected accepted
+    ///                                           drafts under the gated EMAs)
+    ///     T(d) = V * c(1 + d)                  (the shipped depth-price
+    ///                                           curve, `cumulative[d]`)
+    ///
+    /// over the SAME beliefs the greedy rule consumes — the per-position
+    /// acceptance EMAs with the identical top-2 margin gates at positions
+    /// 0/1, and the shipped `depthPrice` table (whose non-uniform shapes are
+    /// `measuredRawDepthPrice`; its level already carries the d*h head-step
+    /// spend, T(d) = V + d*h*V, so no separate draft term is added — that
+    /// would double-count). Zero new GPU ops: pure host arithmetic over at
+    /// most 8 arms, no allocation beyond the gated probability copy.
+    ///
+    /// With a CONSTANT marginal price m the objective is unimodal and the
+    /// argmax coincides with the greedy rule exactly: f(d) > f(d-1) reduces
+    /// to reach_d > m*N(d-1)/c(d), which is verbatim the greedy threshold
+    /// test at that step. The DP therefore only changes WHICH legal adaptive
+    /// depth is offered when the two rules disagree; token-fidelity is
+    /// unaffected (policy-only) and the ledger still derives from actual
+    /// accepted counts.
+    ///
+    /// Ties break toward the SHALLOWER arm (strict improvement required to
+    /// move right), matching the greedy rule's stop-on-non-improvement.
+    internal static func dpDraftLength(
+        cap: Int,
+        prices marginal: [Double],
+        cumulative: [Double],
+        positionAcceptEMAs: [Double],
+        top2Margin: Double?
+    ) -> Int {
+        let limit = Swift.min(
+            cap,
+            Swift.min(marginal.count, cumulative.count - 1),
+            positionAcceptEMAs.count)
+        guard limit > 0 else { return 0 }
+        var p = positionAcceptEMAs
+        if let margin = top2Margin {
+            // Position 0 gate, then position 1 gate — same constants, same
+            // min() override as the greedy walk.
+            let conf = 1.0 / (1.0 + exp(-margin / 2.0))
+            p[0] = Swift.min(p[0], conf)
+            if limit > 1 {
+                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
+                p[1] = Swift.min(p[1], conf2)
+            }
+        }
+        var reach = 1.0
+        var committed = 1.0
+        var bestDepth = 0
+        var bestScore = 1.0 / cumulative[0]
+        for d in 1 ... limit {
+            reach *= p[d - 1]
+            committed += reach
+            let score = committed / cumulative[d]
+            if score > bestScore {
+                bestScore = score
+                bestDepth = d
+            }
+        }
+        return bestDepth
     }
 
     /// Trace-gated record of the schedule's inputs and its extension walk.
@@ -1153,7 +1494,7 @@ public final class Qwen36MTPBlockSession {
     /// full-accept streak and the width cap in force. Recorded so an offline
     /// fit can ask which of these separates a round that accepts its whole
     /// chain from one that accepts nothing, without spending a second run.
-    private func snapshotScheduleSignal(widthCap: Int) {
+    private func snapshotScheduleSignal(widthCap: Int, evSkip: Int?) {
         let margin: Double
         if let tail = pendingTop2, tail.1.count >= 2 {
             margin = tail.1[0] - tail.1[1]
@@ -1163,8 +1504,9 @@ public final class Qwen36MTPBlockSession {
         let emas = positionAcceptEMA
             .map { String(format: "%.6f", $0) }.joined(separator: ",")
         scheduleTrace = "arm=" + Self.depthPriceArm.rawValue + " " + String(
-            format: "m=%.6f streak=%d cap=%d ema=",
-            margin, fullAcceptStreak, widthCap) + emas + " sched="
+            format: "m=%.6f streak=%d cap=%d evSkip=%d ema=",
+            margin, fullAcceptStreak, widthCap, evSkip ?? 0) + emas
+            + " sched="
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
@@ -1242,6 +1584,10 @@ public final class Qwen36MTPBlockSession {
         // Local-only phase trace (MLXFAST_QWEN_MTP_TRACE=1): three boundaries
         // split a round into head-chain graph build, verify graph build, and
         // the single blocking eval's GPU wall. Never on in a ranked run.
+        // H030: one clock read per round for the EV gate's rate samples. The
+        // phase trace's tRound0 below stays trace-gated; this one is not.
+        let evRoundStart = Self.evSkipEnabled
+            ? DispatchTime.now().uptimeNanoseconds : 0
         let tRound0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         let cpuRound0 = Self.traceRounds ? Self.threadCPUNanoseconds() : 0
         var tDraftBuilt: UInt64 = 0
@@ -1625,9 +1971,31 @@ public final class Qwen36MTPBlockSession {
             headHistoryBacklogTokens.append(
                 contentsOf: drafts.prefix(acceptedCount))
         }
+        // H030 COMPOSITION PIN: the adaptive-skip early return above (the
+        // `depth == serialControlDepth || draftCount == 0` branch) leaves
+        // this function BEFORE the update below, so a gate skip round can
+        // never reach it -- `fullAcceptStreak` is neither incremented (no
+        // vacuous 0 == 0 "full acceptance") nor reset by a skip. C1 cap-8
+        // therefore cannot open on skip rounds; only fresh drafting evidence
+        // moves the streak. Pinned by test in QwenMTPRealizedEVSkipTests.
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
         recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
+        // H030 feed: ONLY drafting rounds reach here (d >= 1); the rate
+        // sample is this round's committed tokens (primary + accepted
+        // drafts) over its wall time. Skip rounds returned above and feed
+        // nothing -- the gate is frozen while it skips except for probe
+        // scheduling, which advances at the draftPolicy seam every round.
+        if Self.evSkipEnabled {
+            evGate.observe(
+                RealizedEVSample(
+                    committedTokens: Double(1 + acceptedCount),
+                    roundMicroseconds: Double(
+                        DispatchTime.now().uptimeNanoseconds &- evRoundStart)
+                        / 1000,
+                    draftedDepth: draftCount),
+                round: roundCount)
+        }
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only
             // rows on the accepted trajectory align with the serial leg.
