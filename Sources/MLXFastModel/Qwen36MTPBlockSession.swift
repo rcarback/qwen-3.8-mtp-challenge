@@ -1490,13 +1490,18 @@ public final class Qwen36MTPBlockSession {
         // in ONE eval. The `.item()`/`.asArray` calls below then copy from
         // materialised buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
+        //
+        // Draft ids are already the tail of `verifyTokens`, which the target
+        // forward consumed. Listing each draft array again made the blocking
+        // eval re-walk d extra roots the graph already depends on. Read the
+        // same integers back from that concat after the one eval.
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
-        var bundle: [MLXArray] = [top2IDs, top2Values]
-        bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        eval(cache.flatMap { $0.state } + [top2IDs, top2Values, verifyTokens])
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
-        let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
+        let verifyTok = verifyTokens.asArray(Int32.self).map { Int($0) }
+        precondition(verifyTok.count == draftIdArrays.count + 1)
+        let drafts = Array(verifyTok.dropFirst())
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
