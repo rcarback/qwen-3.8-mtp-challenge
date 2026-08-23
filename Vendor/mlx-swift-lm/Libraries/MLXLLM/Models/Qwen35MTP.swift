@@ -74,11 +74,11 @@ final class Qwen35MTPDecoderLayer: Module {
         // node instead of two, paid once per PROPOSED token (draftCount times a
         // round) rather than once per layer.
         if x.dtype == .bfloat16, r.dtype == .bfloat16, x.dim(-1) == 5120 {
-            let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+            let fused = qwen35FusedResidualRMSNorm(
                 x: x, r: r,
                 weight: postAttentionLayerNorm.weight,
                 eps: postAttentionLayerNorm.eps)
-            return h + (mlp as! UnaryLayer)(postAttnNorm)
+            return fused.residual + (mlp as! UnaryLayer)(fused.normed)
         }
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
