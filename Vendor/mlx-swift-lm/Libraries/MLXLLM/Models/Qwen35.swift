@@ -1856,8 +1856,17 @@ public enum Qwen35CustomQMV {
         else { return nil }
 
         if arm == .fillNoConsume || (arm == .sumTable && tablePays(m: cell.m)) {
+            // The fused-norm producer publishes the chunk-sum table for the
+            // activation it just wrote, so the shipped `sumtable` arm skips
+            // the standalone fill dispatch for those cells and pays it for
+            // every other one. `fill_noconsume` exists to price that fill, so
+            // it always launches it.
+            let fused =
+                arm == .sumTable
+                ? Qwen35XSumsSidecar.take(x, k: cell.k, m: cell.m) : nil
             return matmulWithTable(
-                x, w, scales: scales, biases: biases, xsums: xsumsTable(x),
+                x, w, scales: scales, biases: biases,
+                xsums: fused ?? xsumsTable(x),
                 groupSize: groupSize, bits: bits, mode: mode,
                 consume: arm == .sumTable)
         }
@@ -2155,11 +2164,54 @@ func qwen35AttentionQKRMSRoPE(
 /// because the add is rounded to BF16 BEFORE squaring (matching the write-back
 /// and re-read of `h` in the eager path) and the accumulation / reduction tree
 /// mirrors `rms_norm.metal` exactly.
-private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
-    name: "qwen35_fused_residual_rms_norm",
-    inputNames: ["x", "r", "weight", "eps"],
-    outputNames: ["h", "normed"],
-    source: """
+private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
+    // Lane stride of the chunk-sum table, mirroring
+    // `Qwen35CustomQMV.sumsStride`. The launch is one threadgroup per
+    // activation row, so `threadgroups_per_grid.x` is M.
+    let sumsDecl =
+        emitSums
+        ? """
+
+            const uint xs_stride = threadgroups_per_grid.x <= 8u ? 8u : 16u;
+        """ : ""
+    // The chunk-sum epilogue: the BODY of
+    // `qwen35_custom_affine4_g64_xsums_v1` copied verbatim, run over the
+    // `normed` bytes this pass just wrote instead of over a separate
+    // dispatch's read of the same buffer. Same `vec<bfloat16_t, 4>` loads,
+    // same three BF16 adds per group of four, same ascending float
+    // accumulation onto `0.0f`, same
+    // `(k_block * 32 + lane) * stride + row` address. The table is therefore
+    // the standalone fill's bit pattern by construction -- identical source
+    // text over identical bytes -- not by an algebraic re-association
+    // argument.
+    //
+    // One pass of the write loop stores `lsize * n_reads` values, so the
+    // first `lsize / 4` threads cover them as 16-element groups. The device
+    // barrier publishes the neighbours' stores (the four writers of a group
+    // are always the same simdgroup, but the barrier is threadgroup-wide and
+    // sits in uniform control flow). `xs_elem` is a multiple of 16 and K is a
+    // multiple of 512, so a group lies wholly inside the row or wholly
+    // outside it and the guard never splits one.
+    let sumsEpilogue =
+        emitSums
+        ? """
+
+                threadgroup_barrier(mem_flags::mem_device);
+                const uint xs_elem = r_start + thread_id * 16;
+                if (thread_id < lsize / 4 && xs_elem + 16 <= axis_size) {
+                    const device bfloat16_t* xm = normed + offset + xs_elem;
+                    float s = 0.0f;
+                    for (int i = 0; i < 4; i++) {
+                        const vec<bfloat16_t, 4> xv = *reinterpret_cast<
+                            const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+                        s += xv[0] + xv[1] + xv[2] + xv[3];
+                    }
+                    const uint xs_kb = xs_elem / 512;
+                    const uint xs_lane = (xs_elem % 512) / 16;
+                    xsums[(xs_kb * 32 + xs_lane) * xs_stride + row] = s;
+                }
+        """ : ""
+    return """
         constexpr uint n_reads = 4;
         constexpr uint simd_size = 32;
         constexpr uint lsize = 1024;
@@ -2169,7 +2221,7 @@ private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
         uint simd_thread = thread_index_in_simdgroup;
         uint simd_group = simdgroup_index_in_threadgroup;
 
-        uint axis_size = uint(x_shape[x_ndim - 1]);
+        uint axis_size = uint(x_shape[x_ndim - 1]);\(sumsDecl)
 
         threadgroup float local_inv_mean[1];
         threadgroup float local_sums[simd_size];
@@ -2248,9 +2300,34 @@ private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
                         normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
                     }
                 }
-            }
+            }\(sumsEpilogue)
         }
-    """,
+    """
+}
+
+private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_residual_rms_norm",
+    inputNames: ["x", "r", "weight", "eps"],
+    outputNames: ["h", "normed"],
+    source: qwen35FusedResidualRMSNormSource(emitSums: false),
+    ensureRowContiguous: false
+)
+
+/// The same fused residual + RMSNorm with a third output: the wide-QMV
+/// chunk-sum table of `normed`, filled by an epilogue instead of by the
+/// standalone `qwen35_custom_affine4_g64_xsums_v1` dispatch that the routed
+/// consumer of `normed` would otherwise launch on its own.
+///
+/// `h` and `normed` are produced by the shipped instruction stream, untouched.
+/// The epilogue is the fill kernel's own body over the same bytes, so the
+/// table it writes is the fill's table exactly. At K = 5120 and M <= 8 it is
+/// 10,240 bytes per activation, read back out of the cache lines the write
+/// loop has just touched.
+private let qwen35FusedResidualRMSNormXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_residual_rms_norm_xsums_v1",
+    inputNames: ["x", "r", "weight", "eps"],
+    outputNames: ["h", "normed", "xsums"],
+    source: qwen35FusedResidualRMSNormSource(emitSums: true),
     ensureRowContiguous: false
 )
 
@@ -2265,6 +2342,21 @@ func qwen35FusedResidualRMSNorm(
 ) -> (residual: MLXArray, normed: MLXArray) {
     let nRows = x.size / x.dim(-1)
     let shape = x.shape
+    if Qwen35XSumsSidecar.wants(x) {
+        let k = x.dim(-1)
+        let kBlocks = k / 512
+        let outputs = qwen35FusedResidualRMSNormXSumsKernel(
+            [x, r, weight, MLXArray(eps)],
+            grid: (nRows * 1024, 1, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [
+                shape, shape, [kBlocks * 32 * Qwen35CustomQMV.sumsStride(nRows)],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16, .float32]
+        )
+        Qwen35XSumsSidecar.publish(x: outputs[1], table: outputs[2])
+        return (outputs[0], outputs[1])
+    }
     let outputs = qwen35FusedResidualRMSNormKernel(
         [x, r, weight, MLXArray(eps)],
         grid: (nRows * 1024, 1, 1),
@@ -2273,6 +2365,90 @@ func qwen35FusedResidualRMSNorm(
         outputDTypes: [.bfloat16, .bfloat16]
     )
     return (outputs[0], outputs[1])
+}
+
+/// Chunk-sum tables emitted by a producing kernel's epilogue, keyed by the
+/// identity of the activation tensor they describe.
+///
+/// `Qwen35CustomQMV.matmul` asks here before launching the standalone fill.
+/// A hit is only ever returned for the exact `MLXArray` object the producer
+/// emitted: slots hold the activation weakly, so a released tensor can never
+/// alias a later one, and the slot's `(K, M)` is re-checked against the
+/// consumer's cell and the table's own size before it is handed out. A miss
+/// costs one allocation-free scan of eight slots and falls back to
+/// `xsumsTable`, so every path that does not pass through a publishing
+/// producer keeps today's dispatch exactly.
+///
+/// Only the shipped `sumtable` arm publishes, and only at row counts the
+/// table pays at (`Qwen35CustomQMV.minimumTableWidth ... widths.upperBound`).
+/// `M = 1` -- the serial leg, which the candidate leg shares -- never reaches
+/// the variant kernel, so the serial path is byte-for-byte the shipped one.
+enum Qwen35XSumsSidecar {
+    struct Slot {
+        weak var x: MLXArray?
+        var table: MLXArray?
+        var k = 0
+        var m = 0
+    }
+
+    /// Two producers are live at once in the boundary-fused chain (the entry
+    /// norm's `normed` and the post-attention norm's). Eight slots is four
+    /// times that, so a hit never depends on eviction timing.
+    static let slotCount = 8
+    nonisolated(unsafe) static var slots = [Slot](repeating: Slot(), count: slotCount)
+    nonisolated(unsafe) static var next = 0
+    static let lock = NSLock()
+
+    /// True when the producer should emit the table for this activation.
+    ///
+    /// The consumer's `routable` test is strictly stronger (it also demands
+    /// `N >= 4096`, `N % 8 == 0`, `w.dim(1) == K / 8` and row-contiguous
+    /// weights), so a `true` here is necessary but not sufficient: an
+    /// activation that publishes and is then not routed simply leaves its
+    /// table unread and the round is unchanged apart from the epilogue.
+    ///
+    /// `x.dim(-2) == rows` is the same shape test `routable` applies, so a
+    /// published table can never be offered to a cell the consumer would have
+    /// declined on shape.
+    static func wants(_ x: MLXArray) -> Bool {
+        guard Qwen35CustomQMV.arm == .sumTable, x.ndim >= 2 else { return false }
+        let k = x.dim(-1)
+        let rows = x.size / k
+        return Qwen35CustomQMV.widths.contains(rows)
+            && Qwen35CustomQMV.tablePays(m: rows)
+            && x.dim(-2) == rows
+            && k % 512 == 0
+    }
+
+    static func publish(x: MLXArray, table: MLXArray) {
+        lock.lock()
+        defer { lock.unlock() }
+        slots[next] = Slot(
+            x: x, table: table, k: x.dim(-1), m: x.size / x.dim(-1))
+        next = (next + 1) % slotCount
+    }
+
+    /// The table for `x`, or nil when no producer published one. Slots whose
+    /// activation has been released are dropped on the way past, so a table
+    /// never outlives the tensor it describes by more than one scan.
+    static func take(_ x: MLXArray, k: Int, m: Int) -> MLXArray? {
+        lock.lock()
+        defer { lock.unlock() }
+        var hit: MLXArray?
+        for i in 0 ..< slotCount {
+            guard let held = slots[i].x else {
+                slots[i] = Slot()
+                continue
+            }
+            guard hit == nil, held === x, slots[i].k == k, slots[i].m == m,
+                let table = slots[i].table,
+                table.dtype == .float32,
+                table.size == (k / 512) * 32 * Qwen35CustomQMV.sumsStride(m)
+            else { continue }
+            hit = table
+        }
+        return hit
+    }
 }
 
 // MARK: - Dual independent RMSNorm (proposal-side pre-fc)
@@ -4440,6 +4616,153 @@ private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
 private let qwen35ProbeSortEnabled: Bool =
     ProcessInfo.processInfo.environment["MLX_E87_PROBE_SORT"] != "0"
 
+// ---------------------------------------------------------------------------
+// E123 centroid-only 32-value/lane affine-2 QMV (proposal-side)
+//
+// Live first still scores 12,292 2-bit centroids with library
+// `quantizedMM`. 12,292 % 8 == 4 so `quantized.cpp:259` takes slow
+// `qmv_impl`, not `qmv_fast`. The 32-value/lane body is the same
+// arithmetic as the promoted dense 98,336 kernel, with a 4-row tail.
+//
+// This is NOT full E121 (no gathered-row kernel). E87 select, probe
+// 0.15, row-top32, qL, E020, tight-grid M=2 and tablePays>=4 stay.
+// `MLX_E123_CENTROID_QMV=0` restores the library centroid launch.
+private let qwen35CentroidQMVEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLX_E123_CENTROID_QMV"],
+          !raw.isEmpty
+    else { return true }
+    switch raw {
+    case "1": return true
+    case "0": return false
+    default:
+        fatalError("MLX_E123_CENTROID_QMV must be unset, 0 or 1; got \(raw)")
+    }
+}()
+
+private let qwen35ClusterAffine2QMVHeader = """
+    inline void qwen_e123_a2_qmv4(
+        const device uint32_t* w,
+        const device bfloat16_t* scales,
+        const device bfloat16_t* biases,
+        const device bfloat16_t* x,
+        device bfloat16_t* y,
+        const int K,
+        const int physical_row,
+        const int y_row,
+        const int n_valid,
+        const uint simd_lid
+    ) {
+        constexpr int rows_per_simd = 4;
+        constexpr int values_per_thread = 32;
+        constexpr int block_size = values_per_thread * 32;
+        constexpr int bytes_per_lane = 8;
+        const int in_vec_size_w = K / 4;
+        const int in_vec_size_g = K / 64;
+
+        thread float result[rows_per_simd];
+        for (int r = 0; r < rows_per_simd; r++) {
+            result[r] = 0.0f;
+        }
+
+        for (int k = 0; k < K; k += block_size) {
+            thread ulong packed[rows_per_simd];
+            thread float scale_local[rows_per_simd];
+            thread float bias_local[rows_per_simd];
+            for (int r = 0; r < rows_per_simd; r++) {
+                if (r >= n_valid) {
+                    packed[r] = 0ul;
+                    scale_local[r] = 0.0f;
+                    bias_local[r] = 0.0f;
+                    continue;
+                }
+                const int row = physical_row + r;
+                const device uint8_t* ws =
+                    reinterpret_cast<const device uint8_t*>(w) +
+                    row * in_vec_size_w + k / 4 + int(simd_lid) * bytes_per_lane;
+                packed[r] = *reinterpret_cast<const device ulong*>(ws);
+                const int group_index =
+                    row * in_vec_size_g + k / 64 +
+                    (int(simd_lid) * values_per_thread) / 64;
+                scale_local[r] = scales[group_index];
+                bias_local[r] = biases[group_index];
+            }
+
+            thread float x0[values_per_thread];
+            const device bfloat16_t* xm = x + k + int(simd_lid) * values_per_thread;
+            float sum = 0.0f;
+            for (int i = 0; i < values_per_thread; i += 4) {
+                x0[i]     = static_cast<float>(xm[i]);
+                x0[i + 1] = static_cast<float>(xm[i + 1]);
+                x0[i + 2] = static_cast<float>(xm[i + 2]);
+                x0[i + 3] = static_cast<float>(xm[i + 3]);
+                sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+            }
+
+            for (int r = 0; r < n_valid; r++) {
+                float accum = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 32; j++) {
+                    accum += x0[j] * float((packed[r] >> (2 * j)) & 0x03ul);
+                }
+                result[r] += scale_local[r] * accum + sum * bias_local[r];
+            }
+        }
+
+        for (int r = 0; r < n_valid; r++) {
+            const float reduced = simd_sum(result[r]);
+            if (simd_lid == 0) {
+                y[y_row + r] = static_cast<bfloat16_t>(reduced);
+            }
+        }
+    }
+    """
+
+private let qwen35ClusterCentroidQMVKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_cluster_centroid_qmv_a2g64_v1",
+    inputNames: ["x", "w", "scales", "biases"],
+    outputNames: ["y"],
+    source: """
+        const int K = x_shape[x_ndim - 1];
+        const int N = w_shape[0];
+        const uint3 tid = threadgroup_position_in_grid;
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
+        if (out_row >= N) {
+            return;
+        }
+        const int n_valid = (N - out_row < 4) ? (N - out_row) : 4;
+        qwen_e123_a2_qmv4(
+            w, scales, biases, x, y, K, out_row, out_row, n_valid, simd_lid);
+        """,
+    header: qwen35ClusterAffine2QMVHeader,
+    ensureRowContiguous: true
+)
+
+private func qwen35ClusterCentroidQMV(
+    _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+    clusters: Int, hidden: Int
+) -> MLXArray? {
+    guard qwen35CentroidQMVEnabled else { return nil }
+    guard x.dtype == .bfloat16, scales.dtype == .bfloat16,
+          biases.dtype == .bfloat16, weight.dtype == .uint32
+    else { return nil }
+    guard hidden > 0, hidden % 1024 == 0 else { return nil }
+    guard weight.ndim == 2, weight.dim(0) == clusters,
+          weight.dim(-1) == hidden / 16,
+          scales.ndim == 2, scales.dim(0) == clusters,
+          scales.dim(-1) == hidden / 64, biases.shape == scales.shape
+    else { return nil }
+    let tiles = (clusters + 7) / 8
+    return qwen35ClusterCentroidQMVKernel(
+        [x.reshaped([hidden]), weight, scales, biases],
+        grid: (32, tiles * 2, 1),
+        threadGroup: (32, 2, 1),
+        outputShapes: [[clusters]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Fraction of leaves probed per draft step. 0.15 probes 1,844 of the 12,292
 /// leaves and scores 14,752 coarse rows instead of 24,584, a 40 % cut while
 /// the exact affine-4 rerank and 32-row shortlist stay unchanged. The isolated
@@ -5576,10 +5899,19 @@ extension Qwen35TextModel: MTPCapable {
             _draftRowTop32 = Qwen35RowTop32(
                 rows: probes * rowsPerCluster, rowsPerCluster: rowsPerCluster)
         }
-        let centroidScore = quantizedMM(
-            x, centroidWeight, scales: centroidScales, biases: centroidBiases,
-            transpose: true, groupSize: 64, bits: 2, mode: .affine
-        ).reshaped([clusters])
+        let hidden = configuration.hiddenSize
+        let centroidScore: MLXArray
+        if let y = qwen35ClusterCentroidQMV(
+            x, weight: centroidWeight, scales: centroidScales,
+            biases: centroidBiases, clusters: clusters, hidden: hidden)
+        {
+            centroidScore = y
+        } else {
+            centroidScore = quantizedMM(
+                x, centroidWeight, scales: centroidScales, biases: centroidBiases,
+                transpose: true, groupSize: 64, bits: 2, mode: .affine
+            ).reshaped([clusters])
+        }
         // `gatherQuantizedMM` is handed the probes in ascending index order,
         // while the top-C arrive in partition order.
         let probed: MLXArray
