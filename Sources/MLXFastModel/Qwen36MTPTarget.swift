@@ -139,3 +139,11 @@ extension Qwen36MTPTarget {
 // `QwenMTPBackboneLayoutTests` pins that the qualified spelling stays.
 extension Qwen35TextModel: Qwen36MTPTarget {}
 extension MLXLLM.Qwen35Model: Qwen36MTPTarget {}
+
+
+// E94 compile-head arm: default is nil (eager). Only Qwen35TextModel opts in
+// when MLX_E94_COMPILE_HEAD=1 on a supported machine.
+public extension Qwen36MTPTarget {
+    func makeCompiledMTPStep(cacheRef: [any KVCache])
+        -> (@Sendable ([MLXArray]) -> [MLXArray])? { nil }
+}

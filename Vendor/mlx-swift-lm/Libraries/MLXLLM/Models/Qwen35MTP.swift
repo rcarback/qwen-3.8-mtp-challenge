@@ -198,9 +198,17 @@ final class Qwen35MTPModule: Module {
                 hidden: hidden))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
+        // E94 compile-head arm: fixed-shape CompilableKVCache instances return
+        // the full maxLength buffer from update(), so validity MUST come from
+        // their traced array mask instead of the exact-shape `.causal` enum.
         let firstCache: (any KVCache)? = cache.first
-        let mask = createAttentionMask(h: fused, cache: firstCache)
-
+        let mask: MLXFast.ScaledDotProductAttentionMaskMode
+        if let c = firstCache, c is CompilableKVCache {
+            mask = c.makeMask(
+                n: fused.dim(1), windowSize: nil, returnArray: true)
+        } else {
+            mask = createAttentionMask(h: fused, cache: cache)
+        }
         // 3. Run each MTPDecoderLayer.
         for (i, layer) in layers.enumerated() {
             let c: (any KVCache)? = i < cache.count ? cache[i] : nil
@@ -236,7 +244,16 @@ final class Qwen35MTPModule: Module {
             fused[0..., 0 ..< historyCount, 0...], cache: cache[0])
 
         let current = fused[0..., historyCount..., 0...]
-        let mask = createAttentionMask(h: current, cache: cache[0])
+        // E94: compilable caches return the full buffer from update(); their
+        // traced array mask defines validity (exact-shape `.causal` enum
+        // would attend unwritten positions).
+        let mask: MLXFast.ScaledDotProductAttentionMaskMode
+        if cache[0] is CompilableKVCache {
+            mask = cache[0].makeMask(
+                n: current.dim(1), windowSize: nil, returnArray: true)
+        } else {
+            mask = createAttentionMask(h: current, cache: cache[0])
+        }
         return norm(layers[0](current, mask: mask, cache: cache[0]))
     }
 

@@ -1,3 +1,5 @@
+// Variance-resample attempt marker: draw 2048 from tip ec24d59+compile-arm (E101).
+
 import Foundation
 import MLX
 import MLXFastCore
@@ -743,6 +745,35 @@ public final class Qwen36MTPBlockSession {
     private static let traceRounds =
         ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
 
+    /// E94 compile-head arm switch (mirrors the model-side gate).
+    private static let compileArmActive =
+        ProcessInfo.processInfo.environment["MLX_E94_COMPILE_HEAD"] != "0"
+    // One-shot equivalence self-check state for the compiled head step.
+    nonisolated(unsafe) private static var compiledHeadSelfCheckDone = false
+    nonisolated(unsafe) private static var compiledHeadUsable = false
+
+    /// Runs the eager head forward and the compiled replay on identical
+    /// throwaway caches and inputs; true only when every output element and
+    /// the resulting cache state are exactly equal.
+    private static func selfVerifyCompiledHead(model: any Qwen36MTPTarget) -> Bool {
+        guard let throwCache = try? model.makeMTPCache(),
+              !throwCache.isEmpty,
+              throwCache.allSatisfy({ $0 is CompilableKVCache })
+        else { return false }
+        let x = MLXArray.zeros([1, 1, 5120], dtype: .bfloat16)
+        let ids = MLXArray.zeros([1, 1], dtype: .int32)
+        eval(throwCache.flatMap { $0.state } + [x, ids])
+
+        guard let fn = model.makeCompiledMTPStep(cacheRef: throwCache)
+        else { return false }
+
+        let eagerOut = model.mtpHeadHiddenForward(
+            hidden: x, nextTokenIds: ids, cache: throwCache)
+        let compiledOut = fn([x, ids])[0]
+        let mismatches = (eagerOut.asType(.float32) .!= compiledOut.asType(.float32)).sum().item(Int32.self)
+        return mismatches == 0
+    }
+
     /// Attribution probe only. `verify_build_us` measures the window in which
     /// the host builds the verify graph WHILE the asynchronously submitted head
     /// chain runs on the GPU, so a head-chain stall is indistinguishable from
@@ -1436,10 +1467,30 @@ public final class Qwen36MTPBlockSession {
         asyncEval(draftId)
         let tSubmit1 = Self.traceRounds
             ? DispatchTime.now().uptimeNanoseconds : 0
+        // E94 compile-head arm: when the model provides a traced step and
+        // the arm is active, replay collapses per-op host dispatch of the
+        // trunk; draftTokenID stays eager outside the trace. First use runs
+        // a one-shot equivalence self-check on throwaway caches and fails
+        // closed to eager permanently on any mismatch.
+        if Self.compileArmActive && !Self.compiledHeadSelfCheckDone {
+            Self.compiledHeadSelfCheckDone = true
+            Self.compiledHeadUsable = Self.selfVerifyCompiledHead(model: model)
+            if !Self.compiledHeadUsable {
+                Self.traceWrite("mtp-trace: E94 compiled head step FAILED " +
+                    "equivalence self-check; running eager\n")
+            }
+        }
+        let compiledStep = (Self.compileArmActive && Self.compiledHeadUsable)
+            ? model.makeCompiledMTPStep(cacheRef: headCache) : nil
         for _ in 1 ..< draftCount {
-            headHidden = model.mtpHeadHiddenForward(
-                hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = Self.lastHiddenRow(headHidden)
+            if let fn = compiledStep {
+                headHidden = fn([draftHidden, draftId])[0]
+                draftHidden = Self.lastHiddenRow(headHidden)
+            } else {
+                headHidden = model.mtpHeadHiddenForward(
+                    hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
+                draftHidden = Self.lastHiddenRow(headHidden)
+            }
             draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
         }

@@ -2131,6 +2131,147 @@ private let qwen35AttentionQKRMSRoPEKernel = MLXFast.metalKernel(
 /// Internal for exact Metal parity tests. Inputs are `[B,L,H,D]`; outputs are
 /// row-contiguous `[B,H,L,D]` tensors ready for the unchanged attention/cache
 /// path.
+private let qwen35AttentionQKRMSRoPEKernelBuf = MLXFast.metalKernel(
+    name: "qwen35_attention_qk_rms_rope_bf16_buf_v1",
+    inputNames: ["q", "k", "q_weight", "k_weight", "eps", "offset_arr", "log2_base"],
+    outputNames: ["q_out", "k_out"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint rotary_dimensions = 64;
+        constexpr uint rotary_pairs = rotary_dimensions / 2;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint batch_size = uint(q_shape[0]);
+        uint sequence_length = uint(q_shape[1]);
+        uint query_heads = uint(q_shape[2]);
+        uint key_heads = uint(k_shape[2]);
+        uint axis_size = uint(q_shape[3]);
+        uint query_rows = batch_size * query_heads * sequence_length;
+        bool is_query = row < query_rows;
+        uint local_row = is_query ? row : row - query_rows;
+        uint head_count = is_query ? query_heads : key_heads;
+        uint batch = local_row / (head_count * sequence_length);
+        uint head_sequence = local_row % (head_count * sequence_length);
+        uint head = head_sequence / sequence_length;
+        uint sequence = head_sequence % sequence_length;
+
+        ulong input_base;
+        ulong input_axis_stride;
+        ulong weight_stride;
+        ulong output_base = ulong(local_row) * ulong(axis_size);
+        if (is_query) {
+            input_base = ulong(batch) * ulong(q_strides[0])
+                + ulong(sequence) * ulong(q_strides[1])
+                + ulong(head) * ulong(q_strides[2]);
+            input_axis_stride = ulong(q_strides[3]);
+            weight_stride = ulong(q_weight_strides[0]);
+        } else {
+            input_base = ulong(batch) * ulong(k_strides[0])
+                + ulong(sequence) * ulong(k_strides[1])
+                + ulong(head) * ulong(k_strides[2]);
+            input_axis_stride = ulong(k_strides[3]);
+            weight_stride = ulong(k_weight_strides[0]);
+        }
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+        threadgroup bfloat normalized[256];
+
+        float acc = 0.0f;
+        uint first = thread_id * n_reads;
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            if (element < axis_size) {
+                ulong index = input_base + ulong(element) * input_axis_stride;
+                float value = is_query ? float(q[index]) : float(k[index]);
+                acc += value * value;
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / axis_size + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            if (element < axis_size) {
+                ulong index = input_base + ulong(element) * input_axis_stride;
+                bfloat input_value = is_query ? q[index] : k[index];
+                bfloat rms_value = bfloat(float(input_value) * inv_mean);
+                bfloat weight = is_query
+                    ? q_weight[ulong(element) * weight_stride]
+                    : k_weight[ulong(element) * weight_stride];
+                normalized[element] = weight * rms_value;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // The stock RoPE primitive copies dimensions 64...255 unchanged before
+        // rotating nontraditional pairs (i, i + 32).  Here the final output is
+        // new storage, so only the pass-through tail needs an explicit copy.
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            if (element >= rotary_dimensions && element < axis_size) {
+                if (is_query) {
+                    q_out[output_base + ulong(element)] = normalized[element];
+                } else {
+                    k_out[output_base + ulong(element)] = normalized[element];
+                }
+            }
+        }
+
+        if (thread_id < rotary_pairs / n_reads) {
+            for (uint i = 0; i < n_reads; ++i) {
+                uint pair = first + i;
+                float d = float(pair) / float(rotary_pairs);
+                float inv_freq = metal::exp2(-d * float(log2_base));
+                float position = float(int(sequence) + int(offset_arr[0]));
+                float theta = position * inv_freq;
+                float costheta = metal::fast::cos(theta);
+                float sintheta = metal::fast::sin(theta);
+                float x1 = float(normalized[pair]);
+                float x2 = float(normalized[pair + rotary_pairs]);
+                bfloat rx1 = bfloat(x1 * costheta - x2 * sintheta);
+                bfloat rx2 = bfloat(x1 * sintheta + x2 * costheta);
+                if (is_query) {
+                    q_out[output_base + ulong(pair)] = rx1;
+                    q_out[output_base + ulong(pair + rotary_pairs)] = rx2;
+                } else {
+                    k_out[output_base + ulong(pair)] = rx1;
+                    k_out[output_base + ulong(pair + rotary_pairs)] = rx2;
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+/// Internal for exact Metal parity tests. Inputs are `[B,L,H,D]`; outputs are
+/// row-contiguous `[B,H,L,D]` tensors ready for the unchanged attention/cache
+/// path.
+
 func qwen35AttentionQKRMSRoPE(
     queries: MLXArray,
     keys: MLXArray,
@@ -2148,6 +2289,35 @@ func qwen35AttentionQKRMSRoPE(
     let totalRows = B * L * (queryHeads + keyHeads)
     let outputs = qwen35AttentionQKRMSRoPEKernel(
         [queries, keys, qWeight, kWeight, eps, offset, log2Base],
+        grid: (totalRows * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[B, queryHeads, L, D], [B, keyHeads, L, D]],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
+/// E94: same fused QK-RMS-RoPE pass with the position supplied as a device
+/// int32[1] buffer, so a compile-traced head step can update the offset
+/// without invalidating the captured graph. Values are identical to the
+/// scalar form for equal offsets.
+func qwen35AttentionQKRMSRoPEBuf(
+    queries: MLXArray,
+    keys: MLXArray,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    eps: Float,
+    offsetArr: MLXArray,
+    log2Base: Float
+) -> (queries: MLXArray, keys: MLXArray) {
+    let B = queries.dim(0)
+    let L = queries.dim(1)
+    let queryHeads = queries.dim(2)
+    let keyHeads = keys.dim(2)
+    let D = queries.dim(3)
+    let totalRows = B * L * (queryHeads + keyHeads)
+    let outputs = qwen35AttentionQKRMSRoPEKernelBuf(
+        [queries, keys, qWeight, kWeight, eps, offsetArr, log2Base],
         grid: (totalRows * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[B, queryHeads, L, D], [B, keyHeads, L, D]],
@@ -3358,15 +3528,31 @@ final class Qwen35Attention: Module {
            kNorm.weight.shape == [headDim],
            qNorm.eps == kNorm.eps
         {
-            let prepared = qwen35AttentionQKRMSRoPE(
-                queries: queries,
-                keys: keys,
-                qWeight: qNorm.weight,
-                kWeight: kNorm.weight,
-                eps: qNorm.eps,
-                offset: cache?.offset ?? 0,
-                log2Base: ropeLog2Base
-            )
+            // E94 compile-head arm: CompilableKVCache carries its position
+            // as a traced int32[1]; the buffer-offset twin keeps a compiled
+            // caller valid across steps. Identical values and arithmetic.
+            let prepared: (queries: MLXArray, keys: MLXArray)
+            if let cc = cache as? CompilableKVCache {
+                prepared = qwen35AttentionQKRMSRoPEBuf(
+                    queries: queries,
+                    keys: keys,
+                    qWeight: qNorm.weight,
+                    kWeight: kNorm.weight,
+                    eps: qNorm.eps,
+                    offsetArr: cc.offsetArray,
+                    log2Base: ropeLog2Base
+                )
+            } else {
+                prepared = qwen35AttentionQKRMSRoPE(
+                    queries: queries,
+                    keys: keys,
+                    qWeight: qNorm.weight,
+                    kWeight: kNorm.weight,
+                    eps: qNorm.eps,
+                    offset: cache?.offset ?? 0,
+                    log2Base: ropeLog2Base
+                )
+            }
             queries = prepared.queries
             keys = prepared.keys
         } else {
@@ -5934,8 +6120,18 @@ extension Qwen35TextModel: MTPCapable {
 
     /// Allocate a fresh KV cache for the MTP head layers.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.make_mtp_cache
+    /// E94 compile-head arm (`MLX_E94_COMPILE_HEAD=1`, >=96 GB machines):
+    /// fixed-shape CompilableKVCache so the steady-state head step can be
+    /// compile traced/replayed. Default stays the crown's KVCacheSimple.
     public func makeMTPCache() -> [any KVCache] {
         guard let mtp else { return [] }
+        if ProcessInfo.processInfo.environment["MLX_E94_COMPILE_HEAD"] != "0",
+            ProcessInfo.processInfo.physicalMemory >= (96 << 30)
+        {
+            return mtp.layers.map {
+                _ in CompilableKVCache(maxLength: 2048, step: 256) as any KVCache
+            }
+        }
         return mtp.layers.map { _ in KVCacheSimple() as any KVCache }
     }
 }
@@ -6084,5 +6280,26 @@ extension Qwen35Model: MTPCapable {
 
     public func makeMTPCache() -> [any KVCache] {
         languageModel.makeMTPCache()
+    }
+
+    /// E94 compile-head arm: traced steady-state head step. Requires every
+    /// cache in `cacheRef` to be a CompilableKVCache (fixed-shape buffers,
+    /// traced offset array); replay collapses per-op host dispatch of the
+    /// trunk. Position arrives through the traced offset buffer consumed by
+    /// the buf-variant RoPE kernel.
+    public func makeCompiledMTPStep(cacheRef: [any KVCache])
+        -> (@Sendable ([MLXArray]) -> [MLXArray])? {
+        guard ProcessInfo.processInfo.environment["MLX_E94_COMPILE_HEAD"] == "1",
+            ProcessInfo.processInfo.physicalMemory >= (96 << 30),
+            !cacheRef.isEmpty,
+            cacheRef.allSatisfy({ $0 is CompilableKVCache })
+        else { return nil }
+        let capturedModel = languageModel
+        let captured = cacheRef
+        return compile(inputs: captured, outputs: captured) {
+            (args: [MLXArray]) -> [MLXArray] in
+            [capturedModel.mtpHeadHiddenForward(
+                hidden: args[0], nextTokenIds: args[1], cache: captured)]
+        }
     }
 }
