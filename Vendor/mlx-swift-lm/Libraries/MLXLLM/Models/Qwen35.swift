@@ -894,9 +894,54 @@ final class Qwen35GatedDeltaNet: Module {
     ) -> (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray) {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
+        let nKeep = convKernelSize - 1
+        // Same packed prework the verify twin already runs at S=3...9. Each
+        // threadgroup is one (row, head): 4-tap conv, SiLU, Q/K RMS, g/beta.
+        // T is only the conv-state copy bound, so S=512 is the same arithmetic
+        // as the byte-receipt envelope, one JIT specialization. Seed prefill
+        // (nConfirmed == 0, S == 512) is the path that still paid the unfused
+        // chain; S < 3 keeps the stock body (conv-state copy reads only qkv).
+        let mixerHit = MLXHardwareInfo.isCompiledDecodeSupported
+            && B == 1 && S >= 3 && S <= 512 && nKeep == 3
+            && numKHeads == 16 && numVHeads == 48
+            && headKDim == 128 && headVDim == 128
+            && qkv.dim(2) == 16 * 128 * 2 + 48 * 128
+            && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
+            && a.dtype == .bfloat16 && b.dtype == .bfloat16
+            && mask == nil
+        if mixerHit {
+            let (qScaleConst, kScaleConst) = normScaleConstants(.bfloat16)
+            let outs = qwen35PackedGDNPreworkKernel(
+                [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
+                 qScaleConst,
+                 kScaleConst],
+                template: [
+                    ("Hk", numKHeads), ("Dk", headKDim),
+                    ("Hv", numVHeads), ("Dv", headVDim),
+                    ("NKeep", nKeep), ("C", qkv.dim(2)), ("T", S),
+                ],
+                grid: (32, S, 2 * numKHeads + numVHeads),
+                threadGroup: (32, 1, 1),
+                outputShapes: [
+                    [B, S, numKHeads, headKDim],
+                    [B, S, numKHeads, headKDim],
+                    [B, S, numVHeads, headVDim],
+                    [B, nKeep, qkv.dim(2)],
+                    [B, S, numVHeads],
+                    [B, S, numVHeads],
+                ],
+                outputDTypes: [
+                    .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
+                    .float32,
+                ]
+            )
+            let recurrence = qwen35GatedDeltaPrepared(
+                q: outs[0], k: outs[1], v: outs[2],
+                g: outs[4], beta: outs[5], state: ssmState, mask: mask)
+            return (recurrence.0, outs[3], recurrence.1)
+        }
 
         let convInput = concatenated([convState, qkv], axis: 1)
-        let nKeep = convKernelSize - 1
         let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
         let convOut = silu(conv1d(convInput))
 
