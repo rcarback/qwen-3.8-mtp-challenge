@@ -703,9 +703,10 @@ public final class Qwen36MTPBlockSession {
     // states: the return value need only land in
     // `0 ... min(offeredDepth, Qwen36MTPLimits.maxDepth)`, and the trusted
     // parent derives every ledger quantity from the drafts actually proposed.
-    public var draftPolicy: (_ offeredDepth: Int, _ round: Int) -> Int = {
+    public var draftPolicy: (_ offeredDepth: Int, _ round: Int) -> Int = { [weak self]
         offeredDepth, _ in
-        Swift.min(offeredDepth, 1)
+        guard let self else { return Swift.min(offeredDepth, 1) }
+        return self.costModelDepth(offeredDepth: offeredDepth)
     }
 
     /// Consecutive fully-accepted DRAFTING rounds. Kept as a public-ish
