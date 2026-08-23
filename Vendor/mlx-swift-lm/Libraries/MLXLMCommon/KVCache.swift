@@ -1256,7 +1256,13 @@ public class ArraysCache: BaseKVCache {
     public var prefixReplayTape: PrefixReplayTape? = nil
 
     public struct PrefixReplayTape {
-        public let convInput: MLXArray
+        /// The incoming convolution cache and this verify's raw QKV rows are
+        /// retained separately.  A partial reject needs only the three-row
+        /// cache at its committed boundary, so retaining a pre-concatenated
+        /// `[convPre | convRows]` would force the full wide buffer to be copied
+        /// merely to take that small slice.
+        public let convPre: MLXArray
+        public let convRows: MLXArray
         public let q: MLXArray
         public let k: MLXArray
         public let v: MLXArray
@@ -1270,7 +1276,8 @@ public class ArraysCache: BaseKVCache {
         public let convStateRows: Int
 
         public init(
-            convInput: MLXArray,
+            convPre: MLXArray,
+            convRows: MLXArray,
             q: MLXArray,
             k: MLXArray,
             v: MLXArray,
@@ -1283,7 +1290,8 @@ public class ArraysCache: BaseKVCache {
             rowCount: Int,
             convStateRows: Int
         ) {
-            self.convInput = convInput
+            self.convPre = convPre
+            self.convRows = convRows
             self.q = q
             self.k = k
             self.v = v

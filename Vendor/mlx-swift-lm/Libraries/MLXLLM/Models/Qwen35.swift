@@ -943,7 +943,6 @@ final class Qwen35GatedDeltaNet: Module {
     ) {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
-        let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         // Packed-prework mixer gate: fail closed onto the stock chain for any
         // shape, geometry, or dtype outside the byte-receipt envelope. The
@@ -995,6 +994,7 @@ final class Qwen35GatedDeltaNet: Module {
             g = outs[4]
             beta = outs[5]
         } else {
+            let convInput = concatenated([convState, qkv], axis: 1)
             newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
             let convOut = silu(conv1d(convInput))
 
@@ -1035,7 +1035,8 @@ final class Qwen35GatedDeltaNet: Module {
         let out = recurrence.0
         let newSsmState = recurrence.1
         let tape = ArraysCache.PrefixReplayTape(
-            convInput: convInput,
+            convPre: convState,
+            convRows: qkv,
             q: qNormed,
             k: kNormed,
             v: v,
@@ -1057,8 +1058,14 @@ final class Qwen35GatedDeltaNet: Module {
               committedRows > 0,
               committedRows < tape.rowCount,
               tape.convStateRows == convKernelSize - 1,
-              tape.convInput.dim(1)
-                  >= committedRows + tape.convStateRows,
+              tape.convStateRows > 0,
+              tape.convPre.ndim == 3,
+              tape.convRows.ndim == 3,
+              tape.convPre.dim(1) == tape.convStateRows,
+              tape.convRows.dim(1) == tape.rowCount,
+              tape.convPre.dim(0) == tape.convRows.dim(0),
+              tape.convPre.dim(2) == tape.convRows.dim(2),
+              tape.convPre.dtype == tape.convRows.dtype,
               tape.q.dim(1) == tape.rowCount,
               tape.k.dim(1) == tape.rowCount,
               tape.v.dim(1) == tape.rowCount,
@@ -1112,10 +1119,24 @@ final class Qwen35GatedDeltaNet: Module {
                 state: tape.ssmPre,
                 mask: tape.mask.map { $0[0..., rows] }).1
         }
-        cache[0] = tape.convInput[
-            0...,
-            committedRows ..< (committedRows + tape.convStateRows),
-            0...]
+        // The old representation materialised `[convPre | convRows]` and then
+        // sliced only these `convStateRows` rows.  Assemble exactly that slice
+        // from its two sources instead.  Once the committed prefix is at least
+        // one full cache wide, compact only that slice of `convRows`; early
+        // boundaries concatenate only the final three-row result.  Keeping the
+        // result compact preserves the old cache layout without retaining the
+        // fused projection carrier behind a strided QKV view.
+        if committedRows >= tape.convStateRows {
+            cache[0] = tape.convRows[
+                0...,
+                (committedRows - tape.convStateRows) ..< committedRows,
+                0...].contiguous()
+        } else {
+            cache[0] = concatenated([
+                tape.convPre[0..., committedRows..., 0...],
+                tape.convRows[0..., 0 ..< committedRows, 0...],
+            ], axis: 1)
+        }
         cache[1] = boundarySsm
         cache.prefixReplayTape = nil
         cache.rollbackState = nil
