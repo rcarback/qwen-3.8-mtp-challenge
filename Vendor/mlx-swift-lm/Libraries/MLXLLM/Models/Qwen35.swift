@@ -803,12 +803,12 @@ final class Qwen35GatedDeltaNet: Module {
     /// until every input projection is a matching affine `QuantizedLinear`
     /// (bf16 trees fall back to the four separate calls).
     private func fusedInProjections(
-        _ x: MLXArray
+        _ x: MLXArray, xsums: MLXArray? = nil
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
         if let w = _inW, let s = _inS, let zp = _inZ {
             let y = qwen35RoutedQuantizedMM(
                 x, w, scales: s, biases: zp,
-                groupSize: _inGS, bits: _inBits, mode: _inMode)
+                groupSize: _inGS, bits: _inBits, mode: _inMode, xsums: xsums)
             let qkvEnd = keyDim * 2 + valueDim
             let zEnd = qkvEnd + valueDim
             let bEnd = zEnd + numVHeads
@@ -839,7 +839,7 @@ final class Qwen35GatedDeltaNet: Module {
         _inGS = q.groupSize
         _inBits = q.bits
         _inMode = q.mode
-        return fusedInProjections(x)
+        return fusedInProjections(x, xsums: xsums)
     }
 
     // MARK: - _processChunk (MTP helper)
@@ -1129,7 +1129,8 @@ final class Qwen35GatedDeltaNet: Module {
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
         cache: MambaCache? = nil,
-        nConfirmed: Int = 0
+        nConfirmed: Int = 0,
+        xsums: MLXArray? = nil
     ) -> MLXArray {
         // Port of omlx commit 696d90a:
         //   patches/mlx_lm_mtp/qwen35_model.py GatedDeltaNet.__call__
@@ -1140,7 +1141,7 @@ final class Qwen35GatedDeltaNet: Module {
         let z: MLXArray
         let b: MLXArray
         let a: MLXArray
-        if S <= 9, let fused = fusedInProjections(inputs) {
+        if S <= 9, let fused = fusedInProjections(inputs, xsums: xsums) {
             qkv = fused.0
             z = fused.1.reshaped(B, S, numVHeads, headVDim)
             b = fused.2
@@ -1885,8 +1886,18 @@ func qwen35RoutedQuantizedMM(
     biases: MLXArray,
     groupSize: Int,
     bits: Int,
-    mode: QuantizationMode
+    mode: QuantizationMode,
+    xsums: MLXArray? = nil
 ) -> MLXArray {
+    if let xsums,
+       Qwen35CustomQMV.arm == .sumTable,
+       Qwen35CustomQMV.tablePays(m: x.size / x.dim(-1)),
+       let y = Qwen35CustomQMV.matmulWithTable(
+           x, w, scales: scales, biases: biases, xsums: xsums,
+           groupSize: groupSize, bits: bits, mode: mode, consume: true)
+    {
+        return y
+    }
     if let y = Qwen35CustomQMV.matmul(
         x, w, scales: scales, biases: biases,
         groupSize: groupSize, bits: bits, mode: mode)
@@ -2254,6 +2265,121 @@ private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+private let qwen35FusedResidualRMSNormXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_residual_rms_norm_xsums_v1",
+    inputNames: ["x", "r", "weight", "eps", "stride"],
+    outputNames: ["h", "normed", "xsums"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(x_shape[x_ndim - 1]);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        // x and r share the same shape [..., axis_size] with contiguous last dim.
+        ulong offset = ulong(row) * ulong(axis_size);
+
+        // -- accumulate sum of squares of BF16-rounded (x+r) --
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    acc += float(hi) * float(hi);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        acc += float(hi) * float(hi);
+                    }
+                }
+            }
+        }
+
+        // Same reduction tree as rms_norm.metal rms_looped:
+        // simd_sum -> threadgroup barrier -> write per-simd sums ->
+        // barrier -> simd_sum over simd sums -> rsqrt.
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+
+        // -- write both the residual h and the weight-scaled normed output --
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    h[offset + elem + i] = hi;
+                    bfloat wi = weight[elem + i];
+                    normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        h[offset + elem + i] = hi;
+                        bfloat wi = weight[elem + i];
+                        normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                    }
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint entries_per_row = (axis_size / 512) * 32;
+        if (thread_id < entries_per_row) {
+            uint kb = thread_id / 32;
+            uint lane = thread_id % 32;
+            const device bfloat16_t* xm =
+                normed + offset + kb * 512 + lane * 16;
+            float s = 0.0f;
+            for (int i = 0; i < 4; i++) {
+                const vec<bfloat16_t, 4> xv =
+                    *reinterpret_cast<const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+                s += xv[0] + xv[1] + xv[2] + xv[3];
+            }
+            xsums[(kb * 32 + lane) * uint(stride) + row] = s;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
 /// Wraps the fused residual+RMSNorm kernel.  Returns `(residual, normed)` where
 /// `residual = bf16(x + r)` and `normed = weight * RMSNorm(residual)` with the
 /// same arithmetic as the eager `postAttentionLayerNorm(x + r)`.
@@ -2274,6 +2400,41 @@ func qwen35FusedResidualRMSNorm(
     )
     return (outputs[0], outputs[1])
 }
+
+public func qwen35FusedResidualRMSNormXSums(
+    x: MLXArray,
+    r: MLXArray,
+    weight: MLXArray,
+    eps: Float,
+    m: Int
+) -> (residual: MLXArray, normed: MLXArray, xsums: MLXArray) {
+    let axisSize = x.dim(-1)
+    let nRows = x.size / axisSize
+    let entriesPerRow = (axisSize / 512) * 32
+    precondition(nRows == m && entriesPerRow <= 1024)
+    let stride = Qwen35CustomQMV.sumsStride(m)
+    let shape = x.shape
+    let outputs = qwen35FusedResidualRMSNormXSumsKernel(
+        [x, r, weight, MLXArray(eps), MLXArray(Int32(stride))],
+        grid: (nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [shape, shape, [entriesPerRow * stride]],
+        outputDTypes: [.bfloat16, .bfloat16, .float32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
+private let qwen35FusedResidualNormXSumsEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLX_E123_RESNORM_XSUMS"],
+          !raw.isEmpty
+    else { return true }
+    switch raw {
+    case "fused": return true
+    case "fill": return false
+    default:
+        fatalError("MLX_E123_RESNORM_XSUMS must be fused or fill; got \(raw)")
+    }
+}()
 
 // MARK: - Dual independent RMSNorm (proposal-side pre-fc)
 
@@ -2886,7 +3047,9 @@ final class Qwen35Attention: Module {
     /// One affine-4 GEMM for Q+gate, K, and V. Rows are independent, so
     /// concatenating already-packed weights on N is bit-exact with three
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
-    private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    private func qkv(
+        _ x: MLXArray, xsums: MLXArray? = nil
+    ) -> (MLXArray, MLXArray, MLXArray) {
         // Complete K/V island coverage: narrow the affine-4 pack to the q+gate
         // rows and read K and V straight out of the BF16 island rows. Every
         // quantized K/V value the old form produced was overwritten before any
@@ -2896,7 +3059,8 @@ final class Qwen35Attention: Module {
             if let w = _qOnlyW, let s = _qOnlyS, let z = _qOnlyZ {
                 var q = qwen35RoutedQuantizedMM(
                     x, w, scales: s, biases: z,
-                    groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+                    groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode,
+                    xsums: xsums)
                 q = replaceExactRows(q, input: x, kvOnly: false)
                 let kvRows = matmul(x, kvExact.transposed(1, 0))
                 let kEnd = _exactKVDenseKOut
@@ -2910,13 +3074,14 @@ final class Qwen35Attention: Module {
                 _qkvBits = q.bits
                 _qkvMode = q.mode
                 _qOut = q.shape.0
-                return qkv(x)
+                return qkv(x, xsums: xsums)
             }
         }
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
             var y = qwen35RoutedQuantizedMM(
                 x, w, scales: s, biases: z,
-                groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+                groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode,
+                xsums: xsums)
             y = replaceExactRows(y, input: x, kvOnly: false)
             let qEnd = _qOut
             let kEnd = _qOut + _kOut
@@ -2944,7 +3109,7 @@ final class Qwen35Attention: Module {
             _qkvMode = q.mode
             _qOut = q.shape.0
             _kOut = k.shape.0
-            return qkv(x)
+            return qkv(x, xsums: xsums)
         }
         if !(qProj is QuantizedLinear), !(kProj is QuantizedLinear),
            !(vProj is QuantizedLinear),
@@ -3146,12 +3311,13 @@ final class Qwen35Attention: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        xsums: MLXArray? = nil
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let (qProjOutput, keysIn, valuesIn) = qkv(x)
+        let (qProjOutput, keysIn, valuesIn) = qkv(x, xsums: xsums)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         // Keep the gate 4-D: flattening here merged a head axis across the
@@ -3371,22 +3537,43 @@ final class Qwen35DecoderLayer: Module {
     ) -> (base: MLXArray, delta: MLXArray) {
         let hIn: MLXArray
         let normedIn: MLXArray
+        let inProjectionXSums: MLXArray?
         if let delta {
-            (hIn, normedIn) = qwen35FusedResidualRMSNorm(
-                x: base, r: delta,
-                weight: inputLayerNorm.weight,
-                eps: inputLayerNorm.eps)
+            let m = base.dim(-2)
+            let nRows = base.size / base.dim(-1)
+            if qwen35FusedResidualNormXSumsEnabled,
+               Qwen35CustomQMV.arm == .sumTable,
+               Qwen35CustomQMV.tablePays(m: m),
+               (4 ... 9).contains(m), nRows == m
+            {
+                let fused = qwen35FusedResidualRMSNormXSums(
+                    x: base, r: delta,
+                    weight: inputLayerNorm.weight,
+                    eps: inputLayerNorm.eps, m: m)
+                hIn = fused.residual
+                normedIn = fused.normed
+                inProjectionXSums = fused.xsums
+            } else {
+                (hIn, normedIn) = qwen35FusedResidualRMSNorm(
+                    x: base, r: delta,
+                    weight: inputLayerNorm.weight,
+                    eps: inputLayerNorm.eps)
+                inProjectionXSums = nil
+            }
         } else {
             hIn = base
             normedIn = inputLayerNorm(base)
+            inProjectionXSums = nil
         }
         let r: MLXArray
         if isLinear {
             r = linearAttn!(
                 normedIn, mask: ssmMask, cache: cache as? MambaCache,
-                nConfirmed: nConfirmed)
+                nConfirmed: nConfirmed, xsums: inProjectionXSums)
         } else {
-            r = selfAttn!(normedIn, mask: attentionMask, cache: cache)
+            r = selfAttn!(
+                normedIn, mask: attentionMask, cache: cache,
+                xsums: inProjectionXSums)
         }
         let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
             x: hIn, r: r,
