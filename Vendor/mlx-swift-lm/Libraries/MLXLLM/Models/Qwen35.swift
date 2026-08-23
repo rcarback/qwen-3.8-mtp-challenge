@@ -1604,6 +1604,137 @@ private let qwen35CustomAffine4QMVKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Library pair kernel (`qmv_fast_crossrow_affine4_g64<T,2>`) for the
+/// 1024 <= N < 4096 band. quantized.h keeps that pair body below 4096
+/// because the wide replica thins the grid; the frozen host still launches
+/// two X-groups and the second returns before any read. This dispatch uses
+/// the pair body with one X-group (`first_m = 0`, both input rows).
+private let qwen35CustomAffine4QMVPairKernel = MLXFast.metalKernel(
+    name: "qwen35_custom_affine4_g64_qmv_pair_v1",
+    inputNames: ["w", "scales", "biases", "x"],
+    outputNames: ["y"],
+    source: """
+        const int in_vec_size = x_shape[x_ndim - 1];
+        const int out_vec_size = w_shape[0];
+        const uint3 tid = threadgroup_position_in_grid;
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        qwen_e120_qmv_pair(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        """,
+    header: """
+        inline float qwen_e120_load4(
+            const device bfloat16_t* x, thread float* x_thread
+        ) {
+            float sum = 0.0f;
+            for (int i = 0; i < 16; i += 4) {
+                const float a0 = static_cast<float>(x[i]);
+                const float a1 = static_cast<float>(x[i + 1]);
+                const float a2 = static_cast<float>(x[i + 2]);
+                const float a3 = static_cast<float>(x[i + 3]);
+                sum += a0 + a1 + a2 + a3;
+                x_thread[i] = a0;
+                x_thread[i + 1] = a1 / 16.0f;
+                x_thread[i + 2] = a2 / 256.0f;
+                x_thread[i + 3] = a3 / 4096.0f;
+            }
+            return sum;
+        }
+        inline float2 qwen_e120_qdot_pair(
+            const thread uint16_t* ws,
+            const thread float* x0,
+            const thread float* x1,
+            float scale,
+            float bias,
+            float2 sum
+        ) {
+            float2 accum = 0.0f;
+            for (int i = 0; i < 4; i++) {
+                accum +=
+                    (float2(x0[4 * i], x1[4 * i]) * (ws[i] & 0x000f) +
+                     float2(x0[4 * i + 1], x1[4 * i + 1]) * (ws[i] & 0x00f0) +
+                     float2(x0[4 * i + 2], x1[4 * i + 2]) * (ws[i] & 0x0f00) +
+                     float2(x0[4 * i + 3], x1[4 * i + 3]) * (ws[i] & 0xf000));
+            }
+            return scale * accum + sum * bias;
+        }
+        inline void qwen_e120_qmv_pair(
+            const device uint32_t* w,
+            const device bfloat16_t* scales,
+            const device bfloat16_t* biases,
+            const device bfloat16_t* x,
+            device bfloat16_t* y,
+            const int in_vec_size,
+            const int out_vec_size,
+            uint3 tid,
+            uint simd_gid,
+            uint simd_lid
+        ) {
+            constexpr int M = 2;
+            constexpr int inputs_per_group = 2;
+            constexpr int rows_per_simd = 4;
+            constexpr int values_per_thread = 16;
+            constexpr int block_size = values_per_thread * 32;
+            constexpr int bytes_per_lane = 8;
+            const int first_m = int(tid.x) * inputs_per_group;
+            if (first_m >= M) {
+                return;
+            }
+            const int out_row = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
+            const int in_vec_size_w = in_vec_size / 2;
+            const int in_vec_size_g = in_vec_size / 64;
+            thread float2 pair_result[rows_per_simd];
+            for (int r = 0; r < rows_per_simd; r++) {
+                pair_result[r] = 0.0f;
+            }
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                thread uint16_t packed[rows_per_simd][4];
+                thread float scale_local[rows_per_simd];
+                thread float bias_local[rows_per_simd];
+                for (int r = 0; r < rows_per_simd; r++) {
+                    const int row = out_row + r;
+                    const device uint16_t* ws =
+                        reinterpret_cast<const device uint16_t*>(
+                            reinterpret_cast<const device uint8_t*>(w) +
+                            row * in_vec_size_w + k / 2 +
+                            simd_lid * bytes_per_lane);
+                    for (int i = 0; i < 4; i++) {
+                        packed[r][i] = ws[i];
+                    }
+                    const int group_index =
+                        row * in_vec_size_g + k / 64 + int(simd_lid) / 4;
+                    scale_local[r] = scales[group_index];
+                    bias_local[r] = biases[group_index];
+                }
+                thread float x0[values_per_thread];
+                thread float x1[values_per_thread];
+                const device bfloat16_t* xm0 =
+                    x + first_m * in_vec_size + k +
+                    simd_lid * values_per_thread;
+                const float sum0 = qwen_e120_load4(xm0, x0);
+                const float sum1 = qwen_e120_load4(xm0 + in_vec_size, x1);
+                for (int r = 0; r < rows_per_simd; r++) {
+                    pair_result[r] += qwen_e120_qdot_pair(
+                        packed[r], x0, x1, scale_local[r], bias_local[r],
+                        float2(sum0, sum1));
+                }
+            }
+            for (int r = 0; r < rows_per_simd; r++) {
+                const float reduced0 = simd_sum(pair_result[r].x);
+                const float reduced1 = simd_sum(pair_result[r].y);
+                if (simd_lid == 0) {
+                    y[first_m * out_vec_size + out_row + r] =
+                        static_cast<bfloat16_t>(reduced0);
+                    y[(first_m + 1) * out_vec_size + out_row + r] =
+                        static_cast<bfloat16_t>(reduced1);
+                }
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 private let qwen35CustomAffine4QMVTableKernel = MLXFast.metalKernel(
     name: "qwen35_custom_affine4_g64_qmv_wide_sums_v1",
     inputNames: ["w", "scales", "biases", "x", "xsums"],
@@ -1775,13 +1906,16 @@ public enum Qwen35CustomQMV {
         guard w.ndim == 2, x.ndim >= 2 else { return nil }
         let k = x.dim(-1)
         let n = w.dim(0)
-        // `fast = N % 8 == 0 && K % 512 == 0` (quantized.cpp:260) and the wide
-        // branch needs `out_vec_size >= 4096` (quantized.h:1917).
-        guard w.dim(1) == k / 8, k % 512 == 0, n % 8 == 0, n >= 4096 else {
-            return nil
-        }
         let m = x.size / k
         guard Self.widths.contains(m), x.dim(-2) == m else { return nil }
+        // Library affine4/g64 `qmv_fast` already splits N>=4096 (wide) from
+        // 1024<=N<4096 (pair kernel). FA K/V is N=1024, so it sits in the
+        // pair band where the frozen host still launches two X-groups.
+        // Admit that band at M=2 only; M=3..9 stay on the 4096 floor.
+        let nMin = m == 2 ? 1024 : 4096
+        guard w.dim(1) == k / 8, k % 512 == 0, n % 8 == 0, n >= nMin else {
+            return nil
+        }
         // `ensureRowContiguous: true` would keep a strided input correct by
         // copying it first. `quantizedMM` reads the stride directly, so hand
         // the cell back rather than pay for a copy the incumbent avoids.
@@ -1864,6 +1998,18 @@ public enum Qwen35CustomQMV {
 
         var outShape = x.shape
         outShape[outShape.count - 1] = cell.n
+        // Pair-kernel band: 1024<=N<4096 at M=2. Do not send these cells
+        // through the wide replica; quantized.h kept the pair body here
+        // because a reduced x-group count on the wide kernel thins occupancy.
+        if cell.m == 2, cell.n < 4096 {
+            return qwen35CustomAffine4QMVPairKernel(
+                [w, scales, biases, x],
+                grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / 8) * 2, 1),
+                threadGroup: (32, 2, 1),
+                outputShapes: [outShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
         return qwen35CustomAffine4QMVKernel(
             [w, scales, biases, x],
             grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / 8) * 2, 1),
