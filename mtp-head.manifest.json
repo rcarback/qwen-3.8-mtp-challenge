@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:kumahada/qwen38-mtp-head-domainsoup06@9d03acdc413345da0be039ddc397a9af29287f74",
+  "sha256": "02bf47954511bbc2545a9b5c296fdf54a5826e38c2e601a00e3d8edecdf0da29",
+  "bytes": 427742180,
   "max_bytes": 2147483648,
-  "note": "Skip unused qwen_mtp_probe_sort factory while E87 is live on e8f14c4 (M=2 QMV + 0.15 + activeInputGroups). Probe fraction stays 0.15. M=2 widths 2...9 and IPG=2 kept. 9b6023c1 killed 0.12. 890594e9 is the same skip on stale 1d66bb3; this archive is the restack on the M=2 crown. Head tensors remain pinned. No E121. No tablePays(M=2). E87/qL/E020 untouched. Proposal-only. No remote code."
+  "note": "Domain-targeted fine-tune of the pinned bf16 head on named-pool reproduction corpora (Gutenberg: Plutarch/Dryden, four Shakespeare plays, Victorian travel; fast-domain and generic corpora as tiered regression gates during training), then weight soup a=0.6 with the pinned head. Packaging identical to the promoted artifact: Q4/g64 core triples, draft_lm_head.* inherited verbatim from amal-david q2-q4-rerank-v1@ae628274, precision islands regenerated as this head's own bf16 rows at the inherited indices. All shapes, counts and tensor names byte-compatible with the incumbent; proposal-side only."
 }
