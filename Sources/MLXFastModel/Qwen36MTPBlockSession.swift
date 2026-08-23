@@ -1679,6 +1679,17 @@ public final class Qwen36MTPBlockSession {
                 + "sel_env=\(qwen35RowTop32GateSource) "
                 + "sel_fused=\(qwen35RowTop32FusedDrafts) "
                 + "sel_argpart=\(qwen35RowTop32ArgPartitionDrafts) "
+                // Derived-index geometry this process built, so the leaf-width
+                // arm is witnessed from the run's own trace rather than from
+                // the launch environment.
+                + "leaf=\(qwen35DerivedClusterRowsPerLeafBuilt) "
+                + "leaves=\(qwen35DerivedClusterLeaves) "
+                + "probes=\(qwen35DerivedClusterProbes) "
+                // Chunk-sum fill census: table-paying cells that consumed a
+                // produced table, and the ones that still launched the
+                // standalone fill.
+                + "xs_hit=\(qwen35XSumsSidecarHits) "
+                + "xs_fill=\(qwen35XSumsStandaloneFills) "
                 + scheduleTrace + "\n"
             Self.traceWrite(line)
             // Absolute anchors on the mach uptime clock, so an offline reader
