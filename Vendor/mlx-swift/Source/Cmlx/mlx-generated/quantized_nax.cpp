@@ -703,6 +703,14 @@ struct QuantizedBlockLoader {
       biases += group_stride;
     }
   }
+
+  // Retarget the threadgroup destination by delta elements. Used by the
+  // software-pipelined (double-buffered) kernels to alternate the staging
+  // buffer between loads; the device-side source walk (src / scales / biases)
+  // is unaffected.
+  void shift_dst(const int delta) {
+    dst += delta;
+  }
 };
 
 template <
@@ -843,6 +851,14 @@ struct QuantizedBlockLoader<
       biases += n_groups * group_stride;
     }
   }
+
+  // Retarget the threadgroup destination by delta elements. Used by the
+  // software-pipelined (double-buffered) kernels to alternate the staging
+  // buffer between loads; the device-side source walk (src / scales / biases)
+  // is unaffected.
+  void shift_dst(const int delta) {
+    dst += delta;
+  }
 };
 
 template <typename T>
@@ -938,6 +954,39 @@ METAL_FUNC void adjust_matrix_offsets(
   y += tid.z * output_stride;
 }
 
+// Staging plan for the transposed NAX QMM weight tile.
+//
+// The software-pipelined schedule stages the next weight tile while the
+// current one feeds the matmad, so it needs two tiles of threadgroup memory
+// instead of one. Apple GPUs expose 32 KiB of threadgroup memory per
+// threadgroup.
+//
+// The offline Metal compiler does NOT reject an oversized statically sized
+// threadgroup array; the limit is enforced when the compute pipeline state is
+// created, so an unguarded doubling would fail at run time on the device
+// rather than in the build. The static_assert below therefore carries the
+// check that the toolchain does not.
+//
+// At BN = BK = 64 the doubled tile fits for 2-byte element types
+// (2 * 64 * 72 * 2 = 18432 bytes) but not for float
+// (2 * 64 * 68 * 4 = 34816 bytes). The float instantiations therefore keep the
+// single-buffered schedule and allocate exactly what they allocated before.
+// The kernel entry point and the implementation both read the plan from this
+// one place, so the allocation and the schedule cannot disagree.
+template <typename T, int BN, int BK>
+struct NAXWsStagingPlan {
+  MLX_MTL_CONST int max_threadgroup_bytes = 32768;
+  MLX_MTL_CONST int BK_padded = BK + 16 / sizeof(T);
+  MLX_MTL_CONST int tile = BN * BK_padded;
+  MLX_MTL_CONST bool pipelined =
+      int(2 * tile * sizeof(T)) <= max_threadgroup_bytes;
+  MLX_MTL_CONST int elements = pipelined ? 2 * tile : tile;
+
+  static_assert(
+      int(elements * sizeof(T)) <= max_threadgroup_bytes,
+      "the NAX weight staging plan must fit in threadgroup memory");
+};
+
 template <
     typename T,
     const int group_size,
@@ -971,6 +1020,10 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using staging_t = NAXWsStagingPlan<T, BN, BK>;
+  constexpr bool kPipelined = staging_t::pipelined;
+  constexpr int Ws_tile = staging_t::tile;
 
   using loader_w_t = QuantizedBlockLoader<
       T,
@@ -1030,16 +1083,17 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      auto stage_tile = [&]() {
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
           loader_w.load_safe(short2(BK, tgp_bn));
         }
+      };
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
+      // One k-block of matmad work, reading the weight tile at Wk. Both
+      // schedules share this body so they cannot drift apart numerically.
+      auto accumulate = [&](const threadgroup T* Wk, const device T* xk) {
         STEEL_PRAGMA_NO_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
           NAXTile<T, TM, TK> Atile;
@@ -1048,12 +1102,12 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
           volatile int compiler_barrier;
 
           if constexpr (kAlignedM.value) {
-            Atile.load(x + kk1, K);
+            Atile.load(xk + kk1, K);
           } else {
-            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            Atile.load_safe(xk + kk1, K, short2(SK, sgp_sm));
           }
 
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          Btile.template load<T, BK_padded, 1>(Wk + tn * BK_padded + kk1);
 
           tile_matmad_nax(
               Dtile,
@@ -1064,9 +1118,53 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
           (void)compiler_barrier;
         }
+      };
 
-        x += BK;
-        loader_w.next();
+      if constexpr (kPipelined) {
+        // Two staging halves let the loader fill the next tile while the
+        // matmad consumes the current one, so the dequantized store and the
+        // device read of the following tile overlap the arithmetic.
+        //
+        // Iteration i reads half i&1 and writes half (i+1)&1. The single
+        // loop-top barrier separates iteration i-1's reads of half (i+1)&1
+        // from iteration i's writes to it, and iteration i-1's writes to half
+        // i&1 from iteration i's reads of it. One barrier covers both hazards,
+        // which is why the pipelined schedule needs one instead of two.
+
+        // Prologue: stage tile 0 into the first half of Ws.
+        if (K > 0) {
+          stage_tile();
+          loader_w.next();
+          loader_w.shift_dst(Ws_tile);
+        }
+
+        short cur = 0;
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          if (k + BK < K) {
+            stage_tile();
+            loader_w.next();
+            loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
+          }
+
+          accumulate(Ws + cur * Ws_tile, x);
+
+          x += BK;
+          cur ^= 1;
+        }
+      } else {
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          stage_tile();
+
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          accumulate(Ws, x);
+
+          x += BK;
+          loader_w.next();
+        }
       }
 
       // Store results to device memory
@@ -1238,9 +1336,7 @@ template <
     uint simd_lid [[thread_index_in_simdgroup]]) {
   (void)lid;
 
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
-
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[NAXWsStagingPlan<T, BN, BK>::elements];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1363,9 +1459,7 @@ template <
     uint simd_lid [[thread_index_in_simdgroup]]) {
   (void)lid;
 
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
-
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[NAXWsStagingPlan<T, BN, BK>::elements];
 
   adjust_matrix_offsets<T>(
       x,

@@ -700,6 +700,14 @@ struct QuantizedBlockLoader {
       biases += group_stride;
     }
   }
+
+  /* Retarget the threadgroup destination by delta elements. Used by the
+     software-pipelined (double-buffered) kernels to alternate the staging
+     buffer between loads; the device-side source walk (src / scales / biases)
+     is unaffected. */
+  void shift_dst(const int delta) {
+    dst += delta;
+  }
 };
 
 template <typename T, int group_size, int bits, int D>
@@ -1542,49 +1550,112 @@ METAL_FUNC void qmm_t_impl(
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
   mma_t mma_op(simd_gid, simd_lid);
 
+  /* Software-pipelined k-loop over double-buffered Xs and Ws (the caller
+     allocates two tiles of each). While the mma consumes the tiles staged in
+     one half, the loaders stream the next k tile into the other half. The
+     single barrier per iteration (a) makes the previously staged tiles visible
+     to every mma reader and (b) guarantees every reader of the halves about to
+     be overwritten has finished. The device load/dequant sequence and the
+     per-element mma sequence are identical to the unpipelined loop; only the
+     phases overlap, so the accumulation order and therefore the result are
+     unchanged. */
+  constexpr int Xs_tile = BM * BK_padded;
+  constexpr int Ws_tile = BN * BK_padded;
+
   if (num_els < BM) {
     if (!aligned_N && num_outs < BN) {
-      for (int k = 0; k < K_eff; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (K_eff > 0) {
         loader_x.load_safe(short2(BK, num_els));
         loader_w.load_safe(short2(BK, num_outs));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_op.mma(Xs, Ws);
         loader_x.next();
         loader_w.next();
+        loader_x.dst += Xs_tile;
+        loader_w.shift_dst(Ws_tile);
       }
-    } else {
+      short cur = 0;
       for (int k = 0; k < K_eff; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k + BK < K_eff) {
+          loader_x.load_safe(short2(BK, num_els));
+          loader_w.load_safe(short2(BK, num_outs));
+          loader_x.next();
+          loader_w.next();
+          loader_x.dst += cur ? Xs_tile : -Xs_tile;
+          loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
+        }
+        mma_op.mma(Xs + cur * Xs_tile, Ws + cur * Ws_tile);
+        cur ^= 1;
+      }
+    } else {
+      if (K_eff > 0) {
         loader_x.load_safe(short2(BK, num_els));
         loader_w.load_unsafe();
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_op.mma(Xs, Ws);
         loader_x.next();
         loader_w.next();
+        loader_x.dst += Xs_tile;
+        loader_w.shift_dst(Ws_tile);
+      }
+      short cur = 0;
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k + BK < K_eff) {
+          loader_x.load_safe(short2(BK, num_els));
+          loader_w.load_unsafe();
+          loader_x.next();
+          loader_w.next();
+          loader_x.dst += cur ? Xs_tile : -Xs_tile;
+          loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
+        }
+        mma_op.mma(Xs + cur * Xs_tile, Ws + cur * Ws_tile);
+        cur ^= 1;
       }
     }
   } else {
     if (!aligned_N && num_outs < BN) {
-      for (int k = 0; k < K_eff; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (K_eff > 0) {
         loader_x.load_unsafe();
         loader_w.load_safe(short2(BK, num_outs));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_op.mma(Xs, Ws);
         loader_x.next();
         loader_w.next();
+        loader_x.dst += Xs_tile;
+        loader_w.shift_dst(Ws_tile);
       }
-    } else {
+      short cur = 0;
       for (int k = 0; k < K_eff; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k + BK < K_eff) {
+          loader_x.load_unsafe();
+          loader_w.load_safe(short2(BK, num_outs));
+          loader_x.next();
+          loader_w.next();
+          loader_x.dst += cur ? Xs_tile : -Xs_tile;
+          loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
+        }
+        mma_op.mma(Xs + cur * Xs_tile, Ws + cur * Ws_tile);
+        cur ^= 1;
+      }
+    } else {
+      if (K_eff > 0) {
         loader_x.load_unsafe();
         loader_w.load_unsafe();
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        mma_op.mma(Xs, Ws);
         loader_x.next();
         loader_w.next();
+        loader_x.dst += Xs_tile;
+        loader_w.shift_dst(Ws_tile);
+      }
+      short cur = 0;
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k + BK < K_eff) {
+          loader_x.load_unsafe();
+          loader_w.load_unsafe();
+          loader_x.next();
+          loader_w.next();
+          loader_x.dst += cur ? Xs_tile : -Xs_tile;
+          loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
+        }
+        mma_op.mma(Xs + cur * Xs_tile, Ws + cur * Ws_tile);
+        cur ^= 1;
       }
     }
   }
@@ -2239,8 +2310,8 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Xs[2 * BM * BK_padded];
+  threadgroup T Ws[2 * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -2307,8 +2378,8 @@ template <
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Xs[2 * BM * BK_padded];
+  threadgroup T Ws[2 * BN * BK_padded];
 
   const int k_start = tid.z * k_partition_size;
   x += k_start;
@@ -2623,8 +2694,8 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Xs[2 * BM * BK_padded];
+  threadgroup T Ws[2 * BN * BK_padded];
 
   adjust_matrix_offsets<T>(
       x,
