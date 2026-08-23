@@ -1564,7 +1564,33 @@ private let qwen35E120QMVHeader = """
 private func qwen35E120QMVSource(table: Bool) -> String {
     let sums = table ? "xsums" : "qmv_null_sums"
     let flag = table ? "USE_TABLE" : "false"
-    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3)]
+    // M=5 takes IPG=3 (groups of 3 and 2), NOT IPG=5. `VF` is
+    // `vec<float, NA>`, and 5 is not a native Metal vector width: an NA=5
+    // group carries the register footprint of an 8-wide vector while doing
+    // only 5 rows of work. Every other entry here already lands on NA in
+    // {2, 3, 4}; M=5 was the sole outlier and it cost more than double.
+    //
+    // Measured on this box, mean forward time by verify width (n over one
+    // 512-token local-iterate leg, same instrument both arms):
+    //
+    //     width      w2    w3     w4     w5     w6     w7     w8     w9
+    //     IPG=5    54.8  74.6  105.5  210.1  129.5  176.0  196.0  229.9
+    //     IPG=3    51.3  72.3  102.6   98.6  129.0  173.6  191.4  226.1
+    //
+    // w5 drops 53% (210.1 -> 98.6 ms) and lands back on the M-linear trend
+    // between w4 and w6; every untouched width moves only within the
+    // -0.4%..-6.4% run-to-run drift band. Bit-exact: splitting the m range
+    // across two groups changes only WHICH threadgroup computes a given
+    // (out_row, m), never the per-element k-accumulation order or arithmetic
+    // -- `acc[r][m] += scale_local[r] * partial[r][m] + sums[m] * bias_local[r]`
+    // is evaluated on the same values in the same sequence either way.
+    //
+    // NOTE a 2-pass split is not itself a cost: w8 (IPG=4, two weight passes)
+    // was retimed at IPG=8 (one pass) and moved only -2.3%, inside the drift
+    // band. Weight passes are NOT the dominant term here -- forward cost is
+    // close to linear in M -- so do not "optimize" this table by minimizing
+    // ceil(M/IPG). Keep NA native instead.
+    let cases = [(2, 2), (3, 3), (4, 4), (5, 3), (6, 3), (7, 4), (8, 4), (9, 3)]
         .map { m, ipg in
             """
                     case \(m):
@@ -1718,7 +1744,7 @@ public enum Qwen35CustomQMV {
         case 2: inputsPerGroup = 2
         case 3: inputsPerGroup = 3
         case 4: inputsPerGroup = 4
-        case 5: inputsPerGroup = 5
+        case 5: inputsPerGroup = 3  // NA=5 is not a native vector width; see qwen35E120QMVSource
         case 6: inputsPerGroup = 3
         case 7: inputsPerGroup = 4
         case 8: inputsPerGroup = 4
