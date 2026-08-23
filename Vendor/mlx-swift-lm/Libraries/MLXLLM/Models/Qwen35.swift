@@ -1775,9 +1775,12 @@ public enum Qwen35CustomQMV {
         guard w.ndim == 2, x.ndim >= 2 else { return nil }
         let k = x.dim(-1)
         let n = w.dim(0)
-        // `fast = N % 8 == 0 && K % 512 == 0` (quantized.cpp:260) and the wide
-        // branch needs `out_vec_size >= 4096` (quantized.h:1917).
-        guard w.dim(1) == k / 8, k % 512 == 0, n % 8 == 0, n >= 4096 else {
+        // `fast = N % 8 == 0 && K % 512 == 0` (quantized.cpp:260). The stock
+        // wide switch also wants N >= 4096; this launcher already owns the
+        // wide helper and does not read that switch. 1024 is the live K/V
+        // projection (4 kv heads * 256), still N % 8 == 0, and it is the
+        // last M=2 family still paying the library's dead X-group.
+        guard w.dim(1) == k / 8, k % 512 == 0, n % 8 == 0, n >= 1024 else {
             return nil
         }
         let m = x.size / k
