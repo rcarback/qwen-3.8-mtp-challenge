@@ -5,5 +5,5 @@
   "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
   "bytes": 427742600,
   "max_bytes": 2147483648,
-  "note": "Skip unused qwen_mtp_probe_sort factory while E87 is live on e8f14c4 (M=2 QMV + 0.15 + activeInputGroups). Probe fraction stays 0.15. M=2 widths 2...9 and IPG=2 kept. 9b6023c1 killed 0.12. 890594e9 is the same skip on stale 1d66bb3; this archive is the restack on the M=2 crown. Head tensors remain pinned. No E121. No tablePays(M=2). E87/qL/E020 untouched. Proposal-only. No remote code."
+  "note": "QMV threadgroup row-tile 8->16 on eb5eadc: wide affine-4/g64 custom QMV (plain and sumtable arms) launches N/16 threadgroups of four simdgroups when N%16==0, else the incumbent 8-row tile. Same simdgroup->row map, same bytes, same simd_sum order; threadgroup count halves on all 257 verify-leg wide calls. X stays activeInputGroups. Widths 2...9, IPG table, tablePays>=4, 0.15, skip-probesort kept. Head tensors remain pinned. No remote code. resubmit-2 (prior archive 04c7908 never ran: runner quiescence FATAL, load 2.08>=2.0)"
 }

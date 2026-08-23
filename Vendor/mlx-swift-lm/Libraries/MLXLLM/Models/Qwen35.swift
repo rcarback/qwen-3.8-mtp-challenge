@@ -1397,6 +1397,15 @@ private let qwen35CompiledFusedSwiGLU:
 // every retained `threadgroup_position_in_grid` and simdgroup index is the
 // same value the incumbent reads.
 //
+// The Y extent is the second launch trim. The incumbent tiles N in 8-row
+// threadgroups of two simdgroups. `Qwen35CustomQMV.threadgroupRows` tiles it
+// in 16-row threadgroups of four simdgroups whenever `N % 16 == 0` (every
+// verify shape of this model) and keeps the 8-row tile otherwise. The
+// simdgroup-to-row map `out_row = tid.y * TG_ROWS + sgid * 4` is a bijection
+// onto the same four-row blocks, and each simdgroup's work is the same
+// instruction stream over the same bytes, so the output is unchanged bit for
+// bit while the launched threadgroup count halves.
+//
 // M is read from `x_shape` rather than from `threadgroups_per_grid.x`, because
 // the launched x-extent stops being M as soon as the dispatch is ours to
 // choose.
@@ -1585,7 +1594,7 @@ private func qwen35E120QMVSource(table: Bool) -> String {
             const uint3 qmv_tid = threadgroup_position_in_grid;
             const uint qmv_lid = thread_index_in_simdgroup;
             const uint qmv_sgid = simdgroup_index_in_threadgroup;
-            const int qmv_out_row = int(qmv_tid.y) * 8 + int(qmv_sgid) * 4;
+            const int qmv_out_row = int(qmv_tid.y) * TG_ROWS + int(qmv_sgid) * 4;
             const int qmv_gx = int(qmv_tid.x);\(nullDecl)
             switch (qmv_m) {
         \(cases)
@@ -1705,6 +1714,43 @@ public enum Qwen35CustomQMV {
 
     /// Lane stride of the chunk-sum table, in floats.
     public static func sumsStride(_ m: Int) -> Int { m <= 8 ? 8 : 16 }
+
+    /// Output rows one threadgroup owns. The incumbent tile is 8 rows: two
+    /// simdgroups of four rows each, `(32, 2, 1)` threads, so an `N = 34816`
+    /// gate/up matvec is 4352 threadgroups per X-group and `lm_head`
+    /// (`N = 248320`) is 31040. Every simdgroup is independent -- it reads its
+    /// own four weight rows, its own scales and biases, reduces along K with
+    /// `simd_sum` and writes its own four outputs -- so the tile height is a
+    /// pure launch choice: `out_row = tid.y * TG_ROWS + sgid * 4` visits the
+    /// same `(row, k)` pairs in the same order at any `TG_ROWS` that divides
+    /// `N`. Sixteen rows per threadgroup halves the threadgroup count on every
+    /// verify shape this model dispatches (all seven N are multiples of 16)
+    /// and pays no extra register, threadgroup-memory, or barrier cost: the
+    /// kernel uses none of the three.
+    static let threadgroupRowsWide = 16
+    static let threadgroupRowsNarrow = 8
+
+    /// Rows per threadgroup for one output width.
+    static func threadgroupRows(n: Int) -> Int {
+        n % Self.threadgroupRowsWide == 0
+            ? Self.threadgroupRowsWide : Self.threadgroupRowsNarrow
+    }
+
+    /// Thread grid and threadgroup for one wide QMV cell. X retains exactly
+    /// the active input groups (`activeInputGroups`); Y is `N / TG_ROWS`
+    /// threadgroups of `TG_ROWS / 4` simdgroups, counted in threads because
+    /// `custom_kernel.cpp` dispatches with `dispatch_threads`.
+    static func launch(m: Int, n: Int)
+        -> (grid: (Int, Int, Int), threadGroup: (Int, Int, Int), rows: Int)
+    {
+        let rows = Self.threadgroupRows(n: n)
+        let simdgroups = rows / 4
+        return (
+            (Self.activeInputGroups(m) * 32, (n / rows) * simdgroups, 1),
+            (32, simdgroups, 1),
+            rows
+        )
+    }
 
     /// Number of input-row threadgroups that can execute real work for the
     /// current shared QMV width table. The Metal body maps group `g` to
@@ -1828,11 +1874,12 @@ public enum Qwen35CustomQMV {
         else { return nil }
         var outShape = x.shape
         outShape[outShape.count - 1] = cell.n
+        let geometry = Self.launch(m: cell.m, n: cell.n)
         return qwen35CustomAffine4QMVTableKernel(
             [w, scales, biases, x, xsums],
-            template: [("USE_TABLE", consume)],
-            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / 8) * 2, 1),
-            threadGroup: (32, 2, 1),
+            template: [("USE_TABLE", consume), ("TG_ROWS", geometry.rows)],
+            grid: geometry.grid,
+            threadGroup: geometry.threadGroup,
             outputShapes: [outShape],
             outputDTypes: [.bfloat16]
         )[0]
@@ -1864,10 +1911,12 @@ public enum Qwen35CustomQMV {
 
         var outShape = x.shape
         outShape[outShape.count - 1] = cell.n
+        let geometry = Self.launch(m: cell.m, n: cell.n)
         return qwen35CustomAffine4QMVKernel(
             [w, scales, biases, x],
-            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / 8) * 2, 1),
-            threadGroup: (32, 2, 1),
+            template: [("TG_ROWS", geometry.rows)],
+            grid: geometry.grid,
+            threadGroup: geometry.threadGroup,
             outputShapes: [outShape],
             outputDTypes: [.bfloat16]
         )[0]
