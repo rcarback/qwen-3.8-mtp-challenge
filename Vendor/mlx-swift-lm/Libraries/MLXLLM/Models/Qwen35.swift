@@ -1651,6 +1651,176 @@ private let qwen35CustomAffine4XSumsKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Exact-order tail for the one live 2-bit centroid QMV cell.
+///
+/// The incumbent bounds-checked implementation makes both SIMD groups on the
+/// final eight-row tile replay the same four valid rows. This kernel replays
+/// `qmv_impl`'s normal-block plus aligned-safe-tail arithmetic exactly, then
+/// returns that duplicate second SIMD group. Routing stays restricted to
+/// remainder 4, so every launched row is valid or wholly outside the tensor.
+private let qwen35CentroidQMVKernel = MLXFast.metalKernel(
+    name: "qwen35_centroid_affine2_g64_qmv_tail_v1",
+    inputNames: ["w", "scales", "biases", "x"],
+    outputNames: ["y"],
+    source: """
+        constexpr int VALUES_PER_THREAD = 16;
+        constexpr int BLOCK_SIZE = VALUES_PER_THREAD * 32;
+
+        const int qmv_k = x_shape[x_ndim - 1];
+        const int qmv_n = w_shape[0];
+        const int row_stride_bytes = qmv_k / 4;
+        const int groups_per_row = qmv_k / 64;
+
+        const uint3 tg = threadgroup_position_in_grid;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        const int out_row = int(tg.y) * 8 + int(simd_group) * 4;
+        if (out_row >= qmv_n) {
+            return;
+        }
+
+        const device uint8_t* ws =
+            reinterpret_cast<const device uint8_t*>(w) +
+            out_row * row_stride_bytes + int(lane) * 4;
+        const device bfloat16_t* scale_ptr =
+            scales + out_row * groups_per_row + lane / 4;
+        const device bfloat16_t* bias_ptr =
+            biases + out_row * groups_per_row + lane / 4;
+        const device bfloat16_t* xm =
+            x + int(tg.x) * qmv_k + lane * VALUES_PER_THREAD;
+        device bfloat16_t* ym =
+            y + int(tg.x) * qmv_n + out_row;
+
+        thread float x_thread[VALUES_PER_THREAD];
+        thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        int k = 0;
+        for (; k < qmv_k - BLOCK_SIZE; k += BLOCK_SIZE) {
+            float sum = 0.0f;
+            for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
+                sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+                x_thread[i] = static_cast<float>(xm[i]);
+                x_thread[i + 1] = static_cast<float>(xm[i + 1]) / 4.0f;
+                x_thread[i + 2] = static_cast<float>(xm[i + 2]) / 16.0f;
+                x_thread[i + 3] = static_cast<float>(xm[i + 3]) / 64.0f;
+            }
+
+            for (int row = 0; row < 4; ++row) {
+                const device uint8_t* wl = ws + row * row_stride_bytes;
+                float scale = scale_ptr[row * groups_per_row];
+                float bias = bias_ptr[row * groups_per_row];
+                float accum =
+                    (x_thread[0] * (wl[0] & 0x03) +
+                     x_thread[1] * (wl[0] & 0x0c) +
+                     x_thread[2] * (wl[0] & 0x30) +
+                     x_thread[3] * (wl[0] & 0xc0));
+                accum +=
+                    (x_thread[4] * (wl[1] & 0x03) +
+                     x_thread[5] * (wl[1] & 0x0c) +
+                     x_thread[6] * (wl[1] & 0x30) +
+                     x_thread[7] * (wl[1] & 0xc0));
+                accum +=
+                    (x_thread[8] * (wl[2] & 0x03) +
+                     x_thread[9] * (wl[2] & 0x0c) +
+                     x_thread[10] * (wl[2] & 0x30) +
+                     x_thread[11] * (wl[2] & 0xc0));
+                accum +=
+                    (x_thread[12] * (wl[3] & 0x03) +
+                     x_thread[13] * (wl[3] & 0x0c) +
+                     x_thread[14] * (wl[3] & 0x30) +
+                     x_thread[15] * (wl[3] & 0xc0));
+                result[row] += scale * accum + sum * bias;
+            }
+
+            ws += BLOCK_SIZE / 4;
+            scale_ptr += BLOCK_SIZE / 64;
+            bias_ptr += BLOCK_SIZE / 64;
+            xm += BLOCK_SIZE;
+        }
+
+        const int remaining = clamp(
+            qmv_k - k - int(lane) * VALUES_PER_THREAD,
+            0,
+            VALUES_PER_THREAD);
+        if (remaining > 0) {
+            float sum = 0.0f;
+            for (int i = 0; i < remaining; i += 4) {
+                sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+                x_thread[i] = static_cast<float>(xm[i]);
+                x_thread[i + 1] = static_cast<float>(xm[i + 1]) / 4.0f;
+                x_thread[i + 2] = static_cast<float>(xm[i + 2]) / 16.0f;
+                x_thread[i + 3] = static_cast<float>(xm[i + 3]) / 64.0f;
+            }
+
+            for (int row = 0; row < 4; ++row) {
+                const device uint8_t* wl = ws + row * row_stride_bytes;
+                float scale = scale_ptr[row * groups_per_row];
+                float bias = bias_ptr[row * groups_per_row];
+                float accum =
+                    (x_thread[0] * (wl[0] & 0x03) +
+                     x_thread[1] * (wl[0] & 0x0c) +
+                     x_thread[2] * (wl[0] & 0x30) +
+                     x_thread[3] * (wl[0] & 0xc0));
+                accum +=
+                    (x_thread[4] * (wl[1] & 0x03) +
+                     x_thread[5] * (wl[1] & 0x0c) +
+                     x_thread[6] * (wl[1] & 0x30) +
+                     x_thread[7] * (wl[1] & 0xc0));
+                accum +=
+                    (x_thread[8] * (wl[2] & 0x03) +
+                     x_thread[9] * (wl[2] & 0x0c) +
+                     x_thread[10] * (wl[2] & 0x30) +
+                     x_thread[11] * (wl[2] & 0xc0));
+                accum +=
+                    (x_thread[12] * (wl[3] & 0x03) +
+                     x_thread[13] * (wl[3] & 0x0c) +
+                     x_thread[14] * (wl[3] & 0x30) +
+                     x_thread[15] * (wl[3] & 0xc0));
+                result[row] += scale * accum + sum * bias;
+            }
+        }
+
+        for (int row = 0; row < 4; ++row) {
+            const float reduced = simd_sum(result[row]);
+            if (lane == 0) {
+                ym[row] = static_cast<bfloat16_t>(reduced);
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// Route only the pinned proposal-index centroid cell. Every other shape,
+/// dtype, packing, and benchmark path remains on MLX's incumbent dispatch.
+private func qwen35CentroidScore(_ x: MLXArray,
+                                 _ weight: MLXArray,
+                                 scales: MLXArray,
+                                 biases: MLXArray,
+                                 clusters: Int) -> MLXArray? {
+    guard x.dtype == .bfloat16,
+          weight.dtype == .uint32,
+          scales.dtype == .bfloat16,
+          biases.dtype == .bfloat16,
+          weight.ndim == 2,
+          x.ndim == 2,
+          x.dim(0) == 1,
+          x.dim(1) % 512 == 0,
+          clusters % 8 == 4,
+          weight.dim(0) == clusters,
+          weight.dim(1) == x.dim(1) / 16,
+          scales.shape == [clusters, x.dim(1) / 64],
+          biases.shape == scales.shape
+    else { return nil }
+
+    return qwen35CentroidQMVKernel(
+        [weight, scales, biases, x],
+        grid: (32, ((clusters + 7) / 8) * 2, 1),
+        threadGroup: (32, 2, 1),
+        outputShapes: [[1, clusters]],
+        outputDTypes: [.bfloat16]
+    )[0].reshaped([clusters])
+}
+
 /// Candidate-owned entry point for the wide affine-4/group-64 QMV.
 ///
 /// `matmul` returns `nil` for every cell the incumbent must keep, so a routed
@@ -5576,7 +5746,11 @@ extension Qwen35TextModel: MTPCapable {
             _draftRowTop32 = Qwen35RowTop32(
                 rows: probes * rowsPerCluster, rowsPerCluster: rowsPerCluster)
         }
-        let centroidScore = quantizedMM(
+        let centroidScore = qwen35CentroidScore(
+            x, centroidWeight,
+            scales: centroidScales, biases: centroidBiases,
+            clusters: clusters
+        ) ?? quantizedMM(
             x, centroidWeight, scales: centroidScales, biases: centroidBiases,
             transpose: true, groupSize: 64, bits: 2, mode: .affine
         ).reshaped([clusters])
