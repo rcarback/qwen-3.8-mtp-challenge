@@ -1775,13 +1775,18 @@ public enum Qwen35CustomQMV {
         guard w.ndim == 2, x.ndim >= 2 else { return nil }
         let k = x.dim(-1)
         let n = w.dim(0)
-        // `fast = N % 8 == 0 && K % 512 == 0` (quantized.cpp:260) and the wide
-        // branch needs `out_vec_size >= 4096` (quantized.h:1917).
-        guard w.dim(1) == k / 8, k % 512 == 0, n % 8 == 0, n >= 4096 else {
-            return nil
-        }
         let m = x.size / k
         guard Self.widths.contains(m), x.dim(-2) == m else { return nil }
+        // `fast = N % 8 == 0 && K % 512 == 0` (quantized.cpp:260). The stock
+        // wide switch also wants N >= 4096; this replica already owns the
+        // wide `_m` helper. Mid-width (1024 <= N < 4096) is only admitted
+        // at M >= 3 — FA K/V and the proposal K/V pack. M=2 stays on the
+        // library pair kernel: N=1024 has 128 y-tiles and a 1-group M=2
+        // launch is occupancy-reversed on that grid.
+        let nMin = m >= 3 ? 1024 : 4096
+        guard w.dim(1) == k / 8, k % 512 == 0, n % 8 == 0, n >= nMin else {
+            return nil
+        }
         // `ensureRowContiguous: true` would keep a strided input correct by
         // copying it first. `quantizedMM` reads the stride directly, so hand
         // the cell back rather than pay for a copy the incumbent avoids.
