@@ -4072,7 +4072,13 @@ private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
 // address arithmetic is an injective function applied element-wise to that
 // tail, so element-wise identity of the ids follows from element-wise identity
 // of the selection.
-private let qwen35RowTop32Tiles = 32
+// The derived-index probe cut reduced this live input from 24,584 to 14,752
+// rows, but the stage-1 grid stayed at its old 32 threadgroups. Pack the same
+// exact row partition into 16 groups: every real row is still visited once,
+// each partition still exports its exact local top-32, and the finalizer sees
+// 512 candidates instead of 1,024. At the live shape PER_THREAD is 4, matching
+// the register-sized scan used by the original 24,584-row / 32-tile geometry.
+private let qwen35RowTop32Tiles = 16
 
 private struct Qwen35RowTop32 {
     let plan: Qwen35Top32Plan
