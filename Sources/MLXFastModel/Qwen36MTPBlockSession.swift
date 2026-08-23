@@ -1,3 +1,5 @@
+// Variance-resample attempt marker: draw from tip LATEST (E99b).
+
 import Foundation
 import MLX
 import MLXFastCore
