@@ -192,7 +192,8 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
-        var fused = fc(
+        var fused = qwen35RoutedLinear(
+            fc,
             preFcConcat(
                 nextTokenIds: nextTokenIds, embedTokens: embedTokens,
                 hidden: hidden))
@@ -226,7 +227,8 @@ final class Qwen35MTPModule: Module {
               nextTokenIds.dim(1) == hidden.dim(1)
         else { return nil }
 
-        let fused = fc(
+        let fused = qwen35RoutedLinear(
+            fc,
             preFcConcat(
                 nextTokenIds: nextTokenIds, embedTokens: embedTokens,
                 hidden: hidden))
