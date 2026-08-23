@@ -3858,11 +3858,7 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
 // its 32 selected rows directly from the full affine-4/group-64 matrix, and
 // reduce the exact BF16 values in one dispatch. This replaces gather_qmm plus
 // the separate value/id reducer without changing shortlist identity or order.
-private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_draft_selected_affine4_rerank_g64_v1",
-    inputNames: ["x", "candidate_ids", "weight", "scales", "biases"],
-    outputNames: ["token_id"],
-    source: """
+private let qwen35DraftSelectedAffine4RerankBodySource = """
         constexpr uint TG_SIZE    = 256;
         constexpr uint TOPK       = 32;
         constexpr uint SIMD_SIZE  = 32;
@@ -3943,8 +3939,9 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
                         : best_id + CONTROL_OFFSET);
             }
         }
-    """,
-    header: """
+    """
+
+private let qwen35DraftSelectedAffine4RerankHeaderSource = """
         typedef bfloat16_t InT;
         inline bool qwen_draft_selected_rerank_better(
             float candidate_value,
@@ -3959,9 +3956,270 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
             if (candidate_value < current_value) { return false; }
             return candidate_id < current_id;
         }
-    """,
+    """
+
+private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_selected_affine4_rerank_g64_v1",
+    inputNames: ["x", "candidate_ids", "weight", "scales", "biases"],
+    outputNames: ["token_id"],
+    source: qwen35DraftSelectedAffine4RerankBodySource,
+    header: qwen35DraftSelectedAffine4RerankHeaderSource,
     ensureRowContiguous: false
 )
+
+enum Qwen35FinalizeRerankProductionRoute: Equatable {
+    case fused
+    case incumbent
+}
+
+private struct Qwen35FinalizeRerankProductionPlan {
+    static let pairCount = 1_024
+    static let pairsPerThread = 4
+    static let threadGroupSize = 256
+
+    static func make(
+        leaves: Int, rowsPerLeaf: Int, probes: Int, hidden: Int
+    ) -> Self? {
+        guard leaves == 12_292,
+              rowsPerLeaf == 8,
+              probes == 1_844,
+              hidden == 5_120
+        else { return nil }
+        return Self()
+    }
+}
+
+/// The single production eligibility predicate for E134. Tests exercise this
+/// same function that live construction consumes, so unsupported geometries
+/// and tensor layouts cannot accidentally construct the fused tail.
+func qwen35FinalizeRerankProductionRoute(
+    leaves: Int,
+    rowsPerLeaf: Int,
+    probes: Int,
+    hidden: Int,
+    activation: DType,
+    rowWeight: DType,
+    rowScale: DType,
+    rowBias: DType,
+    permutation: DType,
+    exactWeight: DType,
+    exactScale: DType,
+    exactBias: DType,
+    rowTop32Enabled: Bool = true
+) -> Qwen35FinalizeRerankProductionRoute {
+    guard Qwen35FinalizeRerankProductionPlan.make(
+        leaves: leaves,
+        rowsPerLeaf: rowsPerLeaf,
+        probes: probes,
+        hidden: hidden) != nil,
+          activation == .bfloat16,
+          rowWeight == .uint32,
+          rowScale == .bfloat16,
+          rowBias == .bfloat16,
+          permutation == .int32,
+          exactWeight == .uint32,
+          exactScale == .bfloat16,
+          exactBias == .bfloat16,
+          rowTop32Enabled
+    else { return .incumbent }
+    return .fused
+}
+
+// Validated E134 global top-32 finalize/map specialized to the 1,024 pairs
+// emitted by the existing RowTop32 partial stage at P1844. Its ordering is the
+// stable ascending (ordinal, local index) tail: NaNs, infinities, signed zero,
+// ties, and each thread's sparse fourth slot therefore match the incumbent.
+private let qwen35FinalizeRerankCommonSource = """
+        constexpr uint TG_SIZE = 256;
+        constexpr uint PAIR_COUNT = 1024;
+        constexpr uint PER_THREAD = 4;
+        constexpr uint TOPK = 32;
+        constexpr uint SIMD_SIZE = 32;
+        constexpr uint NSIMD = TG_SIZE / SIMD_SIZE;
+        constexpr uint PB = (NSIMD * TOPK) / SIMD_SIZE;
+        static_assert(PAIR_COUNT == TG_SIZE * PER_THREAD,
+            "D2 pair ownership must cover exactly 4096 pairs");
+        static_assert(PER_THREAD <= 32,
+            "PER_THREAD exceeds taken-bitmask width");
+        static_assert(PB <= 32, "PB exceeds taken-bitmask width");
+        static_assert(sizeof(uint) == 4, "uint must occupy four bytes");
+        static_assert(
+            (2 * NSIMD * TOPK + TOPK) * sizeof(uint) == 2176,
+            "streamed D2 threadgroup storage must be exactly 2176 bytes");
+
+        uint tid = thread_position_in_threadgroup.x;
+        uint lane = thread_index_in_simdgroup;
+        uint sg = simdgroup_index_in_threadgroup;
+
+        uint ord[PER_THREAD];
+        uint idx[PER_THREAD];
+        for (uint t = 0; t < PER_THREAD; ++t) {
+            uint p = t * TG_SIZE + tid;
+            ord[t] = candidate_ordinal[p];
+            idx[t] = candidate_local_index[p];
+        }
+
+        threadgroup uint sc_ord[NSIMD * TOPK];
+        threadgroup uint sc_idx[NSIMD * TOPK];
+        threadgroup uint compact[TOPK];
+
+        uint taken = 0u;
+        for (uint rank = 0; rank < TOPK; ++rank) {
+            uint best_ordinal = 0u;
+            uint best_index = 0u;
+            uint best_slot = 0xffffffffu;
+            for (uint t = 0; t < PER_THREAD; ++t) {
+                if ((taken & (1u << t)) != 0u) { continue; }
+                if (ord[t] > best_ordinal
+                        || (ord[t] == best_ordinal && idx[t] > best_index)) {
+                    best_ordinal = ord[t];
+                    best_index = idx[t];
+                    best_slot = t;
+                }
+            }
+            uint winning_ordinal = simd_max(best_ordinal);
+            uint winning_index = simd_max(
+                best_ordinal == winning_ordinal ? best_index : 0u);
+            if (best_slot != 0xffffffffu
+                    && best_ordinal == winning_ordinal
+                    && best_index == winning_index) {
+                taken |= (1u << best_slot);
+            }
+            if (lane == 0) {
+                sc_ord[sg * TOPK + rank] = winning_ordinal;
+                sc_idx[sg * TOPK + rank] = winning_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg == 0) {
+            uint local_ordinal[PB];
+            uint local_index[PB];
+            for (uint t = 0; t < PB; ++t) {
+                uint p = t * SIMD_SIZE + lane;
+                local_ordinal[t] = sc_ord[p];
+                local_index[t] = sc_idx[p];
+            }
+            uint global_taken = 0u;
+            for (uint rank = 0; rank < TOPK; ++rank) {
+                uint best_ordinal = 0u;
+                uint best_index = 0u;
+                uint best_slot = 0xffffffffu;
+                for (uint t = 0; t < PB; ++t) {
+                    if ((global_taken & (1u << t)) != 0u) { continue; }
+                    if (local_ordinal[t] > best_ordinal
+                            || (local_ordinal[t] == best_ordinal
+                                && local_index[t] > best_index)) {
+                        best_ordinal = local_ordinal[t];
+                        best_index = local_index[t];
+                        best_slot = t;
+                    }
+                }
+                uint winning_ordinal = simd_max(best_ordinal);
+                uint winning_index = simd_max(
+                    best_ordinal == winning_ordinal ? best_index : 0u);
+                if (best_slot != 0xffffffffu
+                        && best_ordinal == winning_ordinal
+                        && best_index == winning_index) {
+                    global_taken |= (1u << best_slot);
+                }
+                if (lane == 0) {
+                    uint ascending_position = TOPK - 1u - rank;
+                    sc_idx[ascending_position] = winning_index;
+                    uint cluster = uint(probed[winning_index / 8u]);
+                    compact[ascending_position] = uint(
+                        perm[cluster * 8u + (winning_index % 8u)]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    """
+
+private let qwen35FinalizeRerankSource =
+    qwen35FinalizeRerankCommonSource
+        + """
+        static_assert(
+            (2 * NSIMD * TOPK * sizeof(uint))
+                + (TOPK * sizeof(uint))
+                + (TOPK * sizeof(float)) == 2304,
+            "E134 threadgroup storage must be exactly 2304 bytes");
+        {
+            threadgroup uint* candidate_ids = compact;
+    """
+        + qwen35DraftSelectedAffine4RerankBodySource
+        + """
+        }
+    """
+
+private let qwen35FinalizeRerankKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_row_top32_finalize_rerank_v1",
+    inputNames: [
+        "x", "candidate_ordinal", "candidate_local_index", "probed", "perm",
+        "weight", "scales", "biases",
+    ],
+    outputNames: ["token_id"],
+    source: qwen35FinalizeRerankSource,
+    header: qwen35DraftSelectedAffine4RerankHeaderSource,
+    ensureRowContiguous: true
+)
+
+private struct Qwen35FinalizeRerankTail {
+    init?(clusters: Int, rowsPerCluster: Int, probes: Int, hidden: Int) {
+        guard Qwen35FinalizeRerankProductionPlan.make(
+            leaves: clusters,
+            rowsPerLeaf: rowsPerCluster,
+            probes: probes,
+            hidden: hidden) != nil
+        else { return nil }
+    }
+
+    func callAsFunction(
+        _ x: MLXArray,
+        candidateOrdinal: MLXArray,
+        candidateLocalIndex: MLXArray,
+        probed: MLXArray,
+        perm: MLXArray,
+        exactWeight: MLXArray,
+        exactScales: MLXArray,
+        exactBiases: MLXArray,
+        prefixCount: Int,
+        controlOffset: Int
+    ) -> MLXArray {
+        qwen35FinalizeRerankKernel(
+            [
+                x, candidateOrdinal, candidateLocalIndex, probed, perm,
+                exactWeight, exactScales, exactBiases,
+            ],
+            template: [
+                ("PREFIX_COUNT", prefixCount),
+                ("CONTROL_OFFSET", controlOffset),
+            ],
+            grid: (Qwen35FinalizeRerankProductionPlan.threadGroupSize, 1, 1),
+            threadGroup: (
+                Qwen35FinalizeRerankProductionPlan.threadGroupSize, 1, 1),
+            outputShapes: [[1, 1]],
+            outputDTypes: [.int32]
+        )[0]
+    }
+}
+
+func qwen35FinalizeRerankSourceContractForTest() -> (
+    pairCount: Int,
+    pairsPerThread: Int,
+    common: String,
+    fused: String,
+    affine4Body: String,
+    header: String
+) {
+    (
+        Qwen35FinalizeRerankProductionPlan.pairCount,
+        Qwen35FinalizeRerankProductionPlan.pairsPerThread,
+        qwen35FinalizeRerankCommonSource,
+        qwen35FinalizeRerankSource,
+        qwen35DraftSelectedAffine4RerankBodySource,
+        qwen35DraftSelectedAffine4RerankHeaderSource
+    )
+}
 
 // ---------------------------------------------------------------------------
 // PROPOSAL-SIDE TOP-32 SHORTLIST
@@ -4280,16 +4538,20 @@ private struct Qwen35RowTop32 {
     /// The 32 compact-vocabulary ids the probed rows carry, ascending under the
     /// reference order. `rowScore` is [rows], `probed` is [probes] uint32 and
     /// `perm` is the whole cluster permutation.
-    func callAsFunction(_ rowScore: MLXArray, _ probed: MLXArray, _ perm: MLXArray)
-        -> MLXArray
-    {
-        let candidates = partial(
+    func partialCandidates(_ rowScore: MLXArray) -> [MLXArray] {
+        partial(
             [rowScore],
             grid: (plan.tiles * qwen35Top32TG, 1, 1),
             threadGroup: (qwen35Top32TG, 1, 1),
             outputShapes: [[plan.cands], [plan.cands]],
             outputDTypes: [.uint32, .uint32]
         )
+    }
+
+    func callAsFunction(_ rowScore: MLXArray, _ probed: MLXArray, _ perm: MLXArray)
+        -> MLXArray
+    {
+        let candidates = partialCandidates(rowScore)
         return finalize(
             [candidates[0], candidates[1], probed, perm],
             grid: (qwen35Top32TG, 1, 1),
@@ -5120,6 +5382,11 @@ public func qwen35VerifySelectedRerankOrderInvariance(
     return (trials, mismatches, firstBad, setMismatches, controlChanged)
 }
 
+private enum Qwen35ClusterDraftResult {
+    case candidateIDs(MLXArray)
+    case tokenID(MLXArray)
+}
+
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -5159,6 +5426,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftProbeSort: MLXFast.MLXFastKernel?
     private var _draftProbeSelect: MLXFast.MLXFastKernel?
     private var _draftRowTop32: Qwen35RowTop32?
+    private var _draftFinalizeRerank: Qwen35FinalizeRerankTail?
     // One attempt only: a head that cannot support a derived index must keep
     // the dense readout instead of re-deriving on every draft step.
     private var _derivedClusterAttempted = false
@@ -5689,15 +5957,20 @@ extension Qwen35TextModel: MTPCapable {
         _draftClusterShape = [leaves, rowsPerLeaf, probes]
     }
 
-    /// The 32 shortlist candidates chosen by the cluster index, or nil when the
-    /// head ships no index and the dense coarse readout must run instead.
+    /// The cluster shortlist result, or nil when the head ships no index and
+    /// the dense coarse readout must run instead.
     ///
     /// Scores `K` centroids, probes the best `C` clusters, and ranks only the
     /// `C * rowsPerCluster` rows those clusters own. The probe depends only on
     /// the current hidden state, and the exact reranker behind it still sees
     /// the target's own lm_head rows, so this changes proposal quality and cost
     /// and nothing else.
-    private func clusterCandidateIDs(_ x: MLXArray) -> MLXArray? {
+    private func clusterDraftResult(
+        _ x: MLXArray,
+        exactWeight: MLXArray,
+        exactScales: MLXArray,
+        exactBiases: MLXArray
+    ) -> Qwen35ClusterDraftResult? {
         // A head that ships no index uses the dense readout. A head that ships
         // a broken one must fail, not silently fall back to a path that would
         // report a plausible time for the wrong mechanism.
@@ -5748,9 +6021,36 @@ extension Qwen35TextModel: MTPCapable {
             _draftProbeSelect = makeQwen35E87ProbeSelectKernel(
                 clusters: clusters, probes: probes)
         }
+
+        let finalizeRerankRoute = qwen35FinalizeRerankProductionRoute(
+            leaves: clusters,
+            rowsPerLeaf: rowsPerCluster,
+            probes: probes,
+            hidden: configuration.hiddenSize,
+            activation: x.dtype,
+            rowWeight: rowWeight.dtype,
+            rowScale: rowScales.dtype,
+            rowBias: rowBiases.dtype,
+            permutation: perm.dtype,
+            exactWeight: exactWeight.dtype,
+            exactScale: exactScales.dtype,
+            exactBias: exactBiases.dtype,
+            rowTop32Enabled: qwen35RowTop32Enabled)
         if qwen35RowTop32Enabled, _draftRowTop32 == nil {
             _draftRowTop32 = Qwen35RowTop32(
                 rows: probes * rowsPerCluster, rowsPerCluster: rowsPerCluster)
+        }
+        if finalizeRerankRoute == .fused, _draftFinalizeRerank == nil {
+            guard let rerank = Qwen35FinalizeRerankTail(
+                clusters: clusters,
+                rowsPerCluster: rowsPerCluster,
+                probes: probes,
+                hidden: configuration.hiddenSize)
+            else {
+                fatalError(
+                    "Qwen MTP finalize-rerank route disagrees with support gate")
+            }
+            _draftFinalizeRerank = rerank
         }
         let centroidScore = quantizedMM(
             x, centroidWeight, scales: centroidScales, biases: centroidBiases,
@@ -5790,9 +6090,33 @@ extension Qwen35TextModel: MTPCapable {
             sortedIndices: true
         ).reshaped([probes * rowsPerCluster])
 
+        if finalizeRerankRoute == .fused {
+            guard let rowTop32 = _draftRowTop32,
+                  let rerank = _draftFinalizeRerank
+            else {
+                fatalError("Qwen MTP finalize-rerank tail was not constructed")
+            }
+            let candidates = rowTop32.partialCandidates(rowScore)
+            qwen35RowTop32FusedDrafts += 1
+            return .tokenID(
+                rerank(
+                    x.reshaped([configuration.hiddenSize]),
+                    candidateOrdinal: candidates[0],
+                    candidateLocalIndex: candidates[1],
+                    probed: probed,
+                    perm: perm,
+                    exactWeight: exactWeight,
+                    exactScales: exactScales,
+                    exactBiases: exactBiases,
+                    prefixCount: Self.compactDraftPrefixCount,
+                    controlOffset:
+                        Self.compactDraftControlStart
+                        - Self.compactDraftPrefixCount))
+        }
+
         if let rowTop32 = _draftRowTop32 {
             qwen35RowTop32FusedDrafts += 1
-            return rowTop32(rowScore, probed, perm)
+            return .candidateIDs(rowTop32(rowScore, probed, perm))
         }
         qwen35RowTop32ArgPartitionDrafts += 1
 
@@ -5803,7 +6127,8 @@ extension Qwen35TextModel: MTPCapable {
             MLX.take(probed.asType(.int32), MLX.floorDivide(local, width), axis: 0)
             * width + MLX.remainder(local, width)
         // uint32 to match what `qwen35DraftTop32` hands the shared exact stage.
-        return MLX.take(perm, permutedRow, axis: 0).asType(.uint32)
+        return .candidateIDs(
+            MLX.take(perm, permutedRow, axis: 0).asType(.uint32))
     }
 
     private func draftTokenIDWithDeclaredRerank(_ x: MLXArray) -> MLXArray? {
@@ -5846,8 +6171,18 @@ extension Qwen35TextModel: MTPCapable {
         else { return nil }
 
         let candidateIDs: MLXArray
-        if let probed = clusterCandidateIDs(x) {
-            candidateIDs = probed
+        if let cluster = clusterDraftResult(
+            x,
+            exactWeight: exact.weight,
+            exactScales: exact.scales,
+            exactBiases: exactBiases)
+        {
+            switch cluster {
+            case .candidateIDs(let ids):
+                candidateIDs = ids
+            case .tokenID(let tokenID):
+                return tokenID
+            }
         } else {
             let coarse = quantizedMM(
                 x, coarseWeight, scales: coarseScales, biases: coarseBiases,
