@@ -412,6 +412,95 @@ public final class Qwen36MTPBlockSession {
                 cache: historyWarmCache)
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+        // FLUSH-FOLD WIDTH WARM. The live first head step of any round with
+        // committed history folds `concatenated(flushHidden, axis: 1)` —
+        // mixed-width post-norm backlog blocks plus the pending [1, 1, h] row
+        // — and feeds the result to `mtpHeadLastHiddenWithKVOnlyHistory`
+        // before chaining `draftTokenID`. The prime (direct [1, 512]) and
+        // fold (direct [1, 2]) warms above compile neither that hidden-dtype
+        // concat nor the head forward at any other total width, so every live
+        // backlog width outside {2, 512} paid its JIT inside a scored streak.
+        // Fold L single-row pieces through the EXACT live call pattern at
+        // every contiguous width 1...40 (H019): realistic post-full-accept
+        // next-round widths are {3, 5, 6, 7, 9} (W = previous accepted depth
+        // + 1) plus backlog sums 10...15, so the earlier {1, 2, 4, 8, 16, 32}
+        // set left every other total width to cold-compile inside a scored
+        // streak. Values are zeros on a throwaway cache, so only shape +
+        // dtype + input-count select kernels here. Runs in the untimed warm
+        // phase and touches no scored-path state.
+        for foldWidth in 1 ... 40 {
+            let pieces = Array(
+                repeating: MLXArray.zeros([1, 1, hDim], dtype: row.dtype),
+                count: foldWidth)
+            let warmFoldHidden = foldWidth == 1
+                ? pieces[0] : concatenated(pieces, axis: 1)
+            let warmFoldTokens = MLXArray(
+                Array(repeating: Int32(0), count: foldWidth)
+            ).reshaped([1, foldWidth])
+            let warmFolded = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                hidden: warmFoldHidden, nextTokenIds: warmFoldTokens,
+                cache: historyWarmCache)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: warmFoldHidden, nextTokenIds: warmFoldTokens,
+                    cache: historyWarmCache)
+            eval(model.draftTokenID(
+                warmFolded[
+                    0...,
+                    (warmFolded.dim(1) - 1) ..< warmFolded.dim(1),
+                    0...]))
+        }
+        // H019 FIRST-ROUND MIXED-FLUSH WARM. The first drafting round after
+        // a serial/skip stretch flushes the 511-row final-normed seed slice
+        // (applyFinalNorm over a strided [1, 511, h] slice of the retained
+        // pre-norm seed hidden) plus k backlog [1, 1, h] blocks plus the
+        // pending [1, 1, h] row through ONE mixed-piece concat, so the live
+        // first-round total width is 512 + k — never one of the uniform-piece
+        // fold widths above, and the direct [1, 512] prime bypasses the concat
+        // entirely. Compile that exact shape family (mixed piece widths,
+        // input count k + 2) for k in 0...8 through the same KV-only head +
+        // draftTokenID chain the live flush dispatches.
+        for extraBacklogRows in 0 ... 8 {
+            var mixedPieces: [MLXArray] = [
+                model.applyFinalNorm(
+                    MLXArray.zeros([1, 511, hDim], dtype: row.dtype)),
+            ]
+            mixedPieces.append(
+                contentsOf: Array(
+                    repeating: MLXArray.zeros([1, 1, hDim], dtype: row.dtype),
+                    count: extraBacklogRows))
+            mixedPieces.append(MLXArray.zeros([1, 1, hDim], dtype: row.dtype))
+            let mixedFlushHidden = concatenated(mixedPieces, axis: 1)
+            let mixedFlushTokens = MLXArray(
+                Array(repeating: Int32(0), count: 512 + extraBacklogRows)
+            ).reshaped([1, 512 + extraBacklogRows])
+            let mixedFlushed = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                hidden: mixedFlushHidden, nextTokenIds: mixedFlushTokens,
+                cache: historyWarmCache)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: mixedFlushHidden, nextTokenIds: mixedFlushTokens,
+                    cache: historyWarmCache)
+            eval(model.draftTokenID(
+                mixedFlushed[
+                    0...,
+                    (mixedFlushed.dim(1) - 1) ..< mixedFlushed.dim(1),
+                    0...]))
+        }
+        // H019 INPUT-COUNT-2 CONCAT FAMILY. MLX concat JIT-specializes by
+        // input count, so the uniform-piece fold sweep above (input count ==
+        // total width) still leaves the two-piece decomposition cold. Live
+        // backlogs present 2...S+2 non-uniform pieces; compile the dominant
+        // input-count-2 shape ([1, T-1, h] + [1, 1, h]) for T in 2...9. The
+        // head forwards at these total widths are already covered by the fold
+        // sweep; only the concat kernel shape is new here.
+        for mixedTotal in 2 ... 9 {
+            eval(concatenated(
+                [
+                    MLXArray.zeros(
+                        [1, mixedTotal - 1, hDim], dtype: row.dtype),
+                    MLXArray.zeros([1, 1, hDim], dtype: row.dtype),
+                ],
+                axis: 1))
+        }
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
@@ -478,6 +567,32 @@ public final class Qwen36MTPBlockSession {
         precondition(model.replayRecurrentPrefix(
             cache: oneRowReplayCache, committedRows: 1))
         eval(oneRowReplayCache.flatMap { $0.state })
+        // H019 REPAIR-PATH INSURANCE. The generic K>1 / defensive fallback
+        // (:1627-1650) undoes the whole verify window and re-forwards the
+        // committed block through callWithHidden([1, L], nConfirmed: 0) at
+        // L in 2...8, reading its tail row through linearTopTwoRows. No warm
+        // above compiles those backbone shapes: the width ladder dispatches
+        // callWithHiddenAndNormed / nConfirmed: 1 at width >= 2, and the seed
+        // warm is L = 512 — so a preflight failure would pay a ~100 ms+
+        // JIT class inside a scored round. Warm each width once on a
+        // throwaway cache; values are zeros, nothing is read out.
+        let repairWarmCache = model.newCache(parameters: nil)
+        for repairWidth in [2, 4, 8] {
+            let (repairWarmLogits, repairWarmHidden) = model.callWithHidden(
+                input: LMInput.Text(
+                    tokens: MLXArray(
+                        Array(repeating: 0, count: repairWidth)
+                    ).reshaped([1, repairWidth])),
+                cache: repairWarmCache, nConfirmed: 0)
+            let repairWarmLastRow = repairWarmLogits[
+                0...,
+                (repairWarmLogits.dim(1) - 1) ..< repairWarmLogits.dim(1),
+                0...]
+            let (repairWarmIDs, repairWarmValues) =
+                Self.linearTopTwoRows(repairWarmLastRow)
+            eval(repairWarmCache.flatMap { $0.state }
+                + [repairWarmIDs, repairWarmValues, repairWarmHidden])
+        }
 
         // SEED-PREFILL SHAPE WARM (M=512 backbone). Keep this as the final
         // warm so the promoted allocator/pipeline end state is preserved.
@@ -1093,6 +1208,16 @@ public final class Qwen36MTPBlockSession {
         // itself. Widths 6..8 are bit-exact per position against the serial
         // trajectory through the sdpa exactness chunk, so 7 is policy.
         //
+        // STAGED-BUT-UNSUBMITTED EXTENSION, NOW LANDED. Amal-David's community
+        // ledger documents a variant of this schedule that raises the cap to
+        // `Qwen36MTPLimits.maxDepth` == 8 for rounds whose full-accept streak
+        // has qualified (`fullAcceptStreak >= segmentedStreakGate`); it sat in
+        // that ledger unsubmitted. Landed here as-is. Widths 6..8 are already
+        // proven bit-exact per position through the sdpa exactness chunk (see
+        // the wall-resolution note above), so the extension is zero numerical
+        // risk by construction -- economic risk only -- and any reject resets
+        // `fullAcceptStreak` to 0, returning the cap to flat 7.
+        //
         // A floor of 6 under the ceiling of 7 was tried and REVERTED. The
         // argument for it read the x4 slot's 4.38 / 0.012191 s/tok off
         // `89cbdc02` as a depth error, but `89cbdc02` was a slow TREE: on the
@@ -1104,7 +1229,8 @@ public final class Qwen36MTPBlockSession {
         //
         // Imported from promoted submission c6af1e24 (organizer 88578f92,
         // official 3.30955573); it supersedes ead84bba (official 3.30221310).
-        let widthCap = Self.segmentedVerifyDepthCap
+        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
+            ? Qwen36MTPLimits.maxDepth : Self.segmentedVerifyDepthCap
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
@@ -1450,6 +1576,15 @@ public final class Qwen36MTPBlockSession {
             eval(draftIdArrays[draftIdArrays.count - 1])
         }
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
+        // PACKED DRAFT-ID READOUT. The per-step arrays keep chaining into the
+        // verify concat below (the [1,1]-piece multi-input shape the warm
+        // block compiled), but the HOST readback no longer maps d separate
+        // buffers: one concatenated [1, d] int32 tensor rides the round's
+        // same blocking eval and a single asArray readback yields the
+        // identical [Int] in identical row-major order. Values are bit-exact
+        // by construction -- the packed tensor is pure copy of the same graph
+        // nodes.
+        let packedDraftIDs = concatenated(draftIdArrays, axis: 1)
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
         //    vendored post-primary rollback checkpoint for the hot K=1 path. A
@@ -1492,11 +1627,11 @@ public final class Qwen36MTPBlockSession {
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
-        bundle.append(contentsOf: draftIdArrays)
+        bundle.append(packedDraftIDs)
         eval(cache.flatMap { $0.state } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
-        let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
+        let drafts = packedDraftIDs.asArray(Int32.self).map { Int($0) }
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
