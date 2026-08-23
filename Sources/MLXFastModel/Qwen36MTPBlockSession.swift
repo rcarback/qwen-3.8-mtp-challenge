@@ -1492,11 +1492,17 @@ public final class Qwen36MTPBlockSession {
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
-        bundle.append(contentsOf: draftIdArrays)
+        // One concatenated draft-id readout rides the round's single batched
+        // eval, so the accept walk copies ONE materialised buffer instead of
+        // paying d separate `.item()` readbacks (Carme99 rider 99e46f4).
+        // Same integers, same order; `verifyTokens` still chains the raw
+        // per-step arrays.
+        let draftsReadout = concatenated(draftIdArrays, axis: 0)
+        bundle.append(draftsReadout)
         eval(cache.flatMap { $0.state } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
-        let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
+        let drafts = draftsReadout.asArray(Int32.self).map { Int($0) }
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
