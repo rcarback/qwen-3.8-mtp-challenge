@@ -275,6 +275,56 @@ public final class Qwen36MTPBlockSession {
         FileHandle.standardError.write(Data(line.utf8))
     }
 
+    /// Read-only mirror of the two entry guards in
+    /// `wireResidentWeightsIfEnabled()`, for warm telemetry only.
+    ///
+    /// A 48 GiB development host fails the 96 GiB guard, so residency sizing
+    /// and its `Memory.clearCache()` never run there. Any warm-arm result read
+    /// off a host reporting `wired_gate_fired=0` says nothing about the ranked
+    /// M5-Max runner, where the gate does fire.
+    private static let residencySizingGateFires: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_QWEN_MTP_WIRED_ZH"] != "0"
+            && ProcessInfo.processInfo.physicalMemory >= (UInt64(96) << 30)
+
+    /// Warm the verify entry point the scored round actually calls.
+    ///
+    /// The width loop warms `callWithHidden`; every scored verify calls
+    /// `callWithHiddenAndNormed` and retains the normed block across the eval.
+    private static let warmNormedVerifyEnabled: Bool =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_QWEN_MTP_WARM_NORMED"] == "1"
+
+    /// Submit the restored recurrent boundary before returning from a prefix
+    /// reject, so the next round's draft chain does not open by building it.
+    ///
+    /// A `static let` like the tip's `traceRounds`, not a computed property:
+    /// `ProcessInfo.environment` rebuilds the whole 90-entry dictionary on
+    /// every read, measured here at 46.5 us, and this flag is read on the
+    /// timed reject path.
+    private static let prefetchRestoredStateEnabled: Bool =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_QWEN_MTP_PREFETCH_RESTORE"] == "1"
+
+    /// Default OFF. A ranked receipt on rival submission `775a26e3` measured a
+    /// second post-wiring warm at +5.28 % F83-weighted SLOWER (z +7.02) with a
+    /// flat serial leg, which FINDING 172 attributes to warm scratch consuming
+    /// the 64 MiB wired slack that decode state then cannot be admitted into.
+    private static let warmRefillEnabled: Bool =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_QWEN_MTP_WARM_REFILL"] == "1"
+
+    /// Research-only, default off, and never read on the ranked runner.
+    ///
+    /// Residency sizing is gated on `physicalMemory >= 96 GiB`, so on a 48 GiB
+    /// development host `wireResidentWeightsIfEnabled()` returns before its
+    /// `Memory.clearCache()` and the refill below has nothing to repair. This
+    /// switch reproduces that one allocator side effect — not the wired ticket,
+    /// which has no local instrument — so the refill can be measured off the
+    /// ranked runner. It runs in the untimed warm and touches no tensor value.
+    private static let emulatesResidencyAllocatorClear: Bool =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_QWEN_MTP_EMULATE_RESIDENCY_CLEAR"] == "1"
+
     /// Input-independent shape warm, run OUTSIDE every scored window.
     ///
     /// Warms the two forward shapes a round dispatches — the batched verify at
@@ -283,8 +333,36 @@ public final class Qwen36MTPBlockSession {
     public func warmAllDepths(maxDepth: Int) throws {
         // Keep the large shape-warm object graph in a separate call frame so
         // every throwaway cache and tensor is released before residency sizing.
+        let tWarmStart = DispatchTime.now().uptimeNanoseconds
         try warmAllDepthShapes(maxDepth: maxDepth)
+        let tShapesDone = DispatchTime.now().uptimeNanoseconds
         Self.wireResidentWeightsIfEnabled()
+        if Self.emulatesResidencyAllocatorClear { Memory.clearCache() }
+        let cacheAfterSizing = Memory.cacheMemory
+        // WARM REFILL, research arm, default OFF. Residency sizing calls
+        // `Memory.clearCache()`, so the seed forward and the first scored round
+        // first-touch fresh allocations INSIDE the timed window. Repeating the
+        // input-independent shapes would repopulate the pool before timing.
+        // The ranked receipt on `775a26e3` says that trade loses badly: the
+        // refilled scratch is admitted into the 64 MiB wired slack ahead of the
+        // decode state, and nothing is ever evicted. Kept behind a flag as the
+        // measured negative control for FINDING 172, not as a candidate.
+        if Self.warmRefillEnabled {
+            try warmAllDepthShapes(maxDepth: maxDepth)
+        }
+        let tDone = DispatchTime.now().uptimeNanoseconds
+        var line = "mlxfast: qwen-mtp warm"
+        line += " shapes_ms=\((tShapesDone - tWarmStart) / 1_000_000)"
+        line += " wnorm=\(Self.warmNormedVerifyEnabled ? 1 : 0)"
+        line += " wprefetch=\(Self.prefetchRestoredStateEnabled ? 1 : 0)"
+        line += " refill=\(Self.warmRefillEnabled ? 1 : 0)"
+        line += " refill_ms=\((tDone - tShapesDone) / 1_000_000)"
+        line += " emulated_clear=\(Self.emulatesResidencyAllocatorClear ? 1 : 0)"
+        line += " cache_after_sizing=\(cacheAfterSizing)"
+        line += " cache_end=\(Memory.cacheMemory) active_end=\(Memory.activeMemory)"
+        line += " wired_gate_fired=\(Self.residencySizingGateFires ? 1 : 0)"
+        line += " physmem=\(ProcessInfo.processInfo.physicalMemory)\n"
+        FileHandle.standardError.write(Data(line.utf8))
     }
 
     private func warmAllDepthShapes(maxDepth: Int) throws {
@@ -418,35 +496,32 @@ public final class Qwen36MTPBlockSession {
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
             // tape. Warm the same shapes the scored rounds dispatch.
-            // Warm the SAME expression scored rounds dispatch:
-            // `callWithHiddenAndNormed`. Warming only `callWithHidden`
-            // leaves the published post-norm output to cold-JIT inside the
-            // first timed verify — the 7b33621 failure mode. (Promoted at
-            // 1d7876fd/be3361b, then deleted by a later whole-file overlay;
-            // restored byte-for-byte with this provenance note.)
+            let warmInput = LMInput.Text(
+                tokens: MLXArray(block).reshaped([1, width]))
+            let nConfirmed = width >= 2 ? 1 : 0
+            // W-NORM. Every scored verify enters through
+            // `callWithHiddenAndNormed` and holds the normed block live across
+            // the round's single eval; this loop enters through
+            // `callWithHidden` and drops both extra outputs. Same primitives,
+            // different retained set, so the warm eval frees buffers the
+            // scored eval keeps. Warming the scored entry point removes that
+            // asymmetry at zero allocation cost outside the timed window.
+            var warmBundle: [MLXArray] = []
             let verifyLogits: MLXArray
-            let verifyNormed: MLXArray?
-            if width >= 2 {
-                let triple = model.callWithHiddenAndNormed(
-                    input: LMInput.Text(
-                        tokens: MLXArray(block).reshaped([1, width])),
-                    cache: warmCache, nConfirmed: 1)
-                verifyLogits = triple.0
-                verifyNormed = triple.2
+            if Self.warmNormedVerifyEnabled, width >= 2 {
+                let (logits, hidden, normed) = model.callWithHiddenAndNormed(
+                    input: warmInput, cache: warmCache, nConfirmed: nConfirmed)
+                verifyLogits = logits
+                warmBundle.append(hidden)
+                if let normed { warmBundle.append(normed) }
             } else {
-                let pair = model.callWithHidden(
-                    input: LMInput.Text(
-                        tokens: MLXArray(block).reshaped([1, width])),
-                    cache: warmCache, nConfirmed: 0)
-                verifyLogits = pair.0
-                verifyNormed = nil
+                (verifyLogits, _) = model.callWithHidden(
+                    input: warmInput, cache: warmCache, nConfirmed: nConfirmed)
             }
             // Compile the two top-2 reduction kernels outside the scored window
             // at every row count a round can dispatch.
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
-            var warmBundle: [MLXArray] = [verifyLogits, warmTop2IDs, warmTop2Values]
-            if let verifyNormed { warmBundle.append(verifyNormed) }
-            eval(warmBundle)
+            eval([verifyLogits, warmTop2IDs, warmTop2Values] + warmBundle)
             eval(warmCache.flatMap { $0.state })
             if width >= 3 {
                 // Warm arbitrary-prefix replay T=2...8. Restore all but the
@@ -467,13 +542,10 @@ public final class Qwen36MTPBlockSession {
         // Width 2 stays on the validated eager K1 path, so compile this last
         // missing replay shape with one extra throwaway width-3 verify.
         let oneRowReplayCache = model.newCache(parameters: nil)
-        let (oneRowReplayLogits, _, oneRowReplayNormed) =
-            model.callWithHiddenAndNormed(
-                input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
-                cache: oneRowReplayCache, nConfirmed: 1)
-        var oneRowBundle = [oneRowReplayLogits]
-        if let oneRowReplayNormed { oneRowBundle.append(oneRowReplayNormed) }
-        eval(oneRowBundle)
+        let (oneRowReplayLogits, _) = model.callWithHidden(
+            input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
+            cache: oneRowReplayCache, nConfirmed: 1)
+        eval(oneRowReplayLogits)
         eval(oneRowReplayCache.flatMap { $0.state })
         precondition(model.replayRecurrentPrefix(
             cache: oneRowReplayCache, committedRows: 1))
@@ -563,11 +635,7 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        // Restores 0dd455f0's validated qL{1..5} SDPA warm extension (receipt
-        // 3.2355→3.2414 in its note), removed by b40c28e's stale-base overlay.
-        // qL∈{2,3} are dispatched as chunk-B of width-7/8 verifies (see
-        // AttentionUtils exactness chunk).
-        for qL in [1, 2, 3, 4, 5] {
+        for qL in [1, 5, 4] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
@@ -593,11 +661,7 @@ public final class Qwen36MTPBlockSession {
             let k1025 = concatenated([extK, kPad1], axis: 2)
             let v1025 = concatenated([extV, vPad1], axis: 2)
             var outs1025: [MLXArray] = []
-            // Same provenance: restores 0dd455f0's validated qL{1..5} warm
-            // extension (receipt 3.2355→3.2414), removed by b40c28e's
-            // stale-base overlay. qL∈{2,3} hit as chunk-B of width-7/8
-            // verifies (AttentionUtils exactness chunk).
-            for qL in [1, 2, 3, 4, 5] {
+            for qL in [1, 5, 4] {
                 let q = MLXArray.zeros(
                     [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
                 outs1025.append(
@@ -897,6 +961,57 @@ public final class Qwen36MTPBlockSession {
     /// reproduce that experiment's published arithmetic exactly.
     internal static let boundaryTierFactor = 2.0301
 
+    /// E134: the verify width this stack prices as a boundary.
+    ///
+    /// The name is historical. It came from the pre-`onepass67` dispatch table
+    /// `[(3,3), (4,4), (5,5), (6,3), (7,4), (8,4), (9,3)]`, where
+    /// `passes(M) = ceil(M / IPG(M))` was 1 up to width 5 and 2 from width 6.
+    /// That justification is DEAD. The compiled default route is
+    /// `Qwen35CustomQMV.widthPlan` / `onepass67`,
+    /// `[(3,3), (4,4), (5,5), (6,6), (7,7), (8,4), (9,3)]`, so width 6 is now
+    /// one pass and the structural pass boundary is width 8.
+    ///
+    /// Width 6 is still the right place to price, for a different and
+    /// independently measured reason: the ranked round-cost curve refitted in
+    /// E134 item 2 puts its largest step at exactly this width, and boundary 4
+    /// is the argmax in 24 of 24 leave-one-prompt-out refits. So this constant
+    /// is now justified by a measurement, not by a pass-count law.
+    ///
+    /// `E134PassBoundaryPriceTests` pins the measured curve and fails if the
+    /// step moves. It no longer parses the dispatch table for this value,
+    /// because the table no longer decides it.
+    internal static let passBoundaryVerifyWidth = 6
+
+    /// E134: the tier factor for the pass boundary.
+    ///
+    /// E56 fitted `boundaryTierFactor` for widths 5 and 7 and this stack never
+    /// priced width 6. Our own ranked round-cost curve puts a `+14,711 us`
+    /// step at that width against a `3,446 us` local slope, a true cost ratio
+    /// of `4.27`. Pricing the true ratio loses: the replayed ranked median
+    /// reads `-2.78 %` at `4.2689` and `-2.23 %` at E56's `2.0301`. The
+    /// decision threshold is not the cost ratio, because the reach estimator
+    /// it multiplies is itself censored and biased low, so the paying tier is
+    /// far below the physical one. The replayed optimum is a broad plateau
+    /// from `1.35` to `1.60`, worth `+2.34 %` leave-one-prompt-out, and this
+    /// value sits in the middle of it.
+    ///
+    /// The E134 item 2 refit against the ranked `623e77af` pair reopened the
+    /// same plateau on the post-arm curve, from `1.35` to `1.60`, and moved
+    /// the held-out value to `+2.4683 %`. The measured argmax is `1.40`, worth
+    /// `+0.0137 pp` more than `1.45` against a leave-one-prompt-out spread of
+    /// `0.0751 pp`, so the constant does not move.
+    ///
+    /// The upper side is closed too. On the measured curve the replayed median
+    /// falls away monotonically above the plateau: `+2.4880 %` at `1.45`,
+    /// `+2.0969 %` at `1.70`, `+1.9173 %` at `1.74`, `+0.6588 %` at `1.85`.
+    /// The leave-one-prompt-out selection picks `1.45` in all 48 folds, so
+    /// raising the tier towards the physical cost ratio only loses value.
+    ///
+    /// Rule 79: no local timing leg can validate this. Only a ranked receipt
+    /// can, so the local pre-submit run is an exactness gate and never
+    /// evidence for the effect size.
+    internal static let passBoundaryTierFactor = 1.45
+
     /// The shipped flat price. `cumulative` repeats the tip's closed form
     /// instead of accumulating: `1.0 + 0.18 + 0.18 + 0.18` and
     /// `1.0 + 3.0 * 0.18` differ by one ulp, and a control arm that is not
@@ -913,13 +1028,14 @@ public final class Qwen36MTPBlockSession {
     /// One priced boundary, holding the total. `width` is the verify width
     /// the priced step ENTERS, so it selects index `width - 2`.
     internal static func makeBoundaryDepthPrice(
-        enteringVerifyWidth width: Int
+        enteringVerifyWidth width: Int,
+        tier: Double = boundaryTierFactor
     ) -> DepthPrice {
         let count = Qwen36MTPLimits.maxDepth
         let within = Double(count) * headStepCostRatio
-            / (Double(count - 1) + boundaryTierFactor)
+            / (Double(count - 1) + tier)
         var marginal = [Double](repeating: within, count: count)
-        marginal[width - 2] = within * boundaryTierFactor
+        marginal[width - 2] = within * tier
         return DepthPrice(marginal: marginal,
                           cumulative: prefixCosts(marginal))
     }
@@ -976,19 +1092,210 @@ public final class Qwen36MTPBlockSession {
     }
 
     internal enum DepthPriceArm: String {
-        case ship, pb5, pb7, pbfit
+        case ship, pb5, pb6, pb7, pbfit
     }
 
-    /// THE ONE LINE AN ARM SESSION PATCHES. `QwenMTPDepthPriceTests` pins the
-    /// shipped value so a leg session cannot leave another arm behind.
+    /// E150 R4: the ranked per-width round cost curve, in microseconds, at
+    /// verify widths 1 through 9.
     ///
-    /// The shipped default is `ship` (uniform). `pbfit` wins by -3.5 % on this
-    /// host's kernel dispatch table and loses that win entirely on the crown
-    /// table (E75 rung B/D: +0.33 % on crown, a +3.8 pp interaction). The
-    /// shape is fitted to one dispatch table, so it is a research arm, not a
-    /// shipped constant. Refit and re-price on the live table before shipping
-    /// any non-uniform shape.
-    internal static let depthPriceArm: DepthPriceArm = .ship
+    /// This is the curve E145 R2 read off LIVE PINNED DECODES on the ranked
+    /// runner, not a curve rebuilt from isolated kernel timings. The pin at
+    /// `MLX_E145_PIN_DEPTH` is what made it measurable: the shipped schedule
+    /// chooses depth from the round's own state, so an unpinned leg only ever
+    /// samples the widths the estimator already believed were hot. E145 R3
+    /// installs it at every width with the two-segment fit held at zero, so
+    /// no fitted line can smooth away the step at width 6.
+    ///
+    /// Width 9 is EXTRAPOLATED from the last measured step. It is reachable
+    /// only at depth 8, which `segmentedVerifyDepthCap` already closes, so it
+    /// never prices a decision this session can take.
+    ///
+    /// Rule 79: no local timing leg can validate this table. Its value is an
+    /// offline replay price, and only a ranked receipt can confirm it.
+    internal static let rankedMeasuredRoundMicroseconds: [Double] = [
+        65778.93576562102,
+        70905.344451175013,
+        76196.540204972174,
+        84374.327044333186,
+        95820.260836797606,
+        124257.1286225723,
+        150803.19359188987,
+        153965.40820598602,
+        157127.62282008218,
+    ]
+
+    /// The ranked curve as a `DepthPrice`, in the units the walk already uses:
+    /// one verify forward at width 1 is `1.0`, so
+    /// `marginal[d] = (C(d + 2) - C(d + 1)) / C(1)`.
+    ///
+    /// This does NOT rescale to `maxDepth * headStepCostRatio`. That rescale
+    /// is what `makeMeasuredDepthPrice` does, and it is the reason `pbfit`
+    /// carries only the SHAPE of its curve: holding the total at the shipped
+    /// `1.44` throws away the level. The level is the whole point here,
+    /// because the linearised rule compares an absolute cost against an
+    /// absolute value of `lambda` and a rescaled table shifts every
+    /// comparison. This table totals `1.3887`, close to but not equal to the
+    /// shipped `1.44`, and the difference is measured rather than assumed.
+    internal static func makeRankedMeasuredDepthPrice() -> DepthPrice {
+        let curve = rankedMeasuredRoundMicroseconds
+        precondition(curve.count == Qwen36MTPLimits.maxDepth + 1,
+                     "E150 R4: the ranked curve must cover widths 1...maxDepth + 1")
+        let unit = curve[0]
+        var marginal = [Double]()
+        marginal.reserveCapacity(Qwen36MTPLimits.maxDepth)
+        for depth in 0 ..< Qwen36MTPLimits.maxDepth {
+            marginal.append((curve[depth + 1] - curve[depth]) / unit)
+        }
+        return DepthPrice(marginal: marginal,
+                          cumulative: prefixCosts(marginal))
+    }
+
+    /// E150 R4: the schedule rule.
+    ///
+    /// `shipped` is the first-break walk that compiles today. It extends while
+    /// the reach estimate beats a LOCAL threshold built from the next step's
+    /// marginal price, and it stops at the first step that fails. `linearised`
+    /// keeps walking to the cap and returns the GLOBAL argmax of
+    /// `lambda * (1 + E[A_d]) - C_d`.
+    ///
+    /// The two rules answer different questions, and only one of them matches
+    /// the score. The published score is a ratio of SUMS over the whole
+    /// window, and the greedy step that minimises `sum C / sum T` is exactly
+    /// the argmax above at the session's running cost per token. A first-break
+    /// walk instead maximises a per-round ratio, which agrees with the score
+    /// only when every round already has the same ratio. The measured cost
+    /// curve makes the difference concrete: it is strongly non-concave, with a
+    /// `+28,437 us` step into width 6 followed by a `+3,162 us` step into
+    /// width 8, so a first-break walk stops in the dip at width 6 and never
+    /// sees that the cheap step past it pays.
+    internal enum ScheduleArm: String {
+        case shipped, linearised
+    }
+
+    /// The session's normalised cost per emitted token at the fixed point.
+    ///
+    /// `lambda` in the linearised rule is the running `sum C / sum T`. E150
+    /// R0.5 solved the self-consistent value by bisection instead of tracking
+    /// it: at `mu*` the schedule the rule chooses achieves exactly `mu*` cost
+    /// per token, so a constant is not an approximation of the tracker, it is
+    /// its fixed point. Bisection converged for all four states with tolerance
+    /// `1e-4` and at most 40 steps.
+    ///
+    /// A constant also removes a whole class of failure. A running tracker
+    /// makes every round's decision depend on the window's history, which
+    /// makes the schedule sensitive to where a window starts and gives a cold
+    /// start no principled value at all.
+    ///
+    /// Fitted leave-one-prompt-out: the eight folds put `mu*` between `0.4072`
+    /// and `0.4768`, and the held-out schedule scores `+1.0487 %` against
+    /// `+1.1178 %` pooled, a `-0.0691 pp` selection cost. E150 R1 reaches the
+    /// same neighbourhood from a different direction: sweeping a frozen
+    /// `lambda` over the R1 predictor peaks at `0.40`.
+    ///
+    /// Rule 79 applies. This constant is priced offline; only a ranked receipt
+    /// can confirm it.
+    internal static let linearisedLambdaStar = 0.45642623901367185
+
+    /// The leave-one-prompt-out spread of `linearisedLambdaStar`, pinned so a
+    /// test can prove the constant sits inside its own folds.
+    internal static let linearisedLambdaStarFoldRange = (0.4072, 0.4768)
+
+    /// `MLX_E150_SCHEDULE_ARM` selects the rule at run time so a local A/B can
+    /// time both with ONE worker binary, the same reason
+    /// `MLX_E134_DEPTH_PRICE_ARM` exists. `MLX_` is load bearing:
+    /// `sanitizedRuntimeWorkerEnvironment` forwards `MLX_` and drops
+    /// `MLXFAST_`, so an `MLXFAST_`-spelled gate never reaches the worker that
+    /// owns the decode path.
+    ///
+    /// Unset gives `.linearised`, so the compiled default IS this experiment's
+    /// candidate. `shipped` restores the previous schedule exactly, including
+    /// its uniform price table and both margin clamps.
+    ///
+    /// The read happens once, at static initialisation, so no round pays for
+    /// it, and the value cannot vary with prompt content or benchmark phase.
+    /// An unrecognised value falls back to the default, so CAMPAIGN RULE 114
+    /// applies: witness the arm from the run's own schedule trace, never from
+    /// the variable it was asked with.
+    internal static let scheduleArm: ScheduleArm = {
+        let requested = ProcessInfo.processInfo
+            .environment["MLX_E150_SCHEDULE_ARM"] ?? ""
+        return ScheduleArm(rawValue: requested) ?? .linearised
+    }()
+
+    /// Built once. A computed property would allocate two arrays per round
+    /// inside the timed path.
+    internal static let linearisedDepthPrice: DepthPrice =
+        makeRankedMeasuredDepthPrice()
+
+    /// THE ONE VALUE AN ARM SESSION VARIES. `QwenMTPDepthPriceTests` pins the
+    /// compiled default so a leg session cannot leave another arm behind.
+    ///
+    /// The shipped arm is `pb6`: one priced step at the width-6 pass boundary,
+    /// tier `1.45`, with the total held so every shallower step gets cheaper.
+    /// E134 rung 4 scored it at `+2.3422 %` held out on the pre-arm curve, and
+    /// the E134 item 2 refit of the ranked `623e77af` pair raised that to
+    /// `+2.4683 %` because the one-pass QMV arm made width 7 cheaper while
+    /// width 6 stayed dear. Boundary 4 is the argmax in 24 of 24 leave-one-
+    /// prompt-out refits and 5997 of 6000 bootstrap draws.
+    ///
+    /// `pbfit` is NOT shipped. It wins by -3.5 % on this host's kernel
+    /// dispatch table and loses that win entirely on the crown table (E75
+    /// rung B/D: +0.33 % on crown, a +3.8 pp interaction). Its shape is
+    /// fitted to one host's timings at every width.
+    ///
+    /// `pb6` differs in two ways. It fits one step, not a whole vector, so
+    /// there are far fewer ways for it to overfit. And its step is placed by
+    /// a curve measured on the RANKED runner, not on this host, which is the
+    /// exact transfer that beat `pbfit`. Note that the one-pass QMV arm moved
+    /// the structural pass boundary off width 6 to width 8, so the pass-count
+    /// law no longer justifies this width; `E134PassBoundaryPriceTests` pins
+    /// that move and pins the measured ranked curve that does justify it.
+    ///
+    /// `MLX_E134_DEPTH_PRICE_ARM` selects the arm at run time so a local A/B
+    /// can time two arms with ONE worker binary. Rebuilding between arms is
+    /// what this avoids: a price arm changes the round count, and comparing
+    /// two separately built binaries also compares every other source change
+    /// between them, which is how the first `pb6` screen ended up carrying an
+    /// unrelated flag-hoisting commit.
+    ///
+    /// Unset gives `.pb6`, so the compiled default IS the shipped behaviour.
+    /// The read happens once, when this `static let` initialises, so no round
+    /// pays for it. The value cannot vary with prompt content, benchmark
+    /// phase, or anything else the request carries. An unrecognised value
+    /// falls back to the default, which is the right runtime behaviour and
+    /// the wrong test behaviour, so CAMPAIGN RULE 114 applies: witness the arm
+    /// from the run's own schedule, never from the variable it was asked with.
+    internal static let depthPriceArm: DepthPriceArm = {
+        let requested = ProcessInfo.processInfo
+            .environment["MLX_E134_DEPTH_PRICE_ARM"] ?? ""
+        return DepthPriceArm(rawValue: requested) ?? .ship
+    }()
+
+    /// E145 RESEARCH INSTRUMENT, DEFAULT OFF. Pin the drafted depth to a
+    /// constant so every drafting round realises verify width `depth + 1`.
+    ///
+    /// The whole depth-price apparatus is priced through a per-width round
+    /// cost curve that was REBUILT from isolated kernel timings and transfer
+    /// factors, never read off a live decode. A per-width cost read from a
+    /// shipped leg cannot replace it: the shipped schedule chooses depth from
+    /// the round's own state, so the rounds that reach width 6 are exactly the
+    /// rounds the estimator already believed were hot. Pinning the depth
+    /// removes that selection and makes the per-round cost at each width
+    /// directly measurable.
+    ///
+    /// `MLX_` is load bearing. `sanitizedRuntimeWorkerEnvironment` forwards
+    /// `MLX_` and drops `MLXFAST_`, so an `MLXFAST_`-spelled gate would never
+    /// reach the worker process that owns the decode path (harness defect 28).
+    ///
+    /// Read once, at static initialisation, so no round pays for it. An absent
+    /// or unparseable value leaves the shipped estimator in charge, which is
+    /// the shipped behaviour byte for byte.
+    internal static let e145PinnedDepth: Int? = {
+        guard let raw = ProcessInfo.processInfo
+            .environment["MLX_E145_PIN_DEPTH"], let value = Int(raw)
+        else { return nil }
+        return value
+    }()
 
     /// Built once. A computed property here would allocate two arrays on
     /// every round, inside the timed path.
@@ -996,6 +1303,9 @@ public final class Qwen36MTPBlockSession {
         switch depthPriceArm {
         case .ship: return makeUniformDepthPrice()
         case .pb5: return makeBoundaryDepthPrice(enteringVerifyWidth: 5)
+        case .pb6: return makeBoundaryDepthPrice(
+            enteringVerifyWidth: passBoundaryVerifyWidth,
+            tier: passBoundaryTierFactor)
         case .pb7: return makeBoundaryDepthPrice(enteringVerifyWidth: 7)
         case .pbfit: return makeMeasuredDepthPrice()
         }
@@ -1114,6 +1424,15 @@ public final class Qwen36MTPBlockSession {
         // there would describe the next round's inputs, not this one's.
         if Self.traceRounds { snapshotScheduleSignal(widthCap: widthCap) }
         guard cap > 0 else { return 0 }
+        // E145: the pin sits INSIDE the shipped width envelope, so a pinned
+        // leg can never reach a verify width the campaign has not proven
+        // exact. Only the estimator is removed.
+        if let pinned = Self.e145PinnedDepth {
+            return Swift.max(0, Swift.min(cap, pinned))
+        }
+        if Self.scheduleArm == .linearised {
+            return linearisedDepth(cap: cap)
+        }
         let price = Self.depthPrice
         var reach = 1.0
         var expected = 0.0
@@ -1143,6 +1462,64 @@ public final class Qwen36MTPBlockSession {
         return depth
     }
 
+    /// E150 R4. The global argmax of `lambda * (1 + E[A_d]) - C_d` over every
+    /// depth the cap allows, on the ranked measured cost curve, with the two
+    /// margin clamps removed.
+    ///
+    /// Three differences from the shipped walk, and each one is measured.
+    ///
+    /// FIRST, it does not break. It evaluates the objective at every reachable
+    /// depth and keeps the best, so a local dip in the cost curve cannot hide
+    /// a cheaper step behind it. On the measured curve the step into width 8
+    /// costs `3,162 us` against `28,437 us` into width 6, so this is not a
+    /// theoretical difference.
+    ///
+    /// SECOND, the price table is the ranked measured curve, not the uniform
+    /// `1 + 0.18d`. E150 R1 separated these two changes: swapping the table
+    /// alone under the shipped rule is worth `+0.1155 pp`, which is exactly
+    /// the published `+0.1338` shipped cell, so the table swap accounts for
+    /// the whole of that published number and the rule change is the rest.
+    ///
+    /// THIRD, the depth-0 and depth-1 sigmoid clamps on `pendingTop2` are
+    /// gone. Under the shipped first-break rule they are protective, because
+    /// an over-confident first step commits the walk. Under an argmax they
+    /// only censor the estimate: E150 R0.5 prices the same rule at `+0.2317 %`
+    /// with the clamps and `+1.1178 %` without, so nearly the whole effect is
+    /// on this line. The clamps are part of the mechanism, not a separate
+    /// experiment, because the rule that makes them safe is the rule this
+    /// replaces.
+    ///
+    /// Safety does not depend on the clamps. `reach` is still a product of the
+    /// per-position acceptance EMAs and still collapses on a cold stretch, and
+    /// `cap` still carries `segmentedVerifyDepthCap`, so no round can reach a
+    /// verify width the campaign has not proven bit-exact.
+    ///
+    /// Rule 79: every number above is an offline replay price.
+    private func linearisedDepth(cap: Int) -> Int {
+        let price = Self.linearisedDepthPrice
+        let lambda = Self.linearisedLambdaStar
+        var best = 0
+        var bestValue = lambda - price.cumulative[0]
+        var reach = 1.0
+        var expected = 0.0
+        var depth = 0
+        while depth < cap {
+            reach *= positionAcceptEMA[depth]
+            expected += reach
+            depth += 1
+            let value = lambda * (1.0 + expected) - price.cumulative[depth]
+            if Self.traceRounds {
+                scheduleTrace += String(
+                    format: "%d:%.6f/%.6f/%.6f;", depth, reach, expected, value)
+            }
+            if value > bestValue {
+                bestValue = value
+                best = depth
+            }
+        }
+        return best
+    }
+
     /// Trace-gated record of the schedule's inputs and its extension walk.
     /// Written only when the phase trace is on, so the scored schedule runs
     /// byte-identical arithmetic without it.
@@ -1162,9 +1539,14 @@ public final class Qwen36MTPBlockSession {
         }
         let emas = positionAcceptEMA
             .map { String(format: "%.6f", $0) }.joined(separator: ",")
-        scheduleTrace = "arm=" + Self.depthPriceArm.rawValue + " " + String(
-            format: "m=%.6f streak=%d cap=%d ema=",
-            margin, fullAcceptStreak, widthCap) + emas + " sched="
+        // CAMPAIGN RULE 114: the run witnesses its own arms here, so a leg
+        // that was asked for one arm and silently fell back to the default is
+        // visible in the trace rather than only in the launch environment.
+        scheduleTrace = "arm=" + Self.depthPriceArm.rawValue
+            + " rule=" + Self.scheduleArm.rawValue + " " + String(
+                format: "lam=%.9f m=%.6f streak=%d cap=%d ema=",
+                Self.linearisedLambdaStar, margin, fullAcceptStreak,
+                widthCap) + emas + " sched="
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
@@ -1816,18 +2198,7 @@ public final class Qwen36MTPBlockSession {
                     _ = entry.trim(entry.offset - committedOffset)
                 }
             }
-            // E020 replay-prefetch (promoted +0.039%, then deleted by a
-            // whole-file overlay in 6209702 whose author never opened this
-            // file — see Amal-David's crown-tree audit note 062ba58): submit
-            // the restored GDN boundary states asynchronously so the next
-            // round's draft chain does not stall on their first use.
-            // Re-validated 2026-08-21: ranked pair a5cd3ef vs ccc5184
-            // moved +0.033%, reproducing the promoted receipt within noise.
-            let replayedRecurrentStates = cache.compactMap { entry -> MLXArray? in
-                guard let arrays = entry as? ArraysCache else { return nil }
-                return arrays[1]
-            }
-            asyncEval(replayedRecurrentStates)
+            prefetchRecurrentBoundary(cache)
             return true
         }
 
@@ -1855,7 +2226,20 @@ public final class Qwen36MTPBlockSession {
                 _ = entry.trim(entry.offset - committedOffset)
             }
         }
+        prefetchRecurrentBoundary(cache)
         return true
+    }
+
+    /// W-PREFETCH (E020). Submit the restored recurrent boundary as soon as the
+    /// reject path defines it, instead of leaving the next round's opening
+    /// draft step to build it inside the charged window. `asyncEval` is a
+    /// scheduling hint on already-defined arrays: it changes no value, so
+    /// exactness is unchanged by construction.
+    private static func prefetchRecurrentBoundary(_ cache: [any KVCache]) {
+        guard prefetchRestoredStateEnabled else { return }
+        let state = cache.compactMap { $0 as? ArraysCache }
+            .flatMap { $0.state }
+        if !state.isEmpty { asyncEval(state) }
     }
 
     private static func clearRecurrentRollback(_ cache: [any KVCache]) {
