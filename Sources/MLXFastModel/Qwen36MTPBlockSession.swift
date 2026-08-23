@@ -412,19 +412,24 @@ public final class Qwen36MTPBlockSession {
                 cache: historyWarmCache)
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
-        // FLUSH-FOLD WARM. After the first accepted streak, a live round folds
-        // `acceptedCount + 1` contiguous history rows into its first head
-        // step, so widths 3...maxDepth+1 can otherwise JIT inside scored
-        // rounds. Feed the same contiguous [1, foldWidth, hDim] layout, the
-        // same K/V-only-history call chain, and the same final draft-ID
-        // expression on zeros; values and throwaway cache are never observed.
+        // Flush-fold widths 3...maxDepth+1. A live round's FIRST head step
+        // folds acceptedCount+1 rows through this exact expression
+        // (`draftInputHidden = concatenated(flushHidden, axis: 1)`), so every
+        // width beyond 2 otherwise JIT-compiles its appendHistoryKV /
+        // folded-rows attention / M-row head projections inside a scored
+        // round the first time a streak reaches it (Floofy6 isolate-B
+        // receipt; sibling qL{2,3} SDPA warm restore ranked +0.18%).
+        // Values are zeros on the same throwaway cache; only shape+dtype
+        // select kernels. The cache grows by <= maxDepth rows past the
+        // folded state, staying in the same long-context dispatch family as
+        // decode (~512+ committed rows), matching how the live history
+        // length also drifts upward across the window.
         if maxDepth >= 2 {
             for foldWidth in 3 ... (maxDepth + 1) {
                 let flushHidden = MLXArray.zeros(
                     [1, foldWidth, hDim], dtype: row.dtype)
                 let flushTokens = MLXArray(
-                    Array(repeating: Int32(0), count: foldWidth)
-                ).reshaped([1, foldWidth])
+                    Array(repeating: Int32(0), count: foldWidth)).reshaped([1, foldWidth])
                 let flushFolded = model.mtpHeadLastHiddenWithKVOnlyHistory(
                     hidden: flushHidden, nextTokenIds: flushTokens,
                     cache: historyWarmCache)
@@ -432,9 +437,7 @@ public final class Qwen36MTPBlockSession {
                         hidden: flushHidden, nextTokenIds: flushTokens,
                         cache: historyWarmCache)
                 eval(model.draftTokenID(
-                    flushFolded[
-                        0..., (flushFolded.dim(1) - 1) ..< flushFolded.dim(1),
-                        0...]))
+                    flushFolded[0..., (flushFolded.dim(1) - 1) ..< flushFolded.dim(1), 0...]))
             }
         }
         eval(historyWarmCache.flatMap { $0.state })
@@ -1001,7 +1004,52 @@ public final class Qwen36MTPBlockSession {
     }
 
     internal enum DepthPriceArm: String {
-        case ship, pb5, pb7, pbfit
+        case ship, pb5, pb7, pbfit, morgan
+    }
+
+    /// Post-specialization measured shape (the `morgan` arm). The E68/pbfit
+    /// shape is fitted to a dispatch table that no longer exists: the
+    /// width-6/7 single-pass QMV bodies (morganmcg1, promoted `623e77a`)
+    /// flattened the verify cost curve so its only remaining step sits
+    /// between verify widths 7 and 8. Raw shape in V units:
+    ///
+    /// - Steps into widths 2..7 (marginal indices 0..5) cost ~0.12 V each
+    ///   — the 27,894.3 + 3,388.3*M cycle line of the post-specialization
+    ///   one-pass table (3,388.3 / 27,894.3 = 0.1215).
+    /// - The step into width 8 (index 6) additionally crosses the sdpa
+    ///   two-call exactness chunk: the forced-depth arms measured a flat
+    ///   +27.5 ms step at that boundary against a ~27 ms verify base
+    ///   (alfranli123 forced-depth receipt), i.e. ~1.14 V total.
+    /// - Index 7 (width-9 entry) is dead under `segmentedVerifyDepthCap`
+    ///   7; it mirrors index 6 so the rescale does not distort the live
+    ///   indices.
+    ///
+    /// Rescaled to the shipped total (`maxDepth * headStepCostRatio`), this
+    /// prices mid-depth drafts well BELOW the uniform 0.18 and prices the
+    /// width-8 entry above any reachable reach, so the walk stops spending
+    /// rounds on the one boundary the kernels made expensive while drafting
+    /// deeper through the widths they made cheap. This is morganmcg1's own
+    /// pre-registered follow-up arm ("whatever this archive scores, it is a
+    /// lower bound" — repricing left out of `623e77a` for attribution).
+    /// Behavior is robust to the exact toll: for any toll in +15..+40 ms the
+    /// qualitative outcome is identical (cheap mid steps, unreachable width-8
+    /// threshold). Distinct from E75's pbfit-on-crown result (+0.33 %): pbfit
+    /// carries the OLD table's big step at width-6 entry; this shape carries
+    /// the live table's.
+    internal static func makeMorganDepthPrice() -> DepthPrice {
+        let count = Qwen36MTPLimits.maxDepth
+        precondition(count == 8,
+            "morgan price assumes the track's maxDepth 8 table")
+        let within = 0.1215
+        let boundary = within + 27.5 / 27.0
+        var raw = [Double](repeating: within, count: count)
+        raw[6] = boundary
+        raw[7] = boundary
+        let total = Double(count) * headStepCostRatio
+        let scale = total / raw.reduce(0.0, +)
+        let marginal = raw.map { $0 * scale }
+        return DepthPrice(marginal: marginal,
+                          cumulative: prefixCosts(marginal))
     }
 
     /// THE ONE LINE AN ARM SESSION PATCHES. `QwenMTPDepthPriceTests` pins the
@@ -1013,7 +1061,7 @@ public final class Qwen36MTPBlockSession {
     /// shape is fitted to one dispatch table, so it is a research arm, not a
     /// shipped constant. Refit and re-price on the live table before shipping
     /// any non-uniform shape.
-    internal static let depthPriceArm: DepthPriceArm = .ship
+    internal static let depthPriceArm: DepthPriceArm = .morgan
 
     /// Built once. A computed property here would allocate two arrays on
     /// every round, inside the timed path.
@@ -1023,6 +1071,7 @@ public final class Qwen36MTPBlockSession {
         case .pb5: return makeBoundaryDepthPrice(enteringVerifyWidth: 5)
         case .pb7: return makeBoundaryDepthPrice(enteringVerifyWidth: 7)
         case .pbfit: return makeMeasuredDepthPrice()
+        case .morgan: return makeMorganDepthPrice()
         }
     }()
 
@@ -1517,11 +1566,17 @@ public final class Qwen36MTPBlockSession {
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
-        bundle.append(contentsOf: draftIdArrays)
+        // One concatenated draft-id readout rides the round's single batched
+        // eval, so the accept walk copies ONE materialised buffer instead of
+        // paying d separate `.item()` readbacks (Carme99 rider 99e46f4).
+        // Same integers, same order; `verifyTokens` still chains the raw
+        // per-step arrays.
+        let draftsReadout = concatenated(draftIdArrays, axis: 0)
+        bundle.append(draftsReadout)
         eval(cache.flatMap { $0.state } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
-        let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
+        let drafts = draftsReadout.asArray(Int32.self).map { Int($0) }
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
