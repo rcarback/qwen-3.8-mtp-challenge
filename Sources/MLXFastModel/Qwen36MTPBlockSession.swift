@@ -1457,9 +1457,7 @@ public final class Qwen36MTPBlockSession {
         //    discard only the draft token instead of re-forwarding the primary.
         let snapshot = Self.snapshotRecurrent(cache)
         if Self.traceRounds { tSnapshotDone = DispatchTime.now().uptimeNanoseconds }
-        let verifyTokens = concatenated(
-            [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
-            axis: 1)
+        let primaryTokenArray = MLXArray([Int32(primary)]).reshaped([1, 1])
         // nConfirmed: 1 at every drafting width. K=1 writes its promoted eager
         // primary checkpoint; K>=2 keeps exact recurrence inputs so a partial
         // accept can replay only its committed prefix without a repair forward.
@@ -1477,10 +1475,22 @@ public final class Qwen36MTPBlockSession {
         // accepted head-history rows do not each repeat the same row-local
         // RMSNorm through applyFinalNorm. Conformers that return nil retain the
         // old path through the guarded hiddenRow overload below.
-        let (verifyLogits, verifyHidden, verifyNormed) =
-            model.callWithHiddenAndNormed(
+        let verifyForward: (MLXArray, MLXArray, MLXArray?)
+        if let segmented = model.callWithSegmentedVerifyInputAndNormed(
+            primaryToken: primaryTokenArray,
+            draftTokenIDs: draftIdArrays,
+            cache: cache,
+            nConfirmed: 1)
+        {
+            verifyForward = segmented
+        } else {
+            let verifyTokens = concatenated(
+                [primaryTokenArray] + draftIdArrays, axis: 1)
+            verifyForward = model.callWithHiddenAndNormed(
                 input: LMInput.Text(tokens: verifyTokens),
                 cache: cache, nConfirmed: 1)
+        }
+        let (verifyLogits, verifyHidden, verifyNormed) = verifyForward
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read

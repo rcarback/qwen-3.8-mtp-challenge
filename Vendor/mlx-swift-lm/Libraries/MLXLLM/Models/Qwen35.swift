@@ -251,6 +251,70 @@ private let qwen35CompiledSigmoidMultiply:
     return body
 }()
 
+/// The verify input is one host-known primary token followed by 1...8
+/// device-resident draft ids. The incumbent first concatenates those scalar
+/// arrays, then launches Embedding. This kernel reads the same ids in the same
+/// order and writes the embedding rows directly, removing the intermediate id
+/// allocation/copy and one dispatch.
+private let qwen35SegmentedVerifyEmbeddingKernel = MLXFast.metalKernel(
+    name: "qwen35_segmented_verify_embedding_v1",
+    inputNames: [
+        "weight", "primary", "draft0", "draft1", "draft2", "draft3",
+        "draft4", "draft5", "draft6", "draft7",
+    ],
+    outputNames: ["embedded"],
+    source: """
+        const uint index = thread_position_in_grid.x;
+        const uint hidden = uint(weight_shape[1]);
+        const uint row = index / hidden;
+        const uint column = index - row * hidden;
+        int token_id;
+        switch (row) {
+        case 0: token_id = primary[0]; break;
+        case 1: token_id = draft0[0]; break;
+        case 2: token_id = draft1[0]; break;
+        case 3: token_id = draft2[0]; break;
+        case 4: token_id = draft3[0]; break;
+        case 5: token_id = draft4[0]; break;
+        case 6: token_id = draft5[0]; break;
+        case 7: token_id = draft6[0]; break;
+        case 8: token_id = draft7[0]; break;
+        default: token_id = draft7[0]; break;
+        }
+        const ulong weight_offset =
+            ulong(token_id) * ulong(weight_strides[0])
+            + ulong(column) * ulong(weight_strides[1]);
+        embedded[index] = weight[weight_offset];
+        """,
+    ensureRowContiguous: false
+)
+
+private func qwen35SegmentedVerifyEmbedding(
+    weight: MLXArray,
+    primary: MLXArray,
+    drafts: [MLXArray]
+) -> MLXArray? {
+    guard (1 ... 8).contains(drafts.count),
+          weight.dtype == .bfloat16,
+          weight.shape == [248_320, 5_120],
+          primary.dtype == .int32,
+          primary.size == 1,
+          drafts.allSatisfy({ $0.dtype == .int32 && $0.size == 1 })
+    else { return nil }
+
+    var padded = drafts
+    while padded.count < 8 { padded.append(drafts[drafts.count - 1]) }
+    let rows = drafts.count + 1
+    let hidden = weight.dim(1)
+    return qwen35SegmentedVerifyEmbeddingKernel(
+        [weight, primary] + Array(padded.prefix(8)),
+        grid: (rows * hidden, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, rows, hidden]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 
 // MARK: - packed GDN prework mixer (verify widths 3...9)
 //
@@ -3639,7 +3703,19 @@ public class Qwen35TextModelInner: Module {
         cache: [KVCache?]? = nil,
         nConfirmed: Int = 0
     ) -> MLXArray {
-        var hiddenStates = embedTokens(inputs)
+        callWithEmbeddings(
+            embedTokens(inputs), cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// Backbone twin for a caller that already produced the exact embedding
+    /// rows. Used by the verify segmented-embedding path; all layer, mask,
+    /// cache, ladder, and final-hidden behavior below is shared.
+    fileprivate func callWithEmbeddings(
+        _ embeddings: MLXArray,
+        cache: [KVCache?]? = nil,
+        nConfirmed: Int = 0
+    ) -> MLXArray {
+        var hiddenStates = embeddings
 
         var cacheArray = cache
         if cacheArray == nil {
@@ -3661,8 +3737,8 @@ public class Qwen35TextModelInner: Module {
         // The seed-prefill stride is fixed at 3: E91 swept 9 schedules over 108
         // blocks and the best arm was 0.94 sigma, because the host enqueues the
         // whole graph in 118.7 ms of a 4043 ms GPU-bound block.
-        let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        let prefillLadder = embeddings.dim(1) >= 512
+        let ladderActive = embeddings.dim(1) <= 9 || prefillLadder
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
             // Boundary-fused chain: the residual boundary flows as an
             // UNMERGED (base, delta) pair, so each interior layer pays one
@@ -5416,6 +5492,33 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden, normed)
     }
 
+    /// Verify forward with a primary scalar and device draft scalars as the
+    /// embedding producer inputs. Returns nil before any cache mutation when
+    /// the exact segmented gather is not applicable.
+    public func callWithSegmentedVerifyInputAndNormed(
+        primaryToken: MLXArray,
+        draftTokenIDs: [MLXArray],
+        cache: [any KVCache],
+        nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?)? {
+        guard let embedded = qwen35SegmentedVerifyEmbedding(
+            weight: model.embedTokens.weight,
+            primary: primaryToken,
+            drafts: draftTokenIDs)
+        else { return nil }
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model.callWithEmbeddings(
+            embedded, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = model.norm(hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = routedLMHead(lmHead, normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, hidden, normed)
+    }
+
     /// Rebuild the target's recurrent cache after an accepted verify prefix.
     public func replayRecurrentPrefix(
         cache: [any KVCache], committedRows: Int
@@ -6016,6 +6119,20 @@ extension Qwen35Model: MTPCapable {
     ) -> (MLXArray, MLXArray, MLXArray?) {
         languageModel.callWithHiddenAndNormed(
             input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.callWithSegmentedVerifyInputAndNormed`.
+    public func callWithSegmentedVerifyInputAndNormed(
+        primaryToken: MLXArray,
+        draftTokenIDs: [MLXArray],
+        cache: [any KVCache],
+        nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?)? {
+        languageModel.callWithSegmentedVerifyInputAndNormed(
+            primaryToken: primaryToken,
+            draftTokenIDs: draftTokenIDs,
+            cache: cache,
+            nConfirmed: nConfirmed)
     }
 
     /// See `Qwen35TextModel.replayRecurrentPrefix`.

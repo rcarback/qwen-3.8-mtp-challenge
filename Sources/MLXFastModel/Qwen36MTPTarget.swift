@@ -59,6 +59,16 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray, MLXArray?)
 
+    /// Optional verify-input producer that consumes one primary scalar and the
+    /// device-resident draft scalars without first concatenating token ids.
+    /// Must return nil before cache mutation when unavailable.
+    func callWithSegmentedVerifyInputAndNormed(
+        primaryToken: MLXArray,
+        draftTokenIDs: [MLXArray],
+        cache: [any KVCache],
+        nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?)?
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.
@@ -124,6 +134,15 @@ extension Qwen36MTPTarget {
         let (logits, hidden) = callWithHidden(
             input: input, cache: cache, nConfirmed: nConfirmed)
         return (logits, hidden, nil)
+    }
+
+    public func callWithSegmentedVerifyInputAndNormed(
+        primaryToken: MLXArray,
+        draftTokenIDs: [MLXArray],
+        cache: [any KVCache],
+        nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?)? {
+        nil
     }
 }
 
