@@ -1,3 +1,5 @@
+// Variance-resample attempt marker: draw 3 from tip ec24d59 (E98b, post-failure retry).
+
 import Foundation
 import MLX
 import MLXFastCore
