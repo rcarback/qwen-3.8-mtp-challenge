@@ -2367,6 +2367,27 @@ func qwen35FusedResidualRMSNorm(
     return (outputs[0], outputs[1])
 }
 
+/// Backbone `model.norm` with producer-side xsums, using the already-promoted
+/// fused residual+RMSNorm kernel and a zero residual.
+///
+/// `bfloat(float(x)+float(0))` is identity at every finite BF16, so `normed`
+/// matches eager `RMSNorm(x)` and the sidecar keys on the object
+/// `routedLMHead` consumes. Serial M=1 never enters (`tablePays >= 4`).
+/// A strided or non-bf16/5120 activation keeps today's `rms(x)`.
+func qwen35FinalNorm(_ rms: RMSNorm, _ x: MLXArray) -> MLXArray {
+    guard Qwen35XSumsSidecar.wants(x),
+        x.dtype == .bfloat16,
+        x.dim(-1) == 5120,
+        Qwen35CustomQMV.rowContiguous(x, rowStride: x.dim(-1))
+    else {
+        return rms(x)
+    }
+    let r = MLXArray.zeros(like: x)
+    return qwen35FusedResidualRMSNorm(
+        x: x, r: r, weight: rms.weight, eps: rms.eps
+    ).normed
+}
+
 /// Chunk-sum tables emitted by a producing kernel's epilogue, keyed by the
 /// identity of the activation tensor they describe.
 ///
@@ -5386,7 +5407,7 @@ extension Qwen35TextModel: MTPCapable {
     ) -> (MLXArray, MLXArray) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
         let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
+        let normed = qwen35FinalNorm(model.norm, hidden)
         let logits: MLXArray
         if let lmHead {
             logits = routedLMHead(lmHead, normed)
@@ -5406,7 +5427,7 @@ extension Qwen35TextModel: MTPCapable {
     ) -> (MLXArray, MLXArray, MLXArray?) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
         let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
+        let normed = qwen35FinalNorm(model.norm, hidden)
         let logits: MLXArray
         if let lmHead {
             logits = routedLMHead(lmHead, normed)
