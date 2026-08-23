@@ -59,29 +59,34 @@ final class Qwen35MTPDecoderLayer: Module {
         super.init()
     }
 
-    func callAsFunction(
+    /// Residual after attention and the MLP delta, unmerged. The module's
+    /// final `norm` is `RMSNorm(h + mlp)` — the same pair the backbone
+    /// already fuses at layer boundaries. Returning them unmerged lets that
+    /// kernel consume the last add.
+    func residualAndMLP(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: (any KVCache)?
-    ) -> MLXArray {
-        // omlx: MTPDecoderLayer.__call__
+    ) -> (MLXArray, MLXArray) {
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        // The backbone's decoder layer has fused this residual+norm boundary
-        // since `qwen35FusedResidualRMSNorm` landed; the head layer was left on
-        // the eager pair. Same kernel, same bf16/5120 guard, same
-        // bf16-round-before-square argument, so the values are bit-identical to
-        // `h = x + r; postAttentionLayerNorm(h)` — one launch and one host graph
-        // node instead of two, paid once per PROPOSED token (draftCount times a
-        // round) rather than once per layer.
         if x.dtype == .bfloat16, r.dtype == .bfloat16, x.dim(-1) == 5120 {
             let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
                 x: x, r: r,
                 weight: postAttentionLayerNorm.weight,
                 eps: postAttentionLayerNorm.eps)
-            return h + (mlp as! UnaryLayer)(postAttnNorm)
+            return (h, (mlp as! UnaryLayer)(postAttnNorm))
         }
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        return (h, (mlp as! UnaryLayer)(postAttentionLayerNorm(h)))
+    }
+
+    func callAsFunction(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: (any KVCache)?
+    ) -> MLXArray {
+        let (h, mlpOut) = residualAndMLP(x, mask: mask, cache: cache)
+        return h + mlpOut
     }
 
     /// Populate this layer's K/V history without computing a dead layer
@@ -201,10 +206,27 @@ final class Qwen35MTPModule: Module {
         let firstCache: (any KVCache)? = cache.first
         let mask = createAttentionMask(h: fused, cache: firstCache)
 
-        // 3. Run each MTPDecoderLayer.
+        // 3. Run each MTPDecoderLayer. The last layer's exit add is the
+        // input to `norm`; fuse that pair with the same residual+RMSNorm
+        // kernel the backbone already uses. Intermediate layers (none on
+        // the pinned 1-layer head) stay merged.
+        let last = layers.count - 1
         for (i, layer) in layers.enumerated() {
             let c: (any KVCache)? = i < cache.count ? cache[i] : nil
-            fused = layer(fused, mask: mask, cache: c)
+            if i == last,
+               fused.dtype == .bfloat16, fused.dim(-1) == 5120
+            {
+                let (h, mlpOut) = layer.residualAndMLP(fused, mask: mask, cache: c)
+                if mlpOut.dtype == .bfloat16 {
+                    return qwen35FusedResidualRMSNorm(
+                        x: h, r: mlpOut,
+                        weight: norm.weight,
+                        eps: norm.eps).1
+                }
+                fused = h + mlpOut
+            } else {
+                fused = layer(fused, mask: mask, cache: c)
+            }
         }
 
         // 4. Return pre-lm_head hidden (norm applied; lm_head is in TextModel).
@@ -237,6 +259,17 @@ final class Qwen35MTPModule: Module {
 
         let current = fused[0..., historyCount..., 0...]
         let mask = createAttentionMask(h: current, cache: cache[0])
+        if current.dtype == .bfloat16, current.dim(-1) == 5120 {
+            let (h, mlpOut) = layers[0].residualAndMLP(
+                current, mask: mask, cache: cache[0])
+            if mlpOut.dtype == .bfloat16 {
+                return qwen35FusedResidualRMSNorm(
+                    x: h, r: mlpOut,
+                    weight: norm.weight,
+                    eps: norm.eps).1
+            }
+            return norm(h + mlpOut)
+        }
         return norm(layers[0](current, mask: mask, cache: cache[0]))
     }
 
