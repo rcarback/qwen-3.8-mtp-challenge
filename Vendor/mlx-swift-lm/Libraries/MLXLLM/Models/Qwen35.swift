@@ -2451,6 +2451,225 @@ enum Qwen35XSumsSidecar {
     }
 }
 
+// MARK: - Remaining producer-side xsums (fa.o_proj after reshape + model.norm)
+
+/// Chunk-sum epilogue: the BODY of `qwen35_custom_affine4_g64_xsums_v1`
+/// over the activation bytes this pass just stored. Same construction as
+/// the residual+RMSNorm emitSums fusion on `0863b06`.
+private let qwen35XSumsEpilogueOnNamedAct = """
+
+                threadgroup_barrier(mem_flags::mem_device);
+                const uint xs_elem = r_start + thread_id * 16;
+                if (thread_id < lsize / 4 && xs_elem + 16 <= axis_size) {
+                    const device bfloat16_t* xm = act + offset + xs_elem;
+                    float s = 0.0f;
+                    for (int i = 0; i < 4; i++) {
+                        const vec<bfloat16_t, 4> xv = *reinterpret_cast<
+                            const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+                        s += xv[0] + xv[1] + xv[2] + xv[3];
+                    }
+                    const uint xs_kb = xs_elem / 512;
+                    const uint xs_lane = (xs_elem % 512) / 16;
+                    xsums[(xs_kb * 32 + xs_lane) * xs_stride + row] = s;
+                }
+"""
+
+/// Full-attention output gate `x * sigmoid(gate)` plus the fill-body
+/// epilogue. Compiled graph cannot grow an epilogue, and publishing the
+/// 4-D product misses `o_proj` because the consumer sees the post-reshape
+/// object (`held === x`). This kernel runs AFTER `reshaped(B, L, -1)` so
+/// the published identity is the tensor `o_proj` consumes.
+///
+/// Sigmoid is the in-tree packed-GDN `prework_beta` helper (0xC0DB →
+/// 0x3A8B), which already matches MLX graph sigmoid on every finite bf16.
+/// The multiply is bf16, same order as `qwen35CompiledSigmoidMultiply`.
+private let qwen35FusedSigmoidMulXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_sigmoid_mul_xsums_v1",
+    inputNames: ["x", "gate"],
+    outputNames: ["act", "xsums"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+
+        uint axis_size = uint(x_shape[x_ndim - 1]);
+        const uint xs_stride = threadgroups_per_grid.x <= 8u ? 8u : 16u;
+        ulong offset = ulong(row) * ulong(axis_size);
+
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    bfloat16_t xv = x[offset + elem + i];
+                    bfloat16_t gv = gate[offset + elem + i];
+                    act[offset + elem + i] = xv * qwen35_ograph_sigmoid(gv);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        bfloat16_t xv = x[offset + elem + i];
+                        bfloat16_t gv = gate[offset + elem + i];
+                        act[offset + elem + i] = xv * qwen35_ograph_sigmoid(gv);
+                    }
+                }
+            }\(qwen35XSumsEpilogueOnNamedAct)
+        }
+    """,
+    header: """
+        inline bfloat16_t qwen35_ograph_sigmoid(bfloat16_t x) {
+            const uint16_t bits = as_type<uint16_t>(x);
+            if (bits == uint16_t(0xC0DB)) {
+                return as_type<bfloat16_t>(uint16_t(0x3A8B));
+            }
+            auto yv = 1 / (1 + metal::exp(metal::abs(x)));
+            return (x < 0) ? yv : 1 - yv;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+func qwen35FusedSigmoidMultiplyXSums(x: MLXArray, gate: MLXArray) -> MLXArray? {
+    guard x.dtype == .bfloat16, gate.dtype == x.dtype,
+        x.ndim >= 2, gate.ndim >= 2, x.shape == gate.shape
+    else { return nil }
+    let k = x.dim(-1)
+    let rows = x.size / k
+    guard Qwen35XSumsSidecar.wants(x),
+        Qwen35CustomQMV.rowContiguous(x, rowStride: k),
+        Qwen35CustomQMV.rowContiguous(gate, rowStride: k)
+    else { return nil }
+    let kBlocks = k / 512
+    let outputs = qwen35FusedSigmoidMulXSumsKernel(
+        [x, gate],
+        grid: (rows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [
+            x.shape, [kBlocks * 32 * Qwen35CustomQMV.sumsStride(rows)],
+        ],
+        outputDTypes: [.bfloat16, .float32]
+    )
+    Qwen35XSumsSidecar.publish(x: outputs[0], table: outputs[1])
+    return outputs[0]
+}
+
+/// Standalone RMSNorm plus the fill-body epilogue over `normed`. Same
+/// looped reduction as `qwen35_dual_rms_norm_bf16_v1` / `rms_looped`
+/// (bit-identical to eager `RMSNorm` at BF16 K=5120). Used for
+/// `model.norm` so `lm_head` can take the table instead of `xsumsTable`.
+private let qwen35RMSNormXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_rms_norm_xsums_v1",
+    inputNames: ["x", "weight", "eps"],
+    outputNames: ["act", "xsums"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(x_shape[x_ndim - 1]);
+        const uint xs_stride = threadgroups_per_grid.x <= 8u ? 8u : 16u;
+        ulong offset = ulong(row) * ulong(axis_size);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    acc += xi * xi;
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        acc += xi * xi;
+                    }
+                }
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    bfloat wi = weight[elem + i];
+                    act[offset + elem + i] = wi * bfloat(xi * inv_mean);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        bfloat wi = weight[elem + i];
+                        act[offset + elem + i] = wi * bfloat(xi * inv_mean);
+                    }
+                }
+            }\(qwen35XSumsEpilogueOnNamedAct)
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+func qwen35RMSNormXSums(x: MLXArray, weight: MLXArray, eps: Float) -> MLXArray? {
+    guard x.dtype == .bfloat16, weight.dtype == .bfloat16,
+        x.ndim >= 2, weight.ndim == 1, x.dim(-1) == weight.dim(0)
+    else { return nil }
+    let k = x.dim(-1)
+    let rows = x.size / k
+    guard Qwen35XSumsSidecar.wants(x),
+        Qwen35CustomQMV.rowContiguous(x, rowStride: k)
+    else { return nil }
+    let kBlocks = k / 512
+    let outputs = qwen35RMSNormXSumsKernel(
+        [x, weight, MLXArray(eps)],
+        grid: (rows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [
+            x.shape, [kBlocks * 32 * Qwen35CustomQMV.sumsStride(rows)],
+        ],
+        outputDTypes: [.bfloat16, .float32]
+    )
+    Qwen35XSumsSidecar.publish(x: outputs[0], table: outputs[1])
+    return outputs[0]
+}
+
+func qwen35FinalNorm(_ norm: RMSNorm, _ x: MLXArray) -> MLXArray {
+    if let y = qwen35RMSNormXSums(x: x, weight: norm.weight, eps: norm.eps) {
+        return y
+    }
+    return norm(x)
+}
+
 // MARK: - Dual independent RMSNorm (proposal-side pre-fc)
 
 /// Two independent RMSNorms in one dispatch. Same looped reduction as
@@ -3390,6 +3609,14 @@ final class Qwen35Attention: Module {
         )
         .transposed(0, 2, 1, 3)
 
+        // Reshape BEFORE the producer so sidecar identity is the tensor
+        // o_proj consumes. Fallback keeps today's 4-D compiled multiply
+        // then free-view flatten (strided inputs, no extra copy).
+        let flatX = output.reshaped(B, L, -1)
+        let flatG = gate.reshaped(B, L, -1)
+        if let fused = qwen35FusedSigmoidMultiplyXSums(x: flatX, gate: flatG) {
+            return qwen35RoutedLinear(oProj, fused)
+        }
         return qwen35RoutedLinear(
             oProj, qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
     }
@@ -5215,7 +5442,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // Inner model now returns pre-norm hidden; apply norm + lm_head here.
         // omlx: TextModel.__call__ (normed = self.model.norm(hidden); out = lm_head(normed))
         let hidden = model(inputs, cache: cache)
-        var out = model.norm(hidden)
+        var out = qwen35FinalNorm(model.norm, hidden)
         if let lmHead {
             out = lmHead(out)
         } else {
@@ -5386,7 +5613,7 @@ extension Qwen35TextModel: MTPCapable {
     ) -> (MLXArray, MLXArray) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
         let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
+        let normed = qwen35FinalNorm(model.norm, hidden)
         let logits: MLXArray
         if let lmHead {
             logits = routedLMHead(lmHead, normed)
@@ -5406,7 +5633,7 @@ extension Qwen35TextModel: MTPCapable {
     ) -> (MLXArray, MLXArray, MLXArray?) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
         let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
+        let normed = qwen35FinalNorm(model.norm, hidden)
         let logits: MLXArray
         if let lmHead {
             logits = routedLMHead(lmHead, normed)
@@ -5445,7 +5672,7 @@ extension Qwen35TextModel: MTPCapable {
     /// `Qwen35TextModelInner.norm` is not visible outside this module, which is the
     /// only reason this accessor exists.
     public func applyFinalNorm(_ x: MLXArray) -> MLXArray {
-        model.norm(x)
+        qwen35FinalNorm(model.norm, x)
     }
 
     /// Run the MTP head forward, returning `(logits, headHidden)`.
