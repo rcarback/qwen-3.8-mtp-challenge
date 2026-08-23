@@ -385,7 +385,16 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
 public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
-    public var step = 256
+    // Ranked window is 512 seed + 512 decode. step=256 reallocs the FA caches
+    // twice inside the decode window (512->768, 768->1024). step=1024
+    // (bfd12563) over-allocated the seed to 1024 and paid unused-tail zeros
+    // inside the timed prefill, and repriced at -0.025%. step=512 keeps the
+    // seed capacity identical to live (512) and does one 512->1024 concat
+    // instead of two 256-row slabs.
+    // Token-neutral: `offset` slicing and the returned `..<offset` views are
+    // unchanged, so every consumer sees the same K/V bytes at the same
+    // positions; only the allocated capacity behind them differs.
+    public var step = 512
 
     public override init() {
         super.init()
