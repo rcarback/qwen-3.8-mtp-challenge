@@ -76,6 +76,8 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
     case alreadyBegun
     case invalidDepth(Int)
     case emptySeed
+    case promisedRecurrentPrefixReplayFailed(
+        draftCount: Int, acceptedCount: Int, round: Int)
 
     public var description: String {
         switch self {
@@ -92,6 +94,11 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
             return "MTP draft depth \(depth) is out of range"
         case .emptySeed:
             return "MTP seed prefill requires a non-empty seed"
+        case .promisedRecurrentPrefixReplayFailed(
+            let draftCount, let acceptedCount, let round):
+            return "MTP target promised recurrent-prefix replay but failed "
+                + "in round \(round) (drafts \(draftCount), accepted "
+                + "\(acceptedCount))"
         }
     }
 }
@@ -1451,11 +1458,16 @@ public final class Qwen36MTPBlockSession {
         }
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
-        // 2. Keep the generic pre-verify snapshot as a fallback, but use the
-        //    vendored post-primary rollback checkpoint for the hot K=1 path. A
-        //    rejected single draft can then retain the primary's target work and
-        //    discard only the draft token instead of re-forwarding the primary.
-        let snapshot = Self.snapshotRecurrent(cache)
+        // 2. Keep the generic pre-verify snapshot for unknown conformers and
+        //    the eager-checkpoint K=1 path. The concrete Qwen target guarantees
+        //    a complete replay tape for every width >= 3 verify, so avoid
+        //    constructing 96 recurrent-state slice expressions and their
+        //    dictionary entries on that hot path. If the promise is ever
+        //    broken, the rejection path throws instead of repairing from an
+        //    absent snapshot or continuing from speculative recurrent state.
+        let snapshot =
+            model.guaranteesWideRecurrentPrefixReplay && draftCount > 1
+            ? nil : Self.snapshotRecurrent(cache)
         if Self.traceRounds { tSnapshotDone = DispatchTime.now().uptimeNanoseconds }
         let verifyTokens = concatenated(
             [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
@@ -1486,17 +1498,21 @@ public final class Qwen36MTPBlockSession {
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
         // this round — the per-row argmaxes (accept walk AND both candidates
         // for the next primary), the draft ids, the top-2 evidence of every
-        // row including the bonus row, and the cache roots — is materialised
-        // in ONE eval. The `.item()`/`.asArray` calls below then copy from
-        // materialised buffers without waiting on the GPU. (MTPLX production
+        // row including the bonus row, the contiguous verify input, and the
+        // cache roots — is materialised
+        // in ONE eval. The `.asArray` calls below then copy from materialised
+        // buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
-        var bundle: [MLXArray] = [top2IDs, top2Values]
-        bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        eval(cache.flatMap { $0.state } + [top2IDs, top2Values, verifyTokens])
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
-        let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
+        // Read the already-built contiguous verify block once. Element zero is
+        // the host-origin primary; the remainder are exactly the device draft
+        // IDs in proposal order. This replaces one `.item()` bridge per draft
+        // without changing the token expression that the target verified.
+        let verifyTokenHost = verifyTokens.asArray(Int32.self)
+        let drafts = verifyTokenHost.dropFirst().map(Int.init)
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
@@ -1575,6 +1591,13 @@ public final class Qwen36MTPBlockSession {
                 // Generic K>1 / defensive fallback: undo the whole verify window
                 // and re-forward the committed block. This rare path pays a
                 // second blocking eval for its own readout.
+                guard let snapshot else {
+                    throw Qwen36MTPSessionError
+                        .promisedRecurrentPrefixReplayFailed(
+                            draftCount: draftCount,
+                            acceptedCount: acceptedCount,
+                            round: roundCount)
+                }
                 Self.rollbackAfterVerify(
                     cache, snapshot, verifiedTokens: draftCount + 1, to: base)
                 let (repairLogits, repairHidden) = model.callWithHidden(

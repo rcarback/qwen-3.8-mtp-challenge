@@ -66,6 +66,13 @@ public protocol Qwen36MTPTarget: AnyObject {
         cache: [any KVCache], committedRows: Int
     ) -> Bool
 
+    /// True only when every width >= 3 verify forward is guaranteed to leave
+    /// a complete recurrent-prefix replay tape. The session uses this promise
+    /// to omit its generic pre-verify snapshot on the wide hot path; a promised
+    /// replay that later fails is a poisoned-session error, never permission to
+    /// continue from speculative recurrent state.
+    var guaranteesWideRecurrentPrefixReplay: Bool { get }
+
     /// MTP head forward returning `(logits, head post-`mtp.norm` hidden)`.
     func mtpForwardWithHidden(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
@@ -118,6 +125,8 @@ public protocol Qwen36MTPTarget: AnyObject {
 }
 
 extension Qwen36MTPTarget {
+    public var guaranteesWideRecurrentPrefixReplay: Bool { false }
+
     public func callWithHiddenAndNormed(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray, MLXArray?) {
@@ -125,6 +134,17 @@ extension Qwen36MTPTarget {
             input: input, cache: cache, nConfirmed: nConfirmed)
         return (logits, hidden, nil)
     }
+}
+
+// These are the only two scored conformers. Their width >= 3, nConfirmed == 1
+// forward records a replay tape in every Qwen35 gated-delta layer, and
+// `replayRecurrentPrefix` preflights the entire stack before mutating it.
+extension Qwen35TextModel {
+    public var guaranteesWideRecurrentPrefixReplay: Bool { true }
+}
+
+extension MLXLLM.Qwen35Model {
+    public var guaranteesWideRecurrentPrefixReplay: Bool { true }
 }
 
 // Both Qwen 3.6 model classes already implement every member; these
