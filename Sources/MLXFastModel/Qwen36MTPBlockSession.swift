@@ -1482,6 +1482,13 @@ public final class Qwen36MTPBlockSession {
                 input: LMInput.Text(tokens: verifyTokens),
                 cache: cache, nConfirmed: 1)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
+        // Submit the verify graph as soon as it exists, the same way the
+        // first head step is submitted before the rest of the draft chain
+        // is built. The 64-layer target is real GPU work; linearTopTwoRows
+        // is host-side kernel bind. One blocking eval still follows.
+        // Values and kernels are unchanged.
+        asyncEval(verifyLogits, verifyHidden)
+        if let verifyNormed { asyncEval(verifyNormed) }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
         // this round — the per-row argmaxes (accept walk AND both candidates
