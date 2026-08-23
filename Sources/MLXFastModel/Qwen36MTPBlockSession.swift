@@ -1413,7 +1413,8 @@ public final class Qwen36MTPBlockSession {
         // GPU works while the host builds the 64-layer verify graph.
         // (Per-step asyncEval was tried here and measured NEUTRAL — the
         // ~2.4 ms/step is host graph BUILD, not GPU work to overlap; see
-        // idea.md V6 journal. Single submission after the loop, as before.)
+        // idea.md V6 journal. The final chain submission is only needed when
+        // the loop added another draft beyond the already-submitted first.)
         let tFlushBuilt = Self.traceRounds
             ? DispatchTime.now().uptimeNanoseconds : 0
         var draftIdArrays: [MLXArray] = []
@@ -1445,7 +1446,9 @@ public final class Qwen36MTPBlockSession {
         }
         let tChainBuilt = Self.traceRounds
             ? DispatchTime.now().uptimeNanoseconds : 0
-        asyncEval(draftIdArrays[draftIdArrays.count - 1])
+        if draftCount > 1 {
+            asyncEval(draftIdArrays[draftIdArrays.count - 1])
+        }
         if Self.traceSyncHeadChain {
             eval(draftIdArrays[draftIdArrays.count - 1])
         }
