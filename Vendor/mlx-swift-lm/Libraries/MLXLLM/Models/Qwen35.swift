@@ -1564,7 +1564,7 @@ private let qwen35E120QMVHeader = """
 private func qwen35E120QMVSource(table: Bool) -> String {
     let sums = table ? "xsums" : "qmv_null_sums"
     let flag = table ? "USE_TABLE" : "false"
-    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3)]
+    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 4), (8, 4), (9, 3)]
         .map { m, ipg in
             """
                     case \(m):
@@ -1706,6 +1706,56 @@ public enum Qwen35CustomQMV {
     /// Lane stride of the chunk-sum table, in floats.
     public static func sumsStride(_ m: Int) -> Int { m <= 8 ? 8 : 16 }
 
+    /// M = 6 takes `IPG = 6`, one X-group, not the `IPG = 3` two-X-group split
+    /// the incumbent inherited from `quantized.h:1156-1187`.
+    ///
+    /// Every X-group re-reads the whole weight matrix. One decode round's 257
+    /// wide calls stream 14.41 GB of 4-bit weights plus their bf16 g64 scales
+    /// and biases per X-group, so the incumbent M = 6 plan streams 28.82 GB and
+    /// this streams 14.41 GB. The kernel is bandwidth-bound on that stream at
+    /// every width the round dispatches except M = 5: measured on an Apple M4
+    /// Pro (273 GB/s peak), the seven verify-leg shapes weighted by their call
+    /// counts run the round's wide QMV at 68-84 % of peak everywhere but M = 5,
+    /// which runs at 49 %.
+    ///
+    /// The trade is traffic against the register cliff: NA = 6 holds six floats
+    /// per accumulator lane instead of three, and the round-weighted achieved
+    /// rate falls from 210 GB/s to 115 GB/s. Halving the bytes beats that 1.83x
+    /// rate loss, but only by 9 %:
+    ///
+    ///     shape          IPG=3 [X2]      IPG=6 [X1]     delta
+    ///     mlp.gate_up      946.6 us        801.0 us    -15.4 %
+    ///     mlp.down         478.8 us        551.1 us    +15.1 %
+    ///     gdn.in_proj      453.3 us        385.2 us    -15.0 %
+    ///     gdn.out_proj     173.7 us        150.6 us    -13.3 %
+    ///     fa.qkv           394.9 us        336.3 us    -14.8 %
+    ///     fa.o_proj        174.0 us        150.4 us    -13.5 %
+    ///     lm_head         6705.7 us       5639.9 us    -15.9 %
+    ///     round (257)   137,132 us      125,680 us     -8.4 %
+    ///
+    /// Six of the seven shapes gain about 15 %. `mlp.down` is the single loser
+    /// and the only shape with K = 17,408; it keeps 64 calls of the round, and
+    /// the weighted total still falls 8.4 %. A per-shape K gate would take the
+    /// round to -11.7 %, but that buys the extra 3.3 points by hard coding one
+    /// host's timings, so this declines the per-shape split the same way
+    /// `minimumTableWidth` declines a per-shape M = 3 table.
+    ///
+    /// Every other cell of the table was measured and every one of them stands.
+    /// All 23 legal `(M, IPG)` cells (`M % IPG != 1`, the recorded `M = 8,
+    /// IPG = 3` kill excluded) were run on all seven shapes with bitwise output
+    /// comparison, 0 mismatches. Round-total delta against the incumbent cell:
+    ///
+    ///     M=4  IPG2 +56.9 %                                    IPG4 *
+    ///     M=5  IPG3 +20.9 %                                    IPG5 *
+    ///     M=6  IPG2 +33.7 %  IPG3 *  IPG4 -0.5 %  IPG6 -8.4 %
+    ///     M=7  IPG4 *  IPG5 +12.0 %  IPG7 +12.8 %
+    ///     M=8  IPG2 +59.3 %  IPG4 *  IPG5 +13.5 %  IPG6 +20.7 %  IPG8 +38.3 %
+    ///     M=9  IPG3 *  IPG5 -6.1 %  IPG6 -1.2 %  IPG7 +9.4 %  IPG9 +31.3 %
+    ///
+    /// M = 6 is the only change. M = 9 also has a winning cell (`IPG = 5`,
+    /// -6.1 %) but the official width histogram never reaches 9, so it is left
+    /// alone rather than bundled into a ticket that could not be attributed.
+    ///
     /// Number of input-row threadgroups that can execute real work for the
     /// current shared QMV width table. The Metal body maps group `g` to
     /// `first_m = g * IPG` and returns before any read or write when
@@ -1719,7 +1769,7 @@ public enum Qwen35CustomQMV {
         case 3: inputsPerGroup = 3
         case 4: inputsPerGroup = 4
         case 5: inputsPerGroup = 5
-        case 6: inputsPerGroup = 3
+        case 6: inputsPerGroup = 6
         case 7: inputsPerGroup = 4
         case 8: inputsPerGroup = 4
         case 9: inputsPerGroup = 3
