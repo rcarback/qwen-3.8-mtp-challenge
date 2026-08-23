@@ -56,14 +56,32 @@ import MLX
 /// Generic models must be v2-adapted — capture `positionOffsets` before
 /// dispatch and call `updateAndAttend` directly — before they can serve
 /// multi-row CBv2 batches. This fails loudly rather than mis-rotating.
-public func attentionWithCacheUpdate(
+/// The result of one cache update plus attention evaluation. Ordinary paths
+/// contain one array. The Qwen wide-decode exactness path contains the two
+/// already-computed SDPA chunks separately so a downstream elementwise
+/// producer can write the joined layout directly instead of materialising an
+/// otherwise dead concatenate buffer.
+public struct AttentionWithCacheUpdateSegments {
+    public let prefix: MLXArray
+    public let suffix: MLXArray?
+
+    public init(prefix: MLXArray, suffix: MLXArray? = nil) {
+        self.prefix = prefix
+        self.suffix = suffix
+    }
+}
+
+/// Segmented twin of `attentionWithCacheUpdate`. Cache mutation and SDPA
+/// arithmetic are identical; only the wide Qwen exactness branch leaves its
+/// two row-adjacent outputs unmaterialised for a capable consumer.
+public func attentionWithCacheUpdateSegments(
     queries: MLXArray,
     keys: MLXArray,
     values: MLXArray,
     cache: KVCache?,
     scale: Float,
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
-) -> MLXArray {
+) -> AttentionWithCacheUpdateSegments {
     // ContinuousBatchingV2 hook — see the LIMITATION notes above.
     if let v2 = cache as? CBv2AttendingLayerCache {
         if let violation = cbv2CustomMaskViolation(mask: mask, layerIndex: v2.layerIndex) {
@@ -74,31 +92,35 @@ public func attentionWithCacheUpdate(
         {
             preconditionFailure(violation)
         }
-        return v2.updateAndAttend(
-            queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
+        return AttentionWithCacheUpdateSegments(
+            prefix: v2.updateAndAttend(
+                queries: queries, keys: keys, values: values, scale: scale,
+                sinks: nil))
     }
     guard let cache else {
-        return MLXFast.scaledDotProductAttention(
-            queries: queries,
-            keys: keys,
-            values: values,
-            scale: scale,
-            mask: mask
-        )
+        return AttentionWithCacheUpdateSegments(
+            prefix: MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: keys,
+                values: values,
+                scale: scale,
+                mask: mask
+            ))
     }
     if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)
-        return quantizedScaledDotProductAttention(
-            queries: queries,
-            quantizedKeys: quantizedKeys,
-            quantizedValues: quantizedValues,
-            scale: scale,
-            mask: mask,
-            groupSize: quantizedKVCache.groupSize,
-            bits: quantizedKVCache.bits,
-            mode: quantizedKVCache.mode
-        )
+        return AttentionWithCacheUpdateSegments(
+            prefix: quantizedScaledDotProductAttention(
+                queries: queries,
+                quantizedKeys: quantizedKeys,
+                quantizedValues: quantizedValues,
+                scale: scale,
+                mask: mask,
+                groupSize: quantizedKVCache.groupSize,
+                bits: quantizedKVCache.bits,
+                mode: quantizedKVCache.mode
+            ))
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
         // WIDE-DECODE EXACTNESS CHUNK (B == 1, causal, 6 <= qL <= 9): the
@@ -138,16 +160,36 @@ public func attentionWithCacheUpdate(
                 scale: scale,
                 mask: .causal
             )
-            return concatenated([outA, outB], axis: 2)
+            return AttentionWithCacheUpdateSegments(prefix: outA, suffix: outB)
         }
-        return MLXFast.scaledDotProductAttention(
-            queries: queries,
-            keys: cachedKeys,
-            values: cachedValues,
-            scale: scale,
-            mask: mask
-        )
+        return AttentionWithCacheUpdateSegments(
+            prefix: MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: cachedKeys,
+                values: cachedValues,
+                scale: scale,
+                mask: mask
+            ))
     }
+}
+
+public func attentionWithCacheUpdate(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    cache: KVCache?,
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+) -> MLXArray {
+    let segments = attentionWithCacheUpdateSegments(
+        queries: queries,
+        keys: keys,
+        values: values,
+        cache: cache,
+        scale: scale,
+        mask: mask)
+    guard let suffix = segments.suffix else { return segments.prefix }
+    return concatenated([segments.prefix, suffix], axis: 2)
 }
 
 /// Custom-mask guard for the CBv2 branch of `attentionWithCacheUpdate` (see

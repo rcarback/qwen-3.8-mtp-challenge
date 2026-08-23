@@ -251,6 +251,101 @@ private let qwen35CompiledSigmoidMultiply:
     return body
 }()
 
+/// Join the two exact wide-SDPA chunks while applying the attention gate.
+///
+/// The incumbent first concatenates `[B,H,5,D]` and `[B,H,L-5,D]`, takes a
+/// transpose view, then evaluates `x * sigmoid(gate)` into a new contiguous
+/// array. This kernel writes that final array directly. Its sigmoid body is
+/// copied verbatim from MLX's `unary_ops.h::Sigmoid`; input/output arithmetic
+/// stays in bf16, so each element is the same SDPA byte multiplied by the same
+/// gate byte in the same order. Only the dead intermediate concatenate is
+/// absent.
+private let qwen35SegmentedAttentionGateKernel = MLXFast.metalKernel(
+    name: "qwen35_segmented_attention_gate_v1",
+    inputNames: ["prefix", "suffix", "gate"],
+    outputNames: ["y"],
+    source: """
+        const uint index = thread_position_in_grid.x;
+        const uint depth = uint(prefix_shape[3]);
+        const uint heads = uint(prefix_shape[1]);
+        const uint prefix_rows = uint(prefix_shape[2]);
+        const uint suffix_rows = uint(suffix_shape[2]);
+        const uint rows = prefix_rows + suffix_rows;
+
+        uint logical = index;
+        const uint d = logical % depth;
+        logical /= depth;
+        const uint h = logical % heads;
+        logical /= heads;
+        const uint row = logical % rows;
+        const uint batch = logical / rows;
+
+        InT attended;
+        if (row < prefix_rows) {
+            const ulong offset =
+                ulong(batch) * ulong(prefix_strides[0])
+                + ulong(h) * ulong(prefix_strides[1])
+                + ulong(row) * ulong(prefix_strides[2])
+                + ulong(d) * ulong(prefix_strides[3]);
+            attended = prefix[offset];
+        } else {
+            const uint suffix_row = row - prefix_rows;
+            const ulong offset =
+                ulong(batch) * ulong(suffix_strides[0])
+                + ulong(h) * ulong(suffix_strides[1])
+                + ulong(suffix_row) * ulong(suffix_strides[2])
+                + ulong(d) * ulong(suffix_strides[3]);
+            attended = suffix[offset];
+        }
+
+        const ulong gate_offset =
+            ulong(batch) * ulong(gate_strides[0])
+            + ulong(row) * ulong(gate_strides[1])
+            + ulong(h) * ulong(gate_strides[2])
+            + ulong(d) * ulong(gate_strides[3]);
+        const InT gate_value = gate[gate_offset];
+        const InT sigmoid_base =
+            1 / (1 + metal::exp(metal::abs(gate_value)));
+        const InT sigmoid_value =
+            (gate_value < 0) ? sigmoid_base : 1 - sigmoid_base;
+        y[index] = attended * sigmoid_value;
+        """,
+    ensureRowContiguous: false
+)
+
+private func qwen35SegmentedAttentionGate(
+    _ segments: AttentionWithCacheUpdateSegments,
+    gate: MLXArray
+) -> MLXArray? {
+    guard let suffix = segments.suffix else { return nil }
+    let prefix = segments.prefix
+    guard prefix.ndim == 4, suffix.ndim == 4, gate.ndim == 4,
+          prefix.dtype == .bfloat16, suffix.dtype == .bfloat16,
+          gate.dtype == .bfloat16,
+          prefix.dim(0) == suffix.dim(0),
+          prefix.dim(1) == suffix.dim(1),
+          prefix.dim(3) == suffix.dim(3),
+          prefix.dim(2) == 5
+    else { return nil }
+
+    let B = prefix.dim(0)
+    let H = prefix.dim(1)
+    let D = prefix.dim(3)
+    let L = prefix.dim(2) + suffix.dim(2)
+    guard B == 1, (6 ... 9).contains(L),
+          gate.shape == [B, L, H, D]
+    else { return nil }
+
+    return qwen35SegmentedAttentionGateKernel(
+        [prefix, suffix, gate],
+        template: [("InT", DType.bfloat16)],
+        grid: (B * L * H * D, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[B, L, H, D]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 
 // MARK: - packed GDN prework mixer (verify widths 3...9)
 //
@@ -3380,7 +3475,7 @@ final class Qwen35Attention: Module {
         // REAL Copy of this function. Multiply 4-D (strided inputs are
         // copy-free in the compiled elementwise), then flatten the compiled
         // kernel's CONTIGUOUS output, which is a free view.
-        let output = attentionWithCacheUpdate(
+        let attentionSegments = attentionWithCacheUpdateSegments(
             queries: queries,
             keys: keys,
             values: values,
@@ -3388,10 +3483,26 @@ final class Qwen35Attention: Module {
             scale: scale,
             mask: mask
         )
-        .transposed(0, 2, 1, 3)
+
+        let gated: MLXArray
+        if let joined = qwen35SegmentedAttentionGate(
+            attentionSegments, gate: gate)
+        {
+            gated = joined
+        } else {
+            let output: MLXArray
+            if let suffix = attentionSegments.suffix {
+                output = concatenated(
+                    [attentionSegments.prefix, suffix], axis: 2)
+            } else {
+                output = attentionSegments.prefix
+            }
+            gated = qwen35CompiledSigmoidMultiply(
+                output.transposed(0, 2, 1, 3), gate)
+        }
 
         return qwen35RoutedLinear(
-            oProj, qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
+            oProj, gated.reshaped(B, L, -1))
     }
 }
 
