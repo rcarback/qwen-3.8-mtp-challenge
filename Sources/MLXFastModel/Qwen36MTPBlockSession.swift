@@ -988,7 +988,7 @@ public final class Qwen36MTPBlockSession {
     /// shape is fitted to one dispatch table, so it is a research arm, not a
     /// shipped constant. Refit and re-price on the live table before shipping
     /// any non-uniform shape.
-    internal static let depthPriceArm: DepthPriceArm = .ship
+    internal static let depthPriceArm: DepthPriceArm = .pb5
 
     /// Built once. A computed property here would allocate two arrays on
     /// every round, inside the timed path.
