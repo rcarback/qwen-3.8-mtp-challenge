@@ -1756,6 +1756,15 @@ public enum Qwen35CustomQMV {
 
     public static func tablePays(m: Int) -> Bool { m >= minimumTableWidth }
 
+    /// K=1 verify width. A standalone fill at this width was measured
+    /// negative; the residual+RMSNorm epilogue already walks the same
+    /// bytes, so a table published there has no extra dispatch. Consume
+    /// that table when the sidecar hits; miss stays on the no-table
+    /// kernel. Not a lowering of `minimumTableWidth`.
+    public static let freePublishWidth = 2
+
+    public static func sidecarPays(m: Int) -> Bool { m == freePublishWidth }
+
     /// True when the last two dimensions are densely packed, so the kernel's
     /// `row * rowStride + col` indexing reads the buffer as it stands.
     public static func rowContiguous(_ a: MLXArray, rowStride: Int) -> Bool {
@@ -1869,6 +1878,17 @@ public enum Qwen35CustomQMV {
                 xsums: fused ?? xsumsTable(x),
                 groupSize: groupSize, bits: bits, mode: mode,
                 consume: arm == .sumTable)
+        }
+
+        // Free residual epilogue at M=2: consume only. No standalone fill.
+        if arm == .sumTable,
+            let fused = Qwen35XSumsSidecar.take(x, k: cell.k, m: cell.m)
+        {
+            return matmulWithTable(
+                x, w, scales: scales, biases: biases,
+                xsums: fused,
+                groupSize: groupSize, bits: bits, mode: mode,
+                consume: true)
         }
 
         var outShape = x.shape
@@ -2379,9 +2399,11 @@ func qwen35FusedResidualRMSNorm(
 /// `xsumsTable`, so every path that does not pass through a publishing
 /// producer keeps today's dispatch exactly.
 ///
-/// Only the shipped `sumtable` arm publishes, and only at row counts the
-/// table pays at (`Qwen35CustomQMV.minimumTableWidth ... widths.upperBound`).
-/// `M = 1` -- the serial leg, which the candidate leg shares -- never reaches
+/// Only the shipped `sumtable` path publishes. Row counts are the
+/// paid table band (`minimumTableWidth ... widths.upperBound`) plus
+/// `freePublishWidth` (M=2), where the residual epilogue writes the
+/// table and the consumer takes it only on a sidecar hit. `M = 1` --
+/// the serial leg, which the candidate leg shares -- never reaches
 /// the variant kernel, so the serial path is byte-for-byte the shipped one.
 enum Qwen35XSumsSidecar {
     struct Slot {
@@ -2415,7 +2437,8 @@ enum Qwen35XSumsSidecar {
         let k = x.dim(-1)
         let rows = x.size / k
         return Qwen35CustomQMV.widths.contains(rows)
-            && Qwen35CustomQMV.tablePays(m: rows)
+            && (Qwen35CustomQMV.tablePays(m: rows)
+                || Qwen35CustomQMV.sidecarPays(m: rows))
             && x.dim(-2) == rows
             && k % 512 == 0
     }
