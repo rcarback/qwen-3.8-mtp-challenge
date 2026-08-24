@@ -345,8 +345,10 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
           const InT conv = static_cast<InT>(acc);
           const InT act = conv * qwen35_prework_sigmoid(conv);
           activated[i] = act;
-          const float value = static_cast<float>(act);
-          sumsq += value * value;
+          if (is_q || is_k) {
+            const float value = static_cast<float>(act);
+            sumsq += value * value;
+          }
         }
 
         if (is_q || is_k) {
@@ -2342,11 +2344,15 @@ func qwen35FusedResidualRMSNorm(
 ) -> (residual: MLXArray, normed: MLXArray) {
     let nRows = x.size / x.dim(-1)
     let shape = x.shape
+    // Same memo as GDN `normScaleConstants`: `MLXArray(eps)` was a fresh
+    // 1-element graph node on every residual boundary (63+ per forward).
+    // Bytes are identical — same scalar, same consumers.
+    let epsArray = Qwen35ResidualRMSNormEps.array(for: eps)
     if Qwen35XSumsSidecar.wants(x) {
         let k = x.dim(-1)
         let kBlocks = k / 512
         let outputs = qwen35FusedResidualRMSNormXSumsKernel(
-            [x, r, weight, MLXArray(eps)],
+            [x, r, weight, epsArray],
             grid: (nRows * 1024, 1, 1),
             threadGroup: (1024, 1, 1),
             outputShapes: [
@@ -2358,13 +2364,28 @@ func qwen35FusedResidualRMSNorm(
         return (outputs[0], outputs[1])
     }
     let outputs = qwen35FusedResidualRMSNormKernel(
-        [x, r, weight, MLXArray(eps)],
+        [x, r, weight, epsArray],
         grid: (nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [shape, shape],
         outputDTypes: [.bfloat16, .bfloat16]
     )
     return (outputs[0], outputs[1])
+}
+
+/// Input-independent `eps` scalar for the fused residual+RMSNorm kernel.
+/// Rebuilt per distinct value only (the tower uses one `rmsNormEps`).
+private enum Qwen35ResidualRMSNormEps {
+    nonisolated(unsafe) static var value: Float?
+    nonisolated(unsafe) static var array: MLXArray?
+
+    static func array(for eps: Float) -> MLXArray {
+        if value == eps, let array { return array }
+        let next = MLXArray(eps)
+        value = eps
+        array = next
+        return next
+    }
 }
 
 /// Chunk-sum tables emitted by a producing kernel's epilogue, keyed by the
@@ -2729,8 +2750,10 @@ private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
 
         threadgroup float local_inv_mean[1];
         threadgroup float local_sums[simd_size];
+        thread float input_values[8];
 
         float acc = 0.0f;
+        uint cache_base = 0;
         for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
             uint elem = r_start + thread_id * n_reads;
             if (elem + n_reads <= axis_size) {
@@ -2739,6 +2762,7 @@ private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
                         ? qwen35_embed_row_value(
                             e_weight, e_scales, e_biases, w_off, g_off, elem + i)
                         : float(b[in_off + elem + i]);
+                    input_values[cache_base + i] = xi;
                     acc += xi * xi;
                 }
             } else {
@@ -2749,10 +2773,12 @@ private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
                                 e_weight, e_scales, e_biases, w_off, g_off,
                                 elem + i)
                             : float(b[in_off + elem + i]);
+                        input_values[cache_base + i] = xi;
                         acc += xi * xi;
                     }
                 }
             }
+            cache_base += n_reads;
         }
 
         acc = simd_sum(acc);
@@ -2776,30 +2802,25 @@ private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float inv_mean = local_inv_mean[0];
+        cache_base = 0;
         for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
             uint elem = r_start + thread_id * n_reads;
             if (elem + n_reads <= axis_size) {
                 for (uint i = 0; i < n_reads; ++i) {
-                    float xi = is_a
-                        ? qwen35_embed_row_value(
-                            e_weight, e_scales, e_biases, w_off, g_off, elem + i)
-                        : float(b[in_off + elem + i]);
+                    float xi = input_values[cache_base + i];
                     bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
                     concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
                 }
             } else {
                 for (uint i = 0; i < n_reads; ++i) {
                     if (elem + i < axis_size) {
-                        float xi = is_a
-                            ? qwen35_embed_row_value(
-                                e_weight, e_scales, e_biases, w_off, g_off,
-                                elem + i)
-                            : float(b[in_off + elem + i]);
+                        float xi = input_values[cache_base + i];
                         bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
                         concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
                     }
                 }
             }
+            cache_base += n_reads;
         }
     """,
     header: """
