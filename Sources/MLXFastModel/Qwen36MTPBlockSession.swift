@@ -1038,7 +1038,20 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 7
+    // 7 -> 8. `qwenMTPMaxDraftDepth` is 8 and the TRUSTED PARENT enforces it
+    // over the draft count a round actually proposes, so 8 is inside the bound,
+    // not a raise of it. rows_per_round = depth + 1 = 9 stays ledger-legal, the
+    // IPG table already carries an M=9 entry, and the QMV width table covers
+    // 2...9.
+    //
+    // Why: in the crown-era ledger this cap BINDS exactly where the head is
+    // best. 25 of the 29 rounds that reach depth 7 accept the FULL chain (86%),
+    // and over the last quarter of the decode 25 of 27 rounds are full-chain at
+    // mean depth 6.93. Those rounds stop because they run out of drafts, not
+    // because a draft was rejected. The streak gate in front of this cap means
+    // deep rounds only fire after the head has been perfect, which is precisely
+    // the population most likely to accept one more.
+    private static let segmentedVerifyDepthCap = 8
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
