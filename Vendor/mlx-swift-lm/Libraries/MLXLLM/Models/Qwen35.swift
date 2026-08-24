@@ -414,6 +414,24 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
                 qkv[raw_base + ulong(i) * ulong(qkv_strides[2])];
           }
         }
+        // T < NKeep: the surviving prefix of the new conv state still lives
+        // in the old conv state (concat window). The qkv copy above only
+        // writes the suffix. Row 0 owns that prefix so S=1 is defined.
+        if (uint(T) < NKeep && row == 0) {
+          const uint prefix = NKeep - uint(T);
+          for (uint state_row = 0; state_row < prefix; ++state_row) {
+            const uint src_row = state_row + uint(T);
+            const ulong src = ulong(src_row) * ulong(conv_state_strides[1])
+                + ulong(channel_base + lane * 4)
+                    * ulong(conv_state_strides[2]);
+            const uint dst = state_row * C + channel_base + lane * 4;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+              conv_out[dst + i] =
+                  conv_state[src + ulong(i) * ulong(conv_state_strides[2])];
+            }
+          }
+        }
         """
     return MLXFast.metalKernel(
         name: "qwen35_packed_gdn_prework",
@@ -897,6 +915,50 @@ final class Qwen35GatedDeltaNet: Module {
 
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
+        // Decode S=1 only. Verify S=3...9 already uses this mixer on the
+        // stash twin. S=512 seed stays on the stock chain (that width
+        // lift printed a miss). The T<NKeep conv-state prefix copy in the
+        // mixer body is what makes T=1 defined.
+        let mixerHit = MLXHardwareInfo.isCompiledDecodeSupported
+            && B == 1 && S == 1 && nKeep == 3
+            && numKHeads == 16 && numVHeads == 48
+            && headKDim == 128 && headVDim == 128
+            && qkv.dim(2) == 16 * 128 * 2 + 48 * 128
+            && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
+            && a.dtype == .bfloat16 && b.dtype == .bfloat16
+            && mask == nil
+        if mixerHit {
+            let (qScaleConst, kScaleConst) = normScaleConstants(.bfloat16)
+            let outs = qwen35PackedGDNPreworkKernel(
+                [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
+                 qScaleConst,
+                 kScaleConst],
+                template: [
+                    ("Hk", numKHeads), ("Dk", headKDim),
+                    ("Hv", numVHeads), ("Dv", headVDim),
+                    ("NKeep", nKeep), ("C", qkv.dim(2)), ("T", S),
+                ],
+                grid: (32, S, 2 * numKHeads + numVHeads),
+                threadGroup: (32, 1, 1),
+                outputShapes: [
+                    [B, S, numKHeads, headKDim],
+                    [B, S, numKHeads, headKDim],
+                    [B, S, numVHeads, headVDim],
+                    [B, nKeep, qkv.dim(2)],
+                    [B, S, numVHeads],
+                    [B, S, numVHeads],
+                ],
+                outputDTypes: [
+                    .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
+                    .float32,
+                ]
+            )
+            let (out, newSsmState) = qwen35GatedDeltaPrepared(
+                q: outs[0], k: outs[1], v: outs[2],
+                g: outs[4], beta: outs[5],
+                state: ssmState, mask: mask)
+            return (out, outs[3], newSsmState)
+        }
         let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
         let convOut = silu(conv1d(convInput))
 
