@@ -4,9 +4,11 @@ Replace the pinned MTP head with a Swift port of `z-lab/Qwen3.8-27B-DFlash2`,
 declared through `mtp-head.manifest.json`. The goal is a higher accept rate,
 which is the quantity the published score depends on.
 
-Status: Now — ported, checked against the reference, and running end to end.
-The accept rate does not beat the pinned head, so the premise below is not yet
-supported. Read "Accept rate on real prose" before doing more work here.
+Status: DONE, and the answer is no. The head is ported, reference-exact,
+wired end to end, and measured. It does not beat the pinned native head on
+accept rate or on time, so it is not worth swapping in. The wiring stays in
+the tree as unused capability. Read "Timing" and "Decision" before reopening
+this.
 
 ## Measured result
 
@@ -107,6 +109,63 @@ One consequence to handle first: `draftPolicy` is a cost model built for the
 autoregressive head. It prices depth `d` at `d` head forwards, which a block
 head does not pay, so it systematically under-drafts one. Give the block path a
 depth-flat policy before reading any timing.
+
+## Timing
+
+Forced-depth sweep, 128 decode tokens on the same prose prompt, median round
+wall (`p50_block_request_seconds_after_first`) normalised by each head's own
+depth-0 round. Every configuration matched the serial trajectory exactly.
+
+| d | Native R/R0 | Block R/R0 | Native s/token | Block s/token |
+|---|---|---|---|---|
+| 0 | 1.000 | 1.000 | 0.1129 | 0.1215 |
+| 1 | 1.261 | 1.249 | 0.0824 | 0.0892 |
+| 2 | 1.622 | 1.290 | 0.0799 | 0.0671 |
+| 3 | 1.522 | 1.416 | 0.0613 | 0.0598 |
+| 4 | 1.724 | 1.564 | 0.0622 | 0.0586 |
+| 6 | 2.313 | 1.957 | 0.0684 | 0.0628 |
+| 8 | 2.884 | 2.489 | 0.0759 | 0.0717 |
+
+That single sweep put the block head ahead at every depth from 2 up. It did
+NOT replicate. Three runs at each head's own optimum:
+
+| Run | Native d=3 | Block d=4 |
+|---|---|---|
+| 1 | 0.0636 | 0.0614 |
+| 2 | 0.0565 | 0.0613 |
+| 3 | 0.0623 | 0.0663 |
+| median | 0.0623 | 0.0614 |
+| mean | 0.0608 | 0.0630 |
+
+Medians favour the block head by 1.5%, means favour the native head by 3.5%,
+and the ranges overlap completely. The two heads are indistinguishable here.
+
+READ THESE AS HOT-START NUMBERS. This host idles at 46.9C against the cool
+gate's 40C target, so the gate cannot arm and every reading above is ungated.
+Within-sweep ratios survive that; a 1.5% difference does not.
+
+## Decision
+
+Keep the pinned native head. Do not declare the block drafter.
+
+Fidelity ranks the three candidates cleanly, and it is the only axis that
+separates them once timing is a wash:
+
+1. The organizer-pinned native head IS the reference. No substitution, no
+   port, no re-quantization, nothing to verify.
+2. DFlash2 8-bit is a reference-exact port: 1.0 ULP per layer and an identical
+   drafted path. Faithful, but a substituted architecture behind a 1.9 GiB
+   artifact and a digest declaration.
+3. DFlash2 4-bit is the only configuration with MEASURED infidelity, and it is
+   the one this plan intended to ship. Rule it out.
+
+Head fidelity is not a correctness argument. Every configuration emitted tokens
+identical to the serial trajectory, because the head only proposes and the
+target decides. Fidelity buys accept-rate faithfulness and nothing else, which
+is exactly the channel the 4-bit head's divergence showed up in.
+
+WHAT WOULD REOPEN THIS. A gated run on the ranked box, where the 1.5% the
+medians hint at is either real or gone. Nothing on this host can settle it.
 
 ## Why this target
 
@@ -218,17 +277,22 @@ Four modules carry the DFlash2 delta over DFlash v1:
    offers 2, 4 and 8.
 6. Measured accept rate against the pinned head on prose. Result above.
 
+7. Replaced the block path's draft price. The shipped cost model charged a
+   block head for `d` head forwards it never performs. The fitted replacement
+   puts the drafter forward on the first step and leaves extra drafts cheap.
+8. Timed both heads. Result above: a wash.
+
 ### Now
 
-7. Give the block path a depth-flat draft policy. The shipped cost model prices
-   a block head as if it paid one head forward per draft.
-8. Time the two heads at the ranked window. Accept rate is now known to be a
-   wash, so the decision rests entirely on round cost.
+Nothing. The question this plan asked is answered.
 
-### Later
+### If this is reopened
 
-9. Declare the chosen head in `mtp-head.manifest.json`, if the timing supports
-   shipping one at all.
+9. Re-time on the ranked box behind the thermal gate. That is the only
+   measurement that can separate the two heads.
+10. Refit `blockDraftForwardCostRatio` and `blockDraftRowCostRatio` there. The
+    shipped values are this host's fit scaled into the native constant's unit,
+    which is a transfer argument, not a measurement.
 
 ## What the round shape turned out to be
 

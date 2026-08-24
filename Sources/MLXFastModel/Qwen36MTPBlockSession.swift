@@ -610,9 +610,18 @@ public final class Qwen36MTPBlockSession {
         // below h. The streak ladder's behavior is the degenerate one-EMA
         // version of this; the per-position EMAs let depth 5-8 pay where the
         // ladder's cap of 4 left committed tokens on the table.
+        // RESEARCH ONLY, and off unless exported. Pins every round to a
+        // constant width so a fit can read round cost as a function of depth
+        // without the schedule moving underneath it. The ranked workflow never
+        // sets it, and with it unset this closure is the shipped schedule.
+        let forcedDepth = ProcessInfo.processInfo
+            .environment["DARKBLOOM_QWEN_MTP_FORCE_DEPTH"].flatMap(Int.init)
         draftPolicy = { [weak self] offeredDepth, _ in
             guard let self else { return Swift.min(offeredDepth, 1) }
             if self.headless { return 0 }
+            if let forcedDepth {
+                return Swift.max(0, Swift.min(forcedDepth, offeredDepth))
+            }
             return self.costModelDepth(offeredDepth: offeredDepth)
         }
         // A declared drafter that is not the native head architecture drafts
@@ -1576,6 +1585,66 @@ public final class Qwen36MTPBlockSession {
         return out
     }
 
+    /// THE BLOCK DRAFTER'S PRICE, and why it is a different SHAPE rather than
+    /// a different level.
+    ///
+    /// The shipped price is uniform: `T(d) = V + d*h*V`, because an
+    /// autoregressive head runs one forward per draft. A block drafter runs
+    /// ONE forward for the whole block, so its depth cost is not the head at
+    /// all -- it is the widening verify plus a few extra rows through the
+    /// drafter's own vocabulary projection. Pricing it uniformly at the native
+    /// head's `h` charges it for `d` forwards it never performs, and the rule
+    /// then stops the walk early: the measured effect is 2.66 committed tokens
+    /// per round against the native head's 2.83 at the same offer.
+    ///
+    /// So the block price puts the drafter's fixed cost on the FIRST step and
+    /// leaves the rest cheap:
+    ///
+    ///     marginal[0]   = blockDraftForwardCostRatio + blockDraftRowCostRatio
+    ///     marginal[d>0] = blockDraftRowCostRatio
+    ///
+    /// which is `T(0) = V`, `T(d>=1) = V + B + d*m*V`. A round that drafts
+    /// nothing still pays nothing, and the first draft carries the whole
+    /// drafter forward, which is what actually happens.
+    ///
+    /// BOTH CONSTANTS ARE MEASURED. Forced-depth sweep, 8-bit DFlash2 head,
+    /// 128 decode tokens on prose, median round wall normalised by each head's
+    /// own depth-0 round:
+    ///
+    ///     d          0      1      2      3      4      6      8
+    ///     native  1.000  1.261  1.622  1.522  1.724  2.313  2.884
+    ///     block   1.000  1.249  1.290  1.416  1.564  1.957  2.489
+    ///
+    /// giving a native slope of 0.232 per draft and a block slope of 0.177,
+    /// with a block first step of 0.249 -- so the drafter forward itself is
+    /// 0.249 - 0.177 = 0.072 and the rest is the widening verify.
+    ///
+    /// THE FLAT-COST STORY IS ONLY PARTLY TRUE, which is why these are fitted
+    /// rather than set to (large, ~0). A block drafter does run one forward
+    /// per round instead of `d`, but the dominant per-draft cost is the
+    /// WIDENING VERIFY, which both heads pay identically. Removing the head
+    /// chain removes the smaller term: 0.177 against 0.232, not against zero.
+    ///
+    /// SCALED TO THE SHIPPED UNIT. That sweep ran on an M4 Max, where the
+    /// native slope measures 0.232 while the shipped `headStepCostRatio` is
+    /// 0.18, fitted on the ranked M5. The block constants are expressed in the
+    /// same unit as the shipped one -- multiplied by 0.18 / 0.232 -- so the
+    /// price transfers with the native constant rather than carrying this
+    /// host's dispatch table into a ranked run. Raw local fit: 0.072 and
+    /// 0.177. Refit after any change to the head artifact or its precision.
+    private static let blockDraftForwardCostRatio = 0.06
+    private static let blockDraftRowCostRatio = 0.14
+
+    internal static func makeBlockDepthPrice() -> DepthPrice {
+        var marginal = [Double](
+            repeating: blockDraftRowCostRatio, count: Qwen36MTPLimits.maxDepth)
+        marginal[0] += blockDraftForwardCostRatio
+        return DepthPrice(
+            marginal: marginal, cumulative: prefixCosts(marginal))
+    }
+
+    internal static let blockDepthPrice: DepthPrice = makeBlockDepthPrice()
+
     internal enum DepthPriceArm: String {
         case ship, pb5, pb7, pbfit
     }
@@ -1715,7 +1784,9 @@ public final class Qwen36MTPBlockSession {
         // there would describe the next round's inputs, not this one's.
         if Self.traceRounds { snapshotScheduleSignal(widthCap: widthCap) }
         guard cap > 0 else { return 0 }
-        let price = Self.depthPrice
+        // A block drafter pays one forward for the whole block, so the depth
+        // it can afford is set by a different price shape entirely.
+        let price = blockDrafter == nil ? Self.depthPrice : Self.blockDepthPrice
         var reach = 1.0
         var expected = 0.0
         var depth = 0
