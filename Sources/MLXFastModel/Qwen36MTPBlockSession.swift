@@ -1,3 +1,5 @@
+// Variance-resample attempt marker: draw 0749 tip ec24d59 (E109).
+
 import Foundation
 import MLX
 import MLXFastCore
