@@ -2367,6 +2367,31 @@ func qwen35FusedResidualRMSNorm(
     return (outputs[0], outputs[1])
 }
 
+/// Same two-output residual+RMSNorm kernel as `qwen35FusedResidualRMSNorm`,
+/// but it never consults the chunk-sum sidecar and never publishes a table.
+/// The final backbone merge is `h = base + delta` followed by `model.norm(h)`.
+/// That pair is the same instruction stream this kernel already runs at every
+/// interior layer. Opening it on the exit add must not also emit a table:
+/// a sidecar fill of the final normed row is a different isolate (extra
+/// producers on `o_proj` / final norm) and is closed.
+func qwen35FusedResidualRMSNormPlain(
+    x: MLXArray,
+    r: MLXArray,
+    weight: MLXArray,
+    eps: Float
+) -> (residual: MLXArray, normed: MLXArray) {
+    let nRows = x.size / x.dim(-1)
+    let shape = x.shape
+    let outputs = qwen35FusedResidualRMSNormKernel(
+        [x, r, weight, MLXArray(eps)],
+        grid: (nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [shape, shape],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 /// Chunk-sum tables emitted by a producing kernel's epilogue, keyed by the
 /// identity of the activation tensor they describe.
 ///
@@ -3634,11 +3659,15 @@ public class Qwen35TextModelInner: Module {
     /// Port of omlx commit 696d90a:
     ///   patches/mlx_lm_mtp/qwen35_model.py `_patch_qwen3_5_text_model`
     ///   (returns hidden_states before self.model.norm so TextModel can apply it)
-    func callAsFunction(
+    /// Layer stack only. On the BF16/5120 path the residual boundary is left
+    /// unmerged so the caller can fold the exit add into the already-paid
+    /// residual+RMSNorm kernel together with `self.norm`. The eager path
+    /// returns the merged hidden in `base` and a nil `delta`.
+    func callUnmerged(
         _ inputs: MLXArray,
         cache: [KVCache?]? = nil,
         nConfirmed: Int = 0
-    ) -> MLXArray {
+    ) -> (base: MLXArray, delta: MLXArray?) {
         var hiddenStates = embedTokens(inputs)
 
         var cacheArray = cache
@@ -3693,7 +3722,7 @@ public class Qwen35TextModelInner: Module {
                     }
                 }
             }
-            hiddenStates = delta.map { base + $0 } ?? base
+            return (base, delta)
         } else {
             for (i, layer) in layers.enumerated() {
                 let mask = layer.isLinear ? ssmMask : nil
@@ -3713,10 +3742,42 @@ public class Qwen35TextModelInner: Module {
                     }
                 }
             }
+            return (hiddenStates, nil)
         }
+    }
 
-        // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
-        return hiddenStates
+    func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache?]? = nil,
+        nConfirmed: Int = 0
+    ) -> MLXArray {
+        let (base, delta) = callUnmerged(
+            inputs, cache: cache, nConfirmed: nConfirmed)
+        return delta.map { base + $0 } ?? base
+    }
+
+    /// Pre-norm hidden and `self.norm` of that hidden, from one residual+RMSNorm
+    /// launch when the unmerged BF16/5120 pair is live. Callers that need both
+    /// tensors (logits + MTP hidden) no longer pay a standalone add and then a
+    /// standalone RMSNorm over the same 5120-wide rows.
+    func callHiddenAndNorm(
+        _ inputs: MLXArray,
+        cache: [KVCache?]? = nil,
+        nConfirmed: Int = 0
+    ) -> (hidden: MLXArray, normed: MLXArray) {
+        let (base, delta) = callUnmerged(
+            inputs, cache: cache, nConfirmed: nConfirmed)
+        if let delta,
+           base.dtype == .bfloat16,
+           delta.dtype == .bfloat16,
+           base.dim(-1) == 5120
+        {
+            let pair = qwen35FusedResidualRMSNormPlain(
+                x: base, r: delta, weight: norm.weight, eps: norm.eps)
+            return (pair.residual, pair.normed)
+        }
+        let hidden = delta.map { base + $0 } ?? base
+        return (hidden, norm(hidden))
     }
 
     /// Atomically rebuild every linear-attention layer at the same committed
@@ -5385,8 +5446,10 @@ extension Qwen35TextModel: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
-        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
+        let pair = model.callHiddenAndNorm(
+            input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let hidden = pair.hidden
+        let normed = pair.normed
         let logits: MLXArray
         if let lmHead {
             logits = routedLMHead(lmHead, normed)
@@ -5405,8 +5468,10 @@ extension Qwen35TextModel: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray, MLXArray?) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
-        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
+        let pair = model.callHiddenAndNorm(
+            input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let hidden = pair.hidden
+        let normed = pair.normed
         let logits: MLXArray
         if let lmHead {
             logits = routedLMHead(lmHead, normed)
