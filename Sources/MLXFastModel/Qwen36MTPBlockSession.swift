@@ -705,13 +705,16 @@ public final class Qwen36MTPBlockSession {
     // parent derives every ledger quantity from the drafts actually proposed.
     public var draftPolicy: (_ offeredDepth: Int, _ round: Int) -> Int = {
         offeredDepth, _ in
-        Swift.min(offeredDepth, 1)
+        Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth)
     }
 
     /// Consecutive fully-accepted DRAFTING rounds. Kept as a public-ish
     /// telemetry counter; the cost-model schedule below reads the per-position
     /// EMAs, not this.
     private var fullAcceptStreak = 0
+    // Congestion-window framing: prove speculative width useful before
+    // spending the next cycle at a deeper draft count.
+    private var activeDraftDepth = 1
 
     /// The last row of a head-chain hidden block. Every step after the first
     /// feeds ONE row in and gets ONE row back, and `lastHiddenWithKVOnlyHistory`
@@ -895,7 +898,7 @@ public final class Qwen36MTPBlockSession {
 
     /// The one-boundary tier factor E56 fitted, retained so `pb5` and `pb7`
     /// reproduce that experiment's published arithmetic exactly.
-    internal static let boundaryTierFactor = 2.0301
+    internal static let boundaryTierFactor = 2.0
 
     /// The shipped flat price. `cumulative` repeats the tip's closed form
     /// instead of accumulating: `1.0 + 0.18 + 0.18 + 0.18` and
@@ -1068,6 +1071,109 @@ public final class Qwen36MTPBlockSession {
     /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
     private static let segmentedStreakGate = 2
 
+    /// E133 -- THE ROUND-TIME MODEL, and the reason this schedule stopped
+    /// walking greedily.
+    ///
+    /// `roundTimeModel[d]` is the wall time of a round that drafts `d` tokens,
+    /// relative to a round that drafts none. It is NOT a marginal price: the
+    /// rule below takes a GLOBAL argmax over it, because the curve is not
+    /// convex and a greedy walk cannot see past its first unprofitable step.
+    ///
+    /// WHERE THE SHAPE COMES FROM. A drafting round verifies at width
+    /// `M = d + 1`, and the verify leg is a weight-stream-bound affine-4 QMV
+    /// over the whole 4-bit backbone. Its cost per round is
+    ///
+    ///     T_qmv(M)  =  C * activeInputGroups(M) / rate(NA(M))
+    ///
+    /// -- the weight stream is re-read once PER X-GROUP, and each group's
+    /// achieved bandwidth falls as its input count `NA = ceil(M / IPG)` rises.
+    /// Both factors are measured. The shipped launch table is
+    /// `activeInputGroups`: 1 X-group at M = 2...5, 2 at M = 6...8, 3 at M = 9.
+    /// The achieved-rate ladder by NA is 2:228 3:206 4:184 5:134 6:115 GB/s.
+    /// With `C = 14,405,360` (the ~14.41 GB single-group stream in those
+    /// units) the closed form reproduces every independently timed cell of the
+    /// 23-cell (M, IPG) sweep to within 2.4 %:
+    ///
+    ///     M=2  63,181   M=3  69,930   M=4  78,290   M=5 107,503
+    ///     M=6 139,860   M=7 148,220   M=8 156,580   M=9 209,790
+    ///
+    /// THE CURVE IS NOT SMOOTH, AND THAT IS THE WHOLE POINT. Steps that stay
+    /// inside one X-group are nearly free; the two steps that ADD a weight
+    /// stream (into M = 6 and into M = 9) and the step onto the NA = 5 rate
+    /// cliff (into M = 5) each cost several times an ordinary step.
+    ///
+    /// LEVEL. The one scale factor is anchored on the only ranked measurement
+    /// of a marginal verify row this track has: raising the cap from 7 to 8
+    /// moved the mean draft length by +0.30 on the 5 prompts it could touch
+    /// and raised time per round by +6.30 % (median), i.e. the step into
+    /// M = 9 costs 0.0630 / (29/108) = 22.5 % of a round. That fixes
+    /// `u = 9.8 ms / (T_qmv(9) - T_qmv(8))` against a 43.6 ms mean round.
+    ///
+    /// CROSS-CHECK, and it is the reason this table is trusted at all: with
+    /// that single constant, the model's own prediction for a d = 1 round is
+    /// 31.8 ms, and the ranked run's near-serial prompt (mean draft 0.154,
+    /// 449 non-drafting rounds) measures 31.0 ms per round. The model was not
+    /// fitted to that number. Summing the model over the ranked 108-round
+    /// width histogram (M = 3x14, 4x7, 5x19, 6x23, 7x16, 8x29) reproduces the
+    /// run's 4.71 s decode window. Three independent anchors, one constant.
+    ///
+    /// Do NOT re-derive this from local wall-clock on any other machine. The
+    /// only inputs are the shipped `activeInputGroups` table, the NA rate
+    /// ladder, and one ranked ratio.
+    internal static let roundTimeModel: [Double] = {
+        let c = 14_405_360.0
+        let rate: [Int: Double] = [2: 228, 3: 206, 4: 184, 5: 134, 6: 115]
+        // X-group count and per-group NA for the SHIPPED launch table.
+        let cells: [(groups: Double, na: Int)] = [
+            (1, 2), (1, 3), (1, 4), (1, 5), (2, 3), (2, 4), (2, 4), (3, 3),
+        ]
+        func qmv(_ m: Int) -> Double {
+            let cell = cells[m - 2]
+            // M=7 runs one NA=4 group and one NA=3 tail group.
+            if m == 7 { return c / rate[4]! + c / rate[3]! }
+            return cell.groups * c / rate[cell.na]!
+        }
+        let stepIntoNine = 9.8 / (qmv(9) - qmv(8))
+        let firstDraftRound = 31.8
+        // THE NON-DRAFTING ROUND IS NOT MEASURED AND IS NOT GUESSED. Nothing
+        // on this board times the adaptive-skip path against a d = 1 round, so
+        // `T(0)` is pinned to exactly the level the tip's own shipped rule
+        // already implies -- its depth-0 threshold is `headStepCostRatio`, so
+        // `T(1)/T(0) = 1 + h` reproduces the tip's skip boundary to the digit.
+        // The SKIP DECISION IS THEREFORE UNCHANGED by this candidate, and the
+        // whole mechanism lives at depth >= 1. (The ranked near-serial prompt
+        // measures 31.0 ms per round at 93 % non-drafting, so the honest
+        // bracket on this quantity is wide; borrowing the incumbent's own
+        // implied value is the only choice here that cannot move a leg the
+        // evidence does not cover.)
+        let serialRound = firstDraftRound / (1.0 + headStepCostRatio)
+        var out = [1.0]
+        for d in 1 ... Qwen36MTPLimits.maxDepth {
+            let ms = firstDraftRound + stepIntoNine * (qmv(d + 1) - qmv(2))
+            out.append(ms / serialRound)
+        }
+        return out
+    }()
+
+    /// Which rule turns the acceptance estimates into a depth.
+    ///
+    /// `greedyMarginal` is the tip's shipped walk, kept byte-for-byte as the
+    /// control arm. `globalArgmax` is shipped.
+    ///
+    /// WHY THE RULE CHANGED, and why this is not the `pbfit` experiment again.
+    /// `pbfit` put the MEASURED width curve into the greedy walk's marginal
+    /// price and lost (+0.33 % on the crown, E75 rung B/D). Replayed against
+    /// the official round ledger that outcome is fully explained: a greedy
+    /// walk stops at its first unprofitable step, so a truthful non-uniform
+    /// price parks 61 of 108 rounds at d = 4 -- the LOCAL optimum, just below
+    /// the expensive stream-adding step -- and reaches the cap only 18 times.
+    /// The tip's uniform price wins that comparison by accident: it cannot
+    /// see the plateau, so it walks across it. Neither rule optimises the
+    /// objective the schedule's own assignment states. A global argmax does,
+    /// and it is the ONLY rule under which a truthful width curve is safe.
+    internal enum DepthScheduleRule: String { case greedyMarginal, globalArgmax }
+    internal static let depthScheduleRule: DepthScheduleRule = .globalArgmax
+
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
         // The width wall binds the SINGLE-CALL verify; a qualifying
@@ -1114,11 +1220,12 @@ public final class Qwen36MTPBlockSession {
         // there would describe the next round's inputs, not this one's.
         if Self.traceRounds { snapshotScheduleSignal(widthCap: widthCap) }
         guard cap > 0 else { return 0 }
-        let price = Self.depthPrice
-        var reach = 1.0
-        var expected = 0.0
-        var depth = 0
-        while depth < cap {
+
+        // The acceptance estimate for position `depth`, before anything is
+        // proposed. Byte-for-byte the tip's expression, factored out so both
+        // rules read the SAME number and an arm swap changes only the rule.
+        @inline(__always)
+        func acceptEstimate(_ depth: Int) -> Double {
             var p = positionAcceptEMA[depth]
             if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
                 let margin = tail.1[0] - tail.1[1]
@@ -1129,18 +1236,66 @@ public final class Qwen36MTPBlockSession {
                 let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
                 p = Swift.min(p, conf2)
             }
-            reach *= p
-            let threshold = price.marginal[depth] * (1.0 + expected) /
-                price.cumulative[depth]
-            if Self.traceRounds {
-                scheduleTrace += String(
-                    format: "%d:%.6f/%.6f/%.6f;", depth, p, reach, threshold)
-            }
-            guard reach > threshold else { break }
-            expected += reach
-            depth += 1
+            return p
         }
-        return depth
+
+        switch Self.depthScheduleRule {
+        case .greedyMarginal:
+            let price = Self.depthPrice
+            var reach = 1.0
+            var expected = 0.0
+            var depth = 0
+            while depth < cap {
+                let p = acceptEstimate(depth)
+                reach *= p
+                let threshold = price.marginal[depth] * (1.0 + expected) /
+                    price.cumulative[depth]
+                if Self.traceRounds {
+                    scheduleTrace += String(
+                        format: "%d:%.6f/%.6f/%.6f;", depth, p, reach, threshold)
+                }
+                guard reach > threshold else { break }
+                expected += reach
+                depth += 1
+            }
+            return depth
+
+        case .globalArgmax:
+            // THE OBJECTIVE THE SCHEDULE'S OWN ASSIGNMENT STATES: choose the
+            // depth that maximises expected committed tokens per unit round
+            // time. `E[tokens](d) = 1 + sum_{k=1..d} prod_{i<k} p_i` and
+            // `T(d) = roundTimeModel[d]`, so the rule is one argmax over at
+            // most `cap + 1` candidates -- a few doubles, no allocation, no
+            // dispatch, no device read. It costs the same host arithmetic the
+            // greedy walk already paid, and never breaks early: the whole
+            // point is that the curve has a plateau a greedy walk cannot
+            // cross.
+            //
+            // Ties keep the SHALLOWER depth (strict `>`), so a flat model
+            // degenerates to the cheapest round rather than the widest.
+            let times = Self.roundTimeModel
+            var reach = 1.0
+            var tokens = 1.0
+            var bestDepth = 0
+            var bestRate = 1.0 / times[0]
+            var depth = 0
+            while depth < cap {
+                let p = acceptEstimate(depth)
+                reach *= p
+                tokens += reach
+                depth += 1
+                let rate = tokens / times[depth]
+                if Self.traceRounds {
+                    scheduleTrace += String(
+                        format: "%d:%.6f/%.6f/%.6f;", depth - 1, p, reach, rate)
+                }
+                if rate > bestRate {
+                    bestRate = rate
+                    bestDepth = depth
+                }
+            }
+            return bestDepth
+        }
     }
 
     /// Trace-gated record of the schedule's inputs and its extension walk.
@@ -1271,7 +1426,13 @@ public final class Qwen36MTPBlockSession {
         // that matters -- the draft loop, the declared row count, the per-row
         // readouts and the rollback all key off it, so a policy change needs no
         // other edit to stay ledger-correct.
-        let draftCount = draftPolicy(depth, roundCount)
+        let policyDepth = draftPolicy(depth, roundCount)
+        precondition(
+            policyDepth >= 0 && policyDepth <= depth
+                && policyDepth <= Qwen36MTPLimits.maxDepth,
+            "draftPolicy returned \(policyDepth) for an offer of \(depth); a "
+                + "policy must return a count in 0 ... offeredDepth")
+        let draftCount = Swift.min(policyDepth, activeDraftDepth)
         precondition(
             draftCount >= 0 && draftCount <= depth
                 && draftCount <= Qwen36MTPLimits.maxDepth,
@@ -1501,10 +1662,8 @@ public final class Qwen36MTPBlockSession {
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
         // same ordering `argMax` uses (larger logit wins, lower id wins an
-        // exact tie), so the separate vocabulary-wide argMax launch is
-        // redundant (credit GPT-5.6 Sol, promoted b71bb35, 1.37645).
-        let verifyArgmax = stride(
-            from: 0, to: flatTop2IDs.count, by: 2).map { flatTop2IDs[$0] }
+        // exact tie). Read those IDs in place below instead of materializing a
+        // second host array for the acceptance walk and carried primary.
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
         //    is the target's greedy continuation of verify input i, i.e. the
@@ -1512,7 +1671,7 @@ public final class Qwen36MTPBlockSession {
         //    used on full acceptance.
         var acceptedCount = 0
         for index in 0 ..< drafts.count {
-            guard verifyArgmax[index] == drafts[index] else { break }
+            guard flatTop2IDs[index * 2] == drafts[index] else { break }
             acceptedCount += 1
             if stopTokens.contains(drafts[index]) { break }
         }
@@ -1536,7 +1695,7 @@ public final class Qwen36MTPBlockSession {
             Self.clearRecurrentRollback(cache)
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
-            pendingPrimary = verifyArgmax[drafts.count]
+            pendingPrimary = flatTop2IDs[drafts.count * 2]
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
@@ -1562,7 +1721,7 @@ public final class Qwen36MTPBlockSession {
                 acceptedCount: acceptedCount, draftCount: draftCount,
                 to: committedOffset)
             {
-                pendingPrimary = verifyArgmax[acceptedCount]
+                pendingPrimary = flatTop2IDs[acceptedCount * 2]
                 pendingHidden = hiddenRow(
                     verifyHidden, verifyNormed, acceptedCount)
                 pendingTop2 = (
@@ -1628,6 +1787,11 @@ public final class Qwen36MTPBlockSession {
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
         recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
+        if !drafts.isEmpty && acceptedCount == drafts.count {
+            activeDraftDepth = Swift.min(depth, activeDraftDepth + 1)
+        } else if acceptedCount < drafts.count {
+            activeDraftDepth = 1
+        }
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only
             // rows on the accepted trajectory align with the serial leg.
