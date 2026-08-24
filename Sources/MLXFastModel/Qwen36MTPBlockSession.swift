@@ -895,7 +895,7 @@ public final class Qwen36MTPBlockSession {
 
     /// The one-boundary tier factor E56 fitted, retained so `pb5` and `pb7`
     /// reproduce that experiment's published arithmetic exactly.
-    internal static let boundaryTierFactor = 2.0301
+    internal static let boundaryTierFactor = 2.0
 
     /// The shipped flat price. `cumulative` repeats the tip's closed form
     /// instead of accumulating: `1.0 + 0.18 + 0.18 + 0.18` and
