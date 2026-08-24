@@ -1564,7 +1564,7 @@ private let qwen35E120QMVHeader = """
 private func qwen35E120QMVSource(table: Bool) -> String {
     let sums = table ? "xsums" : "qmv_null_sums"
     let flag = table ? "USE_TABLE" : "false"
-    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3)]
+    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 3), (9, 3)]
         .map { m, ipg in
             """
                     case \(m):
@@ -1721,7 +1721,7 @@ public enum Qwen35CustomQMV {
         case 5: inputsPerGroup = 5
         case 6: inputsPerGroup = 3
         case 7: inputsPerGroup = 4
-        case 8: inputsPerGroup = 4
+        case 8: inputsPerGroup = 3
         case 9: inputsPerGroup = 3
         default: preconditionFailure("Qwen wide QMV has no width plan for \(m)")
         }

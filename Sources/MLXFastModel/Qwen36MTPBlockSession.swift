@@ -1039,6 +1039,12 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 7
+
+    /// CAP 8 was tried at rank (`023f8351`) and rejected 3.55662 (-17.38%):
+    /// width-9 verifies fire often on the hidden pool and the shipped flat
+    /// per-row price cannot see what they cost. Do not raise without pricing
+    /// the width regime. Width 9 itself is exactness-cleared by value-level
+    /// replay (20/20 rows, forced-saturation local run); the cliff is economic.
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///

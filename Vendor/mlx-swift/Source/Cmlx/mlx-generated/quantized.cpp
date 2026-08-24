@@ -1965,10 +1965,19 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 4+4: two weight streams, receipted on this benchmark (scored
-          // 3.195804751396457 as a promoted submission) before a later
-          // stale-base REPLACE overlay reverted it; restored here.
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
+          // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
+          // two simultaneous vec<float,4> accumulators in every active worker;
+          // M = 9 uses three-lane vectors and profiles CHEAPER despite more work
+          // (319 / 437 / 216 us for M = 7 / 8 / 9 in the public cross-row study)
+          // — a register cliff, not work scaling. The earlier 4+4 promotion
+          // (scored 3.195804751396457) predates that study; a stale-base
+          // REPLACE overlay then restored 4+4 while the AOT header kept the
+          // 3+3+2 argument. Exact: these lanes carry INDEPENDENT input rows and
+          // are never reduced across (simd_sum reduces along K WITHIN a row),
+          // so moving a row from lane 3 of a four-wide vector to lane 0 of a
+          // two-wide one cannot reorder its scalar chain. Receipts:
+          // 85d5bca3 2.91143, yzxoi 2.92675.
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
