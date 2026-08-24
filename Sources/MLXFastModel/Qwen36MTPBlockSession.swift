@@ -553,7 +553,7 @@ public final class Qwen36MTPBlockSession {
             extended.append(contentsOf: [extK, extV])
             if firstKV == nil { firstKV = (extK, extV) }
         }
-        // Pinned Qwen 3.8 tower: 16 FA + 48 GDN. Wrong geometry → no-op.
+        // Pinned Qwen 3.8 tower: 16 FA + 48 GDN layers. Wrong geometry → no-op.
         guard faCount == 16, let (extK, extV) = firstKV, extK.dim(2) >= 1024
         else { return }
         eval(extended)
