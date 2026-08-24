@@ -1719,7 +1719,7 @@ public enum Qwen35CustomQMV {
         case 3: inputsPerGroup = 3
         case 4: inputsPerGroup = 4
         case 5: inputsPerGroup = 5
-        case 6: inputsPerGroup = 3
+        case 6: inputsPerGroup = 6
         case 7: inputsPerGroup = 4
         case 8: inputsPerGroup = 4
         case 9: inputsPerGroup = 3
