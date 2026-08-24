@@ -232,6 +232,134 @@ private let qwen35CompiledGatedDeltaPostNorm:
     return body
 }()
 
+/// GDN post-norm: library `rms_single_row` write-back plus the precise
+/// fp32 SiLU(gate)*x product, one launch. The reduction tree, weight
+/// multiply, and bf16 cast of `x * inv_mean` are the `rms_norm.metal`
+/// single-row body (N_READS=4, 32 threads, axis 128). The SiLU product
+/// then reads that same register-held bf16, matching the two-dispatch
+/// path that writes RMS to memory and reloads it. Proposal and target
+/// both use this helper; the serial control is the pinned tree, so the
+/// candidate leg keeps the deleted follow-on launch.
+private let qwen35GatedDeltaFusedPostNormKernel = MLXFast.metalKernel(
+    name: "qwen35_gdn_fused_post_norm_bf16_v1",
+    inputNames: ["x", "gate", "weight", "eps"],
+    outputNames: ["out"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint lid = thread_position_in_threadgroup.x;
+        uint simd_lane_id = thread_index_in_simdgroup;
+        uint simd_group_id = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(x_shape[x_ndim - 1]);
+        uint heads = uint(x_shape[x_ndim - 2]);
+        uint sequence = uint(x_shape[1]);
+        uint tmp = row;
+        uint head = tmp % heads; tmp /= heads;
+        uint seq = tmp % sequence; tmp /= sequence;
+        uint batch = tmp;
+
+        ulong x_base = ulong(batch) * ulong(x_strides[0])
+            + ulong(seq) * ulong(x_strides[1])
+            + ulong(head) * ulong(x_strides[2]);
+        ulong g_base = ulong(batch) * ulong(gate_strides[0])
+            + ulong(seq) * ulong(gate_strides[1])
+            + ulong(head) * ulong(gate_strides[2]);
+        ulong x_axis = ulong(x_strides[x_ndim - 1]);
+        ulong g_axis = ulong(gate_strides[gate_ndim - 1]);
+        ulong w_stride = ulong(weight_strides[0]);
+        ulong out_base = ulong(row) * ulong(axis_size);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        uint first = lid * n_reads;
+        if (first + n_reads <= axis_size) {
+            for (uint i = 0; i < n_reads; i++) {
+                float xi = float(x[x_base + ulong(first + i) * x_axis]);
+                acc += xi * xi;
+            }
+        } else {
+            for (uint i = 0; i < n_reads; i++) {
+                if (first + i < axis_size) {
+                    float xi = float(x[x_base + ulong(first + i) * x_axis]);
+                    acc += xi * xi;
+                }
+            }
+        }
+        acc = simd_sum(acc);
+        if (simd_group_id == 0) {
+            local_sums[simd_lane_id] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lane_id == 0) {
+            local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group_id == 0) {
+            acc = simd_sum(local_sums[simd_lane_id]);
+            if (simd_lane_id == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        if (first + n_reads <= axis_size) {
+            for (uint i = 0; i < n_reads; i++) {
+                uint element = first + i;
+                float xi = float(x[x_base + ulong(element) * x_axis]);
+                bfloat16_t rms = weight[ulong(element) * w_stride]
+                    * static_cast<bfloat16_t>(xi * inv_mean);
+                float gate32 = float(gate[g_base + ulong(element) * g_axis]);
+                float activated = gate32
+                    * (1.0f / (1.0f + metal::precise::exp(-gate32)));
+                out[out_base + ulong(element)] =
+                    static_cast<bfloat16_t>(activated * float(rms));
+            }
+        } else {
+            for (uint i = 0; i < n_reads; i++) {
+                uint element = first + i;
+                if (element < axis_size) {
+                    float xi = float(x[x_base + ulong(element) * x_axis]);
+                    bfloat16_t rms = weight[ulong(element) * w_stride]
+                        * static_cast<bfloat16_t>(xi * inv_mean);
+                    float gate32 = float(gate[g_base + ulong(element) * g_axis]);
+                    float activated = gate32
+                        * (1.0f / (1.0f + metal::precise::exp(-gate32)));
+                    out[out_base + ulong(element)] =
+                        static_cast<bfloat16_t>(activated * float(rms));
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+private func qwen35GatedDeltaFusedPostNorm(
+    _ x: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float
+) -> MLXArray? {
+    guard MLXHardwareInfo.isCompiledDecodeSupported,
+          x.dtype == .bfloat16, gate.dtype == .bfloat16,
+          weight.dtype == .bfloat16,
+          x.ndim == 4, gate.shape == x.shape,
+          x.dim(-1) == 128, weight.shape == [128]
+    else { return nil }
+    let rows = x.size / x.dim(-1)
+    let outputs = qwen35GatedDeltaFusedPostNormKernel(
+        [x, gate, weight, MLXArray(eps)],
+        grid: (rows * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [x.shape],
+        outputDTypes: [.bfloat16]
+    )
+    return outputs[0]
+}
+
 /// Fuse the full-attention output gate `x * sigmoid(gate)` into one compiled
 /// elementwise pass, replacing the separate sigmoid and multiply launches (and
 /// their intermediate materialization) in every full-attention layer call.
@@ -1313,7 +1441,11 @@ final class Qwen35GatedDeltaNet: Module {
         }
 
         let normedOut: MLXArray
-        if S >= 2 {
+        if let fused = qwen35GatedDeltaFusedPostNorm(
+            out, gate: z, weight: norm.weight, eps: norm.eps)
+        {
+            normedOut = fused
+        } else if S >= 2 {
             let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
         } else {
