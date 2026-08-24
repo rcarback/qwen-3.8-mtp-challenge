@@ -2041,6 +2041,7 @@ private let qwen35AttentionQKRMSRoPEKernel = MLXFast.metalKernel(
         threadgroup float local_inv_mean[1];
         threadgroup float local_sums[simd_size];
         threadgroup bfloat normalized[256];
+        thread bfloat input_values[n_reads];
 
         float acc = 0.0f;
         uint first = thread_id * n_reads;
@@ -2048,7 +2049,9 @@ private let qwen35AttentionQKRMSRoPEKernel = MLXFast.metalKernel(
             uint element = first + i;
             if (element < axis_size) {
                 ulong index = input_base + ulong(element) * input_axis_stride;
-                float value = is_query ? float(q[index]) : float(k[index]);
+                bfloat input_value = is_query ? q[index] : k[index];
+                input_values[i] = input_value;
+                float value = float(input_value);
                 acc += value * value;
             }
         }
@@ -2077,8 +2080,7 @@ private let qwen35AttentionQKRMSRoPEKernel = MLXFast.metalKernel(
         for (uint i = 0; i < n_reads; ++i) {
             uint element = first + i;
             if (element < axis_size) {
-                ulong index = input_base + ulong(element) * input_axis_stride;
-                bfloat input_value = is_query ? q[index] : k[index];
+                bfloat input_value = input_values[i];
                 bfloat rms_value = bfloat(float(input_value) * inv_mean);
                 bfloat weight = is_query
                     ? q_weight[ulong(element) * weight_stride]
