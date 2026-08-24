@@ -4,11 +4,11 @@ Replace the pinned MTP head with a Swift port of `z-lab/Qwen3.8-27B-DFlash2`,
 declared through `mtp-head.manifest.json`. The goal is a higher accept rate,
 which is the quantity the published score depends on.
 
-Status: DONE, and the answer is no. The head is ported, reference-exact,
-wired end to end, and measured. It does not beat the pinned native head on
-accept rate or on time, so it is not worth swapping in. The wiring stays in
-the tree as unused capability. Read "Timing" and "Decision" before reopening
-this.
+Status: DONE, and the answer is no. The head is ported, reference-exact, wired
+end to end, and measured. It ties the organizer head and loses to the head that
+actually ships by 15.6%, so it is not worth swapping in. The wiring stays in the
+tree as unused capability. Read "Against the head that actually ships" before
+reopening this.
 
 ## Measured result
 
@@ -144,15 +144,65 @@ READ THESE AS HOT-START NUMBERS. This host idles at 46.9C against the cool
 gate's 40C target, so the gate cannot arm and every reading above is ungated.
 Within-sweep ratios survive that; a 1.5% difference does not.
 
+## Against the head that actually ships
+
+The comparison above used the ORGANIZER head. The declared head in
+`mtp-head.manifest.json` is a different artifact -- `q2-q4-rerank`, 428 MB
+against the organizer head's 810 MB -- and it is the one a submission is
+measured on. Digest and byte count verified against the manifest before the
+run.
+
+Accept rate first. The declared head proposes IDENTICALLY to the organizer
+head at offers 2 and 4 (109 accepted / 55 rejected over 83 rounds, then
+122 / 76 over 70), and differs only at offer 8 (124 / 83 over 68 against
+126 / 85 over 66). That is the rerank index working as designed: a coarse
+shortlist with an exact reranker reproduces the full-precision argmax, so
+identical proposals are the goal rather than a coincidence. The offer-8
+divergence is what confirms the two artifacts really are different.
+
+Its advantage is therefore entirely round cost, and it is large. Median round
+wall at low depth, where this host's readings are still monotonic:
+
+| d | Declared | Organizer | Block |
+|---|---|---|---|
+| 0 | 0.0980 | 0.1036 | 0.1112 |
+| 1 | 0.1061 | 0.1306 | 0.1389 |
+| 2 | 0.1184 | 0.1680 | 0.1434 |
+
+The first draft step costs 0.008 s against the organizer head's 0.027 s. The
+depth-0 round is cheapest too, because 428 MB resident costs less than 810 MB
+or 1.9 GiB.
+
+Head to head at the live policy, four interleaved runs, 128 decode tokens:
+
+| Run | Declared | Block 8-bit |
+|---|---|---|
+| 1 | 0.0543 | 0.0631 |
+| 2 | 0.0571 | 0.0595 |
+| 3 | 0.0597 | 0.0670 |
+| 4 | 0.0530 | 0.0657 |
+| median | 0.0557 | 0.0644 |
+
+Four paired wins out of four, a 15.6% median gap, and the declared head wins
+while drafting LESS (3.94 committed tokens per round against 4.76). This is
+far larger than the noise that swamped every earlier comparison.
+
+WHY IT WINS, and why the block drafter cannot answer it. DFlash2 reduces the
+NUMBER of head forwards. The declared head instead makes each one about three
+times cheaper, by not streaming the 248320-row vocabulary matrix on every
+draft, and gives up nothing on proposals to do it. Fewer expensive head steps
+lose to the same number of cheap ones.
+
 ## Decision
 
-Keep the pinned native head. Do not declare the block drafter.
+Keep the declared head. Do not declare the block drafter.
 
 Fidelity ranks the three candidates cleanly, and it is the only axis that
 separates them once timing is a wash:
 
 1. The organizer-pinned native head IS the reference. No substitution, no
-   port, no re-quantization, nothing to verify.
+   port, no re-quantization, nothing to verify. The declared head matches its
+   proposals exactly at the depths a round actually uses.
 2. DFlash2 8-bit is a reference-exact port: 1.0 ULP per layer and an identical
    drafted path. Faithful, but a substituted architecture behind a 1.9 GiB
    artifact and a digest declaration.
@@ -164,8 +214,11 @@ identical to the serial trajectory, because the head only proposes and the
 target decides. Fidelity buys accept-rate faithfulness and nothing else, which
 is exactly the channel the 4-bit head's divergence showed up in.
 
-WHAT WOULD REOPEN THIS. A gated run on the ranked box, where the 1.5% the
-medians hint at is either real or gone. Nothing on this host can settle it.
+WHAT WOULD REOPEN THIS. Nothing on the timing side. The 1.5% between the block
+head and the ORGANIZER head needs the ranked box to settle, but that question
+stopped mattering once the declared head beat the block head by 15.6% with four
+paired wins out of four. A block drafter would have to close that gap, not the
+1.5% one.
 
 ## Why this target
 
