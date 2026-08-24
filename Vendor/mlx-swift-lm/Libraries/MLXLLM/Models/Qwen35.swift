@@ -1651,6 +1651,401 @@ private let qwen35CustomAffine4XSumsKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+
+/// Metal header for the tensor-unit wide QMV. See the comment block inside for
+/// the arithmetic and the layout contract. Compiled by MLX's kernel JIT exactly
+/// like the E120 header above; the Metal 4 tensor headers it includes are the
+/// ones MLX's own `nax` kernels include.
+private let qwen35NaxQMVHeader = """
+    #include <metal_simdgroup>
+    #include <metal_tensor>
+    #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+    // Qwen wide QMV on the tensor units: affine 4-bit / group 64 / bf16.
+    //   x [M, K] bf16 (M <= 8), w [N, K/8] u32, scales/biases [N, K/64] bf16 -> y [M, N] bf16
+    // One threadgroup owns NB = 16*TN rows of W. KS simdgroups split the K groups and
+    // reduce through threadgroup memory. Each simdgroup drives a 16 x NB x 16 matmul2d
+    // on the cooperative-tensor API; A rows >= 8 are zero (M <= 8 always).
+    //
+    // Arithmetic. The incumbent computes, per 64-group g and output row n,
+    //   acc += scale[n,g] * sum_{k in g} q[n,k] * x[m,k]  +  bias[n,g] * sum_{k in g} x[m,k]
+    // in fp32. Here q enters the tensor op as the bf16 value (128 + q) built by OR-ing
+    // the nibble into the mantissa of 128.0 (exact), the tensor op accumulates
+    // P = sum (128 + q) x in fp32 over the group, and the epilogue applies
+    //   acc += scale * P + (bias - 128 * scale) * xs
+    // which is the same expression with 128*xs*scale cancelled algebraically. The
+    // shipped MODE 0 subtracts 136 in bf16 first (exact), so the tensor op sums
+    // (q - 8) x, and the epilogue adds 8 * scale * xsF + bias * xsE where xsF is the
+    // fp32 activation sum (undoing the centring exactly) and xsE is the incumbent's
+    // own bf16 chunk sum (so the bias term is the incumbent's, rounding included). xs is the
+    // incumbent's own per-lane bf16 chunk sum (three bf16 adds per four activations,
+    // ascending), reduced across the four lanes of a group in fp32. Products of a bf16
+    // activation and a 4-bit integer are exact in fp32, so only fp32 association
+    // differs from the incumbent -- the class of difference the width-dependent
+    // batched frame already carries.
+    //
+    // Layout. The cooperative tensor's element -> (col,row) map is queried at run time
+    // and checked against two known layouts: the M5 tensor-unit layout MLX's nax.h
+    // hard-codes (NAX), and the pre-M5 software fallback (FB, measured on M4). A
+    // simdgroup whose layout matches neither writes zeros for its tile.
+
+    namespace qnax {
+
+    constant constexpr uint32_t kMagic = 0x43004300u;    // bf16 128.0 in both halves
+    constant constexpr uint32_t kNibMask = 0x000F000Fu;
+
+    // (n_s, n_{s+4}) of the eight nibbles in w as a bf16 pair. MODE 0 (shipped):
+    // (128 + q) - 136 = q - 8, exact in bf16, so the tensor op sums centred values.
+    // MODE 1: the raw (128 + q) offset, cancelled in the epilogue.
+    template <int MODE>
+    inline vec<bfloat16_t, 2> pair(uint32_t w, int s) {
+        const vec<bfloat16_t, 2> v = as_type<vec<bfloat16_t, 2>>(((w >> (4 * s)) & kNibMask) | kMagic);
+        if (MODE == 0) {
+            return v - vec<bfloat16_t, 2>(bfloat16_t(136.0f));
+        }
+        return v;
+    }
+
+    // Two activation sums over a lane's 16-run. `e` is the incumbent's chunk sum
+    // verbatim -- three bf16 adds per four activations, ascending, each chunk widened
+    // to float -- and multiplies the bias exactly as the incumbent multiplies it.
+    // `f` is the plain fp32 sum and only undoes the (q - 8) centring, so the q term
+    // equals the incumbent's scale * sum(q x) up to fp32 association.
+    inline void chunk_sums(const thread bfloat16_t* xv, thread float& e, thread float& f) {
+        e = 0.0f;
+        f = 0.0f;
+        for (int i = 0; i < 4; i++) {
+            e += xv[4 * i] + xv[4 * i + 1] + xv[4 * i + 2] + xv[4 * i + 3];
+            f += float(xv[4 * i]) + float(xv[4 * i + 1]) + float(xv[4 * i + 2]) + float(xv[4 * i + 3]);
+        }
+    }
+
+    inline void load_x16(const device bfloat16_t* p, thread bfloat16_t* r) {
+        const device vec<bfloat16_t, 4>* v = reinterpret_cast<const device vec<bfloat16_t, 4>*>(p);
+        for (int c = 0; c < 4; c++) {
+            const vec<bfloat16_t, 4> a = v[c];
+            r[4 * c] = a.x; r[4 * c + 1] = a.y; r[4 * c + 2] = a.z; r[4 * c + 3] = a.w;
+        }
+    }
+
+    template <int TN, int KS, bool RP, int MODE>
+    inline int qmv(
+        const device uint32_t* w,
+        const device bfloat16_t* scales,
+        const device bfloat16_t* biases,
+        const device bfloat16_t* x,
+        device bfloat16_t* y,
+        const int M,
+        const int K,
+        const int N,
+        const int nTile,
+        const uint sg,
+        const uint lane,
+        threadgroup float* red)        // KS * 8 * NB floats
+    {
+        constexpr int NB = 16 * TN;
+        constexpr int NV = 4 * TN;     // valid (row < 8) C elements per lane
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            16, NB, 16, false, true, RP,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        auto ct_a = op.template get_left_input_cooperative_tensor<bfloat16_t, bfloat16_t, float>();
+        auto ct_b = op.template get_right_input_cooperative_tensor<bfloat16_t, bfloat16_t, float>();
+        auto ct_c = op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+
+        const int G = K / 64;
+        const int gPer = G / KS;
+        const int g0 = int(sg) * gPer;
+        const int nBase = nTile * NB;
+        const int Kw = K / 8;          // u32 per weight row
+        const int li = int(lane);
+        const int qid = li >> 2;
+
+        // ---- layout detection -------------------------------------------------
+        // NAX (MLX nax.h get_coord): element i of a 16x16 frag f sits at
+        //   row = fm + 8*(i>>2) (+16 f for B rows / C cols), col = fn + (i&3).
+        const int fm = (qid & 4) | ((li >> 1) & 3);
+        const int fn = ((qid & 2) | (li & 1)) * 4;
+        // FB (pre-M5 fallback, measured): A elements i: col = c + (i&1) + 8*((i>>1)&1),
+        //   row = r + 8*(i>>2); B elements i: col = kc + 8*(i / NV), row = nr + (i&1) + 8*((i>>1)&(2TN-1));
+        //   C elements i: col(n) = nr + (i&1) + 8*((i>>1)&(2TN-1)), row(m) = r + 8*(i / NV).
+        const int fbR = ((li >> 1) & 3) + 4 * (li >> 4);
+        const int fbC = 2 * (li & 1) + 4 * ((li >> 3) & 1);
+
+        bool isNax = ct_a.get_capacity() == 8 && ct_b.get_capacity() == 8 * TN && ct_c.get_capacity() == 8 * TN;
+        bool isFb = isNax;
+        for (int i = 0; i < 8; i++) {
+            auto id = ct_a.get_multidimensional_index(i);
+            isNax = isNax && id[0] == fn + (i & 3) && id[1] == fm + 8 * (i >> 2);
+            isFb = isFb && id[0] == fbC + (i & 1) + 8 * ((i >> 1) & 1) && id[1] == fbR + 8 * (i >> 2);
+        }
+        for (int i = 0; i < 8 * TN; i++) {
+            auto idb = ct_b.get_multidimensional_index(i);
+            auto idc = ct_c.get_multidimensional_index(i);
+            const int f = i >> 3, e = i & 7;
+            isNax = isNax && idb[0] == fn + (e & 3) && idb[1] == 16 * f + fm + 8 * (e >> 2)
+                          && idc[0] == 16 * f + fn + (e & 3) && idc[1] == fm + 8 * (e >> 2);
+            isFb = isFb && idb[0] == fbR + 8 * (i / NV) && idb[1] == fbC + (i & 1) + 8 * ((i >> 1) & (2 * TN - 1))
+                        && idc[0] == fbC + (i & 1) + 8 * ((i >> 1) & (2 * TN - 1)) && idc[1] == fbR + 8 * (i / NV);
+        }
+        isNax = simd_all(isNax);
+        isFb = simd_all(isFb);
+        // The four lanes of one activation row must be lane, lane^1, lane^8, lane^9 in both layouts.
+        {
+            const int myRow = isNax ? fm : fbR;
+            const bool ok = simd_shuffle_xor(myRow, 1) == myRow && simd_shuffle_xor(myRow, 8) == myRow;
+            const bool allOk = simd_all(ok);
+            isNax = isNax && allOk;
+            isFb = isFb && allOk;
+        }
+
+        // Per-lane geometry, valid for whichever layout matched.
+        //   aRow: activation row this lane feeds (A elements 0..3); xOff: its 16-run offset in the group.
+        //   bRow[j]: W rows this lane loads; NAX has 2*TN rows (per frag: fm, fm+8), FB has NV rows.
+        //   cN[i]: output column of valid C element i (i < NV); cIdx[i]: its ct_c index.
+        const int aRow = isNax ? fm : fbR;
+        const int xOff = isNax ? (fn / 4) * 16 : fbC * 8;
+        const bool rowLive = aRow < M;
+
+        float acc[NV];
+        for (int i = 0; i < NV; i++) acc[i] = 0.0f;
+        for (int i = 4; i < 8; i++) ct_a[i] = bfloat16_t(0.0f);
+
+        if (isNax || isFb) {
+            // Scale/bias caches: four consecutive groups per W row this lane's C elements touch.
+            // Rows touched by C valid elements: NAX -> per frag f: fn+16f .. +3 (4*TN rows);
+            // FB -> nr + (i&1) + 8*((i>>1)&(2TN-1)) (4*TN rows). Both are exactly NV rows and
+            // both index them by the valid element i.
+            int cN[NV];
+            for (int i = 0; i < NV; i++) {
+                cN[i] = isNax ? (16 * (i >> 2) + fn + (i & 3))
+                              : (fbC + (i & 1) + 8 * ((i >> 1) & (2 * TN - 1)));
+            }
+            vec<bfloat16_t, 4> sc[NV];
+            vec<bfloat16_t, 4> bc[NV];
+
+            for (int gi = 0; gi < gPer; gi++) {
+                const int g = g0 + gi;
+                const int kBase = g * 64;
+                if ((gi & 3) == 0) {
+                    for (int i = 0; i < NV; i++) {
+                        const int n = nBase + cN[i];
+                        sc[i] = *reinterpret_cast<const device vec<bfloat16_t, 4>*>(scales + n * G + g);
+                        bc[i] = *reinterpret_cast<const device vec<bfloat16_t, 4>*>(biases + n * G + g);
+                    }
+                }
+                // Activations: this lane's 16-run of row aRow.
+                thread bfloat16_t xv[16];
+                float xsE = 0.0f;   // incumbent bf16 chunk sum, feeds the bias term
+                float xsF = 0.0f;   // fp32 sum, undoes the centring
+                if (rowLive) {
+                    load_x16(x + aRow * K + kBase + xOff, xv);
+                    chunk_sums(xv, xsE, xsF);
+                } else {
+                    for (int i = 0; i < 16; i++) xv[i] = bfloat16_t(0.0f);
+                }
+                xsE += simd_shuffle_xor(xsE, 1);
+                xsE += simd_shuffle_xor(xsE, 8);
+                xsF += simd_shuffle_xor(xsF, 1);
+                xsF += simd_shuffle_xor(xsF, 8);
+
+                for (int i = 0; i < 8 * TN; i++) ct_c[i] = 0.0f;
+
+                if (isNax) {
+                    // W: per frag f, rows fm+16f and fm+8+16f; 16 nibbles each at kBase + xOff.
+                    uint2 wr[2 * TN];
+                    for (int f = 0; f < TN; f++) {
+                        const int n0 = nBase + 16 * f + fm;
+                        const device uint2* p0 = reinterpret_cast<const device uint2*>(w + n0 * Kw + (kBase + xOff) / 8);
+                        const device uint2* p1 = reinterpret_cast<const device uint2*>(w + (n0 + 8) * Kw + (kBase + xOff) / 8);
+                        wr[2 * f] = *p0;
+                        wr[2 * f + 1] = *p1;
+                    }
+                    // Tile t covers run positions {2t, 2t+4, 2t+1, 2t+5} of word (t>>1): pairs s=2(t&1), 2(t&1)+1.
+                    for (int t = 0; t < 4; t++) {
+                        const int s = 2 * (t & 1);
+                        const int o = (t >> 1) * 8;         // run offset of the word feeding tile t
+                        // A elements 0..3 -> positions o + {s, s+4, s+1, s+5}
+                        ct_a[0] = xv[o + s];
+                        ct_a[1] = xv[o + s + 4];
+                        ct_a[2] = xv[o + s + 1];
+                        ct_a[3] = xv[o + s + 5];
+                        for (int f = 0; f < TN; f++) {
+                            const uint32_t w0 = (t >> 1) ? wr[2 * f].y : wr[2 * f].x;
+                            const uint32_t w1 = (t >> 1) ? wr[2 * f + 1].y : wr[2 * f + 1].x;
+                            const vec<bfloat16_t, 2> p00 = pair<MODE>(w0, s), p01 = pair<MODE>(w0, s + 1);
+                            const vec<bfloat16_t, 2> p10 = pair<MODE>(w1, s), p11 = pair<MODE>(w1, s + 1);
+                            ct_b[8 * f + 0] = p00.x; ct_b[8 * f + 1] = p00.y;
+                            ct_b[8 * f + 2] = p01.x; ct_b[8 * f + 3] = p01.y;
+                            ct_b[8 * f + 4] = p10.x; ct_b[8 * f + 5] = p10.y;
+                            ct_b[8 * f + 6] = p11.x; ct_b[8 * f + 7] = p11.y;
+                        }
+                        op.run(ct_a, ct_b, ct_c);
+                    }
+                    // Valid C elements: frag f elements 8f..8f+3 (row fm).
+                    for (int f = 0; f < TN; f++) {
+                        for (int e = 0; e < 4; e++) {
+                            const int i = 4 * f + e;
+                            const float s_ = float(sc[i][gi & 3]);
+                            const float b_ = float(bc[i][gi & 3]);
+                            acc[i] = fma(s_, ct_c[8 * f + e], acc[i]);
+                            acc[i] = fma(MODE == 0 ? 8.0f * s_ : -128.0f * s_, xsF, acc[i]);
+                            acc[i] = fma(b_, xsE, acc[i]);
+                        }
+                    }
+                } else {
+                    // FB: this lane's B rows nr + (j&1) + 8*((j>>1)&(2TN-1)) for j < NV, cols kc, kc+8.
+                    // Run position for (tile t, col kc) = t, (tile t, col kc+8) = t + 4  -> one u32 per row.
+                    uint32_t wr[NV];
+                    for (int j = 0; j < NV; j++) {
+                        const int n = nBase + fbC + (j & 1) + 8 * ((j >> 1) & (2 * TN - 1));
+                        // The FB B column base is kc = fbR-pattern on the k side: cols kc = ((lane>>1)&3)+4*(lane>>4),
+                        // whose run offset is kc*8. Load the eight nibbles at kBase + kc*8.
+                        wr[j] = w[n * Kw + (kBase + fbR * 8) / 8];
+                    }
+                    for (int t = 0; t < 4; t++) {
+                        // A elements i<4: col = fbC + (i&1) + 8*((i>>1)&1) -> run pos (i&1)*8 + 4*((i>>1)&1) + t
+                        ct_a[0] = xv[t];
+                        ct_a[1] = xv[8 + t];
+                        ct_a[2] = xv[4 + t];
+                        ct_a[3] = xv[12 + t];
+                        for (int j = 0; j < NV; j++) {
+                            const vec<bfloat16_t, 2> p = pair<MODE>(wr[j], t);
+                            ct_b[j] = p.x;
+                            ct_b[NV + j] = p.y;
+                        }
+                        op.run(ct_a, ct_b, ct_c);
+                    }
+                    for (int i = 0; i < NV; i++) {
+                        const float s_ = float(sc[i][gi & 3]);
+                        const float b_ = float(bc[i][gi & 3]);
+                        acc[i] = fma(s_, ct_c[i], acc[i]);
+                        acc[i] = fma(MODE == 0 ? 8.0f * s_ : -128.0f * s_, xsF, acc[i]);
+                        acc[i] = fma(b_, xsE, acc[i]);
+                    }
+                }
+            }
+
+            // Publish this simdgroup's partial: red[sg][aRow][cN[i]].
+            for (int i = 0; i < NV; i++) {
+                red[(int(sg) * 8 + aRow) * NB + cN[i]] = acc[i];
+            }
+        } else {
+            // Unsupported layout: zero this simdgroup's partial tile.
+            for (int idx = li; idx < 8 * NB; idx += 32) red[int(sg) * 8 * NB + idx] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Reduce over KS and store rows < M.
+        const int tid = int(sg) * 32 + li;
+        for (int idx = tid; idx < 8 * NB; idx += 32 * KS) {
+            const int m = idx / NB;
+            const int c = idx - m * NB;
+            if (m < M) {
+                float s = 0.0f;
+                for (int k = 0; k < KS; k++) s += red[(k * 8 + m) * NB + c];
+                y[m * N + nBase + c] = bfloat16_t(s);
+            }
+        }
+        return isNax ? 1 : (isFb ? 2 : 0);
+    }
+
+    } // namespace qnax
+    """
+
+/// Kernel body: one threadgroup per 16*TN weight rows, KS simdgroups splitting
+/// the K groups, reduction through threadgroup memory. Grid is in THREADS:
+/// `(32 * KS, N / (16 * TN), 1)` with threadgroup `(32 * KS, 1, 1)`.
+private let qwen35NaxQMVKernel = MLXFast.metalKernel(
+    name: "qwen35_nax_affine4_g64_qmv_wide_v1",
+    inputNames: ["w", "scales", "biases", "x"],
+    outputNames: ["y"],
+    source: """
+        const int qmv_m = x_shape[x_ndim - 2];
+        const int qmv_k = x_shape[x_ndim - 1];
+        const int qmv_n = w_shape[0];
+        threadgroup float qnax_red[KS * 8 * 16 * TN];
+        qnax::qmv<TN, KS, RP, MODE>(
+            w, scales, biases, x, y, qmv_m, qmv_k, qmv_n,
+            int(threadgroup_position_in_grid.y),
+            simdgroup_index_in_threadgroup, thread_index_in_simdgroup, qnax_red);
+        """,
+    header: qwen35NaxQMVHeader,
+    ensureRowContiguous: true
+)
+
+/// The wide affine-4/group-64 QMV on the GPU tensor units.
+///
+/// Per verify row the incumbent pays `NA` scalar FMAs per weight in every
+/// input group it launches -- at m = 8 that is two NA = 4 groups, ~15 ALU ops
+/// per weight, which is why the round cost curve is superlinear in the verify
+/// width. This kernel dequantises each weight once (an OR into the mantissa of
+/// 128.0 and one exact bf16 subtract) and hands the per-row multiply-accumulate
+/// to `mpp::tensor_ops::matmul2d`, so the per-weight ALU cost is flat in the
+/// width and the matvec returns to streaming the weights once.
+///
+/// Numerics: per 64-group the tensor op accumulates `sum (q - 8) x` in fp32 and
+/// the epilogue adds `scale * P + 8 * scale * xsF + bias * xsE`, where `xsF` is
+/// the fp32 activation sum and `xsE` is the incumbent's own bf16 chunk sum. So
+/// the bias term is the incumbent's, rounding included, and the q term is the
+/// incumbent's `scale * sum(q x)` up to fp32 association. Measured against the
+/// incumbent on identical inputs (M4 Pro, fallback execution): outputs agree
+/// bitwise on 99.99 % of elements; the rest differ by one bf16 ulp. Against an
+/// fp32 dequantised reference both kernels sit at the bf16 output-rounding
+/// floor.
+///
+/// Device: the kernel checks the cooperative tensor layout at run time and
+/// only runs its fast path on the M5 layout MLX's `nax.h` hard-codes, or the
+/// pre-M5 fallback layout. The arm is enabled by default only on GPU
+/// generation >= 17 (`applegpu_g17…`), the same gate MLX uses for its own NAX
+/// kernels; `MLX_E120_QMV_ARM` overrides it.
+public enum Qwen35NaxQMV {
+    /// GPU generation parsed from `MLX.GPU.deviceInfo().architecture`,
+    /// e.g. `applegpu_g16s` (M4 Pro) or `applegpu_g17…` (M5).
+    static let gpuGeneration: Int = {
+        let arch = MLX.GPU.deviceInfo().architecture
+        guard let r = arch.range(of: "applegpu_g") else { return 0 }
+        let digits = arch[r.upperBound...].prefix { $0.isNumber }
+        return Int(digits) ?? 0
+    }()
+
+    static var deviceSupported: Bool { gpuGeneration >= 17 }
+
+    /// `TN` weight-row frags per simdgroup and `KS` simdgroups per threadgroup.
+    /// `TN` is exactly 2: `matmul2d` on two cooperative tensors requires one of
+    /// M, N, K to be 32 (a static assert in the Metal 4 headers), and the tile
+    /// here is `16 x 16*TN x 16`. Every scored cell has `N % 32 == 0`; anything
+    /// else keeps the replica. The group count per simdgroup must be a multiple
+    /// of four because scales and biases are cached four groups at a time.
+    static func geometry(n: Int, k: Int) -> (tn: Int, ks: Int)? {
+        guard k % 64 == 0, n % 32 == 0 else { return nil }
+        let g = k / 64
+        for ks in [8, 4, 2, 1] where g % ks == 0 && (g / ks) % 4 == 0 {
+            return (2, ks)
+        }
+        return nil
+    }
+
+    /// Widths 2...8: one 16-row activation tile. M = 9 keeps the incumbent.
+    static func matmul(
+        _ x: MLXArray, _ w: MLXArray, scales: MLXArray, biases: MLXArray,
+        m: Int, k: Int, n: Int
+    ) -> MLXArray? {
+        guard m >= 2, m <= 8, let geo = geometry(n: n, k: k) else { return nil }
+        var outShape = x.shape
+        outShape[outShape.count - 1] = n
+        return qwen35NaxQMVKernel(
+            [w, scales, biases, x],
+            template: [("TN", geo.tn), ("KS", geo.ks), ("RP", false), ("MODE", 0)],
+            grid: (32 * geo.ks, n / (16 * geo.tn), 1),
+            threadGroup: (32 * geo.ks, 1, 1),
+            outputShapes: [outShape],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+}
+
 /// Candidate-owned entry point for the wide affine-4/group-64 QMV.
 ///
 /// `matmul` returns `nil` for every cell the incumbent must keep, so a routed
@@ -1670,6 +2065,9 @@ public enum Qwen35CustomQMV {
         /// Replica reading the chunk sums from the table instead of
         /// recomputing them once per output-row block.
         case sumTable = "sumtable"
+        /// `Qwen35NaxQMV`: the tensor-unit kernel for widths 2...8, with the
+        /// `sumtable` replica behind it for everything it declines.
+        case nax
     }
 
     /// The shipped arm. `sumtable` routes the wide affine-4/group-64 cells the
@@ -1691,9 +2089,10 @@ public enum Qwen35CustomQMV {
     /// the arm switch to be assertable inside the built worker, so the name is
     /// long enough for `strings` to witness it.
     public static let arm: Arm = {
+        let fallback: Arm = Qwen35NaxQMV.deviceSupported ? .nax : .sumTable
         let raw = ProcessInfo.processInfo.environment["MLX_E120_QMV_ARM"]
-        guard let raw, !raw.isEmpty else { return .sumTable }
-        return Arm(rawValue: raw) ?? .sumTable
+        guard let raw, !raw.isEmpty else { return fallback }
+        return Arm(rawValue: raw) ?? fallback
     }()
 
     /// Widths the candidate-owned dispatch may take. M=1 stays on MLX
@@ -1855,7 +2254,17 @@ public enum Qwen35CustomQMV {
                 groupSize: groupSize, bits: bits, mode: mode)
         else { return nil }
 
-        if arm == .fillNoConsume || (arm == .sumTable && tablePays(m: cell.m)) {
+        if arm == .nax,
+            let y = Qwen35NaxQMV.matmul(
+                x, w, scales: scales, biases: biases,
+                m: cell.m, k: cell.k, n: cell.n)
+        {
+            return y
+        }
+
+        if arm == .fillNoConsume
+            || ((arm == .sumTable || arm == .nax) && tablePays(m: cell.m))
+        {
             // The fused-norm producer publishes the chunk-sum table for the
             // activation it just wrote, so the shipped `sumtable` arm skips
             // the standalone fill dispatch for those cells and pays it for
