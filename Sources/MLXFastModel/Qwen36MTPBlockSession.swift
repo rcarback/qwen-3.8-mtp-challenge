@@ -1483,6 +1483,16 @@ public final class Qwen36MTPBlockSession {
                 cache: cache, nConfirmed: 1)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
+        // Submit the verify graph the moment it exists. linearTopTwoRows is
+        // host-only graph build (two custom kernels + concatenates) and does
+        // not change verify arithmetic. Starting the 64-layer target now lets
+        // that host work overlap the GPU. The blocking eval below is still
+        // the one host read of the round; this is mlx_async_eval, not a
+        // second mlx_array_eval. Token-neutral: same arrays, same kernels,
+        // same reduction order.
+        asyncEval(verifyLogits)
+        asyncEval(cache.flatMap { $0.state })
+
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
         // this round — the per-row argmaxes (accept walk AND both candidates
         // for the next primary), the draft ids, the top-2 evidence of every
