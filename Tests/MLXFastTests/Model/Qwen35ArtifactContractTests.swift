@@ -152,7 +152,7 @@ func qwen36TensorInventoryFixturePinsAllPublicHeaders() throws {
     let textTower = fixture.tensors.filter {
         SwiftTransform.isSelectedTextTowerKey($0.name, family: .qwen35)
     }
-    #expect(textTower.count == Qwen35CheckpointValidation.expectedTensorCount)
+    #expect(textTower.count == Qwen35CheckpointValidation.expectedTensorCount())
     #expect(textTower.count == 1_847)
     #expect(
         fixture.tensors.count - textTower.count

@@ -460,6 +460,10 @@ public final class Qwen38DFlash2Head: Module, @unchecked Sendable {
         Qwen38DFlash2CandidateSelector
 
     private let rope: RoPE
+
+    /// The shared RoPE, exposed so a parity check can step the layer stack by
+    /// hand and localize a mismatch to one layer.
+    var ropeForTesting: RoPE { rope }
     private var targetEmbed: ((MLXArray) -> MLXArray)?
     private var targetLMHead: ((MLXArray) -> MLXArray)?
 
@@ -507,8 +511,16 @@ public final class Qwen38DFlash2Head: Module, @unchecked Sendable {
 
     /// `targetHidden` is the concatenation of the target's hidden states at
     /// `config.targetLayerIDs`, shaped `[B, S, contextWidth]`.
+    ///
+    /// `logitsStart` drops the leading rows of the block before the vocabulary
+    /// projection. The caller passes 1: position 0 of the block is the anchor,
+    /// a token the target has already committed, so drafting it again would
+    /// waste a row and shift the whole proposal by one.
     func hiddenStates(
-        inputs: MLXArray, targetHidden: MLXArray, cache: [KVCache]
+        inputs: MLXArray,
+        targetHidden: MLXArray,
+        cache: [KVCache],
+        logitsStart: Int = 0
     ) throws -> MLXArray {
         guard let targetEmbed else {
             throw MLXFastError.invalidInput(
@@ -520,10 +532,17 @@ public final class Qwen38DFlash2Head: Module, @unchecked Sendable {
                     + "match \(config.targetLayerIDs.count) target layers x "
                     + "\(config.hiddenSize)")
         }
+        guard logitsStart >= 0, logitsStart < inputs.dim(1) else {
+            throw MLXFastError.invalidInput(
+                "DFlash2 logitsStart \(logitsStart) is outside the block")
+        }
         var h = targetEmbed(inputs)
         let context = hiddenNorm(contextProjection(targetHidden))
         for (layer, layerCache) in zip(layers, cache) {
             h = layer(h, context: context, rope: rope, cache: layerCache)
+        }
+        if logitsStart > 0 {
+            h = h[0..., logitsStart..., 0...]
         }
         return norm(h)
     }
@@ -597,16 +616,22 @@ public final class Qwen38DFlash2Head: Module, @unchecked Sendable {
 
     /// Propose a block. `inputs` is the mask-token block whose first entry is
     /// the anchor (the target's last committed token); the returned path is the
-    /// drafted continuation.
+    /// drafted continuation, one token shorter than the block.
     public func propose(
-        inputs: MLXArray, targetHidden: MLXArray, cache: [KVCache]
+        inputs: MLXArray,
+        targetHidden: MLXArray,
+        cache: [KVCache],
+        logitsStart: Int = 1
     ) throws -> MLXArray {
         guard let targetLMHead else {
             throw MLXFastError.invalidInput(
                 "the DFlash2 head must be bound to a target before drafting")
         }
         let hidden = try hiddenStates(
-            inputs: inputs, targetHidden: targetHidden, cache: cache)
+            inputs: inputs,
+            targetHidden: targetHidden,
+            cache: cache,
+            logitsStart: logitsStart)
         let (path, _) = candidateSelector.select(
             hidden: hidden,
             logits: targetLMHead(hidden),
