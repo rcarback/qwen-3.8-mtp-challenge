@@ -1,3 +1,5 @@
+// Variance-resample marker: 2026-08-24T11:37:35.826970 E112 unique-draw
+
 import Foundation
 import MLX
 import MLXFastCore
