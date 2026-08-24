@@ -1039,6 +1039,12 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 7
+
+    /// CAP 8 was tried at rank (`023f8351`) and rejected 3.55662 (-17.38%):
+    /// width-9 verifies fire often on the hidden pool and the shipped flat
+    /// per-row price cannot see what they cost. Do not raise without pricing
+    /// the width regime. Width 9 itself is exactness-cleared by value-level
+    /// replay (20/20 rows, forced-saturation local run); the cliff is economic.
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
@@ -1491,12 +1497,17 @@ public final class Qwen36MTPBlockSession {
         // materialised buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
-        var bundle: [MLXArray] = [top2IDs, top2Values]
-        bundle.append(contentsOf: draftIdArrays)
+        // Batched draft-id readout: the ids ride into the round's single
+        // blocking eval as ONE [d,1] concat instead of d separate scalars,
+        // so the accept walk reads one materialised buffer instead of
+        // issuing d host-side scalar copies. Same integers, same order;
+        // `verifyTokens` above still chains the individual id arrays.
+        let draftIDBatch = concatenated(draftIdArrays, axis: 0)
+        var bundle: [MLXArray] = [top2IDs, top2Values, draftIDBatch]
         eval(cache.flatMap { $0.state } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
-        let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
+        let drafts = draftIDBatch.asArray(Int32.self).map { Int($0) }
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
