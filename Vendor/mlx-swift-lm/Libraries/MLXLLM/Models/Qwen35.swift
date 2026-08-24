@@ -2897,7 +2897,7 @@ enum Qwen35IslandArm: String {
     static func fromEnvironment(_ env: [String: String]) -> Qwen35IslandArm {
         if env["MLXFAST_QWEN_MTP_EXACT_QKV_ROWS"] == "0" { return .none }
         guard let raw = env["DARKBLOOM_QWEN_MTP_ISLAND_ARM"], !raw.isEmpty else {
-            return .all
+            return .kv
         }
         guard let arm = Qwen35IslandArm(rawValue: raw.lowercased()) else {
             fatalError(
