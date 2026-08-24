@@ -5188,6 +5188,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private static let derivedClusterRowsPerLeaf = 8
     private static let derivedClusterIterations = 8
     private static let derivedClusterCentroidBits = 2
+    // Stock Metal affine QMV selects its bounds-free path when output rows are
+    // a multiple of eight.  Keep the cluster count logical and pad only the
+    // derived physical centroid table; consumers discard the duplicate tail.
+    private static let derivedClusterCentroidAlignment = 8
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
@@ -5660,8 +5664,22 @@ extension Qwen35TextModel: MTPCapable {
             .asType(.float32)
             .mean(axis: 1)
             .asType(.bfloat16)
+        let centroidAlignment = Self.derivedClusterCentroidAlignment
+        let centroidPadding = (centroidAlignment - leaves % centroidAlignment)
+            % centroidAlignment
+        let physicalCentroids: MLXArray
+        if centroidPadding == 0 {
+            physicalCentroids = centroids
+        } else {
+            // Appending whole duplicate rows preserves every original row's
+            // row-local affine quantization.  The duplicates are never visible
+            // to selection because `clusterCandidateIDs` slices this tail.
+            physicalCentroids = concatenated(
+                [centroids, centroids[0 ..< centroidPadding, 0...]], axis: 0)
+        }
         let quantizedCentroids = quantized(
-            centroids, groupSize: 64, bits: Self.derivedClusterCentroidBits, mode: .affine)
+            physicalCentroids, groupSize: 64,
+            bits: Self.derivedClusterCentroidBits, mode: .affine)
         guard let centroidBiases = quantizedCentroids.biases else { return }
 
         let realCount = MLXArray(Int32(Self.compactDraftRealCount))
@@ -5712,12 +5730,18 @@ extension Qwen35TextModel: MTPCapable {
               shape.count == 3
         else { fatalError("Qwen MTP cluster index is incomplete") }
         let clusters = shape[0], rowsPerCluster = shape[1], probes = shape[2]
+        let centroidRows = centroidWeight.dim(0)
+        let alignedCentroidRows =
+            ((clusters + Self.derivedClusterCentroidAlignment - 1)
+                / Self.derivedClusterCentroidAlignment)
+            * Self.derivedClusterCentroidAlignment
         let candidateCount = Self.draftRerankCandidateCount
         guard rowWeight.shape == [clusters, rowsPerCluster, 320],
               rowScales.shape == [clusters, rowsPerCluster, 80],
               rowBiases.shape == rowScales.shape,
-              centroidWeight.shape == [clusters, 320],
-              centroidScales.shape == [clusters, 80],
+              centroidRows == clusters || centroidRows == alignedCentroidRows,
+              centroidWeight.shape == [centroidRows, 320],
+              centroidScales.shape == [centroidRows, 80],
               centroidBiases.shape == centroidScales.shape,
               perm.shape == [clusters * rowsPerCluster],
               probes >= 1, probes <= clusters,
@@ -5752,10 +5776,16 @@ extension Qwen35TextModel: MTPCapable {
             _draftRowTop32 = Qwen35RowTop32(
                 rows: probes * rowsPerCluster, rowsPerCluster: rowsPerCluster)
         }
-        let centroidScore = quantizedMM(
+        let physicalCentroidScore = quantizedMM(
             x, centroidWeight, scales: centroidScales, biases: centroidBiases,
             transpose: true, groupSize: 64, bits: 2, mode: .affine
-        ).reshaped([clusters])
+        ).reshaped([centroidRows])
+        // A prefix slice is a view: E87 and every fallback continue to see the
+        // original logical cluster count, while the derived table's four-row
+        // tail only aligns the existing QMV launch with its fast path.
+        let centroidScore = centroidRows == clusters
+            ? physicalCentroidScore
+            : physicalCentroidScore[0 ..< clusters]
         // `gatherQuantizedMM` is handed the probes in ascending index order,
         // while the top-C arrive in partition order.
         let probed: MLXArray
