@@ -1,0 +1,157 @@
+# DFlash2 head port plan
+
+Replace the pinned MTP head with a Swift port of `z-lab/Qwen3.8-27B-DFlash2`,
+declared through `mtp-head.manifest.json`. The goal is a higher accept rate,
+which is the quantity the published score depends on.
+
+Status: Now — measured and worth building. No Swift code exists yet.
+
+## Measured result
+
+The upstream Python MLX path, run against our transformed 27B tree on two
+prose prompts, 160 decode tokens each, after a discarded warm-up.
+
+| Configuration | Decode tok/s | Against serial |
+|---|---|---|
+| Serial, no drafter | 11.25 | 1.00 |
+| DFlash2 4-bit, block 2 | 13.65 | 1.21 |
+| DFlash2 4-bit, block 4 | 15.88 | 1.41 |
+| DFlash2 4-bit, block 8 | 12.00 | 1.07 |
+| DFlash2 BF16, block 4 | 13.77 | 1.22 |
+
+Accepted drafts per round at block 8 hold near 2.7 at every precision from
+BF16 down to 4-bit. Head precision does not change the accept rate.
+
+Head precision is therefore pure cost on this machine. At block 4 the decode
+rate falls from 15.88 to 13.77 tok/s as the head grows from 1.01 GiB to 3.58
+GiB, and the accept rate does not move. Use affine 4-bit group-64.
+
+Block 4 beats block 8. Accept saturates near 2.8 while the verify cost grows
+with block width. Re-measure block size after the port: our Swift target
+forward is faster than the Python one, which makes the verify cheaper relative
+to the drafter and may move the optimum back toward 8.
+
+Sample size is two prompts. Trust the ranking between configurations, which
+holds across four independent precision runs. Do not trust the absolute
+figures.
+
+## Why this target
+
+The drafter is built for the exact pinned backbone. Its `config.json` declares
+`num_target_layers: 64`, `vocab_size: 248320`, `hidden_size: 5120`, and
+`intermediate_size: 17408`. Every one of those matches the ranked target. Its
+`block_size` is 8, which equals the trusted maximum draft depth.
+
+An unmodified tree scores about 0.994. A tree that never drafts scores 1.0.
+The shipped speculative machinery therefore costs more than it earns today, so
+accept rate is the binding constraint. Kernel work does not move it.
+
+## What the contract allows
+
+`benchmark.json` lists 89 editable paths. Four matter here.
+
+| Path | Role in this plan |
+|------|-------------------|
+| `mtp-head.manifest.json` | Declares the head artifact by source, digest and byte count |
+| `mtp-head/` | Holds in-branch head weights, exempt from the source byte budget |
+| `Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35MTP.swift` | The vendored MTP head module |
+| `Sources/MLXFastModel/` | The block session, the target glue, and new head code |
+
+`docs/qwen-mtp-editable-surface.md` states the rule that permits the
+substitution: the head only proposes, and the target decides every emitted
+token. The trusted parent re-checks the whole stream after the clock stops.
+
+## Artifact size: resolved
+
+The published drafter is 3.58 GiB of BF16 across 81 tensors, which exceeds the
+2 GiB manifest cap. Every rung of quantization fits, because 1.924 G of its
+1.925 G parameters are quantizable.
+
+| Precision | Size |
+|---|---|
+| BF16 | 3.58 GiB |
+| 8-bit group-64 | 1.90 GiB |
+| 6-bit group-64 | 1.46 GiB |
+| 4-bit group-64 | 1.01 GiB |
+
+Ship affine 4-bit group-64 at 1.01 GiB. The measurements above show it is the
+fastest option and loses no accept rate, so the cap does not constrain the
+design. The previous pinned head shipped in the same format
+(`mlx-community/Qwen3.6-27B-MTP-4bit`).
+
+The head weights are inside the editable surface on this track, so quantizing
+our own head is permitted. The DFlash-track rule that forbids re-quantizing the
+drafter governs a different track and does not apply here.
+
+## Architecture gap
+
+The two heads differ in three ways that decide the work.
+
+| | Pinned MTP head | DFlash2 |
+|---|---|---|
+| Depth | 1 layer | 5 sliding-attention layers |
+| Conditioning | Final hidden state | Hidden states from target layers 5, 19, 33, 47, 61 |
+| Proposal | One token per forward, autoregressive | Whole block in one forward, then a selector traces a path |
+
+The third row is the expensive one. `Qwen36MTPBlockSession` drives the head one
+step at a time through `mtpForwardWithHidden`. DFlash2 produces the whole block
+in a single forward, so the round loop needs a second shape.
+
+The second row is the other cost. `callWithHidden` returns only the final
+hidden state. The target forward must also publish five intermediate layer
+outputs, concatenated into the 25600-wide input that `fc` consumes.
+
+## Reference implementation
+
+Upstream ships `dflash/model_mlx.py`, a complete MLX implementation in 907
+lines. It defines every module the port needs and removes most of the design
+risk. Port from it directly rather than from the paper.
+
+Four modules carry the DFlash2 delta over DFlash v1:
+
+- `GroupedDynamicCausalConv` — a two-tap causal convolution whose kernel is
+  produced per position by a linear projection, added to a static base kernel.
+  Group size 16, kernel size 2.
+- `DFlash2DecoderLayer` — wraps both the attention block and the MLP block in
+  one of those convolutions.
+- `CandidateSelector` — takes the top 16 logits per position, scores each
+  candidate with a rank-256 bilinear edge term between a predecessor codebook,
+  a projected hidden state, and a successor codebook, then walks the block
+  greedily.
+- `DFlash2DraftModel` — binds the target embedding table and `lm_head`, builds
+  the layer stack, and exposes `propose`.
+
+## Plan
+
+### Done
+
+1. Measured the accept rate and decode speed against the transformed 27B tree
+   across four head precisions and four block sizes. Result above: 1.41 over
+   serial at 4-bit, block 4.
+
+### Now
+
+3. Publish the five target hidden states from the Qwen 3.8 forward. Keep the
+   extra output off the path when no head asks for it.
+4. Port the four modules to Swift under `Sources/MLXFastModel/`. Validate each
+   against the Python reference tensor by tensor.
+5. Add a block-parallel round shape to `Qwen36MTPBlockSession`. The existing
+   autoregressive shape stays, because the pinned head still uses it.
+6. Declare the head in `mtp-head.manifest.json` with its digest and byte count.
+
+### Later
+
+7. Tune the draft schedule against the measured accept rate. DFlash2 trained at
+   block size 16 and declares 8, so the depth-2 default is likely wrong.
+8. Warm the new round shapes before the hello, as the existing head does.
+
+## Risks
+
+| Risk | Effect if it holds |
+|------|--------------------|
+| Publishing five hidden states slows the target forward | The numerator gets slower, which the accept rate must repay. This is the main remaining risk |
+| Block-parallel drafting changes round accounting | The trusted parent reads effective depth from its own journal, so the ledger must still close |
+| The 1.41 figure comes from two prompts on the Python path | The Swift result may differ. Re-measure on the eight-prompt shape after the port |
+
+Two risks from the first draft of this plan are now closed. Accept rate does
+survive 4-bit, and the artifact fits the cap with room to spare.
