@@ -2897,7 +2897,22 @@ enum Qwen35IslandArm: String {
     static func fromEnvironment(_ env: [String: String]) -> Qwen35IslandArm {
         if env["MLXFAST_QWEN_MTP_EXACT_QKV_ROWS"] == "0" { return .none }
         guard let raw = env["DARKBLOOM_QWEN_MTP_ISLAND_ARM"], !raw.isEmpty else {
-            return .all
+            // DEFAULT ARM IS `none`, NOT `all`.
+            //
+            // The islands are 31.46 MB of BF16 correction rows that stream on
+            // EVERY draft step. Installing none of them leaves `_exactKVDenseW`
+            // and `_exactQKVWeight` nil, so `qkv` takes its ordinary path:
+            // `q_proj`, `k_proj` and `v_proj` run as the affine-4 packs they
+            // already are, which is 5.90 MB for K and V together against the
+            // 20.97 MB of dense BF16 the island path reads for them, and the
+            // 10.49 MB Q matmul plus its `putAlong` scatter disappear outright.
+            // Net traffic removed from every draft step: 25.56 MB.
+            //
+            // What it costs: K and V stop being exact BF16 rows and go back to
+            // their affine-4 reconstruction, so proposal quality may fall. The
+            // serial control leg never runs the head chain, so this removes
+            // candidate-exclusive work only and cannot move the anchor.
+            return .none
         }
         guard let arm = Qwen35IslandArm(rawValue: raw.lowercased()) else {
             fatalError(
