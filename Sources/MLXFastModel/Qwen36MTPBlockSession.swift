@@ -1744,7 +1744,12 @@ public final class Qwen36MTPBlockSession {
         var snapshot: [Int: [MLXArray?]] = [:]
         for (index, entry) in cache.enumerated() {
             guard let arrays = entry as? ArraysCache else { continue }
-            snapshot[index] = [arrays[0]?[.ellipsis], arrays[1]?[.ellipsis]]
+            // Verify replaces `cache[0]` / `cache[1]` with new arrays. It does
+            // not mutate the pre-verify tensors in place, so retaining those
+            // objects is the snapshot. `[.ellipsis]` was a defensive copy of
+            // every GDN conv+SSM state on every drafting round; full accept
+            // and the K=1 checkpoint restore never read it.
+            snapshot[index] = [arrays[0], arrays[1]]
         }
         return snapshot
     }
