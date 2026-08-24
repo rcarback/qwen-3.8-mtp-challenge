@@ -4381,7 +4381,7 @@ private let qwen35E87KeyHeader = """
     }
     """
 
-private let qwen35E87SelectTG = 1024
+private let qwen35E87SelectTG = 960
 
 /// Replaces `MLX.sorted(MLX.argPartition(score, kth: C - P)[(C - P)...])`
 /// (one 9-dispatch merge sort plus the probe compaction) with ONE dispatch.
@@ -4408,7 +4408,7 @@ private func makeQwen35E87ProbeSelectKernel(clusters: Int, probes: Int)
             constexpr uint WORDS    = (CLUSTERS + 31u) / 32u;
             constexpr uint NSIMD    = TG / 32u;
             static_assert(PROBES >= 1u && PROBES <= CLUSTERS, "probe count");
-            static_assert(NSIMD == 32u, "scan assumes 32 simdgroups");
+            static_assert(NSIMD >= 1u && NSIMD <= 32u, "scan pads to one simd");
 
             const uint tid  = thread_position_in_threadgroup.x;
             const uint lane = thread_index_in_simdgroup;
@@ -4520,8 +4520,9 @@ private func makeQwen35E87ProbeSelectKernel(clusters: Int, probes: Int)
             if (lane == 31u) { sgsum[sg] = incl; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (sg == 0u) {
-                const uint v = sgsum[lane];
-                sgsum[lane] = simd_prefix_exclusive_sum(v);
+                const uint v = (lane < NSIMD) ? sgsum[lane] : 0u;
+                const uint p = simd_prefix_exclusive_sum(v);
+                if (lane < NSIMD) { sgsum[lane] = p; }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint out = sgsum[sg] + incl - cnt;
