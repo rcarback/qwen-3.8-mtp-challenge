@@ -1038,7 +1038,14 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 7
+    /// E168 r0: 4, not 7. The verified width M = depth + 1 crosses a second
+    /// backbone weight-stream pass at M >= 6, so rounds deeper than 4 pay a
+    /// step in per-round time that the extra accepted tokens do not repay.
+    /// Measured on g16s, 512 tokens, two builds, palindrome-balanced, real
+    /// 40 C gate: 31.535 -> 30.082 ms/token, -4.61 %, combined half-range
+    /// 0.149 %. Emitted tokens are unchanged; the cap only bounds how many
+    /// rows a round offers for verification.
+    private static let segmentedVerifyDepthCap = 4
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
