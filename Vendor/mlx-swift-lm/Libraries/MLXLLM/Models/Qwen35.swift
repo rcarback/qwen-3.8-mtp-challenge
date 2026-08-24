@@ -5571,15 +5571,30 @@ extension Qwen35TextModel: MTPCapable {
     /// `mapDraftTokenIds` are unchanged and still serve the declared-head path
     /// and the untimed warm.
     public func draftTokenID(_ x: MLXArray) -> MLXArray {
+        draftTokenID(x, reusingShortlist: nil).tokenID
+    }
+
+    /// Proposal-only shortlist persistence. The first call in a round selects
+    /// the ordinary 32 compact rows; later calls skip that selection chain and
+    /// run the SAME exact affine-4 reranker over the retained ids. A changed
+    /// proposal is safe because the target remains the sole token authority.
+    public func draftTokenID(
+        _ x: MLXArray, reusingShortlist shortlist: MLXArray?
+    ) -> (tokenID: MLXArray, shortlist: MLXArray?) {
         if _draftHeadW != nil {
-            if let reranked = draftTokenIDWithDeclaredRerank(x) {
+            if let reranked = draftTokenIDWithDeclaredRerank(
+                x, reusingShortlist: shortlist)
+            {
                 return reranked
             }
-            return mapDraftTokenIds(
-                argMax(applyDraftLMHead(x), axis: -1).asType(.int32))
+            return (
+                mapDraftTokenIds(
+                    argMax(applyDraftLMHead(x), axis: -1).asType(.int32)),
+                nil)
         }
         guard usesCompactDraftVocabulary else {
-            return argMax(applyDraftLMHead(x), axis: -1).asType(.int32)
+            return (
+                argMax(applyDraftLMHead(x), axis: -1).asType(.int32), nil)
         }
         if _compactDraftHead == nil {
             _compactDraftHead = makeCompactDraftHead()
@@ -5600,7 +5615,7 @@ extension Qwen35TextModel: MTPCapable {
             outputShapes: [[1, 1]],
             outputDTypes: [.int32]
         )
-        return outputs[0]
+        return (outputs[0], nil)
     }
 
     /// Derive the cluster index that a head could have shipped, from the head
@@ -5806,7 +5821,9 @@ extension Qwen35TextModel: MTPCapable {
         return MLX.take(perm, permutedRow, axis: 0).asType(.uint32)
     }
 
-    private func draftTokenIDWithDeclaredRerank(_ x: MLXArray) -> MLXArray? {
+    private func draftTokenIDWithDeclaredRerank(
+        _ x: MLXArray, reusingShortlist shortlist: MLXArray?
+    ) -> (tokenID: MLXArray, shortlist: MLXArray?)? {
         if _draftClusterShape == nil, !_derivedClusterAttempted {
             _derivedClusterAttempted = true
             buildDerivedClusterIndex()
@@ -5846,7 +5863,14 @@ extension Qwen35TextModel: MTPCapable {
         else { return nil }
 
         let candidateIDs: MLXArray
-        if let probed = clusterCandidateIDs(x) {
+        if let shortlist {
+            guard shortlist.shape == [candidateCount], shortlist.dtype == .uint32
+            else {
+                fatalError(
+                    "Qwen MTP reusable shortlist must be uint32[\(candidateCount)]")
+            }
+            candidateIDs = shortlist
+        } else if let probed = clusterCandidateIDs(x) {
             candidateIDs = probed
         } else {
             let coarse = quantizedMM(
@@ -5866,7 +5890,7 @@ extension Qwen35TextModel: MTPCapable {
             }
         }
 
-        return qwen35DraftSelectedAffine4RerankKernel(
+        let tokenID = qwen35DraftSelectedAffine4RerankKernel(
             [x.reshaped([configuration.hiddenSize]), candidateIDs,
              exact.weight, exact.scales, exactBiases],
             template: [
@@ -5879,6 +5903,7 @@ extension Qwen35TextModel: MTPCapable {
             outputShapes: [[1, 1]],
             outputDTypes: [.int32]
         )[0]
+        return (tokenID, candidateIDs)
     }
 
     /// Map compact draft IDs back to the tokenizer's full ID space without a
@@ -6069,6 +6094,13 @@ extension Qwen35Model: MTPCapable {
     /// See `Qwen35TextModel.draftTokenID`.
     public func draftTokenID(_ x: MLXArray) -> MLXArray {
         languageModel.draftTokenID(x)
+    }
+
+    /// See `Qwen35TextModel.draftTokenID(_:reusingShortlist:)`.
+    public func draftTokenID(
+        _ x: MLXArray, reusingShortlist shortlist: MLXArray?
+    ) -> (tokenID: MLXArray, shortlist: MLXArray?) {
+        languageModel.draftTokenID(x, reusingShortlist: shortlist)
     }
 
     /// See `Qwen35TextModel.mapDraftTokenIds`.

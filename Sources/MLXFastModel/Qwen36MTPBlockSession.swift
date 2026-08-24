@@ -1424,7 +1424,17 @@ public final class Qwen36MTPBlockSession {
                 hidden: draftInputHidden, nextTokenIds: draftInputTokens,
                 cache: headCache)
         var draftHidden = Self.lastHiddenRow(headHidden)
-        var draftId = model.draftTokenID(draftHidden)
+        // Select the expensive compact-vocabulary shortlist once per round.
+        // Later proposal steps rerank these same 32 exact affine-4 rows against
+        // their own current hidden state. This removes the centroid QMV, probe
+        // select, gathered row QMV and row-top32 chain from every step after
+        // the first without adding a dispatch or a host readback. A conformer
+        // that cannot expose a reusable shortlist returns nil and follows the
+        // pre-existing per-step selection path through the protocol default.
+        var proposal = model.draftTokenID(
+            draftHidden, reusingShortlist: nil)
+        var draftId = proposal.tokenID
+        let roundShortlist = proposal.shortlist
         draftIdArrays.append(draftId)
         // Early submission of the FIRST head step: its graph exists ~2.4 ms
         // before the rest of the chain is built, and unlike the per-step
@@ -1440,7 +1450,9 @@ public final class Qwen36MTPBlockSession {
             headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
             draftHidden = Self.lastHiddenRow(headHidden)
-            draftId = model.draftTokenID(draftHidden)
+            proposal = model.draftTokenID(
+                draftHidden, reusingShortlist: roundShortlist)
+            draftId = proposal.tokenID
             draftIdArrays.append(draftId)
         }
         let tChainBuilt = Self.traceRounds

@@ -104,6 +104,14 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// instead of six. Proposal side only.
     func draftTokenID(_ x: MLXArray) -> MLXArray
 
+    /// Draft a token while optionally reusing a proposal-only compact
+    /// shortlist selected earlier in the SAME speculative round. The target
+    /// still verifies every returned token; conformers without a reusable
+    /// shortlist keep the ordinary path and return nil.
+    func draftTokenID(
+        _ x: MLXArray, reusingShortlist shortlist: MLXArray?
+    ) -> (tokenID: MLXArray, shortlist: MLXArray?)
+
     /// Fresh KV caches for the MTP head layers, one per draft round.
     func makeMTPCache() -> [any KVCache]
 
@@ -124,6 +132,12 @@ extension Qwen36MTPTarget {
         let (logits, hidden) = callWithHidden(
             input: input, cache: cache, nConfirmed: nConfirmed)
         return (logits, hidden, nil)
+    }
+
+    public func draftTokenID(
+        _ x: MLXArray, reusingShortlist shortlist: MLXArray?
+    ) -> (tokenID: MLXArray, shortlist: MLXArray?) {
+        (draftTokenID(x), nil)
     }
 }
 
