@@ -1864,6 +1864,11 @@ public enum Qwen35CustomQMV {
             let fused =
                 arm == .sumTable
                 ? Qwen35XSumsSidecar.take(x, k: cell.k, m: cell.m) : nil
+            if fused == nil {
+                qwen35XSumsStandaloneFills &+= 1
+            } else {
+                qwen35XSumsSidecarHits &+= 1
+            }
             return matmulWithTable(
                 x, w, scales: scales, biases: biases,
                 xsums: fused ?? xsumsTable(x),
@@ -4331,6 +4336,20 @@ let qwen35RowTop32Resolved: (enabled: Bool, source: String) = {
 public nonisolated(unsafe) var qwen35RowTop32FusedDrafts: Int = 0
 public nonisolated(unsafe) var qwen35RowTop32ArgPartitionDrafts: Int = 0
 
+/// Chunk-sum fill census. `SidecarHits` counts routed table-paying cells that
+/// consumed a table a fused producer published; `StandaloneFills` counts the
+/// ones that still launched `qwen35_custom_affine4_g64_xsums_v1`. Their sum is
+/// the routed table-paying cell count, so the pair witnesses at run time how
+/// much of the 257-site fill surface the inherited fusion actually covers.
+public nonisolated(unsafe) var qwen35XSumsSidecarHits: Int = 0
+public nonisolated(unsafe) var qwen35XSumsStandaloneFills: Int = 0
+
+/// Derived-index geometry this process built, for the arm witness. Zero until
+/// `buildDerivedClusterIndex` runs, which happens once during the untimed warm.
+public nonisolated(unsafe) var qwen35DerivedClusterLeaves: Int = 0
+public nonisolated(unsafe) var qwen35DerivedClusterRowsPerLeafBuilt: Int = 0
+public nonisolated(unsafe) var qwen35DerivedClusterProbes: Int = 0
+
 /// `unset`, `0` or `1`, for the same trace line.
 public var qwen35RowTop32GateSource: String { qwen35RowTop32Resolved.source }
 
@@ -4624,6 +4643,23 @@ private let qwen35ProbeSortEnabled: Bool =
 /// overlap the proposal-side retrieval path restored here.
 private let qwen35DerivedClusterProbeFraction: Double = 0.15
 
+/// `MLX_E141_ROWS_PER_LEAF` widens or narrows the derived index's leaf without
+/// touching its probe fraction, so one binary can time two leaf widths. The
+/// width must stay a multiple of four and 32 rows already fill eight
+/// simdgroups. Unset takes the compiled default bit for bit, which is what a
+/// ranked host always runs: the runner sets no `MLX_` variable. The `MLX_`
+/// prefix is load-bearing, because the worker sanitizer drops `MLXFAST_*`.
+private let qwen35E141RowsPerLeafOverride: Int? = {
+    guard let raw = ProcessInfo.processInfo.environment["MLX_E141_ROWS_PER_LEAF"],
+          !raw.isEmpty
+    else { return nil }
+    guard let value = Int(raw), value >= 4, value <= 32, value % 4 == 0 else {
+        fatalError(
+            "MLX_E141_ROWS_PER_LEAF must be a multiple of 4 in [4, 32]; got \(raw)")
+    }
+    return value
+}()
+
 /// `[m, s, c]` squared distance from every row to every centre, formed as
 /// `||x||^2 - 2 x.c + ||c||^2` so no `[m, s, D]` difference tensor exists.
 private func qwen35ClusterSquaredDistance(
@@ -4826,7 +4862,7 @@ public func qwen35VerifyDraftTop32(trials: Int = 64, seed: UInt64 = 1) -> (Int, 
 /// function of the set `argPartition` chose, never of how it ordered that set.
 /// Returns (checked, mismatches, firstBadTrial). Never called on a scored path.
 public func qwen35VerifyProbeSort(
-    clusters: Int = 12_292, probes: Int = 3_073,
+    clusters: Int = 6_146, probes: Int = 922,
     trials: Int = 64, seed: UInt64 = 1
 ) -> (Int, Int, Int) {
     MLXRandom.seed(seed)
@@ -4863,7 +4899,7 @@ public func qwen35VerifyProbeSort(
 /// one rejected index -- the smallest possible wrong answer -- and requires the
 /// comparison to report it. A gate that cannot fail is not a gate.
 public func qwen35ProbeSortPositiveControl(
-    clusters: Int = 12_292, probes: Int = 3_073, seed: UInt64 = 7
+    clusters: Int = 6_146, probes: Int = 922, seed: UInt64 = 7
 ) -> Bool {
     MLXRandom.seed(seed)
     let sorter = makeQwen35ProbeSortKernel(clusters: clusters, probes: probes)
@@ -4888,7 +4924,7 @@ public func qwen35ProbeSortPositiveControl(
 /// held outside the timed region on both arms. Returns (sortedUs, kernelUs).
 /// Never called on a scored path.
 public func qwen35BenchProbeSort(
-    clusters: Int = 12_292, probes: Int = 3_073, iters: Int = 200
+    clusters: Int = 6_146, probes: Int = 922, iters: Int = 200
 ) -> (Double, Double) {
     MLXRandom.seed(5)
     let sorter = makeQwen35ProbeSortKernel(clusters: clusters, probes: probes)
@@ -4960,7 +4996,7 @@ private func qwen35RowTop32Reference(
 /// Offline equivalence gate for the fused row selection. Needs no checkpoint
 /// and no MTP head. Returns (checked, mismatches, firstBadTrial).
 public func qwen35VerifyRowTop32(
-    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    clusters: Int = 6_146, rowsPerCluster: Int = 16, probes: Int = 922,
     trials: Int = 64, seed: UInt64 = 1
 ) -> (Int, Int, Int) {
     MLXRandom.seed(seed)
@@ -4990,7 +5026,7 @@ public func qwen35VerifyRowTop32(
 /// and requires the comparison to report the difference. A gate that cannot
 /// fail is not a gate.
 public func qwen35RowTop32PositiveControl(
-    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    clusters: Int = 6_146, rowsPerCluster: Int = 16, probes: Int = 922,
     seed: UInt64 = 7
 ) -> Bool {
     MLXRandom.seed(seed)
@@ -5014,7 +5050,7 @@ public func qwen35RowTop32PositiveControl(
 /// Isolated micro-benchmark of the row selection, chain against fused kernel.
 /// Returns (chainUs, kernelUs) per call. Never called on a scored path.
 public func qwen35BenchRowTop32(
-    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    clusters: Int = 6_146, rowsPerCluster: Int = 16, probes: Int = 922,
     iters: Int = 200
 ) -> (Double, Double) {
     MLXRandom.seed(11)
@@ -5182,12 +5218,41 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
     private static let draftRerankCandidateCount = 32
-    // Derived cluster index. Eight rows per leaf and eight refinement passes
-    // are the screened settings; the centroid table stays 2-bit like the rows
-    // it indexes.
+    // Derived cluster index. Eight rows per leaf: 12,292 leaves, and at the
+    // 0.15 probe fraction 1,844 probes refine 14,752 rows.
+    //
+    // REVERTED FROM 16 ON OFFICIAL EVIDENCE (FINDING 323). Width 16 halves the
+    // leaf count and therefore the coarse centroid-pass bytes while holding the
+    // refined-row count at the same 14,752, so it is strictly cheaper to scan.
+    // It still lost: receipt 1509bf95 (commit f95d4bdb) measured +0.5291 % on
+    // the candidate leg against the byte-matched width-8 anchor 5a9f130a
+    // (commit 8ba6e738), 7 of 8 prompts the same sign, published 3.70784519 ->
+    // 3.68242218. Wider leaves select a worse set of rows at equal refinement
+    // cost, and the lost acceptance outweighs the cheaper coarse pass. On this
+    // axis selection quality is scarcer than bandwidth.
+    //
+    // The width must divide `compactDraftPaddedCount` (98,336) exactly, which
+    // both 8 and 16 do. Eight refinement passes are the screened setting and
+    // the centroid table stays 2-bit like the rows it indexes.
     private static let derivedClusterRowsPerLeaf = 8
     private static let derivedClusterIterations = 8
     private static let derivedClusterCentroidBits = 2
+
+    /// Leaf width of the derived index for THIS arm. The width must divide the
+    /// padded row count exactly: `qwen35BisectingPartition` splits a node into
+    /// whole leaves and leaves no room for a partial one, so an indivisible
+    /// override must stop the run instead of silently truncating the table.
+    private static var activeClusterRowsPerLeaf: Int {
+        guard let width = qwen35E141RowsPerLeafOverride else {
+            return derivedClusterRowsPerLeaf
+        }
+        guard compactDraftPaddedCount % width == 0 else {
+            fatalError(
+                "MLX_E141_ROWS_PER_LEAF=\(width) does not divide the padded draft "
+                + "row count \(compactDraftPaddedCount)")
+        }
+        return width
+    }
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
@@ -5639,7 +5704,7 @@ extension Qwen35TextModel: MTPCapable {
               let exactBiases = exact.biases
         else { return }
 
-        let rowsPerLeaf = Self.derivedClusterRowsPerLeaf
+        let rowsPerLeaf = Self.activeClusterRowsPerLeaf
         let leaves = Self.compactDraftPaddedCount / rowsPerLeaf
         let hidden = configuration.hiddenSize
         let rows = dequantized(
@@ -5687,6 +5752,9 @@ extension Qwen35TextModel: MTPCapable {
         _draftCentroidZ = centroidBiases
         _draftClusterPerm = clusterPerm
         _draftClusterShape = [leaves, rowsPerLeaf, probes]
+        qwen35DerivedClusterLeaves = leaves
+        qwen35DerivedClusterRowsPerLeafBuilt = rowsPerLeaf
+        qwen35DerivedClusterProbes = probes
     }
 
     /// The 32 shortlist candidates chosen by the cluster index, or nil when the
