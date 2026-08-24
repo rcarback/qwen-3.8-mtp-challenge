@@ -2342,11 +2342,15 @@ func qwen35FusedResidualRMSNorm(
 ) -> (residual: MLXArray, normed: MLXArray) {
     let nRows = x.size / x.dim(-1)
     let shape = x.shape
+    // Same memo as GDN `normScaleConstants`: `MLXArray(eps)` was a fresh
+    // 1-element graph node on every residual boundary (63+ per forward).
+    // Bytes are identical — same scalar, same consumers.
+    let epsArray = Qwen35ResidualRMSNormEps.array(for: eps)
     if Qwen35XSumsSidecar.wants(x) {
         let k = x.dim(-1)
         let kBlocks = k / 512
         let outputs = qwen35FusedResidualRMSNormXSumsKernel(
-            [x, r, weight, MLXArray(eps)],
+            [x, r, weight, epsArray],
             grid: (nRows * 1024, 1, 1),
             threadGroup: (1024, 1, 1),
             outputShapes: [
@@ -2358,13 +2362,28 @@ func qwen35FusedResidualRMSNorm(
         return (outputs[0], outputs[1])
     }
     let outputs = qwen35FusedResidualRMSNormKernel(
-        [x, r, weight, MLXArray(eps)],
+        [x, r, weight, epsArray],
         grid: (nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [shape, shape],
         outputDTypes: [.bfloat16, .bfloat16]
     )
     return (outputs[0], outputs[1])
+}
+
+/// Input-independent `eps` scalar for the fused residual+RMSNorm kernel.
+/// Rebuilt per distinct value only (the tower uses one `rmsNormEps`).
+private enum Qwen35ResidualRMSNormEps {
+    nonisolated(unsafe) static var value: Float?
+    nonisolated(unsafe) static var array: MLXArray?
+
+    static func array(for eps: Float) -> MLXArray {
+        if value == eps, let array { return array }
+        let next = MLXArray(eps)
+        value = eps
+        array = next
+        return next
+    }
 }
 
 /// Chunk-sum tables emitted by a producing kernel's epilogue, keyed by the
