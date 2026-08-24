@@ -1977,6 +1977,9 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
+            if let fused = qwen35FusedSwiGLUXSums(y) {
+                return qwen35RoutedLinear(downProj, fused)
+            }
             return qwen35RoutedLinear(downProj, qwen35CompiledFusedSwiGLU(y))
         }
         return qwen35RoutedLinear(downProj, silu(gateProj(x)) * upProj(x))
@@ -2449,6 +2452,126 @@ enum Qwen35XSumsSidecar {
         }
         return hit
     }
+}
+
+// MARK: - SwiGLU × xsums (mlp.down)
+
+/// Fold `silu(gate)*up` into the producer `mlp.down` consumes, and emit the
+/// wide-QMV chunk-sum table over those bytes so the sidecar identity hits.
+///
+/// Live `0863b06` still runs `qwen35CompiledFusedSwiGLU` then a standalone
+/// `xsumsTable` on the product. That is ~64 of the 130 fills the residual
+/// fusion left on the table (rung 5d priced the down cell at +11 to +28 us,
+/// 3–4× `fa.o_proj`). E126 bundled this producer with a GDN post-norm
+/// kernel and FAILED the untimed parity gate; those `_v1` kernels are
+/// forbidden. This leftover is mlp.down only: header-free (E132's compile
+/// hole), named source + split launch (E133), and the packed-GDN bf16
+/// sigmoid + 0xC0DB→0x3A8B ulp that already passed ranked parity on E133.
+/// No GDN kernel. No `model.norm`. No `fa.o_proj`. No `header:` argument.
+private let qwen35FusedSwiGLUXSumsSource = """
+        constexpr uint n_reads = 4;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint in_axis = uint(y_shape[y_ndim - 1]);
+        uint axis_size = in_axis / 2u;
+        const uint xs_stride = threadgroups_per_grid.x <= 8u ? 8u : 16u;
+        ulong in_off = ulong(row) * ulong(in_axis);
+        ulong act_off = ulong(row) * ulong(axis_size);
+
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem0 = r_start + thread_id * n_reads;
+            if (elem0 + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    uint elem = elem0 + i;
+                    bfloat16_t gv = y[in_off + elem];
+                    bfloat16_t uv = y[in_off + axis_size + elem];
+                    bfloat16_t sig;
+                    if (as_type<uint16_t>(gv) == uint16_t(0xC0DB)) {
+                        sig = as_type<bfloat16_t>(uint16_t(0x3A8B));
+                    } else {
+                        auto sigy = 1 / (1 + metal::exp(metal::abs(gv)));
+                        sig = (gv < 0) ? sigy : 1 - sigy;
+                    }
+                    act[act_off + elem] = (gv * sig) * uv;
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem0 + i < axis_size) {
+                        uint elem = elem0 + i;
+                        bfloat16_t gv = y[in_off + elem];
+                        bfloat16_t uv = y[in_off + axis_size + elem];
+                        bfloat16_t sig;
+                        if (as_type<uint16_t>(gv) == uint16_t(0xC0DB)) {
+                            sig = as_type<bfloat16_t>(uint16_t(0x3A8B));
+                        } else {
+                            auto sigy = 1 / (1 + metal::exp(metal::abs(gv)));
+                            sig = (gv < 0) ? sigy : 1 - sigy;
+                        }
+                        act[act_off + elem] = (gv * sig) * uv;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+            const uint xs_elem = r_start + thread_id * 16;
+            if (thread_id < lsize / 4 && xs_elem + 16 <= axis_size) {
+                const device bfloat16_t* xm = act + act_off + xs_elem;
+                float sumv = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    const vec<bfloat16_t, 4> xv = *reinterpret_cast<
+                        const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+                    sumv += xv[0] + xv[1] + xv[2] + xv[3];
+                }
+                const uint xs_kb = xs_elem / 512;
+                const uint xs_lane = (xs_elem % 512) / 16;
+                xsums[(xs_kb * 32 + xs_lane) * xs_stride + row] = sumv;
+            }
+        }
+        """
+
+private let qwen35FusedSwiGLUXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_swiglu_xsums_v2",
+    inputNames: ["y"],
+    outputNames: ["act", "xsums"],
+    source: qwen35FusedSwiGLUXSumsSource,
+    ensureRowContiguous: false
+)
+
+/// Compiled-graph SwiGLU (`silu(g)*u` with `silu = g * sigmoid(g)` in bf16)
+/// plus the fill-kernel body over the product, published under the object
+/// `down_proj` consumes. Nil keeps today's compiled SwiGLU and today's fill.
+func qwen35FusedSwiGLUXSums(_ y: MLXArray) -> MLXArray? {
+    guard y.ndim >= 2 else { return nil }
+    guard y.dtype == .bfloat16 else { return nil }
+    let inK = y.dim(-1)
+    guard inK > 0, inK % 2 == 0 else { return nil }
+    let k = inK / 2
+    let rows = y.size / inK
+    guard Qwen35CustomQMV.arm == .sumTable else { return nil }
+    guard Qwen35CustomQMV.widths.contains(rows) else { return nil }
+    guard Qwen35CustomQMV.tablePays(m: rows) else { return nil }
+    guard y.dim(-2) == rows else { return nil }
+    guard k % 512 == 0 else { return nil }
+    guard Qwen35CustomQMV.rowContiguous(y, rowStride: inK) else { return nil }
+    let kBlocks = k / 512
+    var actShape = y.shape
+    actShape[actShape.count - 1] = k
+    let tableLen = kBlocks * 32 * Qwen35CustomQMV.sumsStride(rows)
+    let tableShape = [tableLen]
+    let grid = (rows * 1024, 1, 1)
+    let threadGroup = (1024, 1, 1)
+    let outputs = qwen35FusedSwiGLUXSumsKernel(
+        [y],
+        grid: grid,
+        threadGroup: threadGroup,
+        outputShapes: [actShape, tableShape],
+        outputDTypes: [.bfloat16, .float32]
+    )
+    let act = outputs[0]
+    let table = outputs[1]
+    Qwen35XSumsSidecar.publish(x: act, table: table)
+    return act
 }
 
 // MARK: - Dual independent RMSNorm (proposal-side pre-fc)
