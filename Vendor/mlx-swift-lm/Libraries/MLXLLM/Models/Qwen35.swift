@@ -743,17 +743,15 @@ final class Qwen35GatedDeltaNet: Module {
                 q: q, k: k, v: v, a: a, b: b,
                 aLog: aLog, dtBias: dtBias, state: state, mask: mask)
         }
-        let beta = sigmoid(b).asType(.float32)
-        let g = exp(negExpALog * softplus(a + dtBias))
-        let B = q.dim(0)
-        let Dk = q.dim(3)
-        let Hv = v.dim(2)
-        let Dv = v.dim(3)
-        var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
-        if state.dtype != .float32 {
-            state = state.asType(.float32)
-        }
-        return gatedDeltaKernel(
+        // Same fp32 g/beta bytes as the unfused prologue this helper used to
+        // emit inline. The compiled helper is already the tip's producer on
+        // the S>=2 stash else-branch and the S=2 mid path; processChunk was
+        // the remaining caller that still paid the separate sigmoid / cast /
+        // add / softplus / mul / exp launches. Recurrence stays
+        // qwen35GatedDeltaPrepared / gatedDeltaKernel.
+        let (g, beta) = qwen35CompiledGatedDeltaGBeta(
+            a, b, negExpALog, dtBias)
+        return qwen35GatedDeltaPrepared(
             q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
 
