@@ -528,6 +528,99 @@ private let qwen35GatedDeltaMidKernel: MLXFast.MLXFastKernel? = {
     )
 }()
 
+/// Width-2 verify twin of `qwen35_gated_delta_step_mid` with the unused
+/// `state_mid` tensor removed. The mid kernel writes one fp32 SSM snapshot
+/// after timestep 0 so a later K=1 reject can restore without a repair
+/// forward. A full accept never reads that snapshot — it is cleared with
+/// the rest of the rollback slots — so every GDN layer still paid a
+/// `[1, 1, 48, 128, 128]` store (~3 MiB) that the common path discarded.
+///
+/// `y` and `state_out` keep the mid kernel's instruction stream: same
+/// register recurrence, same `simd_sum`s, same stores, same pointer
+/// increments. Only the `t < T-1` mid-state write (and its output
+/// allocation) is gone. Verify logits and the committed conv/SSM pair
+/// are therefore the mid kernel's bit pattern. A K=1 reject now takes
+/// the session's already-captured generic snapshot and repair forward,
+/// which is the path that existed before the mid kernel landed.
+private let qwen35GatedDeltaNoMidKernel: MLXFast.MLXFastKernel? = {
+    let source = """
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            auto hk_idx = hv_idx / (Hv / Hk);
+            constexpr int n_per_t = Dk / 32;
+
+            // q, k: [B, T, Hk, Dk]
+            auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+            // v, y: [B, T, Hv, Dv]
+            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+            y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+            auto dk_idx = thread_position_in_threadgroup.x;
+            auto dv_idx = thread_position_in_grid.y;
+
+            // g: [B, T, Hv]
+            auto g_ = g + b_idx * T * Hv;
+            auto beta_ = beta + b_idx * T * Hv;
+
+            // state_in, state_out: [B, Hv, Dv, Dk]
+            auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+            auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+            float state[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = static_cast<float>(i_state[s_idx]);
+            }
+
+            for (int t = 0; t < T; ++t) {
+              if (true) {
+                float kv_mem = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  state[i] = state[i] * g_[hv_idx];
+                  kv_mem += state[i] * k_[s_idx];
+                }
+                kv_mem = simd_sum(kv_mem);
+
+                auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  state[i] = state[i] + k_[s_idx] * delta;
+                  out += state[i] * q_[s_idx];
+                }
+                out = simd_sum(out);
+                if (thread_index_in_simdgroup == 0) {
+                  y[dv_idx] = static_cast<InT>(out);
+                }
+              } else {
+                y[dv_idx] = static_cast<InT>(0);
+              }
+              // Increment data pointers to next time step
+              q_ += Hk * Dk;
+              k_ += Hk * Dk;
+              v_ += Hv * Dv;
+              y += Hv * Dv;
+              g_ += Hv;
+              beta_ += Hv;
+            }
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              o_state[s_idx] = static_cast<StT>(state[i]);
+            }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_gated_delta_step_nomid",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["y", "state_out"],
+        source: source
+    )
+}()
+
 // MARK: - GatedDelta state-only replay kernel
 
 /// Clone of the vendored `gated_delta_step` kernel (GatedDelta.swift) with the
@@ -1183,16 +1276,15 @@ final class Qwen35GatedDeltaNet: Module {
             finalSsmState = s
             pendingPrefixTape = tape
         } else if nConfirmed == 1 && S == 2 && mask == nil,
-           let midKernel = qwen35GatedDeltaMidKernel
+           let noMidKernel = qwen35GatedDeltaNoMidKernel
         {
-            // Width-2 MTP verify, single-launch form. The old split path ran
-            // EVERY satellite op twice (conv, silu, split, reshapes, q/k norms,
-            // sigmoid, g) and paid two recurrence launches with a full fp32
-            // state round-trip between them, solely to observe the
-            // post-primary state. Here the prework runs once over both rows —
-            // all of it position-local, so per-row bit-identical to the split
-            // form — and the cloned kernel emits the timestep-0 state as a
-            // third output, so the rollback checkpoint is free.
+            // Width-2 MTP verify, single-launch form. Prework still runs
+            // once over both rows. The recurrence is the mid kernel's
+            // y/state_out stream with the unused timestep-0 SSM snapshot
+            // removed: a full accept never consumed that 3 MiB/layer
+            // store, and a K=1 reject already has the session snapshot
+            // plus repair forward. Clear any stale checkpoint so a later
+            // restore cannot pick up a previous round's frame.
             let convInput = concatenated([convState, qkv], axis: 1)
             let nKeep = convKernelSize - 1
             let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
@@ -1212,8 +1304,6 @@ final class Qwen35GatedDeltaNet: Module {
                 kScaleConst
                 * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-            // Replicates gatedDeltaUpdate's fp32 prologue, fusing beta/g while
-            // serving the gate's input-independent factor from the layer memo.
             let (g, beta) = qwen35CompiledGatedDeltaGBeta(
                 a, b, negExpALog, dtBias)
             var state = ssmState
@@ -1221,7 +1311,7 @@ final class Qwen35GatedDeltaNet: Module {
                     [B, numVHeads, headVDim, headKDim], dtype: .float32)
             if state.dtype != .float32 { state = state.asType(.float32) }
 
-            let outputs = midKernel(
+            let outputs = noMidKernel(
                 [qNormed, kNormed, v, g, beta, state, MLXArray(S)],
                 template: [
                     ("InT", dtype),
@@ -1236,24 +1326,11 @@ final class Qwen35GatedDeltaNet: Module {
                 outputShapes: [
                     [B, S, numVHeads, headVDim],
                     state.shape,
-                    [B, S - 1, numVHeads, headVDim, headKDim],
                 ],
-                outputDTypes: [dtype, .float32, .float32]
+                outputDTypes: [dtype, .float32]
             )
-            // Per-boundary checkpoints: after row t, the conv state is rows
-            // (t+1)..(t+nKeep) of [convState | x0 .. x_{S-1}] and the SSM
-            // state is the kernel's mid output slice t. Checkpoint 0 doubles
-            // as the legacy single-slot `rollbackState` for the K=1 path.
-            var checkpoints: [(MLXArray, MLXArray)] = []
-            checkpoints.reserveCapacity(S - 1)
-            for t in 0 ..< (S - 1) {
-                checkpoints.append((
-                    convInput[0..., (t + 1) ..< (t + 1 + nKeep)],
-                    outputs[2][0..., t]
-                ))
-            }
-            cache?.rollbackState = checkpoints.first
-            cache?.rollbackCheckpoints = checkpoints
+            cache?.rollbackState = nil
+            cache?.rollbackCheckpoints = []
             out = outputs[0]
             finalConvState = newConvState
             finalSsmState = outputs[1]
