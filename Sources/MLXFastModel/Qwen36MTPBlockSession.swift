@@ -557,7 +557,7 @@ public final class Qwen36MTPBlockSession {
         guard faCount == 16, let (extK, extV) = firstKV, extK.dim(2) >= 1024
         else { return }
         eval(extended)
-        // 4 KV heads × 6 GQA = 24 Q heads; head_dim from the live FA tensor
+        // 4 KV heads × 6 GQA = 24 Q heads; head_dim comes from the live FA tensor
         // (config pins 256). Scale matches Qwen35Attention.
         let qHeads = extK.dim(1) * 6
         let headDim = extK.dim(3)
