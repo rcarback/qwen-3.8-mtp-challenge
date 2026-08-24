@@ -1256,7 +1256,11 @@ public class ArraysCache: BaseKVCache {
     public var prefixReplayTape: PrefixReplayTape? = nil
 
     public struct PrefixReplayTape {
-        public let convInput: MLXArray
+        /// Pre-verify conv state and the new qkv rows, stored separately so
+        /// the hot verify does not concatenate them. `convInput` rebuilds
+        /// `concat(convState, qkv)` only if a prefix reject actually replays.
+        public let convState: MLXArray
+        public let qkv: MLXArray
         public let q: MLXArray
         public let k: MLXArray
         public let v: MLXArray
@@ -1269,8 +1273,13 @@ public class ArraysCache: BaseKVCache {
         public let rowCount: Int
         public let convStateRows: Int
 
+        public var convInput: MLXArray {
+            concatenated([convState, qkv], axis: 1)
+        }
+
         public init(
-            convInput: MLXArray,
+            convState: MLXArray,
+            qkv: MLXArray,
             q: MLXArray,
             k: MLXArray,
             v: MLXArray,
@@ -1283,7 +1292,8 @@ public class ArraysCache: BaseKVCache {
             rowCount: Int,
             convStateRows: Int
         ) {
-            self.convInput = convInput
+            self.convState = convState
+            self.qkv = qkv
             self.q = q
             self.k = k
             self.v = v

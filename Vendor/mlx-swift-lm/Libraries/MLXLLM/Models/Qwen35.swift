@@ -943,7 +943,6 @@ final class Qwen35GatedDeltaNet: Module {
     ) {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
-        let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         // Packed-prework mixer gate: fail closed onto the stock chain for any
         // shape, geometry, or dtype outside the byte-receipt envelope. The
@@ -995,6 +994,7 @@ final class Qwen35GatedDeltaNet: Module {
             g = outs[4]
             beta = outs[5]
         } else {
+            let convInput = concatenated([convState, qkv], axis: 1)
             newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
             let convOut = silu(conv1d(convInput))
 
@@ -1035,7 +1035,8 @@ final class Qwen35GatedDeltaNet: Module {
         let out = recurrence.0
         let newSsmState = recurrence.1
         let tape = ArraysCache.PrefixReplayTape(
-            convInput: convInput,
+            convState: convState,
+            qkv: qkv,
             q: qNormed,
             k: kNormed,
             v: v,
@@ -1057,7 +1058,9 @@ final class Qwen35GatedDeltaNet: Module {
               committedRows > 0,
               committedRows < tape.rowCount,
               tape.convStateRows == convKernelSize - 1,
-              tape.convInput.dim(1)
+              tape.convState.dim(1) == tape.convStateRows,
+              tape.qkv.dim(1) == tape.rowCount,
+              tape.convState.dim(1) + tape.qkv.dim(1)
                   >= committedRows + tape.convStateRows,
               tape.q.dim(1) == tape.rowCount,
               tape.k.dim(1) == tape.rowCount,
