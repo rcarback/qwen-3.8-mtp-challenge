@@ -195,7 +195,26 @@ public final class Qwen36MTPBlockSession {
             guard let self else { return Swift.min(offeredDepth, 1) }
             return self.costModelDepth(offeredDepth: offeredDepth)
         }
+        // E159 research instrument. Unset on every ranked and submitted run, so
+        // the shipped adaptive schedule above is the default path.
+        if let pinned = Self.pinnedDraftDepth {
+            draftPolicy = { offeredDepth, _ in Swift.min(offeredDepth, pinned) }
+        }
     }
+
+    /// E159 ROUND-BUDGET INSTRUMENT, off unless `MLX_E159_FIXED_DRAFT_DEPTH`
+    /// is set. It pins the PROPOSED draft count per round so a leg measures
+    /// one point of the round-cost law `R(D) = (s + t0) + (h + t1)·D`, which
+    /// the adaptive schedule hides by varying `D` round to round. The pinned
+    /// count is still an offer-bounded proposal, so every ledger quantity, the
+    /// accept walk and the emitted token stream are unchanged.
+    private static let pinnedDraftDepth: Int? = {
+        guard let raw = ProcessInfo.processInfo
+            .environment["MLX_E159_FIXED_DRAFT_DEPTH"],
+            let value = Int(raw), value >= 0
+        else { return nil }
+        return Swift.min(value, Qwen36MTPLimits.maxDepth)
+    }()
 
     // MARK: - warm
 
@@ -1679,6 +1698,17 @@ public final class Qwen36MTPBlockSession {
                 + "sel_env=\(qwen35RowTop32GateSource) "
                 + "sel_fused=\(qwen35RowTop32FusedDrafts) "
                 + "sel_argpart=\(qwen35RowTop32ArgPartitionDrafts) "
+                // Derived-index geometry this process built, so the leaf-width
+                // arm is witnessed from the run's own trace rather than from
+                // the launch environment.
+                + "leaf=\(qwen35DerivedClusterRowsPerLeafBuilt) "
+                + "leaves=\(qwen35DerivedClusterLeaves) "
+                + "probes=\(qwen35DerivedClusterProbes) "
+                // Chunk-sum fill census: table-paying cells that consumed a
+                // produced table, and the ones that still launched the
+                // standalone fill.
+                + "xs_hit=\(qwen35XSumsSidecarHits) "
+                + "xs_fill=\(qwen35XSumsStandaloneFills) "
                 + scheduleTrace + "\n"
             Self.traceWrite(line)
             // Absolute anchors on the mach uptime clock, so an offline reader
