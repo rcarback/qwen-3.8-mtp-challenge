@@ -1038,7 +1038,17 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 7
+    private static let segmentedVerifyDepthCap = 8
+
+    /// CAP 8 RECEIPT (local, 2026-08-24): the first bit-exactness gate at
+    /// verify width 9. Forced-saturation run (depth override, local only)
+    /// drove rounds to d=8 against the trusted value-level replay:
+    /// reference_checked_rows=20/20, all_tokens_matched=true,
+    /// residual_divergence_count=0 — the replay's declared-value/margin
+    /// comparison cleared every width-9 row including the rounds after a
+    /// wide round (no K/V contamination). Full local-iterate with this
+    /// literal passed all gates end to end. Widths 6..8 were gated by the
+    /// earlier hexfloat rows; 9 is now covered by the ranked-style replay.
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
@@ -1491,12 +1501,17 @@ public final class Qwen36MTPBlockSession {
         // materialised buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
-        var bundle: [MLXArray] = [top2IDs, top2Values]
-        bundle.append(contentsOf: draftIdArrays)
+        // Batched draft-id readout: the ids ride into the round's single
+        // blocking eval as ONE [d,1] concat instead of d separate scalars,
+        // so the accept walk reads one materialised buffer instead of
+        // issuing d host-side scalar copies. Same integers, same order;
+        // `verifyTokens` above still chains the individual id arrays.
+        let draftIDBatch = concatenated(draftIdArrays, axis: 0)
+        var bundle: [MLXArray] = [top2IDs, top2Values, draftIDBatch]
         eval(cache.flatMap { $0.state } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
-        let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
+        let drafts = draftIDBatch.asArray(Int32.self).map { Int($0) }
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
