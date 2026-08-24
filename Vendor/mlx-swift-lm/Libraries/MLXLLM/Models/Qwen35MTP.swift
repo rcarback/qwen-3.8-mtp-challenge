@@ -17,6 +17,41 @@ import MLXNN
 /// patches/mlx_lm_mtp/__init__.py.
 public nonisolated(unsafe) var _qwen35MTPEnabled: Bool = false
 
+/// A proposal head that is not the checkpoint's own MTP module.
+///
+/// The track's 2026-08-14 contract makes the head weights competitive surface,
+/// and a declared head need not share the native head's architecture. This
+/// protocol is deliberately empty: the backbone's only interest in such a head
+/// is that one is attached, so that `hasMTPHead` reports the truth. Everything
+/// about how it drafts belongs to the session that drives it.
+public protocol Qwen35ProposalHead: AnyObject {}
+
+/// A declared proposal head, hidden from the backbone's parameter walk.
+///
+/// THE BOX IS LOAD-BEARING, not decoration. `Module` discovers its children by
+/// reflecting over stored properties and keeping every value that IS a
+/// `Module`, whether or not it carries `@ModuleInfo`. A declared head stored
+/// bare on `Qwen35TextModel` therefore joins the backbone's own parameter tree,
+/// and the loader's `update(parameters:verify: [.all])` then demands checkpoint
+/// keys for a head whose weights live in a different tree entirely -- the
+/// failure reads `keyNotFound(["externalProposalHead", ...])`. Reflection does
+/// not descend into a value that is not itself a `Module`, so wrapping the head
+/// in this box keeps it out of the walk while leaving it reachable.
+public final class Qwen35ProposalHeadBox {
+    public let head: any Qwen35ProposalHead
+    public init(_ head: any Qwen35ProposalHead) { self.head = head }
+}
+
+/// The declared proposal head to attach at the next model init, or nil for the
+/// checkpoint's own MTP module.
+///
+/// Same idiom and same lifetime discipline as `_qwen35MTPEnabled` above: the
+/// model factory builds the model, so an attachment decision that has to be
+/// made before `init` runs has nowhere else to live. Set it around the load and
+/// clear it afterwards.
+public nonisolated(unsafe) var _qwen35ExternalProposalHead:
+    Qwen35ProposalHeadBox?
+
 /// E85 arm gate. `MLX_E85_FUSED_EMBED=0` restores the eager
 /// `embedTokens(ids)` before the dual-norm concat.
 ///

@@ -615,6 +615,13 @@ public final class Qwen36MTPBlockSession {
             if self.headless { return 0 }
             return self.costModelDepth(offeredDepth: offeredDepth)
         }
+        // A declared drafter that is not the native head architecture drafts
+        // through the block-parallel round shape instead of the head chain.
+        // The backbone attached it at load; installing it here is what points
+        // this session's step 1 at it.
+        if let drafter = model.externalProposalHead as? Qwen38DFlash2Head {
+            try installBlockDrafter(drafter)
+        }
     }
 
     /// No MTP head is attached, so every round is a non-drafting round.
@@ -708,18 +715,61 @@ public final class Qwen36MTPBlockSession {
         // below drives the head directly rather than through `draftPolicy`,
         // so warming it would trap. Depth 0 is the only legal width here.
         if headless { return try warmAllDepthShapes(maxDepth: 0) }
+        // A block drafter has no native head to sweep: the width sweep below
+        // drives `mtpForwardWithHidden` directly, which traps when no MTP
+        // module is attached. Warm the target's own shapes at depth 0 and the
+        // proposal shapes through the drafter instead.
+        if blockDrafter != nil {
+            try warmAllDepthShapes(maxDepth: 0)
+            try warmBlockDraftShapes(maxDepth: maxDepth)
+            Self.wireResidentWeightsIfEnabled()
+            return
+        }
         // Keep the large shape-warm object graph in a separate call frame so
         // every throwaway cache and tensor is released before residency sizing.
         try warmAllDepthShapes(maxDepth: maxDepth)
         Self.wireResidentWeightsIfEnabled()
     }
 
+    /// Warm the block-parallel round shapes.
+    ///
+    /// One proposal at every legal width over a seed-sized context, on
+    /// throwaway cache state, so the first scored round does not pay a cold
+    /// graph. The drafter's own cache is discarded afterwards: the warm feeds
+    /// synthetic context, which must not survive into the real session.
+    private func warmBlockDraftShapes(maxDepth: Int) throws {
+        guard let blockDrafter else { return }
+        let width = blockDrafter.config.contextWidth
+        let context = MLXArray.zeros([1, 512, width], dtype: .bfloat16)
+        for depth in 1 ... maxDepth {
+            let warmCache = blockDrafter.makeCache()
+            var block = [Int32(0)]
+            block.append(contentsOf: Array(
+                repeating: Int32(blockDrafter.config.maskTokenID),
+                count: depth))
+            let path = try blockDrafter.propose(
+                inputs: MLXArray(block).reshaped([1, block.count]),
+                targetHidden: context,
+                cache: warmCache,
+                logitsStart: 1)
+            eval(path)
+        }
+        blockDraftCache = blockDrafter.makeCache()
+    }
+
+    /// True when this session drafts through the checkpoint's own MTP module,
+    /// which is the only head the width sweep in `warmAllDepthShapes` drives.
+    private var nativeHeadWarmable: Bool { !headless && blockDrafter == nil }
+
     private func warmAllDepthShapes(maxDepth: Int) throws {
         // Warms every legal verify width from 1 (the serial control's
         // single-token forward) up to maxDepth + 1, plus the head's draft step.
         // The head warm runs even for a serial-only session: the head is resident
         // on both sides, so warming it on both keeps the load shape identical.
-        guard maxDepth >= (headless ? 0 : 1),
+        // Depth 0 is legal exactly when there is no NATIVE head to sweep: a
+        // headless backbone, or one whose proposal source is a declared block
+        // drafter warmed separately by `warmBlockDraftShapes`.
+        guard maxDepth >= (nativeHeadWarmable ? 1 : 0),
               maxDepth <= Qwen36MTPLimits.maxDepth
         else {
             throw Qwen36MTPSessionError.invalidDepth(maxDepth)
@@ -749,7 +799,7 @@ public final class Qwen36MTPBlockSession {
         // Everything from here to the verify-width loop warms the MTP head.
         // A headless backbone has none, so skip it; the width loop below still
         // compiles the serial verify shape this configuration does dispatch.
-        if !headless {
+        if nativeHeadWarmable {
         let headCache = model.makeMTPCache()
         for _ in 0 ..< maxDepth {
             let (draftLogits, draftHidden) = model.mtpForwardWithHidden(

@@ -80,6 +80,11 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// side only.
     func applyEmbedding(_ ids: MLXArray) -> MLXArray
 
+    /// A declared proposal head that is not this checkpoint's MTP module, or
+    /// nil when the native head is in play. The session reads it at init to
+    /// decide which drafting shape a round takes.
+    var externalProposalHead: (any Qwen35ProposalHead)? { get }
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.

@@ -4,6 +4,7 @@
 import Foundation
 import MLX
 import MLXFastCore
+import MLXLLM
 import MLXLMCommon
 import MLXNN
 
@@ -449,7 +450,7 @@ final class Qwen38DFlash2CandidateSelector: Module {
     }
 }
 
-public final class Qwen38DFlash2Head: Module, @unchecked Sendable {
+public final class Qwen38DFlash2Head: Module, Qwen35ProposalHead, @unchecked Sendable {
     public let config: Qwen38DFlash2Configuration
 
     @ModuleInfo(key: "fc") var contextProjection: Linear

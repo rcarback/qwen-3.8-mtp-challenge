@@ -174,28 +174,72 @@ public enum Qwen36MTPHeadAttachment {
         _ body: (BackboneLayout) throws -> T
     ) throws -> T {
         let layout = try backboneLayout(directory: backboneDirectory)
+        // A DECLARED HEAD NEED NOT BE THE NATIVE ARCHITECTURE. The 2026-08-14
+        // contract makes head weights competitive surface, and a head only
+        // proposes, so the shape of the proposal machinery is the submission's
+        // choice. A tree whose config declares a drafter architecture is loaded
+        // as its own model and attached beside the backbone; it is NOT merged
+        // under `mtp.`, because it carries no `mtp.*` tensors and its
+        // quantization is its own.
+        let declaredDrafter = try headDirectory.flatMap {
+            try loadDeclaredDrafter(from: $0)
+        }
         // A nil head is the HEADLESS backbone: the tower loads on its own and
         // decoding runs serially, which is the depth-0 control the track
         // already treats as a legal configuration. It exists for local
         // research on sibling `qwen3_5_text` towers, which have no published
         // MTP head; the ranked path always passes a directory.
-        if let headDirectory {
+        if let headDirectory, declaredDrafter == nil {
             try verifyHeadTree(headDirectory)
         }
         let previousSources = _additionalWeightSources
         let previousStrip = _primaryWeightKeyPrefixStrip
         let previousEnabled = _qwen35MTPEnabled
-        _additionalWeightSources = headDirectory.map {
-            [AdditionalWeightSource(directory: $0, keyPrefix: headKeyPrefix)]
-        } ?? []
+        let previousExternal = _qwen35ExternalProposalHead
+        // The native merge and the declared drafter are exclusive: whichever
+        // the head tree declares is the one proposal source this load attaches.
+        _additionalWeightSources = declaredDrafter == nil
+            ? (headDirectory.map {
+                [AdditionalWeightSource(directory: $0, keyPrefix: headKeyPrefix)]
+            } ?? [])
+            : []
         _primaryWeightKeyPrefixStrip = layout.primaryKeyPrefixStrip
-        _qwen35MTPEnabled = headDirectory != nil
+        _qwen35MTPEnabled = headDirectory != nil && declaredDrafter == nil
+        _qwen35ExternalProposalHead = declaredDrafter
         defer {
             _additionalWeightSources = previousSources
             _primaryWeightKeyPrefixStrip = previousStrip
             _qwen35MTPEnabled = previousEnabled
+            _qwen35ExternalProposalHead = previousExternal
         }
         return try body(layout)
+    }
+
+    /// Load a declared drafter, or return nil when the tree is a native head.
+    ///
+    /// The discriminator is the head config's own `architectures`, not a
+    /// heuristic over tensor names: a tree that declares a drafter but fails to
+    /// load must FAIL, never fall back to reading the same bytes as a native
+    /// head. The ranked runner takes the same posture one level up -- a present
+    /// but broken declaration is a refusal, not a silent fall back to the
+    /// pinned head.
+    public static func loadDeclaredDrafter(
+        from headDirectory: URL
+    ) throws -> Qwen35ProposalHeadBox? {
+        let configURL = headDirectory.appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: configURL),
+              let root = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              let architectures = root["architectures"] as? [String]
+        else { return nil }
+        guard architectures.contains("DFlash2DraftModel") else { return nil }
+        let head = try Qwen38DFlash2Head.load(from: headDirectory)
+        FileHandle.standardError.write(Data(
+            ("mlxfast-worker: qwen-mtp declared drafter DFlash2 attached "
+                + "(\(head.config.numHiddenLayers) layers, block "
+                + "\(head.config.blockSize), target layers "
+                + "\(head.config.targetLayerIDs))\n").utf8))
+        return Qwen35ProposalHeadBox(head)
     }
 
     /// Structural checks that do not need MLX and are therefore unit-testable.

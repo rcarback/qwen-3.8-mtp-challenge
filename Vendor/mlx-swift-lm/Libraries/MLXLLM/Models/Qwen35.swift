@@ -5075,8 +5075,27 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__init__ (MTPModule attachment)
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPModule?
 
+    /// A declared proposal head that is not this checkpoint's MTP module.
+    ///
+    /// Captured from `_qwen35ExternalProposalHead` at init, exactly as `mtp` is
+    /// gated on `_qwen35MTPEnabled`, because the factory owns construction.
+    ///
+    /// It is BOXED rather than stored bare, and the box is load-bearing: the
+    /// head carries its own weights from its own tree, and `Module` reflection
+    /// keeps every stored property that is a `Module`, `@ModuleInfo` or not.
+    /// Stored directly it joins this model's parameter and quantization walks,
+    /// and the loader's `update(parameters:verify: [.all])` then fails with
+    /// `keyNotFound(["externalProposalHead", ...])`.
+    private let externalProposalHeadBox: Qwen35ProposalHeadBox?
+
+    /// The declared proposal head, or nil when the native MTP module is in play.
+    public var externalProposalHead: (any Qwen35ProposalHead)? {
+        externalProposalHeadBox?.head
+    }
+
     public init(_ args: Qwen35TextConfiguration) {
         self.configuration = args
+        self.externalProposalHeadBox = _qwen35ExternalProposalHead
         self.vocabularySize = args.vocabularySize
         self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
         self.model = Qwen35TextModelInner(args)
@@ -5252,7 +5271,14 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 // MARK: - Qwen35TextModel + MTPCapable
 
 extension Qwen35TextModel: MTPCapable {
-    public var hasMTPHead: Bool { mtp != nil }
+    /// True when SOME proposal head is attached, native or declared.
+    ///
+    /// The worker's load-time guard reads this to refuse a backbone that would
+    /// load, never draft, and report a perfectly exact run at zero acceptance.
+    /// A declared head satisfies that intent as squarely as the native one
+    /// does: something will propose. What the guard must not do is pass on a
+    /// backbone with no proposal source at all, and neither disjunct lets it.
+    public var hasMTPHead: Bool { mtp != nil || externalProposalHead != nil }
 
     /// Run a backbone forward that also returns pre-norm hidden states.
     ///
@@ -5928,6 +5954,11 @@ extension Qwen35Model: LoRAModel {
 /// omlx: patches/mlx_lm_mtp/qwen35_model.py `_patch_outer_model`
 extension Qwen35Model: MTPCapable {
     public var hasMTPHead: Bool { languageModel.hasMTPHead }
+
+    /// See `Qwen35TextModel.externalProposalHead`.
+    public var externalProposalHead: (any Qwen35ProposalHead)? {
+        languageModel.externalProposalHead
+    }
 
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int

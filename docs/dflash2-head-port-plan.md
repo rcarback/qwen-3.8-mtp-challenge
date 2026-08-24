@@ -4,8 +4,9 @@ Replace the pinned MTP head with a Swift port of `z-lab/Qwen3.8-27B-DFlash2`,
 declared through `mtp-head.manifest.json`. The goal is a higher accept rate,
 which is the quantity the published score depends on.
 
-Status: Now — measured, ported, checked against the reference, and driven by
-the session. Nothing declares the head yet, so no run selects it.
+Status: Now — ported, checked against the reference, and running end to end.
+The accept rate does not beat the pinned head, so the premise below is not yet
+supported. Read "Accept rate on real prose" before doing more work here.
 
 ## Measured result
 
@@ -68,6 +69,44 @@ traffic per round.
 The port also gained one behaviour the first draft missed. The reference session
 calls `propose` with `logits_start=1`: block position 0 is the anchor the target
 already committed, so drafting it wastes a row and shifts the proposal by one.
+
+## Accept rate on real prose
+
+Measured on this box through `mtp-verify`, one 106-token open-ended prose
+prompt, 192 reference rows, greedy. Every run matched the serial trajectory
+exactly. `mean` is committed tokens per round, which is the quantity a round's
+cost is paid against.
+
+| Head | Offer 2 | Offer 4 | Offer 8 |
+|---|---|---|---|
+| Pinned native | 1.98 | 2.83 | 3.20 |
+| DFlash2 8-bit | 1.90 | 2.66 | 3.00 |
+| DFlash2 4-bit | 1.87 | 2.85 | not run |
+
+Per-draft accept rate at offer 4: pinned 61.6%, DFlash2 8-bit 65.6%, DFlash2
+4-bit 59.9%. The 8-bit head proposes fewer drafts for the same committed
+tokens, which is a real difference, but it is not more committed tokens.
+
+DFlash2 does NOT beat the pinned head on accept rate here. Two readings, and
+they are not exclusive.
+
+- The Python 1.41 figure compares DFlash2 against PLAIN SERIAL decode, not
+  against this repository's native head. That head runs a persistent
+  committed-history KV cache, which the session's own notes measure at 0.903
+  accept with history against 0.262 without. Beating serial is not the bar.
+- 4-bit is measurably worse than 8-bit, exactly as the parity result predicted:
+  the Swift 4-bit path proposes different tokens from the reference. Ship 8-bit
+  if this head ships at all.
+
+WHAT THIS DOES NOT SETTLE. Accept rate is half the round's economics. The
+autoregressive head costs `V + d*H` and the block head costs `V + H`, flat in
+depth, so at equal accept the block head still wins on TIME at depth. That is
+the whole thesis and accept rate cannot test it. Settle it with a timed run.
+
+One consequence to handle first: `draftPolicy` is a cost model built for the
+autoregressive head. It prices depth `d` at `d` head forwards, which a block
+head does not pay, so it systematically under-drafts one. Give the block path a
+depth-flat policy before reading any timing.
 
 ## Why this target
 
@@ -173,17 +212,23 @@ Four modules carry the DFlash2 delta over DFlash v1:
 
 ### Now
 
-5. Declare the head in `mtp-head.manifest.json` with its digest and byte count,
-   and select it in the worker. Measure 8-bit against 4-bit on the Swift path
-   first: see the parity result.
-6. Measure the round on the real backbone. Nothing has yet run the two new
-   paths against the 27B tree.
+5. Wired the drafter end to end. A head tree whose config declares
+   `DFlash2DraftModel` is loaded beside the backbone instead of merged into it,
+   and the session installs it. Verified against the 27B tree: exact tokens at
+   offers 2, 4 and 8.
+6. Measured accept rate against the pinned head on prose. Result above.
+
+### Now
+
+7. Give the block path a depth-flat draft policy. The shipped cost model prices
+   a block head as if it paid one head forward per draft.
+8. Time the two heads at the ranked window. Accept rate is now known to be a
+   wash, so the decision rests entirely on round cost.
 
 ### Later
 
-7. Tune the draft schedule against the measured accept rate. DFlash2 trained at
-   block size 16 and declares 8, so the depth-2 default is likely wrong.
-8. Warm the new round shapes before the hello, as the existing head does.
+9. Declare the chosen head in `mtp-head.manifest.json`, if the timing supports
+   shipping one at all.
 
 ## What the round shape turned out to be
 
