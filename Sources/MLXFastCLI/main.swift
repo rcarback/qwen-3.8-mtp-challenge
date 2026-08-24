@@ -1912,7 +1912,12 @@ private enum MLXFastCLI {
         }
         let modelName = options.value(
             for: "--model-name", default: "qwen3.8-27b-mtp")
+        // Forward the worker's stderr. This is an interactive local server:
+        // a startup failure has to be readable, and the sanitized exit
+        // diagnostic redacts anything containing "expected"/"actual" to
+        // `token-validation-failed`, which says nothing useful here.
         guard let workerOptions = try runtimeWorkerOptions(
+            forwardsWorkerStderr: true,
             decodeCeiling: decodeCeiling
         ) else {
             throw MLXFastError.invalidInput(
