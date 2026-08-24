@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:Artemishehe/qwen38-mtp-head-distill-d3-v1islands@9c10afe4bf6e187c144b734555fa22abda1663f0",
+  "sha256": "0b89ecc0d0c9405b9ac669a567bd58c4af39b7ef768b5b24d00b5e0a11252a35",
+  "bytes": 270404296,
   "max_bytes": 2147483648,
-  "note": "xsums fill fusion on eb5eadc: the fused residual+RMSNorm kernel gains an emitSums variant whose epilogue is the BODY of qwen35_custom_affine4_g64_xsums_v1 verbatim, run over the normed bytes it has just stored (device barrier, same vec<bfloat16_t,4> loads, same three BF16 adds per group of four, same ascending float accumulation onto 0.0f, same (k_block*32+lane)*stride+row address), so the table is the standalone fill's bit pattern by construction. A weak-identity sidecar hands that table to Qwen35CustomQMV.matmul, deleting 127 of the 257 standalone xsums fill dispatches per verify round (mlp.gate_up 64, gdn.in_proj 47, fa.qkv 16); the other 130 keep xsumsTable unchanged. Only the sumtable arm at M=4...9 publishes, so M=1 (the serial leg) and prefill run the shipped kernel byte for byte. Widths 2...9, IPG table, tablePays>=4, 0.15, skip-probesort kept. Head tensors remain pinned. No remote code. resample-2 (54d42a3 diagnose: 6/7 active prompts faster, schedule identical, reprice 3.72612 > frontier 3.71960)"
+  "note": "Declare a better DRAFTER instead of a faster kernel. Acceptance is the drafter predicting the target's next token -- identical arithmetic on any GPU -- so unlike occupancy tuning it is hardware-independent and should transfer to the M5. Measured on trunk, same binary, ONLY the head changing, at 512 local decode tokens (at 64 tokens every head saturates at accept 0.982-1.000 because the public fixtures are longcopy COPY tasks and cannot discriminate): distill-d3 accept 0.9068 / meanDraft 6.527 / score 1.2724 vs the incumbent q2-q4-rerank head at accept 0.8770 / meanDraft 6.359 / score 1.2303, i.e. +3.4%. Reproducible: distill-d3 measured 1.2721 and 1.2724 on two independent runs (0.02% spread), incumbent 1.2343 and 1.2303. Ranked below it in the same sweep: distill-d2-v3a 0.8826/1.2364, q4-islands-v3a 0.8770/1.2295, ftorange 0.8509/1.2153, morgan 0.8549/1.1924 -- acceptance ranking tracks score ranking in both directions, so the instrument discriminates. Head weights are an operator-ratified part of the competitive surface; a head only PROPOSES and the pinned target still decides every emitted token."
 }
