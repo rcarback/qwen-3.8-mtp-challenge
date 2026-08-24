@@ -345,8 +345,10 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
           const InT conv = static_cast<InT>(acc);
           const InT act = conv * qwen35_prework_sigmoid(conv);
           activated[i] = act;
-          const float value = static_cast<float>(act);
-          sumsq += value * value;
+          if (is_q || is_k) {
+            const float value = static_cast<float>(act);
+            sumsq += value * value;
+          }
         }
 
         if (is_q || is_k) {
