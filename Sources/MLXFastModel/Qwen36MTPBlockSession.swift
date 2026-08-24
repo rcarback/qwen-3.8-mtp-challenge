@@ -1,8 +1,12 @@
+// Variance-resample attempt marker: draw 171912 tip ec24d59 (E117).
+
 import Foundation
 import MLX
 import MLXFastCore
 import MLXLLM
 import MLXLMCommon
+import MLXNN
+import os.signpost
 
 // Qwen 3.6 27B native-MTP speculative decode — the worker-side hot path for the
 // `qwen3.8-27b-mtp-v1` track.
@@ -160,6 +164,23 @@ public final class Qwen36MTPBlockSession {
     public private(set) var rejectedDraftTotal = 0
     public private(set) var rollbackRoundCount = 0
     public private(set) var began = false
+
+    /// Approximate bytes of resident model weights ONE target forward streams
+    /// from unified memory (decode is weight-bandwidth-bound at these batch
+    /// sizes: every quantized weight is read ~once per forward regardless of
+    /// the 1..K row count). Summed once from the module's parameter tree —
+    /// includes the attached MTP head, so treat it as an upper bound for a
+    /// serial forward and a joint bound for a drafting round's
+    /// target-verify + head-chain pair. Trace-only diagnostic; never read on
+    /// a ranked run (the trace gate is off there) and never part of any
+    /// scored payload.
+    private lazy var weightBytesEstimate: Int = Self.moduleWeightBytes(model)
+
+    private static func moduleWeightBytes(_ model: AnyObject) -> Int {
+        guard let module = model as? Module else { return 0 }
+        return module.parameters().flattened()
+            .reduce(0) { $0 + $1.1.nbytes }
+    }
 
     public init(
         model: any Qwen36MTPTarget,
@@ -649,8 +670,10 @@ public final class Qwen36MTPBlockSession {
         // One batched readout: the first primary and its tail-row top-2
         // evidence come out of the same eval as the cache roots.
         let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
+        let spBeginEval = Self.spBegin("seed_prefill")
         eval(cache.flatMap { $0.state } + [tailIDs, tailValues,
                                            pendingHidden!, hidden])
+        Self.spEnd("seed_prefill", spBeginEval)
         if Self.traceRounds {
             let tBeginDone = DispatchTime.now().uptimeNanoseconds
             let cpuBeginDone = Self.threadCPUNanoseconds()
@@ -742,6 +765,40 @@ public final class Qwen36MTPBlockSession {
     /// `MLXFAST_OFFICIAL_BENCHMARK_RUN=1`, so this stays local-only.
     private static let traceRounds =
         ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
+
+    /// Instruments signpost gate. Separate from the file trace so a Metal
+    /// System Trace capture does not require (or pay for) the text trace, but
+    /// under the same `MLX_` prefix rule so the sandboxed worker env passes it
+    /// through. Signposts write to the in-kernel os_log buffer, not the
+    /// filesystem, so they work inside the local worker sandbox; on a ranked
+    /// run nothing sets the variable and the cost is one static Bool read per
+    /// round. View in Instruments: subsystem `mlxfast.qwen-mtp`, category
+    /// `PointsOfInterest` — the intervals land in the Points of Interest lane,
+    /// aligned with the Metal System Trace GPU tracks, so `eval_wall` GPU
+    /// idle/busy attribution can be read directly instead of inferred from
+    /// the microsecond counters.
+    private static let signpostRounds =
+        ProcessInfo.processInfo.environment["MLX_QWEN_MTP_SIGNPOST"] == "1"
+
+    /// One signposter for the session's phases. `.pointsOfInterest` so the
+    /// intervals surface in the default Instruments timeline without a custom
+    /// instrument.
+    private static let signposter = OSSignposter(
+        subsystem: "mlxfast.qwen-mtp", category: .pointsOfInterest)
+
+    /// Begin a signpost interval for `name`; returns nil (no state, no cost)
+    /// when the gate is off.
+    @inline(__always)
+    private static func spBegin(_ name: StaticString) -> OSSignpostIntervalState? {
+        guard signpostRounds else { return nil }
+        return signposter.beginInterval(name)
+    }
+
+    @inline(__always)
+    private static func spEnd(_ name: StaticString, _ state: OSSignpostIntervalState?) {
+        guard let state else { return }
+        signposter.endInterval(name, state)
+    }
 
     /// Attribution probe only. `verify_build_us` measures the window in which
     /// the host builds the verify graph WHILE the asynchronously submitted head
@@ -1309,6 +1366,8 @@ public final class Qwen36MTPBlockSession {
         // accepted = rejected = 0, tail = 1 -- and `rows_per_round(0) = 1` in the
         // box wrapper agrees without any special case there.
         if depth == Qwen36MTPLimits.serialControlDepth || draftCount == 0 {
+            let spSerial = Self.spBegin("serial_round")
+            defer { Self.spEnd("serial_round", spSerial) }
             // Keep the committed-history ledger complete across non-drafting
             // rounds: this round's transition is (old pending hidden, primary).
             // Pure array retention — no GPU work, so the serial control's
@@ -1362,6 +1421,7 @@ public final class Qwen36MTPBlockSession {
         //    hidden exactly as before.
         let tDraft0 = Self.traceRounds
             ? DispatchTime.now().uptimeNanoseconds : 0
+        let spDraft = Self.spBegin("draft_build")
         let headCache: [any KVCache]
         var flushHidden: [MLXArray] = []
         var flushTokens: [Int] = []
@@ -1450,6 +1510,8 @@ public final class Qwen36MTPBlockSession {
             eval(draftIdArrays[draftIdArrays.count - 1])
         }
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
+        Self.spEnd("draft_build", spDraft)
+        let spVerifyBuild = Self.spBegin("verify_build")
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
         //    vendored post-primary rollback checkpoint for the hot K=1 path. A
@@ -1482,6 +1544,7 @@ public final class Qwen36MTPBlockSession {
                 input: LMInput.Text(tokens: verifyTokens),
                 cache: cache, nConfirmed: 1)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
+        Self.spEnd("verify_build", spVerifyBuild)
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
         // this round — the per-row argmaxes (accept walk AND both candidates
@@ -1493,7 +1556,11 @@ public final class Qwen36MTPBlockSession {
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
+        let spEval = Self.spBegin("eval_wall")
         eval(cache.flatMap { $0.state } + bundle)
+        Self.spEnd("eval_wall", spEval)
+        let spTail = Self.spBegin("round_tail")
+        defer { Self.spEnd("round_tail", spTail) }
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
@@ -1648,6 +1715,23 @@ public final class Qwen36MTPBlockSession {
             // in principle be overlapping, so the tail segments are the budget
             // for any further pipelining work.
             let tTailDone = DispatchTime.now().uptimeNanoseconds
+            // Achieved-bandwidth roofline proxies (tinygrad-style GB/s).
+            // `bw_eval_gb_s` charges one weight pass to the round's blocking
+            // eval window (the verify forward's GPU wall); `bw_round_gb_s`
+            // charges it to the whole round — a floor, since the head chain
+            // reads weights too. Compare against the box's memory bandwidth
+            // (M5 Max ~546 GB/s class) to see how far off the roofline the
+            // decode sits. Estimator, not a counter: assumes one full weight
+            // read per forward, which holds for weight-bound decode.
+            let evalWallSeconds = Double(tEvalDone - tVerifyBuilt) / 1e9
+            let roundSeconds = Double(tTailDone - tRound0) / 1e9
+            let weightGB = Double(weightBytesEstimate) / 1e9
+            let bwEval = evalWallSeconds > 0 ? weightGB / evalWallSeconds : 0
+            let bwRound = roundSeconds > 0 ? weightGB / roundSeconds : 0
+            // Tokens this round emitted per second of round wall — the local
+            // per-round equivalent of the harness's seconds_per_token mean.
+            let roundTokPerS =
+                roundSeconds > 0 ? Double(committed.count) / roundSeconds : 0
             let line = "mtp-trace: round=\(roundCount) d=\(draftCount) "
                 + "acc=\(acceptedCount) "
                 + "draft_build_us=\((tDraftBuilt - tRound0) / 1000) "
@@ -1671,6 +1755,9 @@ public final class Qwen36MTPBlockSession {
                 // the same host work at a lower clock. E89 measures the same
                 // field on a second host under the same name and units.
                 + "host_thread_cpu_ns=\(Self.threadCPUNanoseconds() &- cpuRound0) "
+                + String(
+                    format: "bw_eval_gb_s=%.1f bw_round_gb_s=%.1f tok_s=%.2f ",
+                    bwEval, bwRound, roundTokPerS)
                 // Which row-selection path the drafts of this run actually
                 // took, and the text that resolved the gate. A leg that
                 // exports nothing must read sel_env=unset with sel_argpart=0,
