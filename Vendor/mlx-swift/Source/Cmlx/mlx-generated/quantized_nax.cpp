@@ -703,6 +703,14 @@ struct QuantizedBlockLoader {
       biases += group_stride;
     }
   }
+
+  // Retarget the threadgroup destination by delta elements. Used by the
+  // software-pipelined (double-buffered) kernels to alternate the staging
+  // buffer between loads; the device-side source walk (src / scales / biases)
+  // is unaffected.
+  void shift_dst(const int delta) {
+    dst += delta;
+  }
 };
 
 template <
@@ -843,6 +851,14 @@ struct QuantizedBlockLoader<
       biases += n_groups * group_stride;
     }
   }
+
+  // Retarget the threadgroup destination by delta elements. Used by the
+  // software-pipelined (double-buffered) kernels to alternate the staging
+  // buffer between loads; the device-side source walk (src / scales / biases)
+  // is unaffected.
+  void shift_dst(const int delta) {
+    dst += delta;
+  }
 };
 
 template <typename T>
@@ -938,6 +954,20 @@ METAL_FUNC void adjust_matrix_offsets(
   y += tid.z * output_stride;
 }
 
+// Metal caps one threadgroup's total threadgroup-memory allocation at 32 KiB
+// (MTLDevice.maxThreadgroupMemoryLength, measured 32768 on Apple M4 Pro), and
+// the limit is enforced when the pipeline state is created, not when the kernel
+// is compiled. The software-pipelined qmm_t path needs two weight halves. At
+// BM = BK = BN = 64 the float32 instantiation already stages
+// 64 * 68 * 4 = 17,408 B, so a second half would ask for 34,816 B and the
+// pipeline could not be created; that instantiation keeps the unpipelined
+// single-buffered loop. The 16-bit instantiations, which are the ones the Qwen
+// path uses, need 2 * 64 * 72 * 2 = 18,432 B and fit with headroom.
+template <typename T, int BN, int BK_padded>
+inline constexpr int qmm_t_nax_ws_halves() {
+  return (2 * BN * BK_padded * sizeof(T) <= 32768) ? 2 : 1;
+}
+
 template <
     typename T,
     const int group_size,
@@ -1028,17 +1058,51 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   x += tm * K;
 
+  constexpr int kWsHalves = qmm_t_nax_ws_halves<T, BN, BK_padded>();
+  constexpr int Ws_tile = BN * BK_padded;
+
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      auto load_w_tile = [&]() {
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
           loader_w.load_safe(short2(BK, tgp_bn));
         }
+      };
 
+      // When Ws is double buffered the loader streams the next k tile into one
+      // half while the mma consumes the half staged by the previous iteration,
+      // so a single barrier per iteration both publishes the staged tile and
+      // proves every reader of the half about to be overwritten has finished.
+      // This mirrors the pipelined loop the fp NAX path already ships. The
+      // device load and dequant sequence and the per-element mma sequence are
+      // unchanged; only the phases overlap. When Ws holds a single half the
+      // loop keeps the original load, barrier, consume ordering exactly.
+      if constexpr (kWsHalves == 2) {
+        if (K > 0) {
+          load_w_tile();
+          loader_w.next();
+          loader_w.shift_dst(Ws_tile);
+        }
+      }
+
+      short cur = 0;
+      for (int k = 0; k < K; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if constexpr (kWsHalves == 2) {
+          if (k + BK < K) {
+            load_w_tile();
+            loader_w.next();
+            loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
+          }
+        } else {
+          load_w_tile();
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const threadgroup T* Wk = Ws + cur * Ws_tile;
 
         STEEL_PRAGMA_NO_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
@@ -1053,7 +1117,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
             Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
           }
 
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          Btile.template load<T, BK_padded, 1>(Wk + tn * BK_padded + kk1);
 
           tile_matmad_nax(
               Dtile,
@@ -1066,7 +1130,11 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
         }
 
         x += BK;
-        loader_w.next();
+        if constexpr (kWsHalves == 2) {
+          cur ^= 1;
+        } else {
+          loader_w.next();
+        }
       }
 
       // Store results to device memory
@@ -1240,7 +1308,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[qmm_t_nax_ws_halves<T, BN, BK_padded>() * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1365,7 +1433,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[qmm_t_nax_ws_halves<T, BN, BK_padded>() * BN * BK_padded];
 
   adjust_matrix_offsets<T>(
       x,
