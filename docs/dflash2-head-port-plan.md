@@ -4,7 +4,8 @@ Replace the pinned MTP head with a Swift port of `z-lab/Qwen3.8-27B-DFlash2`,
 declared through `mtp-head.manifest.json`. The goal is a higher accept rate,
 which is the quantity the published score depends on.
 
-Status: Now — measured and worth building. No Swift code exists yet.
+Status: Now — measured, ported and checked against the reference. The head does
+not yet run inside a session.
 
 ## Measured result
 
@@ -34,6 +35,39 @@ to the drafter and may move the optimum back toward 8.
 Sample size is two prompts. Trust the ranking between configurations, which
 holds across four independent precision runs. Do not trust the absolute
 figures.
+
+## Parity against the reference
+
+`tools/dflash2/dump_dflash2_fixture.py` runs the reference drafter on
+deterministic inputs and saves every input, every per-layer activation and the
+proposal. `Tests/MLXFastTests/Model/Qwen38DFlash2ParityTests.swift` runs the
+Swift port on the same inputs. One round of 8 rows over 5 context rows:
+
+| Head precision | Worst layer delta | Final hidden | Drafted path |
+|---|---|---|---|
+| bfloat16 | 1.0 ULP | 1.5 ULP | identical |
+| affine 8-bit group-64 | 1.0 ULP | 2.1 ULP | identical |
+| affine 4-bit group-64 | 8.1 ULP | 39.6 ULP | diverges at row 1 |
+
+ULP means bfloat16 units in the last place at the reference's own magnitude. The
+residual stream runs near 1e6 before the final norm and near 20 after it, so one
+ULP is 4096 in one place and 0.125 in the other.
+
+The port is correct. The 4-bit row is a property of the vendored affine
+quantized matmul, not of the port: the divergence scales with quantization
+coarseness, which a structural error would not do, and all three runs exercise
+the same modules on the same inputs.
+
+The 4-bit row does carry a planning consequence. Emitted tokens are safe, since
+the target verifies every row, but the 1.41 figure was measured on the Python
+path at 4-bit and the Swift path proposes different tokens there. Measure both
+precisions on the Swift path before choosing the artifact. The 8-bit head is
+1.90 GiB against a 2 GiB cap, so it fits, but it costs 0.89 GiB more of weight
+traffic per round.
+
+The port also gained one behaviour the first draft missed. The reference session
+calls `propose` with `logits_start=1`: block position 0 is the anchor the target
+already committed, so drafting it wastes a row and shifts the proposal by one.
 
 ## Why this target
 
@@ -128,16 +162,17 @@ Four modules carry the DFlash2 delta over DFlash v1:
 1. Measured the accept rate and decode speed against the transformed 27B tree
    across four head precisions and four block sizes. Result above: 1.41 over
    serial at 4-bit, block 4.
+2. Ported the four modules to Swift as `Sources/MLXFastModel/Qwen38DFlash2Head.swift`
+   and checked the port against the reference. Result below.
 
 ### Now
 
 3. Publish the five target hidden states from the Qwen 3.8 forward. Keep the
    extra output off the path when no head asks for it.
-4. Port the four modules to Swift under `Sources/MLXFastModel/`. Validate each
-   against the Python reference tensor by tensor.
 5. Add a block-parallel round shape to `Qwen36MTPBlockSession`. The existing
    autoregressive shape stays, because the pinned head still uses it.
 6. Declare the head in `mtp-head.manifest.json` with its digest and byte count.
+   Measure 8-bit against 4-bit on the Swift path first: see the parity result.
 
 ### Later
 
