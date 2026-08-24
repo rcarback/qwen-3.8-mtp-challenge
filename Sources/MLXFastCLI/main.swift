@@ -70,6 +70,12 @@ private enum MLXFastCLI {
             case "mtp-timed":
                 try runQwenMTPTimed(options)
                 return 0
+            case "chat":
+                try runQwenChat(options)
+                return 0
+            case "serve":
+                try runQwenServe(options)
+                return 0
             case "dflash-reference":
                 try runDFlashReference(options)
                 return 0
@@ -1821,6 +1827,115 @@ private enum MLXFastCLI {
         try emitQwenMTPPayload(report, options: options, timed: true)
     }
 
+    /// `chat`: the interactive REPL. LOCAL TOOLING -- no gate, no score, no
+    /// golden. It drives the same worker and the same MTP round protocol the
+    /// timed verbs use, so the accept rate it reports is the real one.
+    private static func runQwenChat(_ options: ParsedOptions) throws {
+        try options.validate(valueOptions: qwenChatValueOptions)
+        let weightsPath = qwenMTPWeightsPath(options)
+        let mtpHeadPath = try qwenMTPHeadPath(options)
+        // Unlike the timed verbs, depth defaults rather than being required:
+        // a REPL should start without the operator having to pick a schedule.
+        let depthText = options.value(
+            for: "--mtp-depth",
+            default: options.value(for: "--depth", default: "2")
+        )
+        // Zero is legal and meaningful here -- it is the serial control -- so
+        // this cannot go through `positiveInteger`.
+        guard let depth = Int(depthText), depth >= 0 else {
+            throw MLXFastError.invalidInput(
+                "--mtp-depth requires a non-negative integer")
+        }
+        let maxNewTokens = try positiveInteger(
+            options.value(for: "--max-tokens", default: "512"),
+            name: "--max-tokens"
+        )
+        let systemPrompt = options.value(for: "--system", default: "")
+        guard let workerOptions = try runtimeWorkerOptions() else {
+            throw MLXFastError.invalidInput(
+                "chat requires the participant runtime worker"
+            )
+        }
+        logQwenMTPProvenance(
+            verb: "chat", weightsPath: weightsPath, mtpHeadPath: mtpHeadPath)
+        try QwenRuntime.qwenChatREPL(
+            options: QwenRuntime.QwenChatOptions(
+                targetWeightsPath: weightsPath,
+                mtpHeadPath: mtpHeadPath,
+                depth: depth,
+                maxNewTokens: maxNewTokens,
+                systemPrompt: systemPrompt.isEmpty ? nil : systemPrompt
+            ),
+            workerOptions: workerOptions
+        )
+    }
+
+    private static let qwenChatValueOptions: Set<String> = [
+        "--weights", "--mtp-head", "--mtp-depth", "--depth", "--max-tokens",
+        "--system",
+    ]
+
+    /// `serve`: the OpenAI-compatible HTTP front end. LOCAL TOOLING -- no gate,
+    /// no score, no golden. Same worker and same MTP round protocol as `chat`,
+    /// one request at a time, bound to loopback with no authentication.
+    private static func runQwenServe(_ options: ParsedOptions) throws {
+        try options.validate(valueOptions: qwenServeValueOptions)
+        let weightsPath = qwenMTPWeightsPath(options)
+        let mtpHeadPath = try qwenMTPHeadPath(options)
+        let depthText = options.value(
+            for: "--mtp-depth",
+            default: options.value(for: "--depth", default: "2")
+        )
+        // Zero is legal and meaningful -- it is the serial control -- so this
+        // cannot go through `positiveInteger`.
+        guard let depth = Int(depthText), depth >= 0 else {
+            throw MLXFastError.invalidInput(
+                "--mtp-depth requires a non-negative integer")
+        }
+        let maxNewTokens = try positiveInteger(
+            options.value(for: "--max-tokens", default: "4096"),
+            name: "--max-tokens"
+        )
+        // Raise the WORKER's per-session output ceiling before it is spawned.
+        // The variable is read once at worker start; the benchmark never sets
+        // it, so ranked behaviour is untouched. Headroom above --max-tokens
+        // covers a conversation that extends across several requests without
+        // restarting the session.
+        setenv(
+            "MLXFAST_QWEN_MTP_DECODE_CEILING",
+            "\(Swift.max(maxNewTokens * 16, 65_536))", 1)
+        let portValue = try positiveInteger(
+            options.value(for: "--port", default: "8080"), name: "--port")
+        guard portValue <= 65535 else {
+            throw MLXFastError.invalidInput("--port must be 1..65535")
+        }
+        let modelName = options.value(
+            for: "--model-name", default: "qwen3.8-27b-mtp")
+        guard let workerOptions = try runtimeWorkerOptions() else {
+            throw MLXFastError.invalidInput(
+                "serve requires the participant runtime worker"
+            )
+        }
+        logQwenMTPProvenance(
+            verb: "serve", weightsPath: weightsPath, mtpHeadPath: mtpHeadPath)
+        try QwenRuntime.qwenServe(
+            options: QwenRuntime.QwenServeOptions(
+                targetWeightsPath: weightsPath,
+                mtpHeadPath: mtpHeadPath,
+                depth: depth,
+                maxNewTokens: maxNewTokens,
+                port: UInt16(portValue),
+                modelName: modelName
+            ),
+            workerOptions: workerOptions
+        )
+    }
+
+    private static let qwenServeValueOptions: Set<String> = [
+        "--weights", "--mtp-head", "--mtp-depth", "--depth", "--max-tokens",
+        "--port", "--model-name",
+    ]
+
     private static func runQwenMTPReferenceGeneration(
         _ options: ParsedOptions,
         weightsPath: String,
@@ -2704,6 +2819,8 @@ private enum MLXFastCLI {
               mlxfast-swift mtp-verify --mtp-head PATH --golden PATH --mtp-depth D [--weights PATH] [--tokens N] [--output PATH]
               mlxfast-swift mtp-verify --mtp-head PATH --emitted PATH --generate N --output PATH [--weights PATH] [--plan-output PATH]
               mlxfast-swift mtp-timed --mtp-head PATH --golden PATH --mtp-depth D [--weights PATH] [--tokens N] [--output PATH]
+              mlxfast-swift chat --mtp-head PATH [--weights PATH] [--mtp-depth D] [--max-tokens N] [--system TEXT]
+              mlxfast-swift serve --mtp-head PATH [--weights PATH] [--mtp-depth D] [--max-tokens N] [--port N] [--model-name NAME]
 
             Swift-only Qwen 3.6 27B 4-bit harness entrypoint (the DFlash
             subcommands still drive the Laguna target and its pinned drafter).
