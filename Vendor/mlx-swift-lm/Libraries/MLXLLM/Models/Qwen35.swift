@@ -3463,7 +3463,43 @@ public class Qwen35TextModelInner: Module {
         cache: [KVCache?]? = nil,
         nConfirmed: Int = 0
     ) -> MLXArray {
+        var ignored: [MLXArray] = []
+        return forward(
+            inputs, cache: cache, nConfirmed: nConfirmed,
+            captureLayers: [], captured: &ignored)
+    }
+
+    /// The same forward, additionally publishing the output of each layer in
+    /// `captureLayers` into `captured`, in the order requested.
+    ///
+    /// A block-diffusion drafter conditions on intermediate layer outputs
+    /// rather than on the final hidden state, so it needs a seam the plain
+    /// forward does not provide. `captureLayers` empty is the ordinary path:
+    /// the branch below never runs and no op reaches the graph.
+    ///
+    /// ON THE FUSED PATH THE CAPTURE MUST MERGE THE PAIR. The residual
+    /// boundary flows as an unmerged `(base, delta)`, so the value equivalent
+    /// to the unfused loop's `hiddenStates` is `base + delta` -- the same
+    /// merge the loop performs once at exit. Capturing `base` alone drops the
+    /// previous layer's residual and fails silently: the target still decides
+    /// every emitted token, so the only symptom is a collapsed accept rate.
+    func forward(
+        _ inputs: MLXArray,
+        cache: [KVCache?]? = nil,
+        nConfirmed: Int = 0,
+        captureLayers: [Int],
+        captured: inout [MLXArray]
+    ) -> MLXArray {
         var hiddenStates = embedTokens(inputs)
+        // Slot per requested layer, so an out-of-order or repeated request
+        // still yields the caller's own ordering.
+        var captureSlots: [Int: [Int]] = [:]
+        if !captureLayers.isEmpty {
+            for (slot, layerID) in captureLayers.enumerated() {
+                captureSlots[layerID, default: []].append(slot)
+            }
+            captured = Array(repeating: hiddenStates, count: captureLayers.count)
+        }
 
         var cacheArray = cache
         if cacheArray == nil {
@@ -3507,6 +3543,10 @@ public class Qwen35TextModelInner: Module {
                     cache: cacheArray?[i], nConfirmed: nConfirmed)
                 base = out.base
                 delta = out.delta
+                if let slots = captureSlots[i] {
+                    let merged = delta.map { base + $0 } ?? base
+                    for slot in slots { captured[slot] = merged }
+                }
                 if ladderActive {
                     if prefillLadder {
                         if i == 0 || i % 3 == 2 {
@@ -3527,6 +3567,9 @@ public class Qwen35TextModelInner: Module {
                 hiddenStates = layer(
                     hiddenStates, attentionMask: attnMask, ssmMask: mask,
                     cache: cacheArray?[i], nConfirmed: nConfirmed)
+                if let slots = captureSlots[i] {
+                    for slot in slots { captured[slot] = hiddenStates }
+                }
                 if ladderActive {
                     if prefillLadder {
                         if i == 0 || i % 3 == 2 {
@@ -4944,6 +4987,20 @@ public func qwen35VerifySelectedRerankOrderInvariance(
     return (trials, mismatches, firstBad, setMismatches, controlChanged)
 }
 
+/// One backbone forward's published outputs.
+///
+/// `hidden` is PRE-norm and `normed` is the same rows after `model.norm`, the
+/// two the native-MTP head chain already consumed. `layerHidden` is the extra
+/// seam a block-diffusion drafter needs: the outputs of the requested decoder
+/// layers concatenated on the feature axis, in the order requested, or nil
+/// when the caller requested none.
+public struct Qwen35ForwardOutput {
+    public let logits: MLXArray
+    public let hidden: MLXArray
+    public let normed: MLXArray?
+    public let layerHidden: MLXArray?
+}
+
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -5238,6 +5295,50 @@ extension Qwen35TextModel: MTPCapable {
             logits = model.embedTokens.asLinear(normed)
         }
         return (logits, hidden, normed)
+    }
+
+    /// `callWithHiddenAndNormed` plus the outputs of the requested decoder
+    /// layers, concatenated on the feature axis.
+    ///
+    /// `layerIDs` empty is exactly the ordinary forward: `layerHidden` comes
+    /// back nil and no additional op enters the graph. Out-of-range ids are
+    /// dropped rather than trapped, because the ids come from a declared head
+    /// artifact and a mismatched head must fail at load, not mid-decode.
+    public func callWithHiddenNormedAndLayers(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int,
+        layerIDs: [Int]
+    ) -> Qwen35ForwardOutput {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let wanted = layerIDs.filter { $0 >= 0 && $0 < model.layers.count }
+        var captured: [MLXArray] = []
+        let hidden = model.forward(
+            input.tokens, cache: cacheOpt, nConfirmed: nConfirmed,
+            captureLayers: wanted, captured: &captured)
+        let normed = model.norm(hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = routedLMHead(lmHead, normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        let layerHidden =
+            captured.isEmpty ? nil : concatenated(captured, axis: -1)
+        return Qwen35ForwardOutput(
+            logits: logits, hidden: hidden, normed: normed,
+            layerHidden: layerHidden)
+    }
+
+    /// The backbone's decoder-layer count, so a declared drafter's
+    /// `target_layer_ids` can be validated against the loaded backbone.
+    public var decoderLayerCount: Int { model.layers.count }
+
+    /// The backbone's input embedding table, applied to token ids.
+    ///
+    /// A declared block drafter borrows this table rather than shipping its
+    /// own copy of a 248320-row embedding, which is why the seam is public.
+    /// Proposal side only: nothing routed through it reaches an emitted token.
+    public func applyEmbedding(_ ids: MLXArray) -> MLXArray {
+        model.embedTokens(ids)
     }
 
     /// Rebuild the target's recurrent cache after an accepted verify prefix.
@@ -5840,6 +5941,24 @@ extension Qwen35Model: MTPCapable {
     ) -> (MLXArray, MLXArray, MLXArray?) {
         languageModel.callWithHiddenAndNormed(
             input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.callWithHiddenNormedAndLayers`.
+    public func callWithHiddenNormedAndLayers(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int,
+        layerIDs: [Int]
+    ) -> Qwen35ForwardOutput {
+        languageModel.callWithHiddenNormedAndLayers(
+            input: input, cache: cache, nConfirmed: nConfirmed,
+            layerIDs: layerIDs)
+    }
+
+    /// See `Qwen35TextModel.decoderLayerCount`.
+    public var decoderLayerCount: Int { languageModel.decoderLayerCount }
+
+    /// See `Qwen35TextModel.applyEmbedding`.
+    public func applyEmbedding(_ ids: MLXArray) -> MLXArray {
+        languageModel.applyEmbedding(ids)
     }
 
     /// See `Qwen35TextModel.replayRecurrentPrefix`.

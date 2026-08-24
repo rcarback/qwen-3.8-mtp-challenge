@@ -59,6 +59,27 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray, MLXArray?)
 
+    /// `callWithHiddenAndNormed` plus the outputs of the requested decoder
+    /// layers, concatenated on the feature axis.
+    ///
+    /// A block-diffusion drafter conditions on intermediate layer outputs
+    /// rather than on the final hidden state, so it needs this seam. Passing
+    /// an empty `layerIDs` is the ordinary forward and publishes nothing.
+    func callWithHiddenNormedAndLayers(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int,
+        layerIDs: [Int]
+    ) -> Qwen35ForwardOutput
+
+    /// The backbone's decoder-layer count, so a declared drafter's
+    /// `target_layer_ids` can be checked against the loaded backbone at load
+    /// time rather than mid-decode.
+    var decoderLayerCount: Int { get }
+
+    /// The backbone's input embedding table, applied to token ids. A declared
+    /// block drafter borrows it instead of shipping its own copy. Proposal
+    /// side only.
+    func applyEmbedding(_ ids: MLXArray) -> MLXArray
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.

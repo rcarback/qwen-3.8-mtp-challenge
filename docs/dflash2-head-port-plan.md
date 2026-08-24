@@ -4,8 +4,8 @@ Replace the pinned MTP head with a Swift port of `z-lab/Qwen3.8-27B-DFlash2`,
 declared through `mtp-head.manifest.json`. The goal is a higher accept rate,
 which is the quantity the published score depends on.
 
-Status: Now — measured, ported and checked against the reference. The head does
-not yet run inside a session.
+Status: Now — measured, ported, checked against the reference, and driven by
+the session. Nothing declares the head yet, so no run selects it.
 
 ## Measured result
 
@@ -164,15 +164,20 @@ Four modules carry the DFlash2 delta over DFlash v1:
    serial at 4-bit, block 4.
 2. Ported the four modules to Swift as `Sources/MLXFastModel/Qwen38DFlash2Head.swift`
    and checked the port against the reference. Result below.
+3. Published the five target hidden states from the Qwen 3.8 forward. The
+   capture is off unless a caller asks for it: `callWithHiddenNormedAndLayers`
+   with an empty `layerIDs` is the ordinary forward and adds no operation.
+4. Added a block-parallel round shape to `Qwen36MTPBlockSession`
+   (`installBlockDrafter`). The autoregressive shape stays, because the pinned
+   head still uses it.
 
 ### Now
 
-3. Publish the five target hidden states from the Qwen 3.8 forward. Keep the
-   extra output off the path when no head asks for it.
-5. Add a block-parallel round shape to `Qwen36MTPBlockSession`. The existing
-   autoregressive shape stays, because the pinned head still uses it.
-6. Declare the head in `mtp-head.manifest.json` with its digest and byte count.
-   Measure 8-bit against 4-bit on the Swift path first: see the parity result.
+5. Declare the head in `mtp-head.manifest.json` with its digest and byte count,
+   and select it in the worker. Measure 8-bit against 4-bit on the Swift path
+   first: see the parity result.
+6. Measure the round on the real backbone. Nothing has yet run the two new
+   paths against the 27B tree.
 
 ### Later
 
@@ -180,11 +185,27 @@ Four modules carry the DFlash2 delta over DFlash v1:
    block size 16 and declares 8, so the depth-2 default is likely wrong.
 8. Warm the new round shapes before the hello, as the existing head does.
 
-## Risks
+## What the round shape turned out to be
+
+The block-parallel round is structurally cheaper than the autoregressive one,
+beyond the flat cost model. The drafter caches only the injected target
+context. The proposal block's own keys and values are concatenated for one
+attention call and then dropped, so every row that reaches the drafter cache is
+already committed. A rejected draft leaves nothing behind, and the round needs
+no draft-cache rollback at all. The pinned head needs one every round.
+
+Two consequences for the measurement to come:
+
+- The reference block size counts the anchor row. `draftPolicy` returning `d`
+  proposes `d` tokens from a `d + 1` row block, so the Python optimum of block
+  4 is `d = 3` here.
+- `Qwen36MTPLimits.maxDepth` is 8, which makes a 9-row block reachable. The
+  drafter declares `block_size` 8 and trained at 16. Nothing in the port fixes
+  the width, but 9 rows is untested.
 
 | Risk | Effect if it holds |
 |------|--------------------|
-| Publishing five hidden states slows the target forward | The numerator gets slower, which the accept rate must repay. This is the main remaining risk |
+| Publishing five hidden states slows the target forward | The numerator gets slower, which the accept rate must repay. This is the main remaining risk. The capture costs five tensor adds per forward on the boundary-fused path, plus one concatenation |
 | Block-parallel drafting changes round accounting | The trusted parent reads effective depth from its own journal, so the ledger must still close |
 | The 1.41 figure comes from two prompts on the Python path | The Swift result may differ. Re-measure on the eight-prompt shape after the port |
 
