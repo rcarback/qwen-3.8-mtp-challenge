@@ -2897,7 +2897,25 @@ enum Qwen35IslandArm: String {
     static func fromEnvironment(_ env: [String: String]) -> Qwen35IslandArm {
         if env["MLXFAST_QWEN_MTP_EXACT_QKV_ROWS"] == "0" { return .none }
         guard let raw = env["DARKBLOOM_QWEN_MTP_ISLAND_ARM"], !raw.isEmpty else {
-            return .all
+            // DEFAULT ARM IS `kv`, NOT `all`.
+            //
+            // K and V ship one island row for every one of their 1,024 output
+            // rows, so `isCompletePermutation` holds for both and they take the
+            // dense branch: the affine-4 pack and the permutation scatter they
+            // would have needed are dead work, deleted. That mechanism is
+            // banked and this default keeps it.
+            //
+            // Q is different in kind. It has 12,288 output rows and the island
+            // set covers 1,024 of them — 8.3%. `q_proj` therefore still runs in
+            // full, and `replaceExactRows` then adds a 1,024 x 5,120 BF16
+            // matmul (10.49 MB) plus a `putAlong` scatter on top of it, once
+            // per draft step, to correct one row in twelve. Nothing is deleted
+            // in exchange, so the Q island is pure additive traffic on the
+            // draft leg.
+            //
+            // The serial control leg never runs the head chain, so this removes
+            // candidate-exclusive work only: it cannot move the anchor.
+            return .kv
         }
         guard let arm = Qwen35IslandArm(rawValue: raw.lowercased()) else {
             fatalError(
