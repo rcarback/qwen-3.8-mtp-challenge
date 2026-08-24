@@ -2451,6 +2451,147 @@ enum Qwen35XSumsSidecar {
     }
 }
 
+// MARK: - Full-attention gate × sigmoid with xsums (fa.o_proj)
+
+/// Fold `x * sigmoid(gate)` into the producer that `fa.o_proj` actually
+/// consumes, and emit the wide-QMV chunk-sum table over those bytes.
+///
+/// Live `0863b06` still does the multiply on 4-D strided attention output,
+/// then a free-view flatten. The sidecar keys on `MLXArray` identity, so a
+/// table published on the 4-D product can never be handed to `o_proj`.
+/// E127 reshaped first and required a row-contiguous 3-D view — after
+/// `transposed(0,2,1,3)` that view is typically strided along K, so the
+/// fusion missed and the archive's score was the toxic `model.norm` Metal
+/// (REJECTED 3.65163). This leftover does **not** restack that combo: it
+/// reads native 4-D strides, writes a contiguous `[B, L, H*D]` activation,
+/// publishes **that** object, and never touches `model.norm`.
+private let qwen35FusedAttnGateXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_attn_gate_xsums_v1",
+    inputNames: ["x", "gate"],
+    outputNames: ["act", "xsums"],
+    header: """
+        inline bfloat16_t qwen35_attn_gate_sigmoid(bfloat16_t x) {
+          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          return (x < 0) ? y : 1 - y;
+        }
+        inline bfloat16_t qwen35_attn_gate_beta(bfloat16_t x) {
+          const uint16_t bits = as_type<uint16_t>(x);
+          if (bits == uint16_t(0xC0DB)) {
+            return as_type<bfloat16_t>(uint16_t(0x3A8B));
+          }
+          return qwen35_attn_gate_sigmoid(x);
+        }
+        """,
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint L = uint(x_shape[1]);
+        uint H = uint(x_shape[2]);
+        uint D = uint(x_shape[3]);
+        uint axis_size = H * D;
+        const uint xs_stride = threadgroups_per_grid.x <= 8u ? 8u : 16u;
+        uint b = row / L;
+        uint l = row % L;
+        ulong act_off = ulong(row) * ulong(axis_size);
+
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem0 = r_start + thread_id * n_reads;
+            if (elem0 + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    uint elem = elem0 + i;
+                    uint h = elem / D;
+                    uint d = elem % D;
+                    ulong x_idx = ulong(b) * ulong(x_strides[0])
+                        + ulong(l) * ulong(x_strides[1])
+                        + ulong(h) * ulong(x_strides[2])
+                        + ulong(d) * ulong(x_strides[3]);
+                    ulong g_idx = ulong(b) * ulong(gate_strides[0])
+                        + ulong(l) * ulong(gate_strides[1])
+                        + ulong(h) * ulong(gate_strides[2])
+                        + ulong(d) * ulong(gate_strides[3]);
+                    act[act_off + elem] =
+                        x[x_idx] * qwen35_attn_gate_beta(gate[g_idx]);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem0 + i < axis_size) {
+                        uint elem = elem0 + i;
+                        uint h = elem / D;
+                        uint d = elem % D;
+                        ulong x_idx = ulong(b) * ulong(x_strides[0])
+                            + ulong(l) * ulong(x_strides[1])
+                            + ulong(h) * ulong(x_strides[2])
+                            + ulong(d) * ulong(x_strides[3]);
+                        ulong g_idx = ulong(b) * ulong(gate_strides[0])
+                            + ulong(l) * ulong(gate_strides[1])
+                            + ulong(h) * ulong(gate_strides[2])
+                            + ulong(d) * ulong(gate_strides[3]);
+                        act[act_off + elem] =
+                            x[x_idx] * qwen35_attn_gate_beta(gate[g_idx]);
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+            const uint xs_elem = r_start + thread_id * 16;
+            if (thread_id < lsize / 4 && xs_elem + 16 <= axis_size) {
+                const device bfloat16_t* xm = act + act_off + xs_elem;
+                float s = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    const vec<bfloat16_t, 4> xv = *reinterpret_cast<
+                        const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+                    s += xv[0] + xv[1] + xv[2] + xv[3];
+                }
+                const uint xs_kb = xs_elem / 512;
+                const uint xs_lane = (xs_elem % 512) / 16;
+                xsums[(xs_kb * 32 + xs_lane) * xs_stride + row] = s;
+            }
+        }
+        """,
+    ensureRowContiguous: false
+)
+
+/// 4-D attention output × gate → contiguous 3-D activation plus chunk-sum
+/// table, published under the activation `o_proj` consumes. Nil keeps the
+/// shipped 4-D compiled multiply then flatten.
+func qwen35FusedAttnGateXSums(output: MLXArray, gate: MLXArray) -> MLXArray? {
+    guard output.ndim == 4, gate.ndim == 4, output.shape == gate.shape,
+        output.dtype == .bfloat16, gate.dtype == .bfloat16
+    else { return nil }
+    let B = output.dim(0)
+    let L = output.dim(1)
+    let H = output.dim(2)
+    let D = output.dim(3)
+    guard B > 0, L > 0, H > 0, D > 0 else { return nil }
+    let rows = B * L
+    let k = H * D
+    guard Qwen35CustomQMV.arm == .sumTable,
+        Qwen35CustomQMV.widths.contains(rows),
+        Qwen35CustomQMV.tablePays(m: rows),
+        k % 512 == 0, D % 4 == 0
+    else { return nil }
+    let xs = output.strides
+    let gs = gate.strides
+    guard xs.count == 4, gs.count == 4, xs[3] == 1, gs[3] == 1 else {
+        return nil
+    }
+    let kBlocks = k / 512
+    let launched = qwen35FusedAttnGateXSumsKernel(
+        [output, gate],
+        grid: (rows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [
+            [B, L, k],
+            [kBlocks * 32 * Qwen35CustomQMV.sumsStride(rows)],
+        ],
+        outputDTypes: [.bfloat16, .float32]
+    )
+    Qwen35XSumsSidecar.publish(x: launched[0], table: launched[1])
+    return launched[0]
+}
+
 // MARK: - Dual independent RMSNorm (proposal-side pre-fc)
 
 /// Two independent RMSNorms in one dispatch. Same looped reduction as
@@ -3390,6 +3531,9 @@ final class Qwen35Attention: Module {
         )
         .transposed(0, 2, 1, 3)
 
+        if let fused = qwen35FusedAttnGateXSums(output: output, gate: gate) {
+            return qwen35RoutedLinear(oProj, fused)
+        }
         return qwen35RoutedLinear(
             oProj, qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
     }
