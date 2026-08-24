@@ -870,7 +870,7 @@ public final class Qwen36MTPBlockSession {
     /// 0.32 -> 2.84585). The wasted-work term a reject does keep (the
     /// drafted head steps past the break) is already inside the marginal
     /// the rule prices.
-    private static let headStepCostRatio = 0.18
+    private static let headStepCostRatio = 0.16
 
     /// E68: the depth price as a per-position vector.
     ///
