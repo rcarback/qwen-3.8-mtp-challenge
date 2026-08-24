@@ -2372,32 +2372,30 @@ func qwen35FusedResidualRMSNorm(
 ///
 /// `Qwen35CustomQMV.matmul` asks here before launching the standalone fill.
 /// A hit is only ever returned for the exact `MLXArray` object the producer
-/// emitted: slots hold the activation weakly, so a released tensor can never
-/// alias a later one, and the slot's `(K, M)` is re-checked against the
-/// consumer's cell and the table's own size before it is handed out. A miss
-/// costs one allocation-free scan of eight slots and falls back to
-/// `xsumsTable`, so every path that does not pass through a publishing
-/// producer keeps today's dispatch exactly.
+/// emitted, and the slot's `(K, M)` and table size are re-checked against the
+/// consumer before it is handed out. Producers hand their output directly to
+/// one routed projection before another model call can publish, so a single
+/// strong pending slot can be consumed and cleared by that projection. A miss
+/// falls back to `xsumsTable`, preserving every path that does not pass through
+/// a publishing producer.
 ///
 /// Only the shipped `sumtable` arm publishes, and only at row counts the
 /// table pays at (`Qwen35CustomQMV.minimumTableWidth ... widths.upperBound`).
 /// `M = 1` -- the serial leg, which the candidate leg shares -- never reaches
 /// the variant kernel, so the serial path is byte-for-byte the shipped one.
 enum Qwen35XSumsSidecar {
-    struct Slot {
-        weak var x: MLXArray?
+    struct Pending {
+        var x: MLXArray?
         var table: MLXArray?
         var k = 0
         var m = 0
     }
 
-    /// Two producers are live at once in the boundary-fused chain (the entry
-    /// norm's `normed` and the post-attention norm's). Eight slots is four
-    /// times that, so a hit never depends on eviction timing.
-    static let slotCount = 8
-    nonisolated(unsafe) static var slots = [Slot](repeating: Slot(), count: slotCount)
-    nonisolated(unsafe) static var next = 0
-    static let lock = NSLock()
+    /// Model graph construction is serialized by the runtime worker. GPU
+    /// evaluation may overlap it, but never calls back into this Swift state.
+    /// The slot therefore needs neither a lock nor a search. Identity and shape
+    /// checks below still make a stale or reordered lookup a safe miss.
+    nonisolated(unsafe) static var pending = Pending()
 
     /// True when the producer should emit the table for this activation.
     ///
@@ -2421,33 +2419,20 @@ enum Qwen35XSumsSidecar {
     }
 
     static func publish(x: MLXArray, table: MLXArray) {
-        lock.lock()
-        defer { lock.unlock() }
-        slots[next] = Slot(
+        pending = Pending(
             x: x, table: table, k: x.dim(-1), m: x.size / x.dim(-1))
-        next = (next + 1) % slotCount
     }
 
-    /// The table for `x`, or nil when no producer published one. Slots whose
-    /// activation has been released are dropped on the way past, so a table
-    /// never outlives the tensor it describes by more than one scan.
+    /// The table for `x`, or nil when the immediately preceding producer did
+    /// not publish it. A hit consumes the one-use slot immediately.
     static func take(_ x: MLXArray, k: Int, m: Int) -> MLXArray? {
-        lock.lock()
-        defer { lock.unlock() }
-        var hit: MLXArray?
-        for i in 0 ..< slotCount {
-            guard let held = slots[i].x else {
-                slots[i] = Slot()
-                continue
-            }
-            guard hit == nil, held === x, slots[i].k == k, slots[i].m == m,
-                let table = slots[i].table,
-                table.dtype == .float32,
-                table.size == (k / 512) * 32 * Qwen35CustomQMV.sumsStride(m)
-            else { continue }
-            hit = table
-        }
-        return hit
+        guard let held = pending.x, held === x,
+              pending.k == k, pending.m == m,
+              let table = pending.table, table.dtype == .float32,
+              table.size == (k / 512) * 32 * Qwen35CustomQMV.sumsStride(m)
+        else { return nil }
+        pending = Pending()
+        return table
     }
 }
 
