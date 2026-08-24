@@ -1896,14 +1896,15 @@ private enum MLXFastCLI {
             options.value(for: "--max-tokens", default: "4096"),
             name: "--max-tokens"
         )
-        // Raise the WORKER's per-session output ceiling before it is spawned.
-        // The variable is read once at worker start; the benchmark never sets
-        // it, so ranked behaviour is untouched. Headroom above --max-tokens
+        // Raise the WORKER's per-session OUTPUT ceiling. It travels on argv,
+        // not in the environment: `sanitizedRuntimeWorkerEnvironment` is a
+        // strict allowlist whose maintainer contract forbids an `MLXFAST_`
+        // allowance, so an env var would be dropped at spawn and the override
+        // would look applied while doing nothing. Headroom above --max-tokens
         // covers a conversation that extends across several requests without
-        // restarting the session.
-        setenv(
-            "MLXFAST_QWEN_MTP_DECODE_CEILING",
-            "\(Swift.max(maxNewTokens * 16, 65_536))", 1)
+        // restarting the session, because the worker counts emitted tokens for
+        // the life of a session and `extend` does not reset that counter.
+        let decodeCeiling = Swift.max(maxNewTokens * 16, 65_536)
         let portValue = try positiveInteger(
             options.value(for: "--port", default: "8080"), name: "--port")
         guard portValue <= 65535 else {
@@ -1911,7 +1912,9 @@ private enum MLXFastCLI {
         }
         let modelName = options.value(
             for: "--model-name", default: "qwen3.8-27b-mtp")
-        guard let workerOptions = try runtimeWorkerOptions() else {
+        guard let workerOptions = try runtimeWorkerOptions(
+            decodeCeiling: decodeCeiling
+        ) else {
             throw MLXFastError.invalidInput(
                 "serve requires the participant runtime worker"
             )
@@ -2346,7 +2349,8 @@ private enum MLXFastCLI {
 
     private static func runtimeWorkerOptions(
         blockedGoldenPath: String? = nil,
-        forwardsWorkerStderr: Bool = false
+        forwardsWorkerStderr: Bool = false,
+        decodeCeiling: Int? = nil
     ) throws -> RuntimeWorkerOptions? {
         // The trusted binary has no in-process model target. Disabling the worker
         // therefore fails closed in every mode rather than selecting an editable
@@ -2423,7 +2427,10 @@ private enum MLXFastCLI {
             // worker stderr surfaces solely through the sanitized exit
             // diagnostic, so submitted code cannot stream hidden-prompt
             // content into CI logs.
-            forwardsWorkerStderr: forwardsWorkerStderr && !officialRun
+            forwardsWorkerStderr: forwardsWorkerStderr && !officialRun,
+            // Fail closed the same way: an official run keeps the pinned
+            // ceiling no matter what a caller asked for.
+            decodeCeiling: officialRun ? nil : decodeCeiling
         )
     }
 

@@ -299,6 +299,12 @@ public struct RuntimeWorkerOptions: Equatable {
     public let requestTimeoutSeconds: Double
     public let shutdownTimeoutSeconds: Double
     public let terminationGraceSeconds: Double
+    /// Per-session OUTPUT ceiling handed to an MTP worker on argv. `nil` means
+    /// the pinned default, which is what every benchmark and ranked path uses.
+    /// It travels on argv rather than in the environment because
+    /// `sanitizedRuntimeWorkerEnvironment` is a strict allowlist whose
+    /// maintainer contract forbids an `MLXFAST_` allowance.
+    public let decodeCeiling: Int?
 
     public init(
         executablePath: String,
@@ -307,7 +313,8 @@ public struct RuntimeWorkerOptions: Equatable {
         helloTimeoutSeconds: Double = RuntimeWorkerOptions.defaultHelloTimeoutSeconds,
         requestTimeoutSeconds: Double = RuntimeWorkerOptions.defaultRequestTimeoutSeconds,
         shutdownTimeoutSeconds: Double = RuntimeWorkerOptions.defaultShutdownTimeoutSeconds,
-        terminationGraceSeconds: Double = RuntimeWorkerOptions.defaultTerminationGraceSeconds
+        terminationGraceSeconds: Double = RuntimeWorkerOptions.defaultTerminationGraceSeconds,
+        decodeCeiling: Int? = nil
     ) {
         self.executablePath = executablePath
         self.sandboxProfilePath = sandboxProfilePath
@@ -316,6 +323,7 @@ public struct RuntimeWorkerOptions: Equatable {
         self.requestTimeoutSeconds = requestTimeoutSeconds
         self.shutdownTimeoutSeconds = shutdownTimeoutSeconds
         self.terminationGraceSeconds = terminationGraceSeconds
+        self.decodeCeiling = decodeCeiling
     }
 }
 

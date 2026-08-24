@@ -2174,7 +2174,7 @@ final class RuntimeWorkerClient {
         // A drafter path switches the worker to the DFlash block-decode
         // subcommand. The DFlash worker serves only dflash_* kinds, so a serial
         // request cannot be smuggled into a block-decode session or vice versa.
-        let workerArguments: [String]
+        var workerArguments: [String]
         if let dflashDrafterPath {
             workerArguments = [
                 "dflash-runtime-worker",
@@ -2194,6 +2194,11 @@ final class RuntimeWorkerClient {
                 "--mtp-head",
                 mtpHeadPath,
             ]
+            // Only `serve` sets this. The benchmark and every gate leave it
+            // nil, so the worker keeps the pinned default ceiling.
+            if let decodeCeiling = options.decodeCeiling, decodeCeiling > 0 {
+                workerArguments += ["--decode-ceiling", "\(decodeCeiling)"]
+            }
         } else {
             workerArguments = [
                 "runtime-worker",

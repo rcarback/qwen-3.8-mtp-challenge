@@ -77,7 +77,7 @@ private enum ParticipantWorkerCLI {
                 // backbone and the SEPARATELY pinned MTP head (operator Q8:
                 // separate trees, merge at load); serves the mtp_* kinds only.
                 try options.requireOnly(
-                    values: ["--weights", "--mtp-head"]
+                    values: ["--weights", "--mtp-head", "--decode-ceiling"]
                 )
                 let weightsPath = options.value(
                     for: "--weights",
@@ -97,9 +97,22 @@ private enum ParticipantWorkerCLI {
                             + "MLXFAST_QWEN_MTP_HEAD_DIR)"
                     )
                 }
+                // Per-session OUTPUT ceiling. Absent means the pinned
+                // default; the benchmark and ranked paths never pass it.
+                let decodeCeilingText = options.value(
+                    for: "--decode-ceiling", default: ""
+                )
+                let decodeCeiling = decodeCeilingText.isEmpty
+                    ? nil : Int(decodeCeilingText)
+                if !decodeCeilingText.isEmpty, decodeCeiling == nil {
+                    throw MLXFastError.invalidInput(
+                        "--decode-ceiling requires an integer"
+                    )
+                }
                 try QwenRuntime.runQwenMTPWorker(
                     targetWeightsPath: weightsPath,
-                    mtpHeadPath: mtpHeadPath
+                    mtpHeadPath: mtpHeadPath,
+                    decodeCeiling: decodeCeiling
                 )
 
             case "preflight":

@@ -14,13 +14,22 @@ import Tokenizers  // required for #huggingFaceTokenizerLoader() macro expansion
 /// agent turn is not truncated at 1,536 tokens. Input length is NOT capped here
 /// or anywhere else: the 16 full-attention layers use an unbounded
 /// `KVCacheSimple` and the other 48 carry constant-size recurrent state.
-private let qwenMTPDecodeCeiling: Int = {
-    guard let raw = ProcessInfo.processInfo
-            .environment["MLXFAST_QWEN_MTP_DECODE_CEILING"],
-          let value = Int(raw), value > 0
-    else { return MLXFastConstants.experimentalDFlashMaxConfiguredTotalTokens }
-    return value
-}()
+/// The worker's per-session OUTPUT ceiling, supplied by the trusted parent on
+/// argv.
+///
+/// WHY ARGV AND NOT AN ENVIRONMENT VARIABLE. `sanitizedRuntimeWorkerEnvironment`
+/// is a strict allowlist that starts from an empty environment, and its
+/// maintainer contract forbids adding an `MLXFAST_` allowance: worker
+/// configuration travels on argv, the way `--weights` and `--mtp-head` already
+/// do. An env var would have been silently dropped at spawn and the override
+/// would have looked applied while doing nothing.
+///
+/// Defaults to the pinned constant, which is what every benchmark and ranked
+/// path gets because none of them pass the flag. Input length is NOT capped
+/// here or anywhere else: the 16 full-attention layers use an unbounded
+/// `KVCacheSimple` and the other 48 carry constant-size recurrent state.
+nonisolated(unsafe) private var qwenMTPDecodeCeiling =
+    MLXFastConstants.experimentalDFlashMaxConfiguredTotalTokens
 
 /// Validated `mtp_decode_round` request.
 struct QwenMTPRoundRequest: Equatable {
@@ -146,8 +155,14 @@ extension QwenRuntime {
     /// i.e. outside every scored window.
     public static func runQwenMTPWorker(
         targetWeightsPath: String,
-        mtpHeadPath: String
+        mtpHeadPath: String,
+        decodeCeiling: Int? = nil
     ) throws {
+        // Installed before anything reads it, and only when the parent asked
+        // for a different bound. No caller on the ranked path passes one.
+        if let decodeCeiling, decodeCeiling > 0 {
+            qwenMTPDecodeCeiling = decodeCeiling
+        }
         startRuntimeWorkerOrphanReaper()
         let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
         applyQwenMTPStartupMemoryProfile()
