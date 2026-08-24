@@ -151,6 +151,11 @@ public final class Qwen36MTPBlockSession {
     private var headHistoryBacklogTokens: [Int] = []
     /// Seed rows retained for lazy priming; released at the first flush.
     private var seedHiddenForPriming: MLXArray?
+    /// Post-norm twin of `seedHiddenForPriming`. The seed forward already
+    /// writes this block for its vocabulary projection; keeping it lets the
+    /// first draft flush slice those rows instead of launching
+    /// `applyFinalNorm` over the 511-row prefix again.
+    private var seedNormedForPriming: MLXArray?
     private var seedTokensForPriming: [Int] = []
 
     public private(set) var seedTokenCount = 0
@@ -627,7 +632,7 @@ public final class Qwen36MTPBlockSession {
         let tBegin0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         let cpuBegin0 = Self.traceRounds ? Self.threadCPUNanoseconds() : 0
         cache = model.newCache(parameters: nil)
-        let (seedLogits, hidden) = model.callWithHidden(
+        let (seedLogits, hidden, seedNormed) = model.callWithHiddenAndNormed(
             input: LMInput.Text(
                 tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count])),
             cache: cache, nConfirmed: 0)
@@ -639,18 +644,25 @@ public final class Qwen36MTPBlockSession {
         // RMSNorm is row-local, so norm(row)+lmHead == the sliced full
         // projection bit-for-bit (ranked receipt b5130678: +0.09%).
         _ = seedLogits
-        pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
+        pendingHidden = hiddenRow(hidden, seedNormed, hidden.dim(1) - 1)
         let lastLogits = model.applyLMHead(pendingHidden!)
-        // Retain the full pre-norm seed hidden for lazy head-history priming.
-        // ~5 MB at 512x5120 bf16; released at the first drafting round. The
-        // eval below materialises it so no seed graph is kept alive.
+        // Retain the full pre-norm seed hidden AND the post-norm block this
+        // same forward already wrote. The first drafting flush used to
+        // re-launch applyFinalNorm over rows 0..<L-1 of the pre-norm tensor;
+        // those rows are already in `seedNormed`. ~10 MB at 512x5120 bf16
+        // for the pair; released at the first drafting round. The eval
+        // below materialises both so no seed graph is kept alive.
         seedHiddenForPriming = hidden
+        seedNormedForPriming = seedNormed
         seedTokensForPriming = seedTokens
         // One batched readout: the first primary and its tail-row top-2
         // evidence come out of the same eval as the cache roots.
         let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
-        eval(cache.flatMap { $0.state } + [tailIDs, tailValues,
-                                           pendingHidden!, hidden])
+        var beginBundle: [MLXArray] = [tailIDs, tailValues, pendingHidden!, hidden]
+        if let seedNormed {
+            beginBundle.append(seedNormed)
+        }
+        eval(cache.flatMap { $0.state } + beginBundle)
         if Self.traceRounds {
             let tBeginDone = DispatchTime.now().uptimeNanoseconds
             let cpuBeginDone = Self.threadCPUNanoseconds()
@@ -1377,11 +1389,17 @@ public final class Qwen36MTPBlockSession {
                 // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
                 // tokens 1..L-1 (hidden at t predicts alongside token t+1).
                 let primeCount = seedTokensForPriming.count - 1
-                flushHidden.append(
-                    model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
+                // Prefer the post-norm block the seed forward already paid
+                // for. RMSNorm is row-local, so these slices equal
+                // applyFinalNorm over the pre-norm prefix. Fallback keeps
+                // the old launch if a conformer published no twin.
+                let primed = normedRows(seedHidden, seedNormedForPriming, 0 ..< primeCount)
+                    ?? model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...])
+                flushHidden.append(primed)
                 flushTokens.append(contentsOf: seedTokensForPriming[1...])
             }
             seedHiddenForPriming = nil
+            seedNormedForPriming = nil
             seedTokensForPriming = []
         }
         if !headHistoryBacklogHidden.isEmpty {
