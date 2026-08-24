@@ -708,11 +708,6 @@ public final class Qwen36MTPBlockSession {
         Swift.min(offeredDepth, 1)
     }
 
-    /// Consecutive fully-accepted DRAFTING rounds. Kept as a public-ish
-    /// telemetry counter; the cost-model schedule below reads the per-position
-    /// EMAs, not this.
-    private var fullAcceptStreak = 0
-
     /// The last row of a head-chain hidden block. Every step after the first
     /// feeds ONE row in and gets ONE row back, and `lastHiddenWithKVOnlyHistory`
     /// already returns only the final row — so the trailing-row slice those
@@ -1163,8 +1158,8 @@ public final class Qwen36MTPBlockSession {
         let emas = positionAcceptEMA
             .map { String(format: "%.6f", $0) }.joined(separator: ",")
         scheduleTrace = "arm=" + Self.depthPriceArm.rawValue + " " + String(
-            format: "m=%.6f streak=%d cap=%d ema=",
-            margin, fullAcceptStreak, widthCap) + emas + " sched="
+            format: "m=%.6f cap=%d ema=",
+            margin, widthCap) + emas + " sched="
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
@@ -1503,8 +1498,9 @@ public final class Qwen36MTPBlockSession {
         // same ordering `argMax` uses (larger logit wins, lower id wins an
         // exact tie), so the separate vocabulary-wide argMax launch is
         // redundant (credit GPT-5.6 Sol, promoted b71bb35, 1.37645).
-        let verifyArgmax = stride(
-            from: 0, to: flatTop2IDs.count, by: 2).map { flatTop2IDs[$0] }
+        // Top-2 first ID == row argmax (same ordering); read in place from
+        // flatTop2IDs instead of materializing a separate argMax array.
+        func argmaxAt(_ row: Int) -> Int { flatTop2IDs[row * 2] }
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
         //    is the target's greedy continuation of verify input i, i.e. the
@@ -1512,7 +1508,7 @@ public final class Qwen36MTPBlockSession {
         //    used on full acceptance.
         var acceptedCount = 0
         for index in 0 ..< drafts.count {
-            guard verifyArgmax[index] == drafts[index] else { break }
+            guard argmaxAt(index) == drafts[index] else { break }
             acceptedCount += 1
             if stopTokens.contains(drafts[index]) { break }
         }
@@ -1536,7 +1532,7 @@ public final class Qwen36MTPBlockSession {
             Self.clearRecurrentRollback(cache)
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
-            pendingPrimary = verifyArgmax[drafts.count]
+            pendingPrimary = argmaxAt(drafts.count)
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
@@ -1562,7 +1558,7 @@ public final class Qwen36MTPBlockSession {
                 acceptedCount: acceptedCount, draftCount: draftCount,
                 to: committedOffset)
             {
-                pendingPrimary = verifyArgmax[acceptedCount]
+                pendingPrimary = argmaxAt(acceptedCount)
                 pendingHidden = hiddenRow(
                     verifyHidden, verifyNormed, acceptedCount)
                 pendingTop2 = (
@@ -1625,8 +1621,6 @@ public final class Qwen36MTPBlockSession {
             headHistoryBacklogTokens.append(
                 contentsOf: drafts.prefix(acceptedCount))
         }
-        fullAcceptStreak =
-            acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
         recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only
@@ -2167,14 +2161,6 @@ public final class Qwen36MTPBlockSession {
         logits[0, logits.dim(1) - 1]
     }
 
-    private func argmaxLast(_ logits: MLXArray) -> Int {
-        let row = logits[0..., (logits.dim(1) - 1) ..< logits.dim(1), 0...]
-        return argMax(row, axis: -1).item(Int.self)
-    }
-
-    private func argmaxAll(_ logits: MLXArray) -> [Int] {
-        argMax(logits, axis: -1)[0].asArray(Int.self)
-    }
 }
 
 /// Compiled bounds for the native-MTP track. Deliberately not env-overridable.
