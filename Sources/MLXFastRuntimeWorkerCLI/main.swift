@@ -91,7 +91,13 @@ private enum ParticipantWorkerCLI {
                         "MLXFAST_QWEN_MTP_HEAD_DIR"
                     ] ?? ""
                 )
-                guard !mtpHeadPath.isEmpty else {
+                // LOCAL RESEARCH ESCAPE: `none` selects the headless backbone
+                // for sibling `qwen3_5_text` towers, which publish no MTP
+                // head. See `Qwen35CheckpointValidation.resolved`.
+                let headless = mtpHeadPath == "none"
+                    && ProcessInfo.processInfo
+                        .environment["DARKBLOOM_QWEN_GEOMETRY_UNPINNED"] == "1"
+                guard headless || !mtpHeadPath.isEmpty else {
                     throw MLXFastError.invalidInput(
                         "mtp-runtime-worker requires --mtp-head (or "
                             + "MLXFAST_QWEN_MTP_HEAD_DIR)"
@@ -111,7 +117,7 @@ private enum ParticipantWorkerCLI {
                 }
                 try QwenRuntime.runQwenMTPWorker(
                     targetWeightsPath: weightsPath,
-                    mtpHeadPath: mtpHeadPath,
+                    mtpHeadPath: headless ? "" : mtpHeadPath,
                     decodeCeiling: decodeCeiling
                 )
 

@@ -170,20 +170,26 @@ public enum Qwen36MTPHeadAttachment {
     @discardableResult
     public static func withHeadAttached<T>(
         backboneDirectory: URL,
-        headDirectory: URL,
+        headDirectory: URL?,
         _ body: (BackboneLayout) throws -> T
     ) throws -> T {
         let layout = try backboneLayout(directory: backboneDirectory)
-        try verifyHeadTree(headDirectory)
+        // A nil head is the HEADLESS backbone: the tower loads on its own and
+        // decoding runs serially, which is the depth-0 control the track
+        // already treats as a legal configuration. It exists for local
+        // research on sibling `qwen3_5_text` towers, which have no published
+        // MTP head; the ranked path always passes a directory.
+        if let headDirectory {
+            try verifyHeadTree(headDirectory)
+        }
         let previousSources = _additionalWeightSources
         let previousStrip = _primaryWeightKeyPrefixStrip
         let previousEnabled = _qwen35MTPEnabled
-        _additionalWeightSources = [
-            AdditionalWeightSource(
-                directory: headDirectory, keyPrefix: headKeyPrefix)
-        ]
+        _additionalWeightSources = headDirectory.map {
+            [AdditionalWeightSource(directory: $0, keyPrefix: headKeyPrefix)]
+        } ?? []
         _primaryWeightKeyPrefixStrip = layout.primaryKeyPrefixStrip
-        _qwen35MTPEnabled = true
+        _qwen35MTPEnabled = headDirectory != nil
         defer {
             _additionalWeightSources = previousSources
             _primaryWeightKeyPrefixStrip = previousStrip

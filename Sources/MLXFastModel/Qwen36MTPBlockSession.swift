@@ -205,6 +205,172 @@ public final class Qwen36MTPBlockSession {
         rngKey = sampling.map { MLXRandom.key($0.seed) }
     }
 
+    // MARK: - KV cache quantization (nil == bf16 == the ranked path)
+
+    /// Quantization for the 16 full-attention KV caches. The 48 gated-delta
+    /// layers hold a recurrent state rather than a growing cache and are left
+    /// alone.
+    ///
+    /// WHY THIS IS OPT-IN AND OFF BY DEFAULT. Unlike the chunking above, this
+    /// is NOT numerically neutral -- it changes the stored K/V values, so it can
+    /// move an emitted token. It therefore may not be on for the scored path,
+    /// where the contract is exact agreement with a serial trajectory. It earns
+    /// its place at long context, where decode is bandwidth-bound: the cache is
+    /// 64 KiB per token, so at 262k every decode step reads ~17 GB, and 8-bit
+    /// halves that.
+    public struct KVQuantization: Sendable {
+        public let groupSize: Int
+        public let bits: Int
+        /// Positions to keep in full precision before quantizing kicks in.
+        /// Short prompts stay exact; only genuinely long context pays.
+        public let minimumOffset: Int
+
+        public init(groupSize: Int = 64, bits: Int = 8, minimumOffset: Int = 8192) {
+            self.groupSize = groupSize
+            self.bits = bits
+            self.minimumOffset = minimumOffset
+        }
+
+        /// Read the policy from the process environment, or nil for the ranked
+        /// bf16 path.
+        ///
+        /// WHY `DARKBLOOM_` AND NOT `MLXFAST_`. The runtime worker runs with a
+        /// sanitized environment built from a strict allowlist, and
+        /// `MLXFAST_*` is deliberately excluded from it -- a name whose value
+        /// trusted code could set differently between the gate pass and the
+        /// timed pass would let submitted code tell the two apart.
+        /// `DARKBLOOM_` is the allowlisted prefix reserved for model-side
+        /// opt-ins: the ranked workflow sets none of them, in either pass, so
+        /// reading one cannot leak phase identity. Absent variable means
+        /// absent policy, which is what every ranked run sees.
+        ///
+        ///     DARKBLOOM_KV_QUANT_BITS        4 or 8; anything else disables
+        ///     DARKBLOOM_KV_QUANT_GROUP       group size, default 64
+        ///     DARKBLOOM_KV_QUANT_MIN_OFFSET  seed length below which the
+        ///                                    cache stays bf16, default 8192
+        public static func fromEnvironment(
+            _ environment: [String: String] = ProcessInfo.processInfo.environment
+        ) -> KVQuantization? {
+            guard let raw = environment["DARKBLOOM_KV_QUANT_BITS"],
+                  let bits = Int(raw), bits == 4 || bits == 8
+            else { return nil }
+            let groupSize = environment["DARKBLOOM_KV_QUANT_GROUP"]
+                .flatMap(Int.init) ?? 64
+            let minimumOffset = environment["DARKBLOOM_KV_QUANT_MIN_OFFSET"]
+                .flatMap(Int.init) ?? 8192
+            // A group size that does not divide the head dimension, or a
+            // negative threshold, would fail deep inside the quantized
+            // attention kernel with an opaque shape error. Refuse here instead.
+            guard groupSize > 0, groupSize % 32 == 0, minimumOffset >= 0 else {
+                return nil
+            }
+            return KVQuantization(
+                groupSize: groupSize, bits: bits, minimumOffset: minimumOffset)
+        }
+    }
+
+    /// Defaults to the environment policy so a locally launched serve worker
+    /// can enable this without a wire-protocol field; ranked runs see no such
+    /// variable and so get nil, which is bf16.
+    private var kvQuantization: KVQuantization? = KVQuantization.fromEnvironment()
+
+    /// Install (or clear) KV quantization. Passing nil restores bf16 exactly.
+    /// Takes effect at the next `begin`; it does not convert a live cache.
+    public func setKVQuantization(_ quantization: KVQuantization?) {
+        kvQuantization = quantization
+    }
+
+    /// Convert the full-attention caches in place at session start.
+    ///
+    /// `KVCacheSimple.toQuantized` on an EMPTY cache is just a constructor --
+    /// there is nothing to re-encode yet -- so this costs nothing at `begin`
+    /// and the quantized path takes over from the first write.
+    /// `attentionWithCacheUpdate` already dispatches `QuantizedKVCacheProtocol`
+    /// to `quantizedScaledDotProductAttention`, so no attention code changes,
+    /// and `QuantizedKVCache.isTrimmable` is true, so the speculative rollback
+    /// walk keeps working unmodified.
+    private static func quantizedFullAttentionCaches(
+        _ caches: [any KVCache], _ quantization: KVQuantization
+    ) -> [any KVCache] {
+        caches.map { entry in
+            guard let simple = entry as? KVCacheSimple else { return entry }
+            return simple.toQuantized(
+                groupSize: quantization.groupSize, bits: quantization.bits)
+        }
+    }
+
+    // MARK: - chunked prefill
+
+    /// Peak score-matrix budget for one prefill dispatch, as a
+    /// `chunk x already-cached-positions` element product.
+    ///
+    /// The 16 full-attention layers score every chunk row against every cached
+    /// position, so a single-shot prefill of S tokens asks for an S x S
+    /// allocation per head -- 307 GB at S = 80k, which is where the unchunked
+    /// path dies. Bounding the PRODUCT rather than the chunk is what keeps the
+    /// peak flat across the whole 0 -> 262k range instead of only at the short
+    /// end: the chunk shrinks as the context behind it grows.
+    ///
+    /// The 48 gated-delta layers carry a constant-size recurrent state and are
+    /// already O(S) in the prompt; they are unaffected either way.
+    public static let prefillChunkProductBudget = 64 << 20
+
+    /// Clamp for the derived chunk. The UPPER bound is what keeps the scored
+    /// path bit-identical: the ranked window seeds 512 tokens, so `begin` still
+    /// issues the exact single `callWithHidden` it always did. The lower bound
+    /// stops the derived size collapsing into dispatch-bound slivers at 262k.
+    public static let prefillChunkRange = 256 ... 4096
+
+    private static func prefillChunkSize(cached: Int) -> Int {
+        let derived = prefillChunkProductBudget / max(cached, 1)
+        return min(max(derived, prefillChunkRange.lowerBound),
+                   prefillChunkRange.upperBound)
+    }
+
+    /// Forward `tokens` into `cache` in chunks, returning the pre-norm hidden of
+    /// the FINAL chunk together with the tokens that chunk covered.
+    ///
+    /// A single-chunk input takes the identical path the unchunked prefill took
+    /// -- one `callWithHidden`, one retained `hidden`, no extra `eval` -- so
+    /// nothing at or below `prefillChunkRange.upperBound` moves numerically.
+    ///
+    /// A multi-chunk input retains only the LAST chunk's hidden for head
+    /// priming. The whole-prompt hidden is ~2.7 GB at 262k, and the head only
+    /// proposes: priming it from the tail costs accept rate and cannot move an
+    /// emitted token, which is the same reason the rest of the head mechanism
+    /// sits outside the exactness surface.
+    private func forwardPrefill(
+        tokens: [Int], cachedBase: Int
+    ) -> (hidden: MLXArray, primedTokens: [Int]) {
+        var index = 0
+        var lastHidden: MLXArray!
+        var lastTokens: [Int] = []
+        while index < tokens.count {
+            let size = Self.prefillChunkSize(cached: cachedBase + index)
+            let end = min(index + size, tokens.count)
+            let slice = Array(tokens[index ..< end])
+            let (chunkLogits, hidden) = model.callWithHidden(
+                input: LMInput.Text(
+                    tokens: MLXArray(slice).reshaped([1, slice.count])),
+                cache: cache, nConfirmed: 0)
+            // The same dead-graph trim the single-shot path documents: only the
+            // final chunk's last row is ever projected, and the call site does
+            // that from the post-norm hidden.
+            _ = chunkLogits
+            lastHidden = hidden
+            lastTokens = slice
+            index = end
+            // Force each chunk before building the next. Without this the lazy
+            // graph accumulates every chunk's activations and the chunking buys
+            // nothing at all. Skipped on the final chunk, where the call site's
+            // own batched `eval` covers it.
+            if index < tokens.count {
+                eval(cache.flatMap { $0.state } + [hidden])
+            }
+        }
+        return (lastHidden, lastTokens)
+    }
+
     /// Take one key and advance the stream. Never call this outside an
     /// `if let sampling` branch: it mutates state the greedy path must not have.
     private func nextKey() -> MLXArray {
@@ -308,7 +474,16 @@ public final class Qwen36MTPBlockSession {
         stopTokens: Set<Int>,
         postNorm: Bool = true
     ) throws {
-        guard model.hasMTPHead else { throw Qwen36MTPSessionError.headNotAttached }
+        // A backbone with no head decodes serially. That is the depth-0
+        // control the track already treats as a legal configuration, so the
+        // session runs it rather than refusing: `draftPolicy` is pinned to 0
+        // below and no round ever reaches the head. It exists for sibling
+        // `qwen3_5_text` towers (0.8B/4B/9B), which publish no MTP head, and
+        // it is reachable only when the parent passed an empty head path.
+        self.headless = !model.hasMTPHead
+        guard model.hasMTPHead || Qwen35Config.geometryUnpinned() else {
+            throw Qwen36MTPSessionError.headNotAttached
+        }
         self.model = model
         self.stopTokens = stopTokens
         self.postNorm = postNorm
@@ -335,9 +510,13 @@ public final class Qwen36MTPBlockSession {
         // ladder's cap of 4 left committed tokens on the table.
         draftPolicy = { [weak self] offeredDepth, _ in
             guard let self else { return Swift.min(offeredDepth, 1) }
+            if self.headless { return 0 }
             return self.costModelDepth(offeredDepth: offeredDepth)
         }
     }
+
+    /// No MTP head is attached, so every round is a non-drafting round.
+    private let headless: Bool
 
     // MARK: - warm
 
@@ -423,6 +602,10 @@ public final class Qwen36MTPBlockSession {
     /// every legal width `1 ... maxDepth + 1`, and the head's single-token draft
     /// step — on throwaway cache state. Nothing here sees a seed.
     public func warmAllDepths(maxDepth: Int) throws {
+        // Headless decoding never reaches a head step, and the width sweep
+        // below drives the head directly rather than through `draftPolicy`,
+        // so warming it would trap. Depth 0 is the only legal width here.
+        if headless { return try warmAllDepthShapes(maxDepth: 0) }
         // Keep the large shape-warm object graph in a separate call frame so
         // every throwaway cache and tensor is released before residency sizing.
         try warmAllDepthShapes(maxDepth: maxDepth)
@@ -434,7 +617,9 @@ public final class Qwen36MTPBlockSession {
         // single-token forward) up to maxDepth + 1, plus the head's draft step.
         // The head warm runs even for a serial-only session: the head is resident
         // on both sides, so warming it on both keeps the load shape identical.
-        guard maxDepth >= 1, maxDepth <= Qwen36MTPLimits.maxDepth else {
+        guard maxDepth >= (headless ? 0 : 1),
+              maxDepth <= Qwen36MTPLimits.maxDepth
+        else {
             throw Qwen36MTPSessionError.invalidDepth(maxDepth)
         }
         let warmCache = model.newCache(parameters: nil)
@@ -459,6 +644,10 @@ public final class Qwen36MTPBlockSession {
         eval(warmCache.flatMap { $0.state })
         eval(row)
 
+        // Everything from here to the verify-width loop warms the MTP head.
+        // A headless backbone has none, so skip it; the width loop below still
+        // compiles the serial verify shape this configuration does dispatch.
+        if !headless {
         let headCache = model.makeMTPCache()
         for _ in 0 ..< maxDepth {
             let (draftLogits, draftHidden) = model.mtpForwardWithHidden(
@@ -555,6 +744,7 @@ public final class Qwen36MTPBlockSession {
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
         eval(historyWarmCache.flatMap { $0.state })
+        }
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
@@ -769,25 +959,38 @@ public final class Qwen36MTPBlockSession {
         let tBegin0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         let cpuBegin0 = Self.traceRounds ? Self.threadCPUNanoseconds() : 0
         cache = model.newCache(parameters: nil)
-        let (seedLogits, hidden) = model.callWithHidden(
-            input: LMInput.Text(
-                tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count])),
-            cache: cache, nConfirmed: 0)
+        // Quantize only when the prompt is actually long enough to be worth the
+        // accuracy cost. A short prompt keeps bf16 and stays exact, so enabling
+        // quantization does not silently change ordinary interactive replies.
+        if let kvQuantization, seedTokens.count >= kvQuantization.minimumOffset {
+            cache = Self.quantizedFullAttentionCaches(cache, kvQuantization)
+            // Announce it. This path changes stored K/V values, so a run that
+            // took it must never be mistaken for a bf16 run when its numbers
+            // are compared against one.
+            FileHandle.standardError.write(Data(
+                ("qwen-mtp: KV cache quantized to \(kvQuantization.bits)-bit "
+                    + "group-\(kvQuantization.groupSize) for the 16 "
+                    + "full-attention layers (seed \(seedTokens.count) >= "
+                    + "\(kvQuantization.minimumOffset))\n").utf8))
+        }
+        // Chunked: at or below `prefillChunkRange.upperBound` -- which the
+        // ranked 512-token seed is -- this is one `callWithHidden` and the
+        // path is unchanged. The seed vocabulary trim lives inside
+        // `forwardPrefill`: lm_head over every seed row is a dead lazy graph
+        // and is never evaluated, while the one row we need is projected from
+        // the post-norm hidden below. RMSNorm is row-local, so
+        // norm(row)+lmHead == the sliced full projection bit-for-bit (ranked
+        // receipt b5130678: +0.09%).
+        let (hidden, primedTokens) = forwardPrefill(
+            tokens: seedTokens, cachedBase: 0)
         let tBeginBuilt = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
-        // Seed vocabulary trim: `seedLogits` projects lm_head over all 512
-        // seed rows but only the last row is ever used. It is deliberately
-        // NEVER evaluated — a dead lazy graph costs nothing — and the one row
-        // we need is projected directly from the post-norm hidden below.
-        // RMSNorm is row-local, so norm(row)+lmHead == the sliced full
-        // projection bit-for-bit (ranked receipt b5130678: +0.09%).
-        _ = seedLogits
         pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
         let lastLogits = model.applyLMHead(pendingHidden!)
         // Retain the full pre-norm seed hidden for lazy head-history priming.
         // ~5 MB at 512x5120 bf16; released at the first drafting round. The
         // eval below materialises it so no seed graph is kept alive.
         seedHiddenForPriming = hidden
-        seedTokensForPriming = seedTokens
+        seedTokensForPriming = primedTokens
         // One batched readout: the first primary and its tail-row top-2
         // evidence come out of the same eval as the cache roots.
         let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
@@ -858,13 +1061,12 @@ public final class Qwen36MTPBlockSession {
                 expected: expected, actual: base, round: roundCount)
         }
 
-        let (extendLogits, hidden) = model.callWithHidden(
-            input: LMInput.Text(
-                tokens: MLXArray(tokens).reshaped([1, tokens.count])),
-            cache: cache, nConfirmed: 0)
-        // Same dead-graph trim as `begin`: only the last row is ever read, and
-        // it is projected directly from the post-norm hidden below.
-        _ = extendLogits
+        // Chunked, and here the context behind the extension is already `base`
+        // deep, so the derived chunk starts small and shrinks -- an extension
+        // onto a 200k prefix is exactly the case that would otherwise ask for
+        // one unbounded score matrix. Same dead-graph trim as `begin`.
+        let (hidden, primedTokens) = forwardPrefill(
+            tokens: tokens, cachedBase: base)
         pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
         let lastLogits = model.applyLMHead(pendingHidden!)
         let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
@@ -901,7 +1103,7 @@ public final class Qwen36MTPBlockSession {
         headHistoryBacklogHidden.removeAll()
         headHistoryBacklogTokens.removeAll()
         seedHiddenForPriming = hidden
-        seedTokensForPriming = tokens
+        seedTokensForPriming = primedTokens
         return pendingPrimary!
     }
 

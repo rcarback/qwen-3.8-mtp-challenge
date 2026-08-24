@@ -1643,6 +1643,17 @@ private enum MLXFastCLI {
             for: "--mtp-head",
             default: environmentValue("MLXFAST_QWEN_MTP_HEAD_DIR", fallback: "")
         )
+        // LOCAL RESEARCH ESCAPE. Sibling `qwen3_5_text` towers (0.8B/4B/9B)
+        // have no published MTP head, so under the geometry escape the literal
+        // `none` selects the headless, serial-decode backbone. The option
+        // parser rejects an empty value outright, which is why this is a
+        // sentinel rather than "".
+        if path == "none",
+           ProcessInfo.processInfo
+               .environment["DARKBLOOM_QWEN_GEOMETRY_UNPINNED"] == "1"
+        {
+            return "none"
+        }
         guard !path.isEmpty else {
             throw MLXFastError.invalidInput(
                 "the MTP verbs require --mtp-head PATH (or "

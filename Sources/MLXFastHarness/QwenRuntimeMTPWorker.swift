@@ -168,7 +168,13 @@ extension QwenRuntime {
         applyQwenMTPStartupMemoryProfile()
 
         let targetURL = URL(fileURLWithPath: targetWeightsPath)
-        let headURL = URL(fileURLWithPath: mtpHeadPath)
+        // An EMPTY head path is the headless local-research configuration --
+        // a sibling `qwen3_5_text` tower with no published MTP head, decoded
+        // serially. The parent only ever produces it behind the geometry
+        // escape; the ranked path always passes a real directory.
+        let headURL = mtpHeadPath.isEmpty
+            ? nil
+            : URL(fileURLWithPath: mtpHeadPath)
         // The layout is read from the backbone's OWN config and decides both
         // which class the factory builds and whether the transform's
         // `language_model.` text-tower prefix has to be stripped from the
@@ -211,7 +217,7 @@ extension QwenRuntime {
         // configuration also declares `mtp_num_hidden_layers > 0`; a tree whose
         // config lost that field would otherwise load, never draft, and report a
         // perfectly exact run at zero acceptance.
-        guard model.hasMTPHead else {
+        guard model.hasMTPHead || headURL == nil else {
             throw MLXFastError.invalidInput(
                 "the Qwen MTP head did not attach to the loaded backbone: the "
                     + "runtime config.json must declare mtp_num_hidden_layers > 0 "

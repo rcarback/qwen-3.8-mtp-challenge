@@ -74,6 +74,29 @@ public struct Qwen35Config: Equatable, Sendable {
             $0 % 4 == 3 ? .full : .linear
         }
 
+    /// LOCAL RESEARCH ESCAPE -- see `Qwen35CheckpointValidation.resolved`.
+    ///
+    /// When set, the invariants that pin the tower's SIZE (layer count,
+    /// widths, head counts, head tying) are checked for self-consistency
+    /// instead of against the 27B's literals, so a sibling `qwen3_5_text`
+    /// checkpoint runs on the same code path. Everything that pins the
+    /// tower's SHAPE -- model type, activation, norm epsilon, quantization
+    /// scheme, the every-4th-layer full-attention pattern -- still binds.
+    /// The ranked workflow never sets any `DARKBLOOM_` variable, in either
+    /// pass, so the ranked path is byte-identical with this absent.
+    public static func geometryUnpinned(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        environment["DARKBLOOM_QWEN_GEOMETRY_UNPINNED"] == "1"
+    }
+
+    /// The layer pattern this config declares, derived from its own depth.
+    public var derivedLayerTypes: [Qwen35LayerType] {
+        (0..<numHiddenLayers).map {
+            $0 % fullAttentionInterval == fullAttentionInterval - 1 ? .full : .linear
+        }
+    }
+
     public init(
         modelType: String,
         vocabSize: Int,
@@ -157,7 +180,10 @@ public struct Qwen35Config: Equatable, Sendable {
 
         // Reject unsafe counts before parsing the layer array.
         let numHiddenLayers = try qwenInt("num_hidden_layers", in: root)
-        guard numHiddenLayers == MLXFastConstants.numHiddenLayers else {
+        guard numHiddenLayers == MLXFastConstants.numHiddenLayers
+            || (Self.geometryUnpinned() && numHiddenLayers > 0
+                && numHiddenLayers <= 256)
+        else {
             throw MLXFastError.invalidInput(
                 "Qwen3.6 config invariant check failed: num_hidden_layers="
                     + "\(numHiddenLayers) expected \(MLXFastConstants.numHiddenLayers)"
@@ -233,16 +259,24 @@ public struct Qwen35Config: Equatable, Sendable {
             }
         }
 
+        // Size-dependent invariants. Skipped -- and only these -- when the
+        // local geometry escape is on.
+        let sizeUnpinned = Self.geometryUnpinned()
+        func expectSize<T: Equatable>(_ name: String, _ actual: T, _ expected: T) {
+            if sizeUnpinned { return }
+            expect(name, actual, expected)
+        }
+
         expect("model_type", modelType, "qwen3_5_text")
         expect("vocab_size", vocabSize, 248_320)
-        expect("hidden_size", hiddenSize, 5_120)
-        expect("intermediate_size", intermediateSize, 17_408)
-        expect("num_hidden_layers", numHiddenLayers, 64)
-        expect("num_attention_heads", numAttentionHeads, 24)
-        expect("num_key_value_heads", numKeyValueHeads, 4)
+        expectSize("hidden_size", hiddenSize, 5_120)
+        expectSize("intermediate_size", intermediateSize, 17_408)
+        expectSize("num_hidden_layers", numHiddenLayers, 64)
+        expectSize("num_attention_heads", numAttentionHeads, 24)
+        expectSize("num_key_value_heads", numKeyValueHeads, 4)
         expect("head_dim", headDim, 256)
-        expect("linear_num_value_heads", linearNumValueHeads, 48)
-        expect("linear_num_key_heads", linearNumKeyHeads, 16)
+        expectSize("linear_num_value_heads", linearNumValueHeads, 48)
+        expectSize("linear_num_key_heads", linearNumKeyHeads, 16)
         expect("linear_value_head_dim", linearValueHeadDim, 128)
         expect("linear_key_head_dim", linearKeyHeadDim, 128)
         expect("linear_conv_kernel_dim", linearConvKernelDim, 4)
@@ -254,28 +288,31 @@ public struct Qwen35Config: Equatable, Sendable {
         expect("attention_dropout", attentionDropout, 0)
         expect("attn_output_gate", attentionOutputGate, true)
         expect("output_gate_type", outputGateType, "swish")
-        expect("tie_word_embeddings", tieWordEmbeddings, false)
+        expectSize("tie_word_embeddings", tieWordEmbeddings, false)
         expect("mamba_ssm_dtype", mambaSSMDType, "float32")
         expect("dtype", dtype, "bfloat16")
         expect("use_cache", useCache, true)
         expect("rope_parameters.rope_theta", rope.theta, 10_000_000)
         expect("rope_parameters.rope_type", rope.type, "default")
-        expect("rope_parameters.partial_rotary_factor", rope.partialRotaryFactor, 0.25)
+        expectSize("rope_parameters.partial_rotary_factor", rope.partialRotaryFactor, 0.25)
         expect("rope_parameters.mrope_interleaved", rope.mropeInterleaved, true)
-        expect("rope_parameters.mrope_section", rope.mropeSection, [11, 11, 10])
+        expectSize("rope_parameters.mrope_section", rope.mropeSection, [11, 11, 10])
         expect("quantization.group_size", quantizationGroupSize, 64)
         expect("quantization.bits", quantizationBits, 4)
         expect("quantization.mode", quantizationMode, "affine")
         expect("mtp_num_hidden_layers", mtpNumHiddenLayers, 1)
         expect("mtp_use_dedicated_embeddings", mtpUseDedicatedEmbeddings, false)
 
-        if layerTypes != Self.expectedLayerTypes {
-            if layerTypes.count != Self.expectedLayerTypes.count {
+        let expectedLayerTypes = sizeUnpinned
+            ? derivedLayerTypes
+            : Self.expectedLayerTypes
+        if layerTypes != expectedLayerTypes {
+            if layerTypes.count != expectedLayerTypes.count {
                 errors.append(
                     "layer_types count=\(layerTypes.count) "
-                        + "expected \(Self.expectedLayerTypes.count)"
+                        + "expected \(expectedLayerTypes.count)"
                 )
-            } else if let mismatch = zip(layerTypes, Self.expectedLayerTypes)
+            } else if let mismatch = zip(layerTypes, expectedLayerTypes)
                 .enumerated()
                 .first(where: { $0.element.0 != $0.element.1 })
             {

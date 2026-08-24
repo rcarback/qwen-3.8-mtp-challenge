@@ -687,19 +687,33 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
     }
 
     let interval = MLXFastConstants.fullAttentionInterval
-    let expectedLayerTypes = (0..<MLXFastConstants.numHiddenLayers).map {
+    // LOCAL RESEARCH ESCAPE -- see `Qwen35CheckpointValidation.resolved`.
+    // With `DARKBLOOM_QWEN_GEOMETRY_UNPINNED=1` the SIZE-dependent pins below
+    // are read out of the config instead of the 27B constants, so a sibling
+    // `qwen3_5_text` tower loads on the same worker. Every shape-, scheme-
+    // and vocabulary-level pin still binds. The ranked workflow sets no
+    // `DARKBLOOM_` variable in either pass, so ranked behaviour is unchanged.
+    let sizeUnpinned = ProcessInfo.processInfo
+        .environment["DARKBLOOM_QWEN_GEOMETRY_UNPINNED"] == "1"
+    let pinnedLayers = sizeUnpinned
+        ? decoded.numHiddenLayers
+        : MLXFastConstants.numHiddenLayers
+    let expectedLayerTypes = (0..<pinnedLayers).map {
         $0 % interval == interval - 1 ? "full_attention" : "linear_attention"
+    }
+    func sizePin<T: Equatable>(_ actual: T, _ expected: T) -> Bool {
+        sizeUnpinned || actual == expected
     }
     guard decoded.modelType == "qwen3_5_text",
           decoded.vocabSize == MLXFastConstants.vocabSize,
-          decoded.hiddenSize == MLXFastConstants.hiddenSize,
-          decoded.intermediateSize == MLXFastConstants.intermediateSize,
-          decoded.numHiddenLayers == MLXFastConstants.numHiddenLayers,
-          decoded.numAttentionHeads == MLXFastConstants.attentionHeads,
-          decoded.numKeyValueHeads == 4,
+          sizePin(decoded.hiddenSize, MLXFastConstants.hiddenSize),
+          sizePin(decoded.intermediateSize, MLXFastConstants.intermediateSize),
+          sizePin(decoded.numHiddenLayers, MLXFastConstants.numHiddenLayers),
+          sizePin(decoded.numAttentionHeads, MLXFastConstants.attentionHeads),
+          sizePin(decoded.numKeyValueHeads, 4),
           decoded.headDim == 256,
-          decoded.linearNumValueHeads == 48,
-          decoded.linearNumKeyHeads == 16,
+          sizePin(decoded.linearNumValueHeads, 48),
+          sizePin(decoded.linearNumKeyHeads, 16),
           decoded.linearValueHeadDim == 128,
           decoded.linearKeyHeadDim == 128,
           decoded.linearConvKernelDim == 4,
@@ -716,16 +730,16 @@ func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
           decoded.eosTokenID == 248_044,
           decoded.initializerRange == 0.02,
           decoded.padTokenID == nil,
-          decoded.tieWordEmbeddings == false,
+          sizePin(decoded.tieWordEmbeddings, false),
           decoded.mambaSSMDType == "float32",
           decoded.dtype == "bfloat16",
           decoded.useCache,
-          decoded.partialRotaryFactor == 0.25,
+          sizePin(decoded.partialRotaryFactor, 0.25),
           decoded.ropeParameters.ropeTheta == 10_000_000,
           decoded.ropeParameters.ropeType == "default",
-          decoded.ropeParameters.partialRotaryFactor == 0.25,
+          sizePin(decoded.ropeParameters.partialRotaryFactor, 0.25),
           decoded.ropeParameters.mropeInterleaved,
-          decoded.ropeParameters.mropeSection == [11, 11, 10],
+          sizePin(decoded.ropeParameters.mropeSection, [11, 11, 10]),
           decoded.quantization.bits == 4,
           decoded.quantization.groupSize == 64,
           decoded.quantization.mode == "affine",

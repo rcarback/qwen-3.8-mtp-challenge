@@ -75,9 +75,125 @@ enum Qwen35CheckpointValidation {
         static let quantizationMode = "affine"
     }
 
+    /// The subset of `PinnedGeometry` the inventory builder is parameterised
+    /// on, so the same builder can describe a sibling `qwen3_5_text` tower.
+    ///
+    /// The default everywhere is `pinned`, which reproduces the 27B contract
+    /// tensor for tensor. Nothing in the ranked path constructs any other
+    /// value: the only producer is `resolved(sourceConfigRoot:)`, and it
+    /// returns `pinned` unless `DARKBLOOM_QWEN_GEOMETRY_UNPINNED=1` is set in
+    /// the environment. That variable is LOCAL RESEARCH TOOLING -- it exists
+    /// so a smaller in-family checkpoint (0.8B/4B/9B) can be transformed and
+    /// timed on the same runtime, and it deliberately rides the `DARKBLOOM_`
+    /// prefix that the ranked workflow never sets in either pass.
+    struct Geometry: Equatable {
+        var vocabSize: Int
+        var hiddenSize: Int
+        var intermediateSize: Int
+        var layerCount: Int
+        var fullAttentionInterval: Int
+        var attentionHeads: Int
+        var keyValueHeads: Int
+        var headDim: Int
+        var linearValueHeads: Int
+        var linearKeyHeads: Int
+        var linearValueHeadDim: Int
+        var linearKeyHeadDim: Int
+        var linearConvKernelDim: Int
+        var quantizationGroupSize: Int
+        var quantizationBits: Int
+        /// Tied towers ship no `lm_head.*`; the 27B does not tie.
+        var tiedWordEmbeddings: Bool
+    }
+
+    static let pinned = Geometry(
+        vocabSize: PinnedGeometry.vocabSize,
+        hiddenSize: PinnedGeometry.hiddenSize,
+        intermediateSize: PinnedGeometry.intermediateSize,
+        layerCount: PinnedGeometry.layerCount,
+        fullAttentionInterval: PinnedGeometry.fullAttentionInterval,
+        attentionHeads: PinnedGeometry.attentionHeads,
+        keyValueHeads: PinnedGeometry.keyValueHeads,
+        headDim: PinnedGeometry.headDim,
+        linearValueHeads: PinnedGeometry.linearValueHeads,
+        linearKeyHeads: PinnedGeometry.linearKeyHeads,
+        linearValueHeadDim: PinnedGeometry.linearValueHeadDim,
+        linearKeyHeadDim: PinnedGeometry.linearKeyHeadDim,
+        linearConvKernelDim: PinnedGeometry.linearConvKernelDim,
+        quantizationGroupSize: PinnedGeometry.quantizationGroupSize,
+        quantizationBits: PinnedGeometry.quantizationBits,
+        tiedWordEmbeddings: false
+    )
+
+    static func geometryUnpinned(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        environment["DARKBLOOM_QWEN_GEOMETRY_UNPINNED"] == "1"
+    }
+
+    /// `pinned`, unless the local research escape is set -- in which case the
+    /// geometry is read out of the checkpoint's own `text_config`.
+    ///
+    /// A validator that derives its expectations from the artifact it is
+    /// checking cannot detect a changed artifact, which is exactly why this is
+    /// not the default. What survives the escape is still worth having: the
+    /// namespace, dtype, packing arithmetic and per-layer-type structure are
+    /// all still checked, just against a declared geometry rather than a
+    /// frozen one.
+    static func resolved(
+        sourceConfigRoot root: [String: Any],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> Geometry {
+        guard geometryUnpinned(environment) else { return pinned }
+        let text = (root["text_config"] as? [String: Any]) ?? root
+        func field(_ key: String) throws -> Int {
+            guard let value = text[key] as? Int else {
+                throw MLXFastError.invalidInput(
+                    "unpinned Qwen geometry needs integer text_config.\(key)")
+            }
+            return value
+        }
+        let quantization = try quantizationSpec(fromConfigRoot: root)
+        let tied = (text["tie_word_embeddings"] as? Bool)
+            ?? (root["tie_word_embeddings"] as? Bool) ?? false
+        let geometry = Geometry(
+            vocabSize: try field("vocab_size"),
+            hiddenSize: try field("hidden_size"),
+            intermediateSize: try field("intermediate_size"),
+            layerCount: try field("num_hidden_layers"),
+            fullAttentionInterval: try field("full_attention_interval"),
+            attentionHeads: try field("num_attention_heads"),
+            keyValueHeads: try field("num_key_value_heads"),
+            headDim: try field("head_dim"),
+            linearValueHeads: try field("linear_num_value_heads"),
+            linearKeyHeads: try field("linear_num_key_heads"),
+            linearValueHeadDim: try field("linear_value_head_dim"),
+            linearKeyHeadDim: try field("linear_key_head_dim"),
+            linearConvKernelDim: try field("linear_conv_kernel_dim"),
+            quantizationGroupSize: quantization.groupSize,
+            quantizationBits: quantization.bits,
+            tiedWordEmbeddings: tied
+        )
+        guard geometry.layerCount > 0,
+              geometry.fullAttentionInterval > 1,
+              geometry.hiddenSize % geometry.quantizationGroupSize == 0,
+              geometry.intermediateSize % geometry.quantizationGroupSize == 0
+        else {
+            throw MLXFastError.invalidInput(
+                "unpinned Qwen geometry is not self-consistent")
+        }
+        return geometry
+    }
+
     /// Total tensors in the transformed text-tower artifact: 7 top level plus
     /// 48 linear-attention layers of 30 and 16 full-attention layers of 25.
-    static let expectedTensorCount = 1_847
+    static func expectedTensorCount(_ geometry: Geometry = pinned) -> Int {
+        let full = (0..<geometry.layerCount).filter {
+            $0 % geometry.fullAttentionInterval == geometry.fullAttentionInterval - 1
+        }.count
+        let topLevel = geometry.tiedWordEmbeddings ? 4 : 7
+        return topLevel + (geometry.layerCount - full) * 30 + full * 25
+    }
 
     static let textTowerPrefix = "language_model."
 
@@ -153,12 +269,14 @@ enum Qwen35CheckpointValidation {
     /// Exact metadata contract of the transformed text tower, extracted from
     /// the public three-shard `mlx-community/Qwen3.6-27B-4bit` artifact at
     /// revision `c000ac2c2057d94be3fa931000c31723aac53282`.
-    static func expectedTensorInventory() -> [String: ExpectedTensorMetadata] {
-        let hidden = PinnedGeometry.hiddenSize
-        let intermediate = PinnedGeometry.intermediateSize
-        let vocab = PinnedGeometry.vocabSize
-        let bits = PinnedGeometry.quantizationBits
-        let groupSize = PinnedGeometry.quantizationGroupSize
+    static func expectedTensorInventory(
+        _ geometry: Geometry = pinned
+    ) -> [String: ExpectedTensorMetadata] {
+        let hidden = geometry.hiddenSize
+        let intermediate = geometry.intermediateSize
+        let vocab = geometry.vocabSize
+        let bits = geometry.quantizationBits
+        let groupSize = geometry.quantizationGroupSize
 
         var inventory: [String: ExpectedTensorMetadata] = [:]
         func add(_ name: String, _ dtype: TensorDType, _ shape: [Int]) {
@@ -179,18 +297,20 @@ enum Qwen35CheckpointValidation {
             inFeatures: hidden
         )
         add("language_model.model.norm.weight", .bf16, [hidden])
-        addAffine("language_model.lm_head", outFeatures: vocab, inFeatures: hidden)
+        if !geometry.tiedWordEmbeddings {
+            addAffine("language_model.lm_head", outFeatures: vocab, inFeatures: hidden)
+        }
 
-        let linearKeySize = PinnedGeometry.linearKeyHeads * PinnedGeometry.linearKeyHeadDim
-        let linearValueSize = PinnedGeometry.linearValueHeads * PinnedGeometry.linearValueHeadDim
+        let linearKeySize = geometry.linearKeyHeads * geometry.linearKeyHeadDim
+        let linearValueSize = geometry.linearValueHeads * geometry.linearValueHeadDim
         let linearConvSize = linearKeySize * 2 + linearValueSize
         // The full-attention query projection carries the per-head output
         // gate in the same matrix, hence the factor of two.
-        let fullQuerySize = PinnedGeometry.attentionHeads * PinnedGeometry.headDim * 2
-        let fullKeyValueSize = PinnedGeometry.keyValueHeads * PinnedGeometry.headDim
-        let fullOutputSize = PinnedGeometry.attentionHeads * PinnedGeometry.headDim
+        let fullQuerySize = geometry.attentionHeads * geometry.headDim * 2
+        let fullKeyValueSize = geometry.keyValueHeads * geometry.headDim
+        let fullOutputSize = geometry.attentionHeads * geometry.headDim
 
-        for layerIndex in 0..<PinnedGeometry.layerCount {
+        for layerIndex in 0..<geometry.layerCount {
             let prefix = "\(layerPrefix)\(layerIndex)"
             add("\(prefix).input_layernorm.weight", .bf16, [hidden])
             add("\(prefix).post_attention_layernorm.weight", .bf16, [hidden])
@@ -199,11 +319,11 @@ enum Qwen35CheckpointValidation {
             addAffine("\(prefix).mlp.up_proj", outFeatures: intermediate, inFeatures: hidden)
             addAffine("\(prefix).mlp.down_proj", outFeatures: hidden, inFeatures: intermediate)
 
-            if layerIndex % PinnedGeometry.fullAttentionInterval
-                == PinnedGeometry.fullAttentionInterval - 1
+            if layerIndex % geometry.fullAttentionInterval
+                == geometry.fullAttentionInterval - 1
             {
-                add("\(prefix).self_attn.q_norm.weight", .bf16, [PinnedGeometry.headDim])
-                add("\(prefix).self_attn.k_norm.weight", .bf16, [PinnedGeometry.headDim])
+                add("\(prefix).self_attn.q_norm.weight", .bf16, [geometry.headDim])
+                add("\(prefix).self_attn.k_norm.weight", .bf16, [geometry.headDim])
                 addAffine(
                     "\(prefix).self_attn.q_proj",
                     outFeatures: fullQuerySize,
@@ -230,11 +350,11 @@ enum Qwen35CheckpointValidation {
             add(
                 "\(prefix).linear_attn.conv1d.weight",
                 .bf16,
-                [linearConvSize, PinnedGeometry.linearConvKernelDim, 1]
+                [linearConvSize, geometry.linearConvKernelDim, 1]
             )
-            add("\(prefix).linear_attn.A_log", .bf16, [PinnedGeometry.linearValueHeads])
-            add("\(prefix).linear_attn.dt_bias", .bf16, [PinnedGeometry.linearValueHeads])
-            add("\(prefix).linear_attn.norm.weight", .bf16, [PinnedGeometry.linearValueHeadDim])
+            add("\(prefix).linear_attn.A_log", .bf16, [geometry.linearValueHeads])
+            add("\(prefix).linear_attn.dt_bias", .bf16, [geometry.linearValueHeads])
+            add("\(prefix).linear_attn.norm.weight", .bf16, [geometry.linearValueHeadDim])
             addAffine(
                 "\(prefix).linear_attn.in_proj_qkv",
                 outFeatures: linearConvSize,
@@ -247,12 +367,12 @@ enum Qwen35CheckpointValidation {
             )
             addAffine(
                 "\(prefix).linear_attn.in_proj_b",
-                outFeatures: PinnedGeometry.linearValueHeads,
+                outFeatures: geometry.linearValueHeads,
                 inFeatures: hidden
             )
             addAffine(
                 "\(prefix).linear_attn.in_proj_a",
-                outFeatures: PinnedGeometry.linearValueHeads,
+                outFeatures: geometry.linearValueHeads,
                 inFeatures: hidden
             )
             addAffine(
@@ -263,8 +383,8 @@ enum Qwen35CheckpointValidation {
         }
 
         precondition(
-            inventory.count == expectedTensorCount,
-            "Qwen3.6 inventory must contain \(expectedTensorCount) tensors"
+            inventory.count == expectedTensorCount(geometry),
+            "Qwen3.6 inventory must contain \(expectedTensorCount(geometry)) tensors"
         )
         return inventory
     }
@@ -273,7 +393,8 @@ enum Qwen35CheckpointValidation {
         selectedKeys: Set<String>,
         index: CheckpointIndex,
         headers: [String: SafetensorsHeader],
-        quantization: Qwen35TransformQuantizationSpec
+        quantization: Qwen35TransformQuantizationSpec,
+        geometry: Geometry = pinned
     ) throws {
         // Affine quantization legitimately ships `.biases`, so unlike the
         // Laguna NVFP4 contract that suffix is NOT forbidden here.
@@ -358,16 +479,18 @@ enum Qwen35CheckpointValidation {
         try validateExactPublicInventory(
             selectedKeys: selectedKeys,
             index: index,
-            headers: headers
+            headers: headers,
+            geometry: geometry
         )
     }
 
     static func validateExactPublicInventory(
         selectedKeys: Set<String>,
         index: CheckpointIndex,
-        headers: [String: SafetensorsHeader]
+        headers: [String: SafetensorsHeader],
+        geometry: Geometry = pinned
     ) throws {
-        let expected = expectedTensorInventory()
+        let expected = expectedTensorInventory(geometry)
         let expectedNames = Set(expected.keys)
         // The public checkpoint also carries the `vision_tower.*` namespace,
         // which the transform never selects, so -- unlike the Laguna
@@ -387,7 +510,7 @@ enum Qwen35CheckpointValidation {
             let unindexed = expectedNames.subtracting(Set(index.weightMap.keys)).sorted()
             throw MLXFastError.invalidInput(
                 "Qwen3.6 checkpoint tensor inventory must match the exact public "
-                    + "\(expectedTensorCount)-tensor contract "
+                    + "\(expectedTensorCount(geometry))-tensor contract "
                     + "(missing: \(missing.prefix(8).joined(separator: ", ")); "
                     + "extra: \(extra.prefix(8).joined(separator: ", ")); "
                     + "unindexed/duplicate header tensors: "
@@ -400,7 +523,16 @@ enum Qwen35CheckpointValidation {
                 preconditionFailure("missing expected Qwen3.6 metadata for \(name)")
             }
             let actual = try tensorInfo(named: name, index: index, headers: headers)
-            guard actual.dtype == expectedMetadata.dtype,
+            // Sibling towers publish the gated-delta decay in F32 where the
+            // 27B publishes BF16. It is a 16-element vector the runtime
+            // promotes to F32 anyway, so accept both -- but only when the
+            // geometry is already unpinned, so the 27B contract stays exact.
+            let dtypeMatches = actual.dtype == expectedMetadata.dtype
+                || (geometry != pinned
+                    && name.hasSuffix(".linear_attn.A_log")
+                    && actual.dtype == TensorDType.f32.rawValue
+                    && expectedMetadata.dtype == TensorDType.bf16.rawValue)
+            guard dtypeMatches,
                   actual.shape == expectedMetadata.shape
             else {
                 throw MLXFastError.invalidInput(

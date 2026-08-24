@@ -210,6 +210,9 @@ public enum SwiftTransform {
                 headers: validatedHeaders,
                 quantization: Qwen35CheckpointValidation.quantizationSpec(
                     fromConfigRoot: sourceConfigRoot
+                ),
+                geometry: Qwen35CheckpointValidation.resolved(
+                    sourceConfigRoot: sourceConfigRoot
                 )
             )
         case .gemma4:
