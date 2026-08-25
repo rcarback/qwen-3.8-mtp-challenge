@@ -361,9 +361,33 @@ public final class Qwen36MTPBlockSession {
         // LOST, because its warm evaluated compact logits while the live graph
         // differed: first MTP block 0.941 s vs 0.402 s, the JIT paid inside
         // the scored window. A new selection kernel resets that hazard exactly.
-        let primedDraftID = model.draftTokenID(
-            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
+        let primedRow = primed[
+            0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...]
+        let primedDraftID = model.draftTokenID(primedRow)
         eval(primedDraftID)
+
+        // Later drafts replace the full embedding+hidden fusion FC with the
+        // one-row hidden-half affine4 kernel. Run that exact expression after
+        // the 512-row history prime, outside every scored window, so its Metal
+        // library/JIT and its downstream graph are resident before round 1.
+        // Unsupported heads return nil before cache mutation and need no new
+        // warm because their scored path falls back to the already-warmed full
+        // MTP expression above.
+        let laterDraftWarmOffset = historyWarmCache[0].offset
+        if let laterDraftHidden = model.mtpHeadHiddenOnlyForward(
+            hidden: primedRow, cache: historyWarmCache)
+        {
+            let laterDraftID = model.draftTokenID(laterDraftHidden)
+            eval(laterDraftID)
+            eval(historyWarmCache.flatMap { $0.state })
+            // The following 2-row fold warm must retain its incumbent kL=512
+            // shape. Discard only the one throwaway hidden-only row after its
+            // graph and cache side effect have been evaluated.
+            let appended = historyWarmCache[0].offset - laterDraftWarmOffset
+            if appended > 0, historyWarmCache[0].isTrimmable {
+                _ = historyWarmCache[0].trim(appended)
+            }
+        }
         // VERIFY-CONCAT JIT WARM. Scored rounds assemble verifyTokens as
         // concatenated([host primary] + device draftIds) over int32 [1, 1]
         // arrays. The width loop below feeds callWithHidden a single host
@@ -1437,8 +1461,16 @@ public final class Qwen36MTPBlockSession {
         let tSubmit1 = Self.traceRounds
             ? DispatchTime.now().uptimeNanoseconds : 0
         for _ in 1 ..< draftCount {
-            headHidden = model.mtpHeadHiddenForward(
-                hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
+            // The first proposal/history flush above keeps the complete MTP
+            // fusion. Only later draft steps may omit the just-proposed token's
+            // embedding contribution. A geometry mismatch returns nil before
+            // touching headCache, then the incumbent full step runs exactly
+            // once through the lazy nil-coalescing fallback.
+            headHidden = model.mtpHeadHiddenOnlyForward(
+                hidden: draftHidden, cache: headCache)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: draftHidden, nextTokenIds: draftId,
+                    cache: headCache)
             draftHidden = Self.lastHiddenRow(headHidden)
             draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)

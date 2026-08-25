@@ -5508,6 +5508,16 @@ extension Qwen35TextModel: MTPCapable {
             cache: cache)
     }
 
+    /// Later-draft proposal path that omits the token embedding contribution
+    /// to the MTP fusion projection. Nil is a pre-mutation fail-closed signal;
+    /// callers must use `mtpHeadHiddenForward` as the fallback.
+    public func mtpHeadHiddenOnlyForward(
+        hidden: MLXArray, cache: [any KVCache]
+    ) -> MLXArray? {
+        guard let mtp else { return nil }
+        return mtp.hiddenOnlyForward(hidden: hidden, cache: cache)
+    }
+
     /// Return the final proposal hidden row while populating preceding history
     /// through a K/V-only path. Returns nil before mutation when unavailable.
     public func mtpHeadLastHiddenWithKVOnlyHistory(
@@ -6046,6 +6056,13 @@ extension Qwen35Model: MTPCapable {
     ) -> MLXArray {
         languageModel.mtpHeadHiddenForward(
             hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
+    }
+
+    /// See `Qwen35TextModel.mtpHeadHiddenOnlyForward`.
+    public func mtpHeadHiddenOnlyForward(
+        hidden: MLXArray, cache: [any KVCache]
+    ) -> MLXArray? {
+        languageModel.mtpHeadHiddenOnlyForward(hidden: hidden, cache: cache)
     }
 
     /// See `Qwen35TextModel.mtpHeadLastHiddenWithKVOnlyHistory`.

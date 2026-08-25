@@ -27,6 +27,144 @@ public nonisolated(unsafe) var _qwen35MTPEnabled: Bool = false
 let qwen35FusedEmbedConcatEnabled: Bool =
     ProcessInfo.processInfo.environment["MLX_E85_FUSED_EMBED"] != "0"
 
+// The later proposal steps consume only the hidden half of MTP `fc`. A view
+// over columns 640..<1280 of the packed weight is not row-contiguous: MLX's
+// quantized-matmul launcher would materialize weight, scale, and bias copies on
+// every step (14,745,600 bytes at the current geometry). This kernel instead
+// binds the original contiguous [5120, 1280] / [5120, 160] arrays and applies
+// the hidden-half offsets inside each row. It is deliberately single-row and
+// affine-4/group-64; the Swift guard below rejects every other geometry before
+// any cache mutation or kernel construction.
+private let qwen35MTPHiddenHalfAffine4Kernel = MLXFast.metalKernel(
+    name: "qwen35_mtp_hidden_half_affine4_g64_qmv_v1",
+    inputNames: ["w", "scales", "biases", "x"],
+    outputNames: ["y"],
+    source: """
+        constexpr int mtp_rows_per_simd = 4;
+        constexpr int mtp_values_per_thread = 16;
+        constexpr int mtp_block_size = mtp_values_per_thread * 32;
+        constexpr int mtp_bytes_per_lane = 8;
+
+        const int mtp_hidden_k = x_shape[x_ndim - 1];
+        const int mtp_full_k = w_shape[1] * 8;
+        const int mtp_hidden_offset = mtp_full_k - mtp_hidden_k;
+        const int mtp_full_weight_row_bytes = mtp_full_k / 2;
+        const int mtp_full_group_row = mtp_full_k / 64;
+        const int mtp_hidden_weight_offset_bytes = mtp_hidden_offset / 2;
+        const int mtp_hidden_group_offset = mtp_hidden_offset / 64;
+
+        const uint3 mtp_tid = threadgroup_position_in_grid;
+        const uint mtp_simd_lid = thread_index_in_simdgroup;
+        const uint mtp_simd_group = simdgroup_index_in_threadgroup;
+        const int mtp_out_row = int(mtp_tid.y) * 8
+            + int(mtp_simd_group) * mtp_rows_per_simd;
+
+        thread float mtp_acc[mtp_rows_per_simd];
+        for (int r = 0; r < mtp_rows_per_simd; r++) {
+            mtp_acc[r] = 0.0f;
+        }
+
+        for (int k = 0; k < mtp_hidden_k; k += mtp_block_size) {
+            thread uint16_t mtp_packed[mtp_rows_per_simd][4];
+            thread float mtp_scale[mtp_rows_per_simd];
+            thread float mtp_bias[mtp_rows_per_simd];
+            for (int r = 0; r < mtp_rows_per_simd; r++) {
+                const int row = mtp_out_row + r;
+                const device uint16_t* ws =
+                    reinterpret_cast<const device uint16_t*>(
+                        reinterpret_cast<const device uint8_t*>(w)
+                        + row * mtp_full_weight_row_bytes
+                        + mtp_hidden_weight_offset_bytes + k / 2
+                        + int(mtp_simd_lid) * mtp_bytes_per_lane);
+                for (int i = 0; i < 4; i++) {
+                    mtp_packed[r][i] = ws[i];
+                }
+                const int group_index = row * mtp_full_group_row
+                    + mtp_hidden_group_offset + k / 64
+                    + int(mtp_simd_lid) / 4;
+                mtp_scale[r] = scales[group_index];
+                mtp_bias[r] = biases[group_index];
+            }
+
+            float mtp_sum = 0.0f;
+            thread float mtp_partial[mtp_rows_per_simd];
+            for (int r = 0; r < mtp_rows_per_simd; r++) {
+                mtp_partial[r] = 0.0f;
+            }
+            for (int i = 0; i < 4; i++) {
+                const device bfloat16_t* xm = x + k
+                    + int(mtp_simd_lid) * mtp_values_per_thread + 4 * i;
+                const vec<bfloat16_t, 4> xv =
+                    *reinterpret_cast<const device vec<bfloat16_t, 4>*>(xm);
+                mtp_sum += xv[0] + xv[1] + xv[2] + xv[3];
+                const float a0 = static_cast<float>(xv[0]);
+                const float a1 = static_cast<float>(xv[1]);
+                const float a2 = static_cast<float>(xv[2]);
+                const float a3 = static_cast<float>(xv[3]);
+                for (int r = 0; r < mtp_rows_per_simd; r++) {
+                    mtp_partial[r] +=
+                        a0 * (mtp_packed[r][i] & 0x000f)
+                        + a1 * ((mtp_packed[r][i] >> 4) & 0x000f)
+                        + a2 * ((mtp_packed[r][i] >> 8) & 0x000f)
+                        + a3 * ((mtp_packed[r][i] >> 12) & 0x000f);
+                }
+            }
+            for (int r = 0; r < mtp_rows_per_simd; r++) {
+                mtp_acc[r] += mtp_scale[r] * mtp_partial[r]
+                    + mtp_sum * mtp_bias[r];
+            }
+        }
+
+        for (int r = 0; r < mtp_rows_per_simd; r++) {
+            const float reduced = simd_sum(mtp_acc[r]);
+            if (mtp_simd_lid == 0) {
+                y[mtp_out_row + r] = static_cast<bfloat16_t>(reduced);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Zero-copy entry point for the one-row hidden half of the current MTP FC.
+/// Every input must already be row-contiguous; returning nil is preferable to
+/// letting the custom-kernel launcher insert a hidden copy.
+private enum Qwen35MTPHiddenHalfAffine4 {
+    static func matmul(
+        _ x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray
+    ) -> MLXArray? {
+        let hiddenSize = 5120
+        let packedColumns = 1280
+        let groupsPerRow = 160
+        guard x.dtype == .bfloat16,
+              x.shape == [1, 1, hiddenSize],
+              weight.dtype == .uint32,
+              weight.shape == [hiddenSize, packedColumns],
+              scales.dtype == .bfloat16,
+              scales.shape == [hiddenSize, groupsPerRow],
+              biases.dtype == .bfloat16,
+              biases.shape == scales.shape,
+              Qwen35CustomQMV.rowContiguous(x, rowStride: hiddenSize),
+              Qwen35CustomQMV.rowContiguous(
+                weight, rowStride: packedColumns),
+              Qwen35CustomQMV.rowContiguous(
+                scales, rowStride: groupsPerRow),
+              Qwen35CustomQMV.rowContiguous(
+                biases, rowStride: groupsPerRow)
+        else { return nil }
+
+        return qwen35MTPHiddenHalfAffine4Kernel(
+            [weight, scales, biases, x],
+            grid: (32, (hiddenSize / 8) * 2, 1),
+            threadGroup: (32, 2, 1),
+            outputShapes: [x.shape],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+}
+
 // MARK: - MTPDecoderLayer
 
 /// Full-attention transformer layer used inside the Qwen3.5/3.6 MTP head.
@@ -209,6 +347,63 @@ final class Qwen35MTPModule: Module {
 
         // 4. Return pre-lm_head hidden (norm applied; lm_head is in TextModel).
         return norm(fused)
+    }
+
+    /// Later-draft proposal primitive that drops the next-token embedding and
+    /// the embedding half of `fc`, while retaining the decoder layer, K/V
+    /// update, MLP, and final head norm. The first proposal/history flush must
+    /// continue through `callAsFunction` or `lastHiddenWithKVOnlyHistory`.
+    ///
+    /// This is proposal-only: target verification still decides every emitted
+    /// token. Any architecture, dtype, shape, quantization, or contiguity
+    /// mismatch returns nil before cache mutation, so the caller can execute
+    /// the incumbent full MTP step instead.
+    func hiddenOnlyForward(
+        hidden: MLXArray,
+        cache: [any KVCache]
+    ) -> MLXArray? {
+        let hiddenSize = 5120
+        let fullInputSize = hiddenSize * 2
+        let packedColumns = fullInputSize / 8
+        let groupsPerRow = fullInputSize / 64
+
+        guard layers.count == 1, cache.count == 1,
+              hidden.dtype == .bfloat16,
+              hidden.shape == [1, 1, hiddenSize],
+              Qwen35CustomQMV.rowContiguous(hidden, rowStride: hiddenSize),
+              preFcNormHidden.weight.dtype == .bfloat16,
+              preFcNormHidden.weight.shape == [hiddenSize],
+              let quantized = fc as? QuantizedLinear,
+              quantized.bias == nil,
+              quantized.mode == .affine,
+              quantized.bits == 4,
+              quantized.groupSize == 64,
+              quantized.shape.0 == hiddenSize,
+              quantized.shape.1 == fullInputSize,
+              quantized.weight.dtype == .uint32,
+              quantized.weight.shape == [hiddenSize, packedColumns],
+              quantized.scales.dtype == .bfloat16,
+              quantized.scales.shape == [hiddenSize, groupsPerRow],
+              let zeroPoints = quantized.biases,
+              zeroPoints.dtype == .bfloat16,
+              zeroPoints.shape == quantized.scales.shape,
+              Qwen35CustomQMV.rowContiguous(
+                quantized.weight, rowStride: packedColumns),
+              Qwen35CustomQMV.rowContiguous(
+                quantized.scales, rowStride: groupsPerRow),
+              Qwen35CustomQMV.rowContiguous(
+                zeroPoints, rowStride: groupsPerRow)
+        else { return nil }
+
+        let normalized = preFcNormHidden(hidden)
+        guard let fused = Qwen35MTPHiddenHalfAffine4.matmul(
+            normalized,
+            weight: quantized.weight,
+            scales: quantized.scales,
+            biases: zeroPoints)
+        else { return nil }
+        let mask = createAttentionMask(h: fused, cache: cache[0])
+        return norm(layers[0](fused, mask: mask, cache: cache[0]))
     }
 
     /// Run one proposal flush while omitting leading-row outputs that have no

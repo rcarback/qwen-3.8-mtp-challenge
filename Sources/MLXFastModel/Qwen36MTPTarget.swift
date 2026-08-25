@@ -79,6 +79,13 @@ public protocol Qwen36MTPTarget: AnyObject {
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray
 
+    /// Later-draft proposal primitive that omits the next-token embedding and
+    /// its half of the MTP fusion projection. Returns nil without mutation
+    /// unless the model can execute the exact guarded hidden-half geometry.
+    func mtpHeadHiddenOnlyForward(
+        hidden: MLXArray, cache: [any KVCache]
+    ) -> MLXArray?
+
     /// Return the final proposal hidden row while preceding rows only append
     /// K/V state. Returns nil without mutation when the head architecture
     /// requires the ordinary full-history forward.
