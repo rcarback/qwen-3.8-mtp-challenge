@@ -6,6 +6,71 @@ import MLX
 /// This provides a single function that automatically routes to quantized or regular
 /// attention based on cache type, matching Python's `scaled_dot_product_attention`
 
+/// Diagnostic counters for the quantized attention dispatch.
+///
+/// Set `DARKBLOOM_KV_DISPATCH_STATS` to a file path to count how often the
+/// fused kernel is actually reached and why it is skipped when it is not. The
+/// counts are written when the process exits. `serve` does not forward worker
+/// stderr, so a file is the only way these become visible. Off by default, and
+/// when off the whole block costs one already-loaded Bool test.
+public enum QuantizedDispatchStats {
+    nonisolated(unsafe) private static var quantizedCalls = 0
+    nonisolated(unsafe) private static var fusedTaken = 0
+    nonisolated(unsafe) private static var skippedNotCausal = 0
+    nonisolated(unsafe) private static var skippedUnsupported = 0
+    nonisolated(unsafe) private static var rowHistogram: [Int: Int] = [:]
+    private static let lock = NSLock()
+
+    public static let path: String? =
+        ProcessInfo.processInfo.environment["DARKBLOOM_KV_DISPATCH_STATS"]
+    public static let enabled: Bool = path != nil
+
+    public static func record(queryRows: Int, causal: Bool, supported: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        quantizedCalls += 1
+        rowHistogram[queryRows, default: 0] += 1
+        if !causal {
+            skippedNotCausal += 1
+        } else if !supported {
+            skippedUnsupported += 1
+        } else {
+            fusedTaken += 1
+        }
+    }
+
+    /// Registered once, on first use, so the counts survive process exit.
+    public static func installWriterIfNeeded() {
+        guard enabled else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        if installed { return }
+        installed = true
+        atexit {
+            QuantizedDispatchStats.write()
+        }
+    }
+
+    nonisolated(unsafe) private static var installed = false
+
+    private static func write() {
+        guard let path else { return }
+        lock.lock()
+        let rows = rowHistogram
+            .sorted { $0.key < $1.key }
+            .map { "\"\($0.key)\": \($0.value)" }
+            .joined(separator: ", ")
+        let json = """
+            {"quantized_calls": \(quantizedCalls), "fused_taken": \(fusedTaken), \
+            "skipped_not_causal": \(skippedNotCausal), \
+            "skipped_unsupported": \(skippedUnsupported), \
+            "query_rows": {\(rows)}}
+            """
+        lock.unlock()
+        try? json.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+}
+
 /// Whether the fused quantized decode kernel is enabled.
 ///
 /// Reads `DARKBLOOM_KV_FUSED_SDPA` once. Set it to `0` to force the
@@ -107,16 +172,21 @@ public func attentionWithCacheUpdate(
         // falls through unchanged.
         var causal = false
         if case .causal = mask { causal = true }
-        if fusedQuantizedEnabled, causal,
-            FusedQuantizedSDPA.isSupported(
-                headDim: queries.dim(3),
-                valueHeadDim: values.dim(3),
-                queryRows: queries.dim(2),
-                bits: quantizedKVCache.bits,
-                groupSize: quantizedKVCache.groupSize,
-                mode: quantizedKVCache.mode,
-                hasSinks: false,
-                hasBiases: quantizedKeys.2 != nil && quantizedValues.2 != nil)
+        let supportedShape = FusedQuantizedSDPA.isSupported(
+            headDim: queries.dim(3),
+            valueHeadDim: values.dim(3),
+            queryRows: queries.dim(2),
+            bits: quantizedKVCache.bits,
+            groupSize: quantizedKVCache.groupSize,
+            mode: quantizedKVCache.mode,
+            hasSinks: false,
+            hasBiases: quantizedKeys.2 != nil && quantizedValues.2 != nil)
+        if QuantizedDispatchStats.enabled {
+            QuantizedDispatchStats.installWriterIfNeeded()
+            QuantizedDispatchStats.record(
+                queryRows: queries.dim(2), causal: causal, supported: supportedShape)
+        }
+        if fusedQuantizedEnabled, causal, supportedShape
         {
             return FusedQuantizedSDPA.attention(
                 queries: queries,
