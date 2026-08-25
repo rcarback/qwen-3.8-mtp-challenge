@@ -23,14 +23,6 @@ struct FusedQuantizedSDPATests {
         MLX.max(MLX.abs(a.asType(.float32))).item(Float.self)
     }
 
-    /// Used where the tolerance should track the typical element rather than
-    /// the largest one, such as the end-to-end dispatch test, where the
-    /// compared tensors are decode outputs rather than a single kernel's
-    /// float32 golden.
-    private static func meanMagnitude(_ a: MLXArray) -> Float {
-        MLX.mean(MLX.abs(a.asType(.float32))).item(Float.self)
-    }
-
     /// Attention computed in float32 from the dequantized keys and values.
     /// Neither path under test is precise enough to be the other's oracle:
     /// the decomposed reference rounds its scores, its softmax and its output
@@ -257,6 +249,17 @@ struct FusedQuantizedSDPATests {
         let (b, qHeads, kvHeads, dim, group, bits) = (1, 24, 4, 256, 64, 4)
         let scale = 1.0 / Float(dim).squareRoot()
 
+        // The dispatch guard is a pure function of these shape/type values, so
+        // asserting `isSupported` here proves the second round's call (the
+        // only round where useFused can matter -- the first round's 128 query
+        // rows are prefill-width and always fall through) satisfies the guard
+        // and is actually routed to the fused kernel when useFused is true,
+        // not merely that both paths happen to agree.
+        #expect(
+            FusedQuantizedSDPA.isSupported(
+                headDim: dim, valueHeadDim: dim, queryRows: 3, bits: bits,
+                groupSize: group, mode: .affine, hasSinks: false, hasBiases: true))
+
         func attend(useFused: Bool) -> MLXArray {
             let cache = QuantizedKVCache(groupSize: group, bits: bits)
             var last = MLXArray.zeros([1])
@@ -277,8 +280,12 @@ struct FusedQuantizedSDPATests {
         let decomposed = attend(useFused: false)
         #expect(fused.shape == decomposed.shape)
         let diff = Self.maxAbsDifference(fused, decomposed)
-        let magnitude = Self.meanMagnitude(decomposed)
-        #expect(diff < max(magnitude * 0.05, 1e-3),
+        let magnitude = Self.maxMagnitude(decomposed)
+        // Both paths emit bfloat16 and approximate the same computation, so the
+        // shared output rounding dominates. This checks that the fused kernel is
+        // routed and produces equivalent output, not that it is bit-identical;
+        // the parity tests are the numerical gate.
+        #expect(diff < magnitude * 0.02,
             "diff=\(diff) magnitude=\(magnitude)")
     }
 
