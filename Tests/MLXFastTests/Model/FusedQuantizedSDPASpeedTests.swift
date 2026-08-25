@@ -11,11 +11,31 @@ import Testing
 /// KV memory reduction becomes free. The decomposed figure is what ships today.
 @Suite(.serialized)
 struct FusedQuantizedSDPASpeedTests {
+    /// Warmup and measurement are both time-based, not iteration-based. This
+    /// machine scales its GPU clock, and three iterations of a half-millisecond
+    /// kernel is under two milliseconds of work, which is far too little to
+    /// leave idle clocks. A fixed iteration count therefore charges the clock
+    /// ramp to whichever configuration is measured first, which was observed to
+    /// penalise the first bit width by roughly a factor of two at the shortest
+    /// context, in both the fused and the decomposed path.
     private static func seconds(_ body: () -> MLXArray) -> Double {
-        for _ in 0 ..< 3 { MLX.eval(body()) }
+        let warmupSeconds = 0.05
+        let measureSeconds = 0.10
+
+        var warmupCount = 0
+        let warmupStart = Date()
+        while warmupCount < 3 || Date().timeIntervalSince(warmupStart) < warmupSeconds {
+            MLX.eval(body())
+            warmupCount += 1
+        }
+
+        var count = 0
         let start = Date()
-        for _ in 0 ..< 20 { MLX.eval(body()) }
-        return Date().timeIntervalSince(start) / 20.0
+        while count < 20 || Date().timeIntervalSince(start) < measureSeconds {
+            MLX.eval(body())
+            count += 1
+        }
+        return Date().timeIntervalSince(start) / Double(count)
     }
 
     @Test("fused quantized attention speed at 4 and 8 bits")
