@@ -1455,7 +1455,12 @@ public final class Qwen36MTPBlockSession {
         //    vendored post-primary rollback checkpoint for the hot K=1 path. A
         //    rejected single draft can then retain the primary's target work and
         //    discard only the draft token instead of re-forwarding the primary.
-        let snapshot = Self.snapshotRecurrent(cache)
+        // K=1 restore uses mid-kernel checkpoints, not this map. Copying 48
+        // GDN states here is unused work on that path. K>=2 still snapshots
+        // for the rare replay-fail fallback. Tip `[.ellipsis]` copies stay
+        // on that arm (dropping them at every depth scored −7.39%).
+        let snapshot =
+            draftCount == 1 ? [:] : Self.snapshotRecurrent(cache)
         if Self.traceRounds { tSnapshotDone = DispatchTime.now().uptimeNanoseconds }
         let verifyTokens = concatenated(
             [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
