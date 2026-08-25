@@ -837,6 +837,22 @@ public final class Qwen36MTPBlockSession {
     private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
         .map { 0.85 * pow(0.98, Double($0)) }
     private static let acceptEMAAlpha = 0.15
+    /// Depth-0 retry floor. `recordAcceptOutcome` performs NO update when a
+    /// round drafts nothing, so once `min(EMA[0], conf)` stays below
+    /// threshold_0 == headStepCostRatio (0.18, arm .ship: marginal[0] *
+    /// (1 + 0) / cumulative[0] = 0.18 exactly) the schedule enters an
+    /// ABSORBING non-drafting state (measured: prompt c1ec5866, 449 frozen
+    /// rounds, ratio 1.2556 on the promoted crown ec24d591 -- this very
+    /// tree). The floor sits AFTER the depth-0 confidence clamp: warm rounds
+    /// carry EMA[0] ~ 0.85 and conf >= 0.5, so max(p, 0.20) never binds and
+    /// warm arithmetic is bit-identical. It binds exactly when EMA[0] < 0.20
+    /// (frozen or near-frozen), forcing reach = 0.20 > 0.18: a one-token
+    /// retry (depth-1 continuation needs p1 > 0.915 at reach 0.20 --
+    /// impossible cold). One ACCEPTED retry refolds EMA[0] += 0.15 *
+    /// (1 - EMA[0]) >= 0.188 from any freeze point, which is above
+    /// threshold: a single accept rethaws the schedule. A rejected retry
+    /// costs ~h*V on that round only.
+    private static let coldRetryFloor = 0.20
 
     /// h = (one head draft step) / (one batched verify forward), the only
     /// constant the marginal rule needs. Derivation from the campaign's
@@ -1124,6 +1140,7 @@ public final class Qwen36MTPBlockSession {
                 let margin = tail.1[0] - tail.1[1]
                 let conf = 1.0 / (1.0 + exp(-margin / 2.0))
                 p = Swift.min(p, conf)
+                p = Swift.max(p, Self.coldRetryFloor)
             } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
                 let margin = tail.1[0] - tail.1[1]
                 let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
