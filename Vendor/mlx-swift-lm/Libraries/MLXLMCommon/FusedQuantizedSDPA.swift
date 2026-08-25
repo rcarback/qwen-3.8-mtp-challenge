@@ -284,10 +284,15 @@ public enum FusedQuantizedSDPA {
             fatalError("FusedQuantizedSDPA requires affine biases; check isSupported first")
         }
 
-        // The causal predicate is compiled into the kernel. A non-causal decode
-        // window is the same computation with the predicate always true, which
-        // holds whenever the query rows sit at the end of the key range.
-        _ = causal
+        // The kernel applies the causal predicate unconditionally. Over a single
+        // query row that is a no-op, because the one query sits at the last key
+        // position and so attends every key. Over more rows a non-causal request
+        // is a different computation that this kernel cannot express, so refuse
+        // it rather than return a masked result the caller did not ask for.
+        precondition(
+            causal || queryRows == 1,
+            "FusedQuantizedSDPA cannot compute non-causal attention over "
+                + "\(queryRows) query rows")
 
         let outputs = kernel(for: key)(
             [

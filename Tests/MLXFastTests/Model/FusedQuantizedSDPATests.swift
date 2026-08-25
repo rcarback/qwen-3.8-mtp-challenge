@@ -23,6 +23,14 @@ struct FusedQuantizedSDPATests {
         MLX.max(MLX.abs(a.asType(.float32))).item(Float.self)
     }
 
+    /// Used where the tolerance should track the typical element rather than
+    /// the largest one, such as the end-to-end dispatch test, where the
+    /// compared tensors are decode outputs rather than a single kernel's
+    /// float32 golden.
+    private static func meanMagnitude(_ a: MLXArray) -> Float {
+        MLX.mean(MLX.abs(a.asType(.float32))).item(Float.self)
+    }
+
     /// Attention computed in float32 from the dequantized keys and values.
     /// Neither path under test is precise enough to be the other's oracle:
     /// the decomposed reference rounds its scores, its softmax and its output
