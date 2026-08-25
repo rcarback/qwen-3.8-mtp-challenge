@@ -145,15 +145,34 @@ for entry in "${CONFIGS[@]}"; do
     fi
   fi
 
+  # Divergence from bf16 answers "how much did quantization cost". It does not
+  # answer "did the fused kernel change anything", because two legs that
+  # diverge from bf16 at the same character are not thereby the same stream.
+  # Compare a fused leg against the decomposed leg it is an A/B of, directly.
+  partner=""
+  case "$label" in
+  *-fused) partner="${label%-fused}-slow" ;;
+  esac
+  paired=""
+  if [[ -n "$partner" && -f "$WORK/$partner.txt" ]]; then
+    paired=$({ cmp -l "$WORK/$partner.txt" "$WORK/$label.txt" 2>/dev/null || true; } |
+      head -1 | awk '{print $1-1}')
+    if [[ -z "$paired" ]]; then
+      paired=$(wc -c <"$WORK/$label.txt" | tr -d ' ')
+    fi
+  fi
+
   # grep exits 1 when the log has no rate line, which is not fatal either.
   rate=$({ grep -o '[0-9.]* tok/s decode' "$WORK/$label.serve.log" || true; } |
     tail -1 | awk '{print $1}')
   jq -nc --arg label "$label" --arg bits "${bits:-16}" \
     --arg rotate "${rotate:-n/a}" --arg fused "${fused:-n/a}" \
+    --arg partner "${partner:-n/a}" --arg paired "${paired:-n/a}" \
     --argjson prefix "${prefix:-0}" \
     --arg rate "${rate:-unknown}" \
     --argjson total "$(wc -c <"$WORK/bf16.txt" | tr -d ' ')" \
     '{label:$label, bits:$bits, rotate:$rotate, fused:$fused,
       identical_prefix_chars:$prefix, reference_chars:$total,
+      ab_partner:$partner, paired_prefix_chars:$paired,
       decode_tok_s:$rate}'
 done

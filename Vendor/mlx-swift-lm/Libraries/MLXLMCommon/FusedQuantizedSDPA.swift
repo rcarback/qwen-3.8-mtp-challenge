@@ -222,7 +222,11 @@ public enum FusedQuantizedSDPA {
                     outputs[lane * BD + sg] = o[r][i];
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                     float acc = simd_sum(outputs[sg * BD + lane] * factor);
-                    o[r][i] = total == 0.0f ? acc : (acc / total);
+                    // `!(total > 0)` rather than `total == 0`: a row that
+                    // attended no key leaves total NaN, and a NaN comparison
+                    // against zero is false, so the equality form would divide
+                    // by it and emit NaN.
+                    o[r][i] = !(total > 0.0f) ? acc : (acc / total);
                 }
 
                 if (lane == 0) {
@@ -272,6 +276,15 @@ public enum FusedQuantizedSDPA {
         let queryRows = queries.dim(2)
         let headDim = queries.dim(3)
         let kvHeads = quantizedKeys.0.dim(1)
+        // The kernel maps a query head to its KV head by integer division. An
+        // uneven ratio would make that quotient too small and index past the
+        // last KV head, reading outside the cache. No such geometry exists in
+        // this tree, and `isSupported` is never shown the KV head count, so
+        // this is the only place the assumption can be stated.
+        precondition(
+            kvHeads > 0 && queryHeads % kvHeads == 0,
+            "FusedQuantizedSDPA requires the query head count to be a multiple "
+                + "of the key-value head count, got \(queryHeads) and \(kvHeads)")
         let key = KernelKey(
             headDim: headDim, queryHeads: queryHeads, queryRows: queryRows,
             gqa: queryHeads / kvHeads, bits: bits, groupSize: groupSize)

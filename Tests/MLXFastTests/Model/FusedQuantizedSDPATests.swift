@@ -325,4 +325,51 @@ struct FusedQuantizedSDPATests {
         #expect(fusedError < magnitude * 1e-5,
             "fused=\(fusedError) magnitude=\(magnitude)")
     }
+
+    @Test("fused output matches float32 attention at every supported width")
+    func everySupportedQueryWidth() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1"
+        else { return }
+        MLXRandom.seed(0x5157_454E)
+
+        // `isSupported` admits widths 1 through 8, and the draft policy may
+        // legally ask for any of them, so every admitted width must actually
+        // dispatch. The register footprint grows with the width, so a wide
+        // specialization could fail to reach the 1024 threads the kernel
+        // requests, and the predicate has already promised support by then.
+        let (b, qHeads, kvHeads, dim, group) = (1, 24, 4, 256, 64)
+        let scale = 1.0 / Float(dim).squareRoot()
+
+        for bits in [4, 8] {
+            for queryRows in 1 ... 8 {
+                #expect(
+                    FusedQuantizedSDPA.isSupported(
+                        headDim: dim, valueHeadDim: dim, queryRows: queryRows,
+                        bits: bits, groupSize: group, mode: .affine,
+                        hasSinks: false, hasBiases: true))
+
+                let q = MLXRandom.normal([b, qHeads, queryRows, dim]).asType(.float32)
+                let k = MLXRandom.normal([b, kvHeads, 512, dim]).asType(.float32)
+                let v = MLXRandom.normal([b, kvHeads, 512, dim]).asType(.float32)
+                let qk = MLX.quantized(k, groupSize: group, bits: bits)
+                let qv = MLX.quantized(v, groupSize: group, bits: bits)
+
+                let fused = FusedQuantizedSDPA.attention(
+                    queries: q,
+                    quantizedKeys: (qk.wq, qk.scales, qk.biases),
+                    quantizedValues: (qv.wq, qv.scales, qv.biases),
+                    scale: scale, causal: true, groupSize: group, bits: bits)
+                let golden = Self.float32Golden(
+                    queries: q,
+                    keys: (qk.wq, qk.scales, qk.biases),
+                    values: (qv.wq, qv.scales, qv.biases),
+                    scale: scale, groupSize: group, bits: bits)
+
+                let error = Self.maxAbsDifference(fused, golden)
+                let magnitude = Self.maxMagnitude(golden)
+                #expect(error < magnitude * 1e-5,
+                    "bits=\(bits) rows=\(queryRows) error=\(error) magnitude=\(magnitude)")
+            }
+        }
+    }
 }
