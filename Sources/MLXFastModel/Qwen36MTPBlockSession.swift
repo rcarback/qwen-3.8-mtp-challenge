@@ -195,7 +195,26 @@ public final class Qwen36MTPBlockSession {
             guard let self else { return Swift.min(offeredDepth, 1) }
             return self.costModelDepth(offeredDepth: offeredDepth)
         }
+        // E159 research instrument. Unset on every ranked and submitted run, so
+        // the shipped adaptive schedule above is the default path.
+        if let pinned = Self.pinnedDraftDepth {
+            draftPolicy = { offeredDepth, _ in Swift.min(offeredDepth, pinned) }
+        }
     }
+
+    /// E159 ROUND-BUDGET INSTRUMENT, off unless `MLX_E159_FIXED_DRAFT_DEPTH`
+    /// is set. It pins the PROPOSED draft count per round so a leg measures
+    /// one point of the round-cost law `R(D) = (s + t0) + (h + t1)·D`, which
+    /// the adaptive schedule hides by varying `D` round to round. The pinned
+    /// count is still an offer-bounded proposal, so every ledger quantity, the
+    /// accept walk and the emitted token stream are unchanged.
+    private static let pinnedDraftDepth: Int? = {
+        guard let raw = ProcessInfo.processInfo
+            .environment["MLX_E159_FIXED_DRAFT_DEPTH"],
+            let value = Int(raw), value >= 0
+        else { return nil }
+        return Swift.min(value, Qwen36MTPLimits.maxDepth)
+    }()
 
     // MARK: - warm
 
@@ -798,6 +817,13 @@ public final class Qwen36MTPBlockSession {
         traceSink.write(Data(line.utf8))
     }
 
+    /// Absolute uptime at which the PREVIOUS round finished emitting its trace.
+    /// E165 measures a GPU-idle window that spans the round boundary, and the
+    /// trace emission itself sits inside that window, so the window has to be
+    /// corrected by the instrument's own cost. Reporting the anchor in the NEXT
+    /// round's line is the only ordering that can carry it.
+    nonisolated(unsafe) private static var traceEmitDone: UInt64 = 0
+
     /// CPU nanoseconds this thread has consumed. `CLOCK_THREAD_CPUTIME_ID`
     /// advances only while the thread runs, so pairing it with the wall clock
     /// separates a descheduled host from a slow one.
@@ -1038,7 +1064,7 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 7
+    private static let segmentedVerifyDepthCap = 8
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
@@ -1148,6 +1174,187 @@ public final class Qwen36MTPBlockSession {
     /// byte-identical arithmetic without it.
     private var scheduleTrace = ""
 
+    // MARK: - head-chain prefetch (E165)
+
+    /// One drafting round's FIRST head step: the committed-history flush plus
+    /// the proposal it produces. Depth-independent by construction — every
+    /// drafting round starts with exactly this step whatever width it goes on
+    /// to propose — which is what makes it safe to build one round early.
+    private struct HeadFlushStep {
+        let draftId: MLXArray
+        let draftHidden: MLXArray
+        let cache: [any KVCache]
+        /// Head-cache offset after the flush. Every flushed row is committed
+        /// history, so this is also the rollback boundary for the round's
+        /// speculative deeper rows.
+        let validHistoryOffset: Int
+        /// The committed token the flush ended on. The consuming round asserts
+        /// it against its own primary, so a mismatched pipeline cannot run.
+        let primary: Int
+        /// Everything `undoHeadPrefetch` needs to put the head back exactly
+        /// where the shipped order would have left it.
+        let preflushBacklogHidden: [MLXArray]
+        let preflushBacklogTokens: [Int]
+        let preflushHeadOffset: Int
+    }
+
+    /// The step built for the NEXT round, already submitted to the device.
+    private var pendingHeadStep: HeadFlushStep?
+
+    /// Prefetch census, reported through the phase trace.
+    private var prefetchMadeCount = 0
+    private var prefetchHitCount = 0
+    private var prefetchUndoCount = 0
+
+    /// Flush every committed row the head has not seen, ending on
+    /// `(hidden, primary)`, and propose one draft from the final row.
+    ///
+    /// The head cache is created and seed-primed here on the first call. The
+    /// step is NOT evaluated: the caller decides when to submit it.
+    private func buildHeadFlushStep(
+        hidden: MLXArray, primary: Int
+    ) -> HeadFlushStep {
+        let preflushBacklogHidden = headHistoryBacklogHidden
+        let preflushBacklogTokens = headHistoryBacklogTokens
+        let preflushHeadOffset = headHistoryCache?.first?.offset ?? 0
+        let headCache: [any KVCache]
+        var flushHidden: [MLXArray] = []
+        var flushTokens: [Int] = []
+        if let existing = headHistoryCache {
+            headCache = existing
+        } else {
+            let fresh = model.makeMTPCache()
+            headHistoryCache = fresh
+            headCache = fresh
+            if let seedHidden = seedHiddenForPriming,
+               seedTokensForPriming.count > 1
+            {
+                // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
+                // tokens 1..L-1 (hidden at t predicts alongside token t+1).
+                let primeCount = seedTokensForPriming.count - 1
+                flushHidden.append(
+                    model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
+                flushTokens.append(contentsOf: seedTokensForPriming[1...])
+            }
+            seedHiddenForPriming = nil
+            seedTokensForPriming = []
+        }
+        if !headHistoryBacklogHidden.isEmpty {
+            flushHidden.append(contentsOf: headHistoryBacklogHidden)
+            flushTokens.append(contentsOf: headHistoryBacklogTokens)
+            headHistoryBacklogHidden.removeAll(keepingCapacity: true)
+            headHistoryBacklogTokens.removeAll(keepingCapacity: true)
+        }
+        flushHidden.append(hidden)
+        flushTokens.append(primary)
+
+        let draftBase = headCache.first?.offset ?? 0
+        // Every flushed position is committed history plus the (pendingHidden,
+        // primary) row — primary commits unconditionally — so all of them stay
+        // valid whatever the verify decides. Deeper drafted positions are
+        // speculative and are trimmed after the round (MTPLX
+        // `_rollback_mtp_cache(cycle_offset + 1)`).
+        let validHistoryOffset = draftBase + flushTokens.count
+        let draftInputHidden =
+            flushHidden.count == 1 ? hidden : concatenated(flushHidden, axis: 1)
+        let draftInputTokens = MLXArray(flushTokens.map(Int32.init))
+            .reshaped([1, flushTokens.count])
+
+        // Draft ids stay ON DEVICE and chain straight into the verify input —
+        // no host readback between the head forward and the verify forward
+        // (MTPLX batched_decode: the draft id is an mx.array stacked into the
+        // verify block; the ledger reads the values from the round's single
+        // batched eval afterwards).
+        let headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
+            hidden: draftInputHidden, nextTokenIds: draftInputTokens,
+            cache: headCache)
+            ?? model.mtpHeadHiddenForward(
+                hidden: draftInputHidden, nextTokenIds: draftInputTokens,
+                cache: headCache)
+        let draftHidden = Self.lastHiddenRow(headHidden)
+        return HeadFlushStep(
+            draftId: model.draftTokenID(draftHidden),
+            draftHidden: draftHidden,
+            cache: headCache,
+            validHistoryOffset: validHistoryOffset,
+            primary: primary,
+            preflushBacklogHidden: preflushBacklogHidden,
+            preflushBacklogTokens: preflushBacklogTokens,
+            preflushHeadOffset: preflushHeadOffset)
+    }
+
+    /// Build and submit the next round's first head step now.
+    ///
+    /// THE DEVICE IS IDLE HERE. The round's one blocking eval has returned, so
+    /// every submitted command buffer is complete and nothing is queued; in the
+    /// shipped order the next submission does not happen until the host has
+    /// finished this round's bookkeeping, returned through the trusted
+    /// protocol, and rebuilt this same graph at the top of the next round. The
+    /// step depends only on committed state, so issuing it here is the same
+    /// arithmetic on the same inputs, started earlier.
+    private func prefetchHeadStep(hidden: MLXArray, primary: Int) {
+        // Only ever called from a drafting round's tail, so the head cache and
+        // its seed priming already exist. Undo can therefore restore the head
+        // by trimming alone; it never has to recreate a primed cache.
+        precondition(
+            headHistoryCache != nil,
+            "head prefetch ran before the head cache was primed")
+        let step = buildHeadFlushStep(hidden: hidden, primary: primary)
+        asyncEval(step.draftId)
+        pendingHeadStep = step
+        prefetchMadeCount += 1
+    }
+
+    /// Undo a prefetch this round then invalidated, or that the next round
+    /// cannot use.
+    ///
+    /// Two callers. The generic repair path re-forwards the committed block and
+    /// produces its own pending row, so the flush described a transition that
+    /// never happened. A non-drafting round reads no draft at all and must
+    /// leave the head exactly as the shipped order would. Both want the same
+    /// thing: trim the head cache back to the pre-flush offset and put the
+    /// consumed backlog back.
+    private func undoHeadPrefetch() {
+        guard let step = pendingHeadStep else { return }
+        pendingHeadStep = nil
+        prefetchUndoCount += 1
+        headHistoryBacklogHidden = step.preflushBacklogHidden
+        headHistoryBacklogTokens = step.preflushBacklogTokens
+        Self.trimTrimmable(step.cache, to: step.preflushHeadOffset)
+    }
+
+    /// Trim the round's speculative head rows and queue its accepted
+    /// transitions for the next flush.
+    ///
+    /// Reads only the verify output and the head's own cache, so it is
+    /// independent of the target-cache commit and may run on either side of
+    /// it. The prefetch order runs it first because the flush it feeds cannot
+    /// be built until the backlog is complete.
+    private func runHeadUpkeep(
+        headCache: [any KVCache], validHistoryOffset: Int,
+        acceptedCount: Int, drafts: [Int],
+        verifyHidden: MLXArray, verifyNormed: MLXArray?
+    ) {
+        Self.trimTrimmable(headCache, to: validHistoryOffset)
+        guard acceptedCount > 0 else { return }
+        // Keep accepted post-norm rows as one contiguous block. The backlog
+        // already supports multi-row blocks (seed priming uses one), while the
+        // token list remains flat and preserves the same row order.
+        if let block = normedRows(
+            verifyHidden, verifyNormed, 0 ..< acceptedCount)
+        {
+            headHistoryBacklogHidden.append(block)
+        } else {
+            // Preserve the exact pre-existing per-row normalization path
+            // whenever no matching published block is available.
+            for index in 0 ..< acceptedCount {
+                headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
+            }
+        }
+        headHistoryBacklogTokens.append(
+            contentsOf: drafts.prefix(acceptedCount))
+    }
+
     /// Every scalar the schedule may legally read BEFORE it proposes anything:
     /// the pending primary's target top-2 margin, the per-position EMAs, the
     /// full-accept streak and the width cap in force. Recorded so an offline
@@ -1244,12 +1451,15 @@ public final class Qwen36MTPBlockSession {
         // the single blocking eval's GPU wall. Never on in a ranked run.
         let tRound0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         let cpuRound0 = Self.traceRounds ? Self.threadCPUNanoseconds() : 0
+        if Qwen35BandTimer.enabled { Qwen35BandTimer.reset() }
         var tDraftBuilt: UInt64 = 0
         var tSnapshotDone: UInt64 = 0
         var tVerifyBuilt: UInt64 = 0
         var tEvalDone: UInt64 = 0
         var tReadDone: UInt64 = 0
         var tCommitDone: UInt64 = 0
+        var tRowTrace0: UInt64 = 0
+        var tRowTraceDone: UInt64 = 0
 
         // Round-top invariant, kept as a THROW rather than a comment: every
         // emitted token is in the trimmable caches and the pending primary is
@@ -1309,6 +1519,10 @@ public final class Qwen36MTPBlockSession {
         // accepted = rejected = 0, tail = 1 -- and `rows_per_round(0) = 1` in the
         // box wrapper agrees without any special case there.
         if depth == Qwen36MTPLimits.serialControlDepth || draftCount == 0 {
+            // A prefetched first head step is unusable here: this round reads
+            // no draft, so the flush must be given back before the backlog
+            // below is extended, or the transition would be counted twice.
+            undoHeadPrefetch()
             // Keep the committed-history ledger complete across non-drafting
             // rounds: this round's transition is (old pending hidden, primary).
             // Pure array retention — no GPU work, so the serial control's
@@ -1340,6 +1554,30 @@ public final class Qwen36MTPBlockSession {
             Self.traceRow(
                 pos: seedTokenCount + committedTokenCount,
                 ids: tailTokens, values: tailLogits)
+            if Self.traceRounds {
+                // The M = 1 anchor of the width ladder. The serial body has no
+                // draft, no snapshot and no rollback, so only the verify
+                // window, the blocking eval and the round total are defined;
+                // the drafting-only fields stay zero rather than absent so one
+                // parser reads every width.
+                let tSerialDone = DispatchTime.now().uptimeNanoseconds
+                Self.traceWrite(
+                    "mtp-trace: round=\(roundCount) d=0 acc=0 "
+                        + "draft_build_us=0 d_pre_us=0 d_flush_us=0 "
+                        + "d_head1_us=0 d_submit1_us=0 d_chain_us=0 "
+                        + "d_submit2_us=0 "
+                        + "verify_build_us=0 "
+                        + "eval_wall_us=\((tSerialDone - tRound0) / 1000) "
+                        + "readout_us=0 commit_us=0 upkeep_us=0 "
+                        + "round_us=\((tSerialDone - tRound0) / 1000) "
+                        + "band_pre_us=\(Qwen35BandTimer.preNs / 1000) "
+                        + "band_gdn_mixer_us=\(Qwen35BandTimer.gdnMixerNs / 1000) "
+                        + "band_gdn_mlp_us=\(Qwen35BandTimer.gdnMLPNs / 1000) "
+                        + "band_fa_mixer_us=\(Qwen35BandTimer.faMixerNs / 1000) "
+                        + "band_fa_mlp_us=\(Qwen35BandTimer.faMLPNs / 1000) "
+                        + "band_fwd=\(Qwen35BandTimer.forwards) "
+                        + "serial_body=1\n")
+            }
             return Qwen36MTPRoundResult(
                 tokens: committed,
                 declaredRows: 1,
@@ -1362,82 +1600,47 @@ public final class Qwen36MTPBlockSession {
         //    hidden exactly as before.
         let tDraft0 = Self.traceRounds
             ? DispatchTime.now().uptimeNanoseconds : 0
-        let headCache: [any KVCache]
-        var flushHidden: [MLXArray] = []
-        var flushTokens: [Int] = []
-        if let existing = headHistoryCache {
-            headCache = existing
-        } else {
-            let fresh = model.makeMTPCache()
-            headHistoryCache = fresh
-            headCache = fresh
-            if let seedHidden = seedHiddenForPriming,
-               seedTokensForPriming.count > 1
-            {
-                // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
-                // tokens 1..L-1 (hidden at t predicts alongside token t+1).
-                let primeCount = seedTokensForPriming.count - 1
-                flushHidden.append(
-                    model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
-                flushTokens.append(contentsOf: seedTokensForPriming[1...])
-            }
-            seedHiddenForPriming = nil
-            seedTokensForPriming = []
-        }
-        if !headHistoryBacklogHidden.isEmpty {
-            flushHidden.append(contentsOf: headHistoryBacklogHidden)
-            flushTokens.append(contentsOf: headHistoryBacklogTokens)
-            headHistoryBacklogHidden.removeAll(keepingCapacity: true)
-            headHistoryBacklogTokens.removeAll(keepingCapacity: true)
-        }
-        flushHidden.append(hidden)
-        flushTokens.append(primary)
-
-        let draftBase = headCache.first?.offset ?? 0
-        // Every flushed position is committed history plus the (pendingHidden,
-        // primary) row — primary commits unconditionally — so all of them stay
-        // valid whatever the verify decides. Deeper drafted positions are
-        // speculative and are trimmed after the round (MTPLX
-        // `_rollback_mtp_cache(cycle_offset + 1)`).
-        let validHistoryOffset = draftBase + flushTokens.count
-        let draftInputHidden =
-            flushHidden.count == 1 ? hidden : concatenated(flushHidden, axis: 1)
-        let draftInputTokens = MLXArray(flushTokens.map(Int32.init))
-            .reshaped([1, flushTokens.count])
-
-        // Draft ids stay ON DEVICE and chain straight into the verify input —
-        // no host readback between the head forward and the verify forward
-        // (MTPLX batched_decode: the draft id is an mx.array stacked into the
-        // verify block; the ledger reads the values from the round's single
-        // batched eval afterwards). `asyncEval` submits the head chain so the
-        // GPU works while the host builds the 64-layer verify graph.
-        // (Per-step asyncEval was tried here and measured NEUTRAL — the
-        // ~2.4 ms/step is host graph BUILD, not GPU work to overlap; see
-        // idea.md V6 journal. Single submission after the loop, as before.)
         let tFlushBuilt = Self.traceRounds
             ? DispatchTime.now().uptimeNanoseconds : 0
-        var draftIdArrays: [MLXArray] = []
-        var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
-            hidden: draftInputHidden, nextTokenIds: draftInputTokens,
-            cache: headCache)
-            ?? model.mtpHeadHiddenForward(
-                hidden: draftInputHidden, nextTokenIds: draftInputTokens,
-                cache: headCache)
-        var draftHidden = Self.lastHiddenRow(headHidden)
-        var draftId = model.draftTokenID(draftHidden)
-        draftIdArrays.append(draftId)
-        // Early submission of the FIRST head step: its graph exists ~2.4 ms
-        // before the rest of the chain is built, and unlike the per-step
-        // variant (measured neutral — nothing but build time between steps)
-        // the first step carries the history flush, which IS real GPU work
-        // the device can start while the host builds steps 2..d.
-        let tHead1Built = Self.traceRounds
-            ? DispatchTime.now().uptimeNanoseconds : 0
-        asyncEval(draftId)
-        let tSubmit1 = Self.traceRounds
-            ? DispatchTime.now().uptimeNanoseconds : 0
+        // THE FIRST HEAD STEP MAY ALREADY BE RUNNING. The previous round
+        // submitted it as soon as it knew this round's committed row, so on a
+        // hit there is nothing to build here and the device has been working
+        // through the host tail and the protocol turnaround.
+        let usedPrefetch: Bool
+        let step: HeadFlushStep
+        var tHead1Built: UInt64 = 0
+        var tSubmit1: UInt64 = 0
+        if let stash = pendingHeadStep {
+            precondition(
+                stash.primary == primary,
+                "prefetched head step was flushed for token \(stash.primary) "
+                    + "but this round commits \(primary)")
+            step = stash
+            pendingHeadStep = nil
+            prefetchHitCount += 1
+            usedPrefetch = true
+            if Self.traceRounds {
+                tHead1Built = DispatchTime.now().uptimeNanoseconds
+                tSubmit1 = tHead1Built
+            }
+        } else {
+            step = buildHeadFlushStep(hidden: hidden, primary: primary)
+            if Self.traceRounds {
+                tHead1Built = DispatchTime.now().uptimeNanoseconds
+            }
+            asyncEval(step.draftId)
+            if Self.traceRounds {
+                tSubmit1 = DispatchTime.now().uptimeNanoseconds
+            }
+            usedPrefetch = false
+        }
+        let headCache = step.cache
+        let validHistoryOffset = step.validHistoryOffset
+        var draftIdArrays: [MLXArray] = [step.draftId]
+        var draftHidden = step.draftHidden
+        var draftId = step.draftId
         for _ in 1 ..< draftCount {
-            headHidden = model.mtpHeadHiddenForward(
+            let headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
             draftHidden = Self.lastHiddenRow(headHidden)
             draftId = model.draftTokenID(draftHidden)
@@ -1529,6 +1732,42 @@ public final class Qwen36MTPBlockSession {
 
         if Self.traceRounds { tReadDone = DispatchTime.now().uptimeNanoseconds }
 
+        // THE NEXT ROUND'S COMMITTED ROW IS ALREADY DECIDED. Whether the walk
+        // accepted everything or stopped short, the row that carries forward is
+        // row `acceptedCount` of the verify output and nothing below can change
+        // it — only the rare generic repair replaces it, and that path says so
+        // for itself. On full acceptance `acceptedCount == draftCount ==
+        // verifyHidden.dim(1) - 1`, so this is the bonus row by another name.
+        precondition(
+            acceptedCount < drafts.count
+                || acceptedCount == verifyHidden.dim(1) - 1,
+            "full acceptance must carry the bonus row")
+        let nextBase = acceptedCount * 2
+        let nextIDs = Array(flatTop2IDs[nextBase ..< (nextBase + 2)])
+        let nextValues = Array(flatTop2Values[nextBase ..< (nextBase + 2)])
+        // Top-2 first ID == row argmax (same ordering); no separate argMax.
+        pendingPrimary = nextIDs[0]
+        pendingHidden = hiddenRow(verifyHidden, verifyNormed, acceptedCount)
+        pendingTop2 = (nextIDs, nextValues)
+        perRowTop2Tokens.append(nextIDs)
+        perRowTop2Logits.append(nextValues)
+
+        // Head-history upkeep. Trim the speculative deeper-draft rows back to
+        // the valid prefix, then queue the ACCEPTED transitions for the next
+        // drafting round's flush: row i of the verify output is the trunk
+        // hidden at draft i's position, so (hiddenRow(i), drafts[i]) is the
+        // committed pair. The rejecting round queues nothing — the next
+        // round's own (pendingHidden, primary) row covers that transition.
+        //
+        // This depends only on the verify output, so it may run BEFORE the
+        // target cache work rather than after it. That is what lets the next
+        // round's first head step be issued while the device is still idle.
+        runHeadUpkeep(
+            headCache: headCache, validHistoryOffset: validHistoryOffset,
+            acceptedCount: acceptedCount, drafts: drafts,
+            verifyHidden: verifyHidden, verifyNormed: verifyNormed)
+        prefetchHeadStep(hidden: pendingHidden!, primary: pendingPrimary!)
+
         if acceptedCount == drafts.count {
             // FULL ACCEPTANCE: the verify state IS the committed state. No
             // rollback, no repair forward; the bonus row carries the next primary
@@ -1536,15 +1775,6 @@ public final class Qwen36MTPBlockSession {
             Self.clearRecurrentRollback(cache)
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
-            pendingPrimary = verifyArgmax[drafts.count]
-            pendingHidden = hiddenRow(
-                verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
-            let base = drafts.count * 2
-            let ids = Array(flatTop2IDs[base ..< (base + 2)])
-            let values = Array(flatTop2Values[base ..< (base + 2)])
-            pendingTop2 = (ids, values)
-            perRowTop2Tokens.append(ids)
-            perRowTop2Logits.append(values)
         } else {
             rollbackRoundCount += 1
             committed.append(contentsOf: drafts.prefix(acceptedCount))
@@ -1557,24 +1787,18 @@ public final class Qwen36MTPBlockSession {
             // the same post-primary distribution, so reuse its already-recorded
             // top-2 evidence rather than running the target again.
             let committedOffset = base + committed.count
-            if Self.restoreAfterPrefixReject(
+            if !Self.restoreAfterPrefixReject(
                 model, cache,
                 acceptedCount: acceptedCount, draftCount: draftCount,
                 to: committedOffset)
             {
-                pendingPrimary = verifyArgmax[acceptedCount]
-                pendingHidden = hiddenRow(
-                    verifyHidden, verifyNormed, acceptedCount)
-                pendingTop2 = (
-                    perRowTop2Tokens[acceptedCount],
-                    perRowTop2Logits[acceptedCount]
-                )
-                perRowTop2Tokens.append(perRowTop2Tokens[acceptedCount])
-                perRowTop2Logits.append(perRowTop2Logits[acceptedCount])
-            } else {
                 // Generic K>1 / defensive fallback: undo the whole verify window
                 // and re-forward the committed block. This rare path pays a
                 // second blocking eval for its own readout.
+                //
+                // THE ONLY PATH THAT REVISES THE CARRIED ROW, so it is also the
+                // only path that must hand a prefetched head step back.
+                undoHeadPrefetch()
                 Self.rollbackAfterVerify(
                     cache, snapshot, verifiedTokens: draftCount + 1, to: base)
                 let (repairLogits, repairHidden) = model.callWithHidden(
@@ -1589,46 +1813,20 @@ public final class Qwen36MTPBlockSession {
                 eval(cache.flatMap { $0.state } + [tailIDs, tailValues])
                 let ids = tailIDs.asArray(Int32.self).map { Int($0) }
                 let values = tailValues.asArray(Float.self).map { Double($0) }
-                // Top-2 first ID == row argmax; no separate argMax launch.
                 pendingPrimary = ids[0]
                 pendingTop2 = (ids, values)
-                perRowTop2Tokens.append(ids)
-                perRowTop2Logits.append(values)
+                perRowTop2Tokens[perRowTop2Tokens.count - 1] = ids
+                perRowTop2Logits[perRowTop2Logits.count - 1] = values
             }
         }
 
         if Self.traceRounds { tCommitDone = DispatchTime.now().uptimeNanoseconds }
 
-        // Head-history upkeep. Trim the speculative deeper-draft rows back to
-        // the valid prefix, then queue the ACCEPTED transitions for the next
-        // drafting round's flush: row i of the verify output is the trunk
-        // hidden at draft i's position, so (hiddenRow(i), drafts[i]) is the
-        // committed pair. The rejecting round queues nothing — the next
-        // round's own (pendingHidden, primary) row covers that transition.
-        Self.trimTrimmable(headCache, to: validHistoryOffset)
-        if acceptedCount > 0 {
-            // Keep accepted post-norm rows as one contiguous block. The backlog
-            // already supports multi-row blocks (seed priming uses one), while
-            // the token list remains flat and preserves the same row order.
-            if let block = normedRows(
-                verifyHidden, verifyNormed, 0 ..< acceptedCount)
-            {
-                headHistoryBacklogHidden.append(block)
-            } else {
-                // Preserve the exact pre-existing per-row normalization path
-                // whenever no matching published block is available.
-                for index in 0 ..< acceptedCount {
-                    headHistoryBacklogHidden.append(
-                        hiddenRow(verifyHidden, index))
-                }
-            }
-            headHistoryBacklogTokens.append(
-                contentsOf: drafts.prefix(acceptedCount))
-        }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
         recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
         if Self.traceRounds {
+            tRowTrace0 = DispatchTime.now().uptimeNanoseconds
             // Row i's distribution follows (primary + drafts[0..<i]); only
             // rows on the accepted trajectory align with the serial leg.
             let rowBase = expected + 1
@@ -1642,12 +1840,21 @@ public final class Qwen36MTPBlockSession {
 
         acceptedDraftTotal += acceptedCount
         rejectedDraftTotal += drafts.count - acceptedCount
+        if Self.traceRounds { tRowTraceDone = DispatchTime.now().uptimeNanoseconds }
         if Self.traceRounds {
-            // Five-way split of the round. `eval_wall` is the only segment the
-            // GPU owns; everything after it is host time that the device could
-            // in principle be overlapping, so the tail segments are the budget
-            // for any further pipelining work.
+            // Five-way split of the round. The device owns work from the first
+            // `asyncEval` right through `eval_wall`, NOT `eval_wall` alone:
+            // under the shipped ladder `verify_build_us` is about 97 % GPU
+            // wait (see the counter contract above), so the two must be read
+            // together. Only the segments AFTER `eval_wall` are time in which
+            // the device provably owns nothing, and they are therefore the
+            // whole budget for any further pipelining work.
             let tTailDone = DispatchTime.now().uptimeNanoseconds
+            // Read the round's dedup census before the line is built, then
+            // clear it after the line is written, so each trace line describes
+            // exactly one round and the census holds one round of activations
+            // at a time.
+            let xsDedupSummary = Qwen35XSumsDedupCensus.roundSummary()
             let line = "mtp-trace: round=\(roundCount) d=\(draftCount) "
                 + "acc=\(acceptedCount) "
                 + "draft_build_us=\((tDraftBuilt - tRound0) / 1000) "
@@ -1671,6 +1878,18 @@ public final class Qwen36MTPBlockSession {
                 // the same host work at a lower clock. E89 measures the same
                 // field on a second host under the same name and units.
                 + "host_thread_cpu_ns=\(Self.threadCPUNanoseconds() &- cpuRound0) "
+                // E182 verify-forward band attribution. All zero unless
+                // MLX_E182_BAND_SYNC=1, which adds a device drain at every
+                // mixer and MLP boundary: the bands are then real device time
+                // per layer family, and the round is inflated by the lost
+                // overlap. `band_fwd` counts the forwards folded into one
+                // round, so a repair forward is visible instead of silent.
+                + "band_pre_us=\(Qwen35BandTimer.preNs / 1000) "
+                + "band_gdn_mixer_us=\(Qwen35BandTimer.gdnMixerNs / 1000) "
+                + "band_gdn_mlp_us=\(Qwen35BandTimer.gdnMLPNs / 1000) "
+                + "band_fa_mixer_us=\(Qwen35BandTimer.faMixerNs / 1000) "
+                + "band_fa_mlp_us=\(Qwen35BandTimer.faMLPNs / 1000) "
+                + "band_fwd=\(Qwen35BandTimer.forwards) "
                 // Which row-selection path the drafts of this run actually
                 // took, and the text that resolved the gate. A leg that
                 // exports nothing must read sel_env=unset with sel_argpart=0,
@@ -1679,8 +1898,49 @@ public final class Qwen36MTPBlockSession {
                 + "sel_env=\(qwen35RowTop32GateSource) "
                 + "sel_fused=\(qwen35RowTop32FusedDrafts) "
                 + "sel_argpart=\(qwen35RowTop32ArgPartitionDrafts) "
+                // Derived-index geometry this process built, so the leaf-width
+                // arm is witnessed from the run's own trace rather than from
+                // the launch environment.
+                + "leaf=\(qwen35DerivedClusterRowsPerLeafBuilt) "
+                + "leaves=\(qwen35DerivedClusterLeaves) "
+                + "probes=\(qwen35DerivedClusterProbes) "
+                // Chunk-sum fill census: table-paying cells that consumed a
+                // produced table, and the ones that still launched the
+                // standalone fill.
+                + "xs_hit=\(qwen35XSumsSidecarHits) "
+                + "xs_fill=\(qwen35XSumsStandaloneFills) "
+                // Fixed build witness for the compiled QMV width plan. No
+                // runtime state, no hot-path counter.
+                + "qmv_plan=\(qwen35QMVWidthPlanWitness) "
+                // E174 step 1. `xs_uniq` counts DISTINCT activations among
+                // those fills, so `xs_fill - xs_uniq` per round is the number
+                // of fills that rebuilt a table an earlier cell in the same
+                // round had already built. `xs_dedup` carries the per-shape
+                // split and the duplicates-per-activation histogram. Both read
+                // `off`/zero unless MLX_E174_DEDUP_CENSUS=1.
+                + "xs_uniq=\(qwen35XSumsFillDistinct) "
+                + "xs_dedup=\(xsDedupSummary) "
+                // E179 launch-config cache. `cfg=0` is the off arm, where both
+                // counters must stay zero. `cfg_miss` is the number of distinct
+                // launch geometries, so the per-round delta of `cfg_miss` falls
+                // to zero once the geometry set is warm.
+                + "cfg=\(Qwen35KernelConfigCache.enabled ? 1 : 0) "
+                + "cfg_hit=\(qwen35KernelConfigCacheHits) "
+                + "cfg_miss=\(qwen35KernelConfigCacheMisses) "
+                // Head-chain prefetch census. The prefetch is unconditional, so
+                // `pf` is a build witness rather than an arm flag: a trace
+                // without it came from a build that predates the mechanism.
+                // `pf_hit` says this round consumed a step the PREVIOUS round
+                // submitted, and the running counts show what the leg actually
+                // did rather than what it was asked to do.
+                + "pf=1 "
+                + "pf_hit=\(usedPrefetch ? 1 : 0) "
+                + "pf_made=\(prefetchMadeCount) "
+                + "pf_hits=\(prefetchHitCount) "
+                + "pf_undo=\(prefetchUndoCount) "
                 + scheduleTrace + "\n"
             Self.traceWrite(line)
+            Qwen35XSumsDedupCensus.rollRound()
             // Absolute anchors on the mach uptime clock, so an offline reader
             // can intersect the round's inter-anchor windows with the GPU
             // execution intervals of the research-only command-buffer ledger
@@ -1701,7 +1961,14 @@ public final class Qwen36MTPBlockSession {
                     + "t_snapshot_done=\(tSnapshotDone) "
                     + "t_verify_built=\(tVerifyBuilt) t_eval_done=\(tEvalDone) "
                     + "t_read_done=\(tReadDone) t_commit_done=\(tCommitDone) "
+                    // E165: the row dump and the trace emission are instrument
+                    // cost inside the cross-round GPU-idle window, so both are
+                    // bracketed and subtracted rather than assumed small.
+                    + "t_row_trace0=\(tRowTrace0) "
+                    + "t_row_trace_done=\(tRowTraceDone) "
+                    + "t_prev_trace_done=\(Self.traceEmitDone) "
                     + "t_tail_done=\(tTailDone)\n")
+            Self.traceEmitDone = DispatchTime.now().uptimeNanoseconds
         }
         // No trailing eval: every host-read value was materialised by the
         // round bundle above. A successful wide-prefix replay intentionally
