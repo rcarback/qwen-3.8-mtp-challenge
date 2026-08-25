@@ -1656,6 +1656,7 @@ private let qwen35CustomAffine4XSumsKernel = MLXFast.metalKernel(
 /// `matmul` returns `nil` for every cell the incumbent must keep, so a routed
 /// call site is a strict subset of the shipped dispatch: same kernel family,
 /// same partition, same arithmetic.
+// Final deadline redraw after the measured schedule failed hidden timing.
 public enum Qwen35CustomQMV {
     public enum Arm: String, Sendable {
         /// MLX's own launcher. The comparison arm, and the fallback whenever a
