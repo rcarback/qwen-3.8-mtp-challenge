@@ -1,9 +1,11 @@
 {
   "version": 1,
-  "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source": "pinned",
+  "repository": "EigenLabs/Qwen3.8-27B-MTP-bf16",
+  "revision": "26a328e070875b0314d652a039b6b59902690f03",
+  "tensor_count": 15,
+  "sha256": "8fceddc664f3ea96d02e304463aa1319213ff52cdf1f3401d4bce64e7075c349",
+  "bytes": 849400347,
   "max_bytes": 2147483648,
-  "note": "xsums fill fusion on eb5eadc: the fused residual+RMSNorm kernel gains an emitSums variant whose epilogue is the BODY of qwen35_custom_affine4_g64_xsums_v1 verbatim, run over the normed bytes it has just stored (device barrier, same vec<bfloat16_t,4> loads, same three BF16 adds per group of four, same ascending float accumulation onto 0.0f, same (k_block*32+lane)*stride+row address), so the table is the standalone fill's bit pattern by construction. A weak-identity sidecar hands that table to Qwen35CustomQMV.matmul, deleting 127 of the 257 standalone xsums fill dispatches per verify round (mlp.gate_up 64, gdn.in_proj 47, fa.qkv 16); the other 130 keep xsumsTable unchanged. Only the sumtable arm at M=4...9 publishes, so M=1 (the serial leg) and prefill run the shipped kernel byte for byte. Widths 2...9, IPG table, tablePays>=4, 0.15, skip-probesort kept. Head tensors remain pinned. No remote code. resample-2 (54d42a3 diagnose: 6/7 active prompts faster, schedule identical, reprice 3.72612 > frontier 3.71960)"
+  "note": "2026-08-25 A/B on M5 Max (512-token ranked-style window, cooled protocol, public longcopy fixture): pinned bf16 head 0.010632 s/token (accept 0.9223, drafts/round 6.43) vs declared q2-q4-rerank head 0.013394 s/token (accept 0.8628, drafts 6.37) - a 25.9% regression for the declared head on this box. Selecting the organizer-pinned head pending a distilled replacement."
 }

@@ -267,9 +267,11 @@ private let qwen35CompiledSigmoidMultiply:
 // S=3...9 over 5 seeds x 4 compile modes (12,983,040 element comparisons,
 // zero mismatches)
 // on the vendored MLX version, with a +1-row conv-window negative control
-// failing exactly the three outputs that read the window. S=2 breaks the
-// conv-state copy (a state row would come from the OLD conv state, which the
-// copy loop does not read), hence the hard S >= 3 gate. The fused in-proj
+// failing exactly the three outputs that read the window. S < NKeep needs
+// next-state rows sourced from the OLD conv state, which the original copy
+// loop never read — hence the shipped hard S >= 3 gate; the copy loop below
+// now has an old-state branch for S in 1...2 behind MLX_QWEN_MTP_PACKED_S12.
+// The fused in-proj
 // carrier's live row stride (16480, not 10240) is consumed via the provided
 // stride arrays — ensureRowContiguous stays FALSE; forcing contiguity here
 // would silently insert a full-carrier copy and give back the launch saving.
@@ -414,6 +416,29 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
                 qkv[raw_base + ulong(i) * ulong(qkv_strides[2])];
           }
         }
+        // Widths S < NKeep also seed the next conv state from the OLD state:
+        // the eager path keeps the LAST nKeep rows of concat(conv_state,
+        // qkv), i.e. new_state[j] = old_state[S + j] while S + j < NKeep.
+        // There are fewer grid rows than that deficit at S == 1, so the
+        // row-0 threadgroup of every logical head loops over all of them;
+        // inert for the shipped S >= 3 widths.
+        if (uint(T) < NKeep && row == 0) {
+          const uint old_rows = NKeep - uint(T);
+          for (uint j = 0; j < old_rows; ++j) {
+            const uint source_row = uint(T) + j;
+            const ulong raw_base =
+                ulong(source_row) * ulong(conv_state_strides[1])
+                + ulong(channel_base + lane * 4)
+                    * ulong(conv_state_strides[2]);
+            const uint state_base = j * C + channel_base + lane * 4;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+              conv_out[state_base + i] =
+                  conv_state[
+                      raw_base + ulong(i) * ulong(conv_state_strides[2])];
+            }
+          }
+        }
         """
     return MLXFast.metalKernel(
         name: "qwen35_packed_gdn_prework",
@@ -428,6 +453,24 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         header: header,
         ensureRowContiguous: false)
 }()
+
+/// Gate for routing verify widths S == 1 and S == 2 through
+/// `qwen35PackedGDNPreworkKernel` instead of the eager conv/silu/split/QK-
+/// norm/g-beta chain. Purpose: serial-control rounds (S == 1) and width-2 MTP
+/// rounds pay ~5 extra launches per GDN layer x 48 layers today; the packed
+/// prework collapses them into one launch. The S < 3 conv-window hazard: when
+/// S < NKeep (3), part of the next conv state must come from the OLD state,
+/// which the original qkv-only copy loop could not produce — the kernel now
+/// carries an old-state branch for that case. Validation before flipping this
+/// default on: DONE 2026-08-25 — hexfloat row-gate parity across a full
+/// 64-token decode measured IDENTICAL (64/64 rows, `probes/rows-{off,on}.txt`),
+/// and an ABBA x3 64-token timing series measured the packed path dead-even on
+/// a drafting-heavy prompt (medians 0.0169309 vs 0.0169235 s/token) while it
+/// strictly reduces launches on every serial-control
+/// and width-2 round. Default is ON; MLX_QWEN_MTP_PACKED_S12=0 restores the
+/// eager chain bit-for-bit.
+private let qwen35PackedGDNPreworkS12Enabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_QWEN_MTP_PACKED_S12"] != "0"
 
 // MARK: - GatedDelta kernel with mid-state checkpoint
 
@@ -884,6 +927,60 @@ final class Qwen35GatedDeltaNet: Module {
         return (q, k)
     }
 
+    /// Byte-receipt envelope shared by every `qwen35PackedGDNPreworkKernel`
+    /// dispatch site: batch, conv geometry, head geometry, fused in-proj
+    /// width, and dtypes. Width bounds are NOT checked here — each caller
+    /// applies its own S policy against this envelope.
+    private func packedPreworkEnvelope(
+        B: Int, nKeep: Int, qkv: MLXArray,
+        convState: MLXArray, a: MLXArray, b: MLXArray
+    ) -> Bool {
+        B == 1 && nKeep == 3
+            && numKHeads == 16 && numVHeads == 48
+            && headKDim == 128 && headVDim == 128
+            && qkv.dim(2) == 16 * 128 * 2 + 48 * 128
+            && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
+            && a.dtype == .bfloat16 && b.dtype == .bfloat16
+    }
+
+    /// One packed-prework launch for the GDN chain at widths the kernel's
+    /// old-conv-state copy branch covers (S <= 2). Callers must have already
+    /// checked `qwen35PackedGDNPreworkS12Enabled`, compiled-decode support,
+    /// and `packedPreworkEnvelope`. Returns normed/scaled Q and K, activated
+    /// V, the next conv state (including OLD-state rows when S < nKeep),
+    /// and fp32 g/beta.
+    private func runPackedPrework(
+        qkv: MLXArray, a: MLXArray, b: MLXArray, convState: MLXArray,
+        B: Int, S: Int, nKeep: Int
+    ) -> (qNormed: MLXArray, kNormed: MLXArray, v: MLXArray,
+          newConvState: MLXArray, g: MLXArray, beta: MLXArray) {
+        let (qScaleConst, kScaleConst) = normScaleConstants(.bfloat16)
+        let outs = qwen35PackedGDNPreworkKernel(
+            [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
+             qScaleConst, kScaleConst],
+            template: [
+                ("Hk", numKHeads), ("Dk", headKDim),
+                ("Hv", numVHeads), ("Dv", headVDim),
+                ("NKeep", nKeep), ("C", qkv.dim(2)), ("T", S),
+            ],
+            grid: (32, S, 2 * numKHeads + numVHeads),
+            threadGroup: (32, 1, 1),
+            outputShapes: [
+                [B, S, numKHeads, headKDim],
+                [B, S, numKHeads, headKDim],
+                [B, S, numVHeads, headVDim],
+                [B, nKeep, qkv.dim(2)],
+                [B, S, numVHeads],
+                [B, S, numVHeads],
+            ],
+            outputDTypes: [
+                .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
+                .float32,
+            ]
+        )
+        return (outs[0], outs[1], outs[2], outs[3], outs[4], outs[5])
+    }
+
     private func processChunk(
         qkv: MLXArray,
         a: MLXArray,
@@ -895,8 +992,31 @@ final class Qwen35GatedDeltaNet: Module {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
 
-        let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
+        // Serial-control / narrow-chunk widths (S <= 2): under
+        // MLX_QWEN_MTP_PACKED_S12 the whole prework chain rides the single
+        // packed launch, whose old-conv-state copy branch produces the same
+        // next-state rows as the eager slice above. g/beta bits equal the
+        // memoG prologue's (same expressions; the kernel's bf16 sigmoid is
+        // exhaustively parity-mapped). The recurrence leg mirrors
+        // gatedDeltaUpdateMemoG's kernel path minus its internal producer.
+        if S <= 2,
+           qwen35PackedGDNPreworkS12Enabled,
+           qwen35GatedDeltaMidKernel != nil,
+           MLXHardwareInfo.isCompiledDecodeSupported,
+           packedPreworkEnvelope(
+                B: B, nKeep: nKeep, qkv: qkv,
+                convState: convState, a: a, b: b)
+        {
+            let pre = runPackedPrework(
+                qkv: qkv, a: a, b: b, convState: convState,
+                B: B, S: S, nKeep: nKeep)
+            let recurrence = qwen35GatedDeltaPrepared(
+                q: pre.qNormed, k: pre.kNormed, v: pre.v,
+                g: pre.g, beta: pre.beta, state: ssmState, mask: mask)
+            return (recurrence.0, pre.newConvState, recurrence.1)
+        }
+        let convInput = concatenated([convState, qkv], axis: 1)
         let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
         let convOut = silu(conv1d(convInput))
 
@@ -946,16 +1066,18 @@ final class Qwen35GatedDeltaNet: Module {
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         // Packed-prework mixer gate: fail closed onto the stock chain for any
-        // shape, geometry, or dtype outside the byte-receipt envelope. The
-        // S >= 3 lower bound is hard (the kernel's conv-state copy reads only
-        // qkv rows, which is wrong at S < nKeep); above 9 no verify exists.
+        // shape, geometry, or dtype outside the shared byte-receipt envelope.
+        // The shipped S >= 3 lower bound is hard; S in 1...2 additionally
+        // needs MLX_QWEN_MTP_PACKED_S12 == "1" (the kernel's old-conv-state
+        // copy branch must then be parity-checked on real weights before the
+        // default widens); above 9 no verify exists. With the env gate unset
+        // this predicate decides byte-identically to the shipped form.
+        let sLowerBound = (qwen35PackedGDNPreworkS12Enabled && S >= 1) || S >= 3
         let mixerHit = MLXHardwareInfo.isCompiledDecodeSupported
-            && B == 1 && S >= 3 && S <= 9 && nKeep == 3
-            && numKHeads == 16 && numVHeads == 48
-            && headKDim == 128 && headVDim == 128
-            && qkv.dim(2) == 16 * 128 * 2 + 48 * 128
-            && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
-            && a.dtype == .bfloat16 && b.dtype == .bfloat16
+            && sLowerBound && S <= 9
+            && packedPreworkEnvelope(
+                B: B, nKeep: nKeep, qkv: qkv,
+                convState: convState, a: a, b: b)
         let qNormed: MLXArray
         let kNormed: MLXArray
         let v: MLXArray
@@ -1195,27 +1317,61 @@ final class Qwen35GatedDeltaNet: Module {
             // third output, so the rollback checkpoint is free.
             let convInput = concatenated([convState, qkv], axis: 1)
             let nKeep = convKernelSize - 1
-            let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
-            let convOut = silu(conv1d(convInput))
+            // Kept even on the packed arm: the per-boundary rollback
+            // checkpoints below slice their conv rows out of this tensor.
+            let qNormed: MLXArray
+            let kNormed: MLXArray
+            let v: MLXArray
+            let g: MLXArray
+            let beta: MLXArray
+            let newConvState: MLXArray
+            let dtype: DType
+            if qwen35PackedGDNPreworkS12Enabled,
+               MLXHardwareInfo.isCompiledDecodeSupported,
+               packedPreworkEnvelope(
+                    B: B, nKeep: nKeep, qkv: qkv,
+                    convState: convState, a: a, b: b)
+            {
+                // MLX_QWEN_MTP_PACKED_S12: the whole prework chain rides the
+                // single packed launch; its old-conv-state copy branch yields
+                // the same next-state rows as the eager slice, and the g/beta
+                // bits equal the compiled producer's below.
+                let pre = runPackedPrework(
+                    qkv: qkv, a: a, b: b, convState: convState,
+                    B: B, S: S, nKeep: nKeep)
+                qNormed = pre.qNormed
+                kNormed = pre.kNormed
+                v = pre.v
+                g = pre.g
+                beta = pre.beta
+                newConvState = pre.newConvState
+                dtype = .bfloat16
+            } else {
+                newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
+                let convOut = silu(conv1d(convInput))
 
-            let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-            let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-            let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-            let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+                let convSplit = MLX.split(
+                    convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+                let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+                let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+                v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-            let dtype = q.dtype
-            let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
-            let qNormed =
-                qScaleConst
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                kScaleConst
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+                dtype = q.dtype
+                let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
+                qNormed =
+                    qScaleConst
+                    * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+                kNormed =
+                    kScaleConst
+                    * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-            // Replicates gatedDeltaUpdate's fp32 prologue, fusing beta/g while
-            // serving the gate's input-independent factor from the layer memo.
-            let (g, beta) = qwen35CompiledGatedDeltaGBeta(
-                a, b, negExpALog, dtBias)
+                // Replicates gatedDeltaUpdate's fp32 prologue, fusing beta/g while
+                // serving the gate's input-independent factor from the layer memo.
+                let gBeta = qwen35CompiledGatedDeltaGBeta(
+                    a, b, negExpALog, dtBias)
+                g = gBeta.0
+                beta = gBeta.1
+            }
             var state = ssmState
                 ?? MLXArray.zeros(
                     [B, numVHeads, headVDim, headKDim], dtype: .float32)
