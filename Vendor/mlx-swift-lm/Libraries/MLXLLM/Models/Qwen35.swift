@@ -2869,12 +2869,12 @@ func qwen35DualRMSNormConcat(
 
 /// Which of the proposal head's BF16 precision-island corrections to install.
 ///
-/// RESEARCH-ONLY selector for E124, read once in `Qwen35TextModel.sanitize`.
-/// `all` is the default and reproduces the shipped behaviour exactly. The
-/// partial arms exist to separate the acceptance cost of the correction from
-/// the time cost of the traffic it adds: K and V together are 20.97 MB of
-/// dense BF16 per proposal step, while Q is 10.49 MB plus a `putAlong` scatter
-/// over only 1,024 of 12,288 output rows.
+/// Selector for E124, read once in `Qwen35TextModel.sanitize`.
+/// `all` reproduces the original Q/K/V correction. `q` is the default: it
+/// retains the Q correction's 10.49 MB BF16 matmul and exact-row scatter while
+/// K/V use their ordinary affine-4 projections instead of reading 20.97 MB of
+/// dense BF16 island rows per proposal step. The remaining arms isolate the
+/// acceptance and traffic cost of each correction family.
 enum Qwen35IslandArm: String {
     case all
     case none
@@ -2897,7 +2897,7 @@ enum Qwen35IslandArm: String {
     static func fromEnvironment(_ env: [String: String]) -> Qwen35IslandArm {
         if env["MLXFAST_QWEN_MTP_EXACT_QKV_ROWS"] == "0" { return .none }
         guard let raw = env["DARKBLOOM_QWEN_MTP_ISLAND_ARM"], !raw.isEmpty else {
-            return .all
+            return .q
         }
         guard let arm = Qwen35IslandArm(rawValue: raw.lowercased()) else {
             fatalError(
