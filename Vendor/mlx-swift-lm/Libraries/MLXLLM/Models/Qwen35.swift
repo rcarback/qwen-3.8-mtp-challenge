@@ -2238,6 +2238,7 @@ private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
                     float xi = float(x[offset + elem + i]);
                     float ri = float(r[offset + elem + i]);
                     bfloat hi = bfloat(xi + ri);
+                    h[offset + elem + i] = hi;
                     acc += float(hi) * float(hi);
                 }
             } else {
@@ -2246,6 +2247,7 @@ private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
                         float xi = float(x[offset + elem + i]);
                         float ri = float(r[offset + elem + i]);
                         bfloat hi = bfloat(xi + ri);
+                        h[offset + elem + i] = hi;
                         acc += float(hi) * float(hi);
                     }
                 }
@@ -2277,25 +2279,22 @@ private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
 
         float inv_mean = local_inv_mean[0];
 
-        // -- write both the residual h and the weight-scaled normed output --
+        // -- write the weight-scaled output from the residual produced above --
+        // Each thread re-reads only the BF16 values it wrote itself. This keeps
+        // the eager write/read rounding boundary while avoiding a second read
+        // of x and r and a second residual add.
         for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
             uint elem = r_start + thread_id * n_reads;
             if (elem + n_reads <= axis_size) {
                 for (uint i = 0; i < n_reads; ++i) {
-                    float xi = float(x[offset + elem + i]);
-                    float ri = float(r[offset + elem + i]);
-                    bfloat hi = bfloat(xi + ri);
-                    h[offset + elem + i] = hi;
+                    bfloat hi = h[offset + elem + i];
                     bfloat wi = weight[elem + i];
                     normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
                 }
             } else {
                 for (uint i = 0; i < n_reads; ++i) {
                     if (elem + i < axis_size) {
-                        float xi = float(x[offset + elem + i]);
-                        float ri = float(r[offset + elem + i]);
-                        bfloat hi = bfloat(xi + ri);
-                        h[offset + elem + i] = hi;
+                        bfloat hi = h[offset + elem + i];
                         bfloat wi = weight[elem + i];
                         normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
                     }
