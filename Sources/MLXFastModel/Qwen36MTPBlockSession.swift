@@ -975,6 +975,7 @@ public final class Qwen36MTPBlockSession {
         return out
     }
 
+    // redraw marker r1787651436 -- comment only, no semantic change
     internal enum DepthPriceArm: String {
         case ship, pb5, pb7, pbfit
     }
