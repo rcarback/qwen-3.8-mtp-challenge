@@ -10,12 +10,34 @@ PROMPT_FILE="${1:?usage: kvquant-fidelity.sh <prompt-file> [max-tokens]}"
 MAX_TOKENS="${2:-256}"
 PORT=8099
 BINARY=".build/release/mlxfast-swift"
+# serve runs the model inside the sandboxed worker: the trusted binary links
+# no model code, so this is the binary that carries every edit under test.
+WORKER=".build-worker/release/mlxfast-runtime-worker"
 HEAD="${MLXFAST_MTP_HEAD:-$HOME/.cache/mlxfast/declared-q2q4-rerank}"
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+WORK="${MLXFAST_KVQUANT_WORK:-.local/kvquant-work}"
+mkdir -p "$WORK"
 
 if [[ ! -x "$BINARY" ]]; then
   echo "build first: swift build -c release --force-resolved-versions" >&2
+  exit 1
+fi
+
+# A stale binary is the worst failure this script can have: every leg still
+# runs, still emits plausible numbers, and silently measures code that is not
+# in the working tree. Refuse rather than measure the wrong build.
+if [[ ! -x "$WORKER" ]]; then
+  echo "build the worker first:" >&2
+  echo "  swift build -c release --scratch-path .build-worker \\" >&2
+  echo "    --product mlxfast-runtime-worker --force-resolved-versions" >&2
+  exit 1
+fi
+STALE="$(find Sources Vendor/mlx-swift-lm/Libraries -name '*.swift' \
+  -newer "$WORKER" -print -quit 2>/dev/null)"
+if [[ -n "$STALE" ]]; then
+  echo "$WORKER is older than $STALE" >&2
+  echo "rebuild the worker:" >&2
+  echo "  swift build -c release --scratch-path .build-worker \\" >&2
+  echo "    --product mlxfast-runtime-worker --force-resolved-versions" >&2
   exit 1
 fi
 
@@ -64,23 +86,43 @@ run_config() {
     return 1
   fi
 
+  local status=0
   jq -n --rawfile p "$PROMPT_FILE" --argjson n "$MAX_TOKENS" \
     '{model:"qwen", temperature:0, max_tokens:$n,
-      messages:[{role:"user", content:$p}]}' |
-    curl -fsS -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
-      -H 'content-type: application/json' --data-binary @- |
-    jq -r '.choices[0].message.content' >"$out"
-
+      messages:[{role:"user", content:$p}]}' \
+    >"$WORK/$label.request.json"
+  # No -f: a 4xx/5xx body is the diagnosis, and -f discards it. Check the
+  # status code explicitly instead.
+  local code
+  code=$(curl -sS -o "$WORK/$label.response.json" -w '%{http_code}' \
+    -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
+    -H 'content-type: application/json' \
+    --data-binary "@$WORK/$label.request.json" 2>"$WORK/$label.curl.log") || status=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  # One model residency at a time: do not start the next leg until this
-  # process has actually released its 14 GiB.
   sleep 5
+  if [[ "$status" -ne 0 || "$code" != "200" ]]; then
+    echo "$label: request failed (curl=$status http=$code)" >&2
+    echo "  response: $WORK/$label.response.json" >&2
+    echo "  serve log: $WORK/$label.serve.log" >&2
+    return 1
+  fi
+  jq -r '.choices[0].message.content' <"$WORK/$label.response.json" >"$out"
+
 }
 
 for entry in "${CONFIGS[@]}"; do
   IFS=: read -r label bits rotate <<<"$entry"
-  run_config "$label" "$bits" "$rotate" "$WORK/$label.txt"
+  if ! run_config "$label" "$bits" "$rotate" "$WORK/$label.txt"; then
+    jq -nc --arg label "$label" --arg bits "${bits:-16}" \
+      --arg rotate "${rotate:-n/a}" \
+      '{label:$label, bits:$bits, rotate:$rotate, error:"leg failed"}'
+    if [[ "$label" == "bf16" ]]; then
+      echo "reference leg failed; the remaining legs have nothing to diff" >&2
+      exit 1
+    fi
+    continue
+  fi
 
   # Identical prefix in characters. Token-level would be better, but the
   # completions endpoint returns text and character prefix length is a
