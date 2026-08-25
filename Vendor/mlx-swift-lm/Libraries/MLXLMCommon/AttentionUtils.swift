@@ -56,13 +56,22 @@ import MLX
 /// Generic models must be v2-adapted — capture `positionOffsets` before
 /// dispatch and call `updateAndAttend` directly — before they can serve
 /// multi-row CBv2 batches. This fails loudly rather than mis-rotating.
+/// Whether the fused quantized decode kernel is enabled.
+///
+/// Reads `DARKBLOOM_KV_FUSED_SDPA` once. Set it to `0` to force the
+/// decomposed path. This only ever applies to a cache that is already
+/// quantized, which is itself opt-in, so a default run never reaches it.
+public let fusedQuantizedSDPADefault: Bool =
+    ProcessInfo.processInfo.environment["DARKBLOOM_KV_FUSED_SDPA"] != "0"
+
 public func attentionWithCacheUpdate(
     queries: MLXArray,
     keys: MLXArray,
     values: MLXArray,
     cache: KVCache?,
     scale: Float,
-    mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+    mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+    fusedQuantizedEnabled: Bool = fusedQuantizedSDPADefault
 ) -> MLXArray {
     // ContinuousBatchingV2 hook — see the LIMITATION notes above.
     if let v2 = cache as? CBv2AttendingLayerCache {
@@ -89,6 +98,34 @@ public func attentionWithCacheUpdate(
     if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)
+        // FUSED DECODE PATH. The decomposed call below materializes a
+        // [B, heads, L, N] score matrix, which is nine to twelve times slower
+        // than the fused bfloat16 kernel at decode shapes and gets worse as
+        // context grows. The fused kernel computes the same thing without
+        // writing scores to memory. Anything it does not support -- prefill
+        // widths, unsupported bit widths, sinks, a non-causal array mask --
+        // falls through unchanged.
+        var causal = false
+        if case .causal = mask { causal = true }
+        if fusedQuantizedEnabled, causal,
+            FusedQuantizedSDPA.isSupported(
+                headDim: queries.dim(3),
+                valueHeadDim: values.dim(3),
+                queryRows: queries.dim(2),
+                bits: quantizedKVCache.bits,
+                groupSize: quantizedKVCache.groupSize,
+                mode: quantizedKVCache.mode,
+                hasSinks: false,
+                hasBiases: quantizedKeys.2 != nil && quantizedValues.2 != nil)
+        {
+            return FusedQuantizedSDPA.attention(
+                queries: queries,
+                quantizedKeys: quantizedKeys,
+                quantizedValues: quantizedValues,
+                scale: scale, causal: true,
+                groupSize: quantizedKVCache.groupSize,
+                bits: quantizedKVCache.bits)
+        }
         return quantizedScaledDotProductAttention(
             queries: queries,
             quantizedKeys: quantizedKeys,

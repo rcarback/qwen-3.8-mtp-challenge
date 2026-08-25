@@ -247,4 +247,75 @@ struct FusedQuantizedSDPATests {
         #expect(fusedError < magnitude * 0.02,
             "fused=\(fusedError) magnitude=\(magnitude)")
     }
+
+    @Test("attentionWithCacheUpdate routes a quantized cache through the fused kernel")
+    func dispatchThroughAttentionUtils() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1"
+        else { return }
+        MLXRandom.seed(23)
+
+        let (b, qHeads, kvHeads, dim, group, bits) = (1, 24, 4, 256, 64, 4)
+        let scale = 1.0 / Float(dim).squareRoot()
+
+        func attend(useFused: Bool) -> MLXArray {
+            let cache = QuantizedKVCache(groupSize: group, bits: bits)
+            var last = MLXArray.zeros([1])
+            MLXRandom.seed(23)
+            for rows in [128, 3] {
+                let q = MLXRandom.normal([b, qHeads, rows, dim]).asType(.bfloat16)
+                let k = MLXRandom.normal([b, kvHeads, rows, dim]).asType(.bfloat16)
+                let v = MLXRandom.normal([b, kvHeads, rows, dim]).asType(.bfloat16)
+                last = attentionWithCacheUpdate(
+                    queries: q, keys: k, values: v, cache: cache,
+                    scale: scale, mask: .causal,
+                    fusedQuantizedEnabled: useFused)
+            }
+            return last
+        }
+
+        let fused = attend(useFused: true)
+        let decomposed = attend(useFused: false)
+        #expect(fused.shape == decomposed.shape)
+        let diff = Self.maxAbsDifference(fused, decomposed)
+        let magnitude = Self.meanMagnitude(decomposed)
+        #expect(diff < max(magnitude * 0.05, 1e-3),
+            "diff=\(diff) magnitude=\(magnitude)")
+    }
+
+    @Test("fused output matches float32 attention on non-contiguous slices")
+    func nonContiguousInputsFloat32() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1"
+        else { return }
+        MLXRandom.seed(11)
+
+        // The bfloat16 output dtype puts a floor under the previous test that
+        // is far above any plausible stride error. Driving the same cache in
+        // float32 removes that floor, so the strided indexing is held to the
+        // same 1e-5 bound the contiguous case is held to.
+        let (b, qHeads, kvHeads, dim, group, bits) = (1, 24, 4, 256, 64, 4)
+        let scale = 1.0 / Float(dim).squareRoot()
+        let cache = QuantizedKVCache(groupSize: group, bits: bits)
+
+        for rows in [300, 37] {
+            let k = MLXRandom.normal([b, kvHeads, rows, dim]).asType(.float32)
+            let v = MLXRandom.normal([b, kvHeads, rows, dim]).asType(.float32)
+            _ = cache.updateQuantized(keys: k, values: v)
+        }
+        let k = MLXRandom.normal([b, kvHeads, 1, dim]).asType(.float32)
+        let v = MLXRandom.normal([b, kvHeads, 1, dim]).asType(.float32)
+        let (qk, qv) = cache.updateQuantized(keys: k, values: v)
+
+        let q = MLXRandom.normal([b, qHeads, 1, dim]).asType(.float32)
+        let fused = FusedQuantizedSDPA.attention(
+            queries: q, quantizedKeys: qk, quantizedValues: qv,
+            scale: scale, causal: true, groupSize: group, bits: bits)
+        let golden = Self.float32Golden(
+            queries: q, keys: qk, values: qv,
+            scale: scale, groupSize: group, bits: bits)
+
+        let fusedError = Self.maxAbsDifference(fused, golden)
+        let magnitude = Self.maxMagnitude(golden)
+        #expect(fusedError < magnitude * 1e-5,
+            "fused=\(fusedError) magnitude=\(magnitude)")
+    }
 }
