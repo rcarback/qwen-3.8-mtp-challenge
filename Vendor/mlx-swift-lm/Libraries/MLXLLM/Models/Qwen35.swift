@@ -3658,11 +3658,16 @@ public class Qwen35TextModelInner: Module {
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept). The rung
         // set is overridable via MLX_QWEN_MTP_LADDER for schedule research.
-        // The seed-prefill stride is fixed at 3: E91 swept 9 schedules over 108
-        // blocks and the best arm was 0.94 sigma, because the host enqueues the
-        // whole graph in 118.7 ms of a 4043 ms GPU-bound block.
-        let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        //
+        // Seed prefill does NOT ride this ladder. E91 swept 9 seed schedules
+        // over 108 blocks and the best arm was 0.94 sigma: the host enqueues
+        // the whole 64-layer graph in 118.7 ms of a 4043 ms GPU-bound block,
+        // so the extra asyncEval submits cannot overlap useful host work.
+        // Extra asyncEval of a graph a later blocking eval already submits
+        // has already printed negative on this crown (0b5a592, −5.74%). The
+        // seed is charged inside the timed window, so those unpaid submits
+        // are deleted. Decode S<=9 is unchanged.
+        let ladderActive = inputs.dim(1) <= 9
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
             // Boundary-fused chain: the residual boundary flows as an
             // UNMERGED (base, delta) pair, so each interior layer pays one
@@ -3683,14 +3688,8 @@ public class Qwen35TextModelInner: Module {
                     cache: cacheArray?[i], nConfirmed: nConfirmed)
                 base = out.base
                 delta = out.delta
-                if ladderActive {
-                    if prefillLadder {
-                        if i == 0 || i % 3 == 2 {
-                            asyncEval(base, out.delta)
-                        }
-                    } else if qwen35DecodeLadderRungs.contains(i) {
-                        asyncEval(base, out.delta)
-                    }
+                if ladderActive, qwen35DecodeLadderRungs.contains(i) {
+                    asyncEval(base, out.delta)
                 }
             }
             hiddenStates = delta.map { base + $0 } ?? base
@@ -3703,14 +3702,8 @@ public class Qwen35TextModelInner: Module {
                 hiddenStates = layer(
                     hiddenStates, attentionMask: attnMask, ssmMask: mask,
                     cache: cacheArray?[i], nConfirmed: nConfirmed)
-                if ladderActive {
-                    if prefillLadder {
-                        if i == 0 || i % 3 == 2 {
-                            asyncEval(hiddenStates)
-                        }
-                    } else if qwen35DecodeLadderRungs.contains(i) {
-                        asyncEval(hiddenStates)
-                    }
+                if ladderActive, qwen35DecodeLadderRungs.contains(i) {
+                    asyncEval(hiddenStates)
                 }
             }
         }
