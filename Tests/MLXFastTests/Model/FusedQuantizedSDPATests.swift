@@ -4,18 +4,57 @@ import MLXLMCommon
 import MLXRandom
 import Testing
 
-/// The fused kernel must compute the same thing as the decomposed path it
-/// replaces. These compare against `quantizedScaledDotProductAttention`
-/// directly rather than against bfloat16 attention, because the quantization
-/// error is shared and only the reduction order differs.
+/// Neither the fused kernel nor the decomposed path it replaces is precise
+/// enough to serve as the other's oracle, so both are measured against
+/// attention computed in float32 over the same dequantized keys and values.
+/// `parity` runs in float32 to expose the kernel's own reduction error, which
+/// the bfloat16 output dtype would otherwise hide; `bfloat16Parity` then
+/// checks the production dtype against the path being replaced.
 @Suite(.serialized)
 struct FusedQuantizedSDPATests {
     private static func maxAbsDifference(_ a: MLXArray, _ b: MLXArray) -> Float {
         MLX.max(MLX.abs(a.asType(.float32) - b.asType(.float32))).item(Float.self)
     }
 
-    private static func meanMagnitude(_ a: MLXArray) -> Float {
-        MLX.mean(MLX.abs(a.asType(.float32))).item(Float.self)
+    /// Tolerances scale with the largest element, not the mean: the measured
+    /// quantity is a maximum, and a max compared against a fraction of a mean
+    /// is not a bound on anything.
+    private static func maxMagnitude(_ a: MLXArray) -> Float {
+        MLX.max(MLX.abs(a.asType(.float32))).item(Float.self)
+    }
+
+    /// Attention computed in float32 from the dequantized keys and values.
+    /// Neither path under test is precise enough to be the other's oracle:
+    /// the decomposed reference rounds its scores, its softmax and its output
+    /// to bfloat16, while the fused kernel accumulates in float32. This is
+    /// what both of them are approximating.
+    private static func float32Golden(
+        queries: MLXArray,
+        keys: (MLXArray, MLXArray, MLXArray?),
+        values: (MLXArray, MLXArray, MLXArray?),
+        scale: Float, groupSize: Int, bits: Int
+    ) -> MLXArray {
+        let q = queries.asType(.float32)
+        let kvHeads = keys.0.dim(1)
+        let repeats = q.dim(1) / kvHeads
+        func expand(_ t: (MLXArray, MLXArray, MLXArray?)) -> MLXArray {
+            let d = MLX.dequantized(
+                t.0, scales: t.1, biases: t.2,
+                groupSize: groupSize, bits: bits, mode: .affine
+            ).asType(.float32)
+            return MLX.repeated(d, count: repeats, axis: 1)
+        }
+        let k = expand(keys)
+        let v = expand(values)
+
+        var scores = MLX.matmul(q, k.transposed(0, 1, 3, 2)) * scale
+        // `.causal` aligns the final query row with the final key, so query
+        // row i may attend keys 0 through (N - L + i).
+        let (rows, count) = (q.dim(2), k.dim(2))
+        let qPos = MLXArray(0 ..< rows).reshaped([rows, 1]) + (count - rows)
+        let kPos = MLXArray(0 ..< count).reshaped([1, count])
+        scores = MLX.where(kPos .<= qPos, scores, MLXArray(-Float.infinity))
+        return MLX.matmul(MLX.softmax(scores, axis: -1), v)
     }
 
     @Test("the support predicate accepts 4 and 8 bits and refuses the rest")
@@ -57,8 +96,57 @@ struct FusedQuantizedSDPATests {
                 groupSize: 64, mode: .affine, hasSinks: false, hasBiases: false))
     }
 
-    @Test("fused output matches the decomposed path at 4 and 8 bits")
+    @Test("fused output matches float32 attention at 4 and 8 bits")
     func parity() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1"
+        else { return }
+        MLXRandom.seed(0x5157_454E)
+
+        let (b, qHeads, kvHeads, dim, group) = (1, 24, 4, 256, 64)
+        let scale = 1.0 / Float(dim).squareRoot()
+
+        for bits in [4, 8] {
+            for queryRows in [1, 2, 3] {
+                for keyCount in [37, 512, 4096] {
+                    let q = MLXRandom.normal([b, qHeads, queryRows, dim]).asType(.float32)
+                    let k = MLXRandom.normal([b, kvHeads, keyCount, dim]).asType(.float32)
+                    let v = MLXRandom.normal([b, kvHeads, keyCount, dim]).asType(.float32)
+                    let qk = MLX.quantized(k, groupSize: group, bits: bits)
+                    let qv = MLX.quantized(v, groupSize: group, bits: bits)
+
+                    let reference = quantizedScaledDotProductAttention(
+                        queries: q,
+                        quantizedKeys: (qk.wq, qk.scales, qk.biases),
+                        quantizedValues: (qv.wq, qv.scales, qv.biases),
+                        scale: scale, mask: .causal,
+                        groupSize: group, bits: bits, mode: .affine)
+
+                    let fused = FusedQuantizedSDPA.attention(
+                        queries: q,
+                        quantizedKeys: (qk.wq, qk.scales, qk.biases),
+                        quantizedValues: (qv.wq, qv.scales, qv.biases),
+                        scale: scale, causal: true, groupSize: group, bits: bits)
+
+                    let golden = Self.float32Golden(
+                        queries: q,
+                        keys: (qk.wq, qk.scales, qk.biases),
+                        values: (qv.wq, qv.scales, qv.biases),
+                        scale: scale, groupSize: group, bits: bits)
+
+                    #expect(fused.shape == reference.shape)
+                    let fusedError = Self.maxAbsDifference(fused, golden)
+                    let magnitude = Self.maxMagnitude(golden)
+                    // Float32 in, float32 out: nothing but the kernel's own
+                    // accumulation order separates it from the golden.
+                    #expect(fusedError < magnitude * 1e-5,
+                        "bits=\(bits) rows=\(queryRows) keys=\(keyCount) fused=\(fusedError) magnitude=\(magnitude)")
+                }
+            }
+        }
+    }
+
+    @Test("fused output is no worse than the decomposed path in bfloat16")
+    func bfloat16Parity() throws {
         guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1"
         else { return }
         MLXRandom.seed(0x5157_454E)
@@ -81,21 +169,28 @@ struct FusedQuantizedSDPATests {
                         quantizedValues: (qv.wq, qv.scales, qv.biases),
                         scale: scale, mask: .causal,
                         groupSize: group, bits: bits, mode: .affine)
-
                     let fused = FusedQuantizedSDPA.attention(
                         queries: q,
                         quantizedKeys: (qk.wq, qk.scales, qk.biases),
                         quantizedValues: (qv.wq, qv.scales, qv.biases),
                         scale: scale, causal: true, groupSize: group, bits: bits)
+                    let golden = Self.float32Golden(
+                        queries: q,
+                        keys: (qk.wq, qk.scales, qk.biases),
+                        values: (qv.wq, qv.scales, qv.biases),
+                        scale: scale, groupSize: group, bits: bits)
 
                     #expect(fused.shape == reference.shape)
-                    let diff = Self.maxAbsDifference(fused, reference)
-                    let magnitude = Self.meanMagnitude(reference)
-                    // Both paths carry identical quantization error, so only the
-                    // reduction order differs. bfloat16 inputs with float32
-                    // accumulation put this well below one percent of magnitude.
-                    #expect(diff < max(magnitude * 0.05, 1e-3),
-                        "bits=\(bits) rows=\(queryRows) keys=\(keyCount) diff=\(diff) magnitude=\(magnitude)")
+                    let fusedError = Self.maxAbsDifference(fused, golden)
+                    let referenceError = Self.maxAbsDifference(reference, golden)
+                    let magnitude = Self.maxMagnitude(golden)
+                    // Both paths round their output to bfloat16, and that
+                    // shared floor dominates: the bar is that the fused kernel
+                    // does not lose ground, not that it wins.
+                    #expect(fusedError <= referenceError * 1.25,
+                        "bits=\(bits) rows=\(queryRows) keys=\(keyCount) fused=\(fusedError) reference=\(referenceError)")
+                    #expect(fusedError < magnitude * 0.02,
+                        "bits=\(bits) rows=\(queryRows) keys=\(keyCount) fused=\(fusedError) magnitude=\(magnitude)")
                 }
             }
         }
@@ -133,9 +228,15 @@ struct FusedQuantizedSDPATests {
             queries: q, quantizedKeys: qk, quantizedValues: qv,
             scale: scale, causal: true, groupSize: group, bits: bits)
 
-        let diff = Self.maxAbsDifference(fused, reference)
-        let magnitude = Self.meanMagnitude(reference)
-        #expect(diff < max(magnitude * 0.05, 1e-3),
-            "diff=\(diff) magnitude=\(magnitude)")
+        let golden = Self.float32Golden(
+            queries: q, keys: qk, values: qv,
+            scale: scale, groupSize: group, bits: bits)
+        let fusedError = Self.maxAbsDifference(fused, golden)
+        let referenceError = Self.maxAbsDifference(reference, golden)
+        let magnitude = Self.maxMagnitude(golden)
+        #expect(fusedError <= referenceError * 1.25,
+            "fused=\(fusedError) reference=\(referenceError)")
+        #expect(fusedError < magnitude * 0.02,
+            "fused=\(fusedError) magnitude=\(magnitude)")
     }
 }
