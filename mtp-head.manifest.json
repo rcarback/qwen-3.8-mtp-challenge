@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:Lie24/qwen38-mtp-head-q2q4-cons@20d1733226edc4657b8ec7433a4273b14986f1b7",
+  "sha256": "cce73a84246732321c8c5be7e567f4887a6cb2666a1c2742063fd16a1b7b4b43",
+  "bytes": 427742168,
   "max_bytes": 2147483648,
-  "note": "xsums fill fusion on eb5eadc: the fused residual+RMSNorm kernel gains an emitSums variant whose epilogue is the BODY of qwen35_custom_affine4_g64_xsums_v1 verbatim, run over the normed bytes it has just stored (device barrier, same vec<bfloat16_t,4> loads, same three BF16 adds per group of four, same ascending float accumulation onto 0.0f, same (k_block*32+lane)*stride+row address), so the table is the standalone fill's bit pattern by construction. A weak-identity sidecar hands that table to Qwen35CustomQMV.matmul, deleting 127 of the 257 standalone xsums fill dispatches per verify round (mlp.gate_up 64, gdn.in_proj 47, fa.qkv 16); the other 130 keep xsumsTable unchanged. Only the sumtable arm at M=4...9 publishes, so M=1 (the serial leg) and prefill run the shipped kernel byte for byte. Widths 2...9, IPG table, tablePays>=4, 0.15, skip-probesort kept. Head tensors remain pinned. No remote code. resample-2 (54d42a3 diagnose: 6/7 active prompts faster, schedule identical, reprice 3.72612 > frontier 3.71960)"
+  "note": "Head swap to Lie24/qwen38-mtp-head-q2q4-cons, declared against the organizer-pinned target and the frontier tree otherwise untouched. Chosen on a structural check rather than a claim: reading the safetensors headers of the published heads with range requests, this one carries the same 40 tensors as the shipped q2-q4-rerank head with EVERY tensor identical in both shape and dtype, so the fused QKV pack and the island-completeness K/V fast path the tree depends on are preserved by construction. Candidates that matched on tensor names but halved mlp.gate_proj / mlp.up_proj from 640 to 320 columns were rejected for that reason. The declared digest is the tree digest the trusted harness specifies -- SHA-256 over \"<file sha256>  <relative path>\\n\" in sorted order, excluding a top-level README.md -- and the implementation was validated by reproducing two independently published manifests before being used here. No source file changes; the head only proposes and the trusted parent re-checks every emitted token against the hidden serial trajectory."
 }
