@@ -7,6 +7,7 @@
 //  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3_5.py
 //
 
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -1422,7 +1423,7 @@ private let qwen35CompiledFusedSwiGLU:
 /// `qwen35CustomAffine4XSumsKernel`. The table entry is the same float
 /// accumulation of the same BF16 expression tree, in the same `i` order, so the
 /// two paths agree bit for bit.
-private let qwen35E120QMVHeader = """
+let qwen35E120QMVHeader = """
     template <int NA, bool USE_TABLE>
     inline void qwen_e120_qmv_wide(
         const device uint32_t* w,
@@ -1557,14 +1558,117 @@ private let qwen35E120QMVHeader = """
     }
     """
 
+/// How a compiled QMV kernel partitions its input rows across threadgroups.
+///
+/// One threadgroup streams the whole weight matrix, so a cell pays
+/// `G(m) = ceil(m / IPG)` weight passes. `staged` is the plan E120 shipped: it
+/// keeps `IPG <= 5`, so m = 6, 7 and 8 pay two passes. `singlePass` sets
+/// `IPG = m` at those widths, so the weights stream once and the kernel holds
+/// `rows_per_simd * m` live accumulators instead.
+///
+/// The two forms compile different sources, so each needs its own JIT kernel
+/// name. Both are built lazily, so a process that never selects `singlePass`
+/// never compiles it.
+///
+/// The staged m = 9 entry is `IPG = 5`, not the `IPG = 3` E120 shipped, so a
+/// width-9 round pays `G(9) = 2` weight passes instead of 3. It stays inside
+/// the `IPG <= 5` regime the staged plan already wins in at m = 5, and it is
+/// not the m = 7/8 single-pass mechanism that lost. Group 1 serves the
+/// four-row tail through the template's existing `TAIL` branch. The per-row
+/// arithmetic of `qwen_e120_qmv_wide` is lane-independent, so regrouping rows
+/// cannot reorder any row's own reduction and the two partitions are
+/// bit-exact against each other.
+enum Qwen35QMVKernelVariant: String, Sendable, CaseIterable {
+    case staged
+    case singlePass = "singlepass"
+
+    /// `(width, inputs per group)`. The Metal body maps group `g` to
+    /// `first_m = g * IPG`, so the pair fixes both the template instantiation
+    /// and the launched x-extent.
+    var pairs: [(m: Int, ipg: Int)] {
+        switch self {
+        case .staged:
+            return [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 5)]
+        case .singlePass:
+            return [(2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 3)]
+        }
+    }
+
+    var kernelNameSuffix: String { self == .staged ? "" : "_sp" }
+}
+
+/// The distinct wide affine-4/group-64 shapes a decode round routes here.
+/// Identity is `(k, n)` only: the model geometry is fixed, so the map is a
+/// compile-time property of the checkpoint and never depends on the request,
+/// the prompt or the benchmark phase. `gdn.out_proj` and `fa.o_proj` share
+/// `(6144, 5120)` and are therefore one entry.
+enum Qwen35QMVCell: String, Sendable {
+    case mlpGateUp = "mlp.gate_up"
+    case mlpDown = "mlp.down"
+    case gdnInProj = "gdn.in_proj"
+    /// `gdn.out_proj` and `fa.o_proj`.
+    case outProj = "out_proj"
+    case faQKV = "fa.qkv"
+    case lmHead = "lm_head"
+    /// Any routable shape outside the decode round's seven fused cells.
+    case unlisted
+
+    static func identify(k: Int, n: Int) -> Qwen35QMVCell {
+        switch (k, n) {
+        case (5120, 34816): return .mlpGateUp
+        case (17408, 5120): return .mlpDown
+        case (5120, 16480): return .gdnInProj
+        case (6144, 5120): return .outProj
+        case (5120, 14336): return .faQKV
+        case (5120, 248_320): return .lmHead
+        default: return .unlisted
+        }
+    }
+}
+
+/// The shipped QMV width plan: which kernel variant each `(cell, width)` uses.
+///
+/// The `singlePass` kernels are bit-exact against `staged` (E195 gate: 42 cell
+/// configurations, 13,831,104 elements, zero differing, zero ULP), so the plan
+/// changes only how the work is dispatched, never what the model decides.
+///
+/// The plan is per `(cell, width)` because neither dimension alone predicts the
+/// winner. At m = 6 single-pass wins on six of the seven decode cells but loses
+/// on `mlp.down`, and holding that one cell staged nearly doubles the end-to-end
+/// gain (7.31 ms/round against 3.81 ms/round for an all-cells switch). At m = 7
+/// and m = 8 the kernel leaves the weight-streaming regime and becomes
+/// register/occupancy bound, so an all-cells switch costs 23.62 ms/round at
+/// m = 7. An `lm_head`-only switch at m = 7 also failed end to end (+0.60
+/// ms/round) despite winning by 18 % as an isolated cell, so m = 7 stays staged.
+///
+/// `m` is the verified width of the round, not the configured draft depth: tail
+/// rounds propose fewer drafts and land at lower widths, so every row here is
+/// live. The plan is a function of checkpoint geometry and width only. It cannot
+/// depend on the request, the prompt or the benchmark phase.
+@inline(__always)
+func qwen35QMVVariant(m: Int, cell: Qwen35QMVCell) -> Qwen35QMVKernelVariant {
+    guard m == 6, cell != .mlpDown, cell != .unlisted else { return .staged }
+    return .singlePass
+}
+
+/// Witness that a build carries the plan above, including the staged m = 9
+/// group partition. The IPG figure is read from the table itself, so the
+/// witness cannot desynchronise from the kernel the round actually launched.
+/// No runtime state: the trace can prove which dispatch plan shipped.
+public let qwen35QMVWidthPlanWitness =
+    "selective-m6+ipg9-"
+    + String(Qwen35CustomQMV.inputsPerGroup(9, variant: .staged))
+
 /// Geometry and width switch shared by both QMV pipelines. `table` decides
 /// whether the chunk-sum table is a bound buffer at all: the four-input
 /// pipeline has no such buffer and passes a null pointer that `USE_TABLE =
 /// false` never reads.
-private func qwen35E120QMVSource(table: Bool) -> String {
+func qwen35E120QMVSource(
+    table: Bool, variant: Qwen35QMVKernelVariant = .staged
+) -> String {
     let sums = table ? "xsums" : "qmv_null_sums"
     let flag = table ? "USE_TABLE" : "false"
-    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3)]
+    let cases = variant.pairs
         .map { m, ipg in
             """
                     case \(m):
@@ -1595,6 +1699,198 @@ private func qwen35E120QMVSource(table: Bool) -> String {
         """
 }
 
+/// The launch geometry of one custom-kernel call: exactly the fields that
+/// `MLXFast.MLXFastKernel.callAsFunction` writes into an
+/// `mlx_fast_metal_kernel_config`, and nothing else. Two calls that agree here
+/// build byte-identical configs, so serving the second from a cache hands
+/// `mlx_fast_metal_kernel_apply` the arguments it would have built anyway.
+struct Qwen35KernelLaunch: Hashable {
+    let gridX: Int32
+    let gridY: Int32
+    let gridZ: Int32
+    let threadGroupX: Int32
+    let threadGroupY: Int32
+    let threadGroupZ: Int32
+    let outputShape: [Int32]
+    let outputDType: DType
+    /// `USE_TABLE`, the only template argument this path uses. `nil` means the
+    /// kernel takes no template arguments.
+    let useTable: Bool?
+
+    init(
+        grid: (Int, Int, Int), threadGroup: (Int, Int, Int),
+        outputShape: [Int32], outputDType: DType, useTable: Bool? = nil
+    ) {
+        self.gridX = Int32(grid.0)
+        self.gridY = Int32(grid.1)
+        self.gridZ = Int32(grid.2)
+        self.threadGroupX = Int32(threadGroup.0)
+        self.threadGroupY = Int32(threadGroup.1)
+        self.threadGroupZ = Int32(threadGroup.2)
+        self.outputShape = outputShape
+        self.outputDType = outputDType
+        self.useTable = useTable
+    }
+}
+
+/// A custom Metal kernel that keeps one launch config per geometry.
+///
+/// `MLXFastKernel.callAsFunction` builds a fresh `mlx_fast_metal_kernel_config`
+/// on every call: a C++ config object, the template argument, the grid, the
+/// thread group and the output argument, then frees it, and it boxes the
+/// template arguments and the inputs into Swift existential arrays on the way.
+/// Every one of those fields is a function of the launch geometry alone. One
+/// decode round launches about 387 records over about fifteen distinct
+/// geometries, so all but the first call at each geometry rebuilds a config it
+/// has already built.
+///
+/// `mlx_fast_metal_kernel_apply` copies the config and never writes to it, so a
+/// reused config is bit-exact by construction: it changes no input, no output
+/// shape, no dtype and no dispatch dimension. The per-call graph work inside
+/// `apply` -- source regeneration, kernel naming and primitive construction --
+/// is untouched.
+///
+/// The decode path builds its graph on one thread, like the counters in this
+/// file, so the cache takes no lock.
+final class Qwen35CachedKernel: @unchecked Sendable {
+    private let kernel: mlx_fast_metal_kernel
+    private var configs: [Qwen35KernelLaunch: mlx_fast_metal_kernel_config] = [:]
+
+    init(
+        name: String, inputNames: [String], outputNames: [String],
+        source: String, header: String = "", ensureRowContiguous: Bool = true
+    ) {
+        let inputNameVector = mlx_vector_string_new()
+        defer { mlx_vector_string_free(inputNameVector) }
+        for name in inputNames {
+            mlx_vector_string_append_value(inputNameVector, name)
+        }
+
+        let outputNameVector = mlx_vector_string_new()
+        defer { mlx_vector_string_free(outputNameVector) }
+        for name in outputNames {
+            mlx_vector_string_append_value(outputNameVector, name)
+        }
+
+        self.kernel = mlx_fast_metal_kernel_new(
+            name, inputNameVector, outputNameVector, source, header,
+            ensureRowContiguous, false)
+    }
+
+    deinit {
+        for (_, config) in configs {
+            mlx_fast_metal_kernel_config_free(config)
+        }
+        mlx_fast_metal_kernel_free(kernel)
+    }
+
+    private static func makeConfig(
+        _ launch: Qwen35KernelLaunch
+    ) -> mlx_fast_metal_kernel_config {
+        let config = mlx_fast_metal_kernel_config_new()
+        if let useTable = launch.useTable {
+            mlx_fast_metal_kernel_config_add_template_arg_bool(
+                config, "USE_TABLE", useTable)
+        }
+        mlx_fast_metal_kernel_config_set_grid(
+            config, launch.gridX, launch.gridY, launch.gridZ)
+        mlx_fast_metal_kernel_config_set_thread_group(
+            config, launch.threadGroupX, launch.threadGroupY, launch.threadGroupZ)
+        _ = launch.outputShape.withUnsafeBufferPointer { shape in
+            mlx_fast_metal_kernel_config_add_output_arg(
+                config, shape.baseAddress, shape.count,
+                launch.outputDType.cmlxDtype)
+        }
+        mlx_fast_metal_kernel_config_set_verbose(config, false)
+        return config
+    }
+
+    func callAsFunction(
+        _ inputs: [MLXArray], _ launch: Qwen35KernelLaunch,
+        stream: StreamOrDevice = .default
+    ) -> MLXArray {
+        let config: mlx_fast_metal_kernel_config
+        if let cached = configs[launch] {
+            qwen35KernelConfigCacheHits &+= 1
+            config = cached
+        } else {
+            config = Self.makeConfig(launch)
+            configs[launch] = config
+            qwen35KernelConfigCacheMisses &+= 1
+        }
+
+        let inputVector = withExtendedLifetime(inputs) {
+            mlx_vector_array_new_data(inputs.map { $0.ctx }, inputs.count)
+        }
+        defer { mlx_vector_array_free(inputVector) }
+
+        var result = mlx_vector_array_new()
+        defer { mlx_vector_array_free(result) }
+        let rc = mlx_fast_metal_kernel_apply(
+            &result, kernel, inputVector, config, stream.ctx)
+        precondition(rc == 0, "[Qwen35CachedKernel] apply failed with rc=\(rc)")
+
+        // ctx is a +1 object, the array takes ownership.
+        var output = mlx_array_new()
+        mlx_vector_array_get(&output, result, 0)
+        return MLXArray(output)
+    }
+}
+
+/// The launch-config cache arm.
+public enum Qwen35KernelConfigCache {
+    /// Read once at process start; it never varies with the request, the prompt
+    /// or the benchmark phase. `sanitizedRuntimeWorkerEnvironment` drops every
+    /// `MLXFAST_*` name, so the switch carries the `MLX_` prefix, and the name
+    /// is long enough for `strings` to witness it in the built worker.
+    public static let enabled: Bool = {
+        ProcessInfo.processInfo.environment["MLX_E179_CFG_CACHE_ARM"] != "off"
+    }()
+}
+
+private let qwen35CachedAffine4QMVKernel = Qwen35CachedKernel(
+    name: "qwen35_custom_affine4_g64_qmv_wide_v1",
+    inputNames: ["w", "scales", "biases", "x"],
+    outputNames: ["y"],
+    source: qwen35E120QMVSource(table: false),
+    header: qwen35E120QMVHeader
+)
+
+private let qwen35CachedAffine4QMVTableKernel = Qwen35CachedKernel(
+    name: "qwen35_custom_affine4_g64_qmv_wide_sums_v1",
+    inputNames: ["w", "scales", "biases", "x", "xsums"],
+    outputNames: ["y"],
+    source: qwen35E120QMVSource(table: true),
+    header: qwen35E120QMVHeader
+)
+
+private let qwen35CachedAffine4QMVKernelSinglePass = Qwen35CachedKernel(
+    name: "qwen35_custom_affine4_g64_qmv_wide_v1_sp",
+    inputNames: ["w", "scales", "biases", "x"],
+    outputNames: ["y"],
+    source: qwen35E120QMVSource(table: false, variant: .singlePass),
+    header: qwen35E120QMVHeader
+)
+
+private let qwen35CachedAffine4QMVTableKernelSinglePass = Qwen35CachedKernel(
+    name: "qwen35_custom_affine4_g64_qmv_wide_sums_v1_sp",
+    inputNames: ["w", "scales", "biases", "x", "xsums"],
+    outputNames: ["y"],
+    source: qwen35E120QMVSource(table: true, variant: .singlePass),
+    header: qwen35E120QMVHeader
+)
+
+private func qwen35CachedQMVKernel(
+    table: Bool, variant: Qwen35QMVKernelVariant
+) -> Qwen35CachedKernel {
+    switch (table, variant) {
+    case (false, .staged): return qwen35CachedAffine4QMVKernel
+    case (true, .staged): return qwen35CachedAffine4QMVTableKernel
+    case (false, .singlePass): return qwen35CachedAffine4QMVKernelSinglePass
+    case (true, .singlePass): return qwen35CachedAffine4QMVTableKernelSinglePass
+    }
+}
+
 private let qwen35CustomAffine4QMVKernel = MLXFast.metalKernel(
     name: "qwen35_custom_affine4_g64_qmv_wide_v1",
     inputNames: ["w", "scales", "biases", "x"],
@@ -1613,6 +1909,35 @@ private let qwen35CustomAffine4QMVTableKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+private let qwen35CustomAffine4QMVKernelSinglePass = MLXFast.metalKernel(
+    name: "qwen35_custom_affine4_g64_qmv_wide_v1_sp",
+    inputNames: ["w", "scales", "biases", "x"],
+    outputNames: ["y"],
+    source: qwen35E120QMVSource(table: false, variant: .singlePass),
+    header: qwen35E120QMVHeader,
+    ensureRowContiguous: true
+)
+
+private let qwen35CustomAffine4QMVTableKernelSinglePass = MLXFast.metalKernel(
+    name: "qwen35_custom_affine4_g64_qmv_wide_sums_v1_sp",
+    inputNames: ["w", "scales", "biases", "x", "xsums"],
+    outputNames: ["y"],
+    source: qwen35E120QMVSource(table: true, variant: .singlePass),
+    header: qwen35E120QMVHeader,
+    ensureRowContiguous: true
+)
+
+private func qwen35UncachedQMVKernel(
+    table: Bool, variant: Qwen35QMVKernelVariant
+) -> MLXFast.MLXFastKernel {
+    switch (table, variant) {
+    case (false, .staged): return qwen35CustomAffine4QMVKernel
+    case (true, .staged): return qwen35CustomAffine4QMVTableKernel
+    case (false, .singlePass): return qwen35CustomAffine4QMVKernelSinglePass
+    case (true, .singlePass): return qwen35CustomAffine4QMVTableKernelSinglePass
+    }
+}
+
 /// Produces the activation chunk-sum table consumed by
 /// `qwen35CustomAffine4QMVTableKernel`.
 ///
@@ -1626,29 +1951,38 @@ private let qwen35CustomAffine4QMVTableKernel = MLXFast.metalKernel(
 /// else: three BF16 adds per group of four activations, accumulated into a
 /// float across the four groups a lane owns, in ascending `i`. Filling this
 /// table from host float32 would change the arithmetic and break exactness.
+private let qwen35CustomAffine4XSumsSource = """
+    const int xs_m = x_shape[x_ndim - 2];
+    const int xs_k = x_shape[x_ndim - 1];
+    const int xs_stride = xs_m <= 8 ? 8 : 16;
+    const uint3 xs_gid = thread_position_in_grid;
+    const int xs_lane = int(xs_gid.x);
+    const int xs_kb = int(xs_gid.y);
+    const int xs_row = int(xs_gid.z);
+    const device bfloat16_t* xm =
+        x + xs_row * xs_k + xs_kb * 512 + xs_lane * 16;
+    float s = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        const vec<bfloat16_t, 4> xv =
+            *reinterpret_cast<const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+        s += xv[0] + xv[1] + xv[2] + xv[3];
+    }
+    xsums[(xs_kb * 32 + xs_lane) * xs_stride + xs_row] = s;
+    """
+
 private let qwen35CustomAffine4XSumsKernel = MLXFast.metalKernel(
     name: "qwen35_custom_affine4_g64_xsums_v1",
     inputNames: ["x"],
     outputNames: ["xsums"],
-    source: """
-        const int xs_m = x_shape[x_ndim - 2];
-        const int xs_k = x_shape[x_ndim - 1];
-        const int xs_stride = xs_m <= 8 ? 8 : 16;
-        const uint3 xs_gid = thread_position_in_grid;
-        const int xs_lane = int(xs_gid.x);
-        const int xs_kb = int(xs_gid.y);
-        const int xs_row = int(xs_gid.z);
-        const device bfloat16_t* xm =
-            x + xs_row * xs_k + xs_kb * 512 + xs_lane * 16;
-        float s = 0.0f;
-        for (int i = 0; i < 4; i++) {
-            const vec<bfloat16_t, 4> xv =
-                *reinterpret_cast<const device vec<bfloat16_t, 4>*>(xm + 4 * i);
-            s += xv[0] + xv[1] + xv[2] + xv[3];
-        }
-        xsums[(xs_kb * 32 + xs_lane) * xs_stride + xs_row] = s;
-        """,
+    source: qwen35CustomAffine4XSumsSource,
     ensureRowContiguous: true
+)
+
+private let qwen35CachedAffine4XSumsKernel = Qwen35CachedKernel(
+    name: "qwen35_custom_affine4_g64_xsums_v1",
+    inputNames: ["x"],
+    outputNames: ["xsums"],
+    source: qwen35CustomAffine4XSumsSource
 )
 
 /// Candidate-owned entry point for the wide affine-4/group-64 QMV.
@@ -1706,26 +2040,32 @@ public enum Qwen35CustomQMV {
     /// Lane stride of the chunk-sum table, in floats.
     public static func sumsStride(_ m: Int) -> Int { m <= 8 ? 8 : 16 }
 
-    /// Number of input-row threadgroups that can execute real work for the
-    /// current shared QMV width table. The Metal body maps group `g` to
-    /// `first_m = g * IPG` and returns before any read or write when
-    /// `first_m >= M`; launching `M` groups therefore submitted 67--80 %
-    /// no-op groups at every routed width. Keep the table explicit so a future
-    /// width-plan edit must update this launch witness deliberately.
-    static func activeInputGroups(_ m: Int) -> Int {
-        let inputsPerGroup: Int
-        switch m {
-        case 2: inputsPerGroup = 2
-        case 3: inputsPerGroup = 3
-        case 4: inputsPerGroup = 4
-        case 5: inputsPerGroup = 5
-        case 6: inputsPerGroup = 3
-        case 7: inputsPerGroup = 4
-        case 8: inputsPerGroup = 4
-        case 9: inputsPerGroup = 3
-        default: preconditionFailure("Qwen wide QMV has no width plan for \(m)")
+    /// Input rows one threadgroup serves at this width, read from the same
+    /// table the kernel source compiles. The launch witness and the kernel's own
+    /// switch therefore cannot desynchronise.
+    static func inputsPerGroup(_ m: Int, variant: Qwen35QMVKernelVariant) -> Int {
+        guard let entry = variant.pairs.first(where: { $0.m == m }) else {
+            preconditionFailure("Qwen wide QMV has no width plan for \(m)")
         }
-        return (m + inputsPerGroup - 1) / inputsPerGroup
+        return entry.ipg
+    }
+
+    /// Number of input-row threadgroups that can execute real work. The Metal
+    /// body maps group `g` to `first_m = g * IPG` and returns before any read or
+    /// write when `first_m >= M`; launching `M` groups therefore submitted
+    /// 67--80 % no-op groups at every routed width.
+    static func activeInputGroups(_ m: Int, variant: Qwen35QMVKernelVariant) -> Int {
+        let ipg = inputsPerGroup(m, variant: variant)
+        return (m + ipg - 1) / ipg
+    }
+
+    /// The compiled kernel form this `(cell, width)` uses under the shipped
+    /// width plan.
+    static func kernelVariant(_ cell: (m: Int, k: Int, n: Int))
+        -> Qwen35QMVKernelVariant
+    {
+        qwen35QMVVariant(
+            m: cell.m, cell: Qwen35QMVCell.identify(k: cell.k, n: cell.n))
     }
 
     /// The chunk-sum table costs one fill dispatch, measured at 4 to 6 us and
@@ -1798,6 +2138,15 @@ public enum Qwen35CustomQMV {
         let k = x.dim(-1)
         let m = x.size / k
         let kBlocks = k / 512
+        if Qwen35KernelConfigCache.enabled {
+            return qwen35CachedAffine4XSumsKernel(
+                [x],
+                Qwen35KernelLaunch(
+                    grid: (32, kBlocks, m),
+                    threadGroup: (32, 1, 1),
+                    outputShape: [Int32(kBlocks * 32 * sumsStride(m))],
+                    outputDType: .float32))
+        }
         return qwen35CustomAffine4XSumsKernel(
             [x],
             grid: (32, kBlocks, m),
@@ -1828,10 +2177,22 @@ public enum Qwen35CustomQMV {
         else { return nil }
         var outShape = x.shape
         outShape[outShape.count - 1] = cell.n
-        return qwen35CustomAffine4QMVTableKernel(
+        let variant = Self.kernelVariant(cell)
+        let groups = Self.activeInputGroups(cell.m, variant: variant)
+        if Qwen35KernelConfigCache.enabled {
+            return qwen35CachedQMVKernel(table: true, variant: variant)(
+                [w, scales, biases, x, xsums],
+                Qwen35KernelLaunch(
+                    grid: (groups * 32, (cell.n / 8) * 2, 1),
+                    threadGroup: (32, 2, 1),
+                    outputShape: outShape.map(Int32.init),
+                    outputDType: .bfloat16,
+                    useTable: consume))
+        }
+        return qwen35UncachedQMVKernel(table: true, variant: variant)(
             [w, scales, biases, x, xsums],
             template: [("USE_TABLE", consume)],
-            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / 8) * 2, 1),
+            grid: (groups * 32, (cell.n / 8) * 2, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [outShape],
             outputDTypes: [.bfloat16]
@@ -1864,6 +2225,14 @@ public enum Qwen35CustomQMV {
             let fused =
                 arm == .sumTable
                 ? Qwen35XSumsSidecar.take(x, k: cell.k, m: cell.m) : nil
+            if fused == nil {
+                qwen35XSumsStandaloneFills &+= 1
+                if Qwen35XSumsDedupCensus.enabled {
+                    Qwen35XSumsDedupCensus.record(x: x, k: cell.k, m: cell.m)
+                }
+            } else {
+                qwen35XSumsSidecarHits &+= 1
+            }
             return matmulWithTable(
                 x, w, scales: scales, biases: biases,
                 xsums: fused ?? xsumsTable(x),
@@ -1873,9 +2242,20 @@ public enum Qwen35CustomQMV {
 
         var outShape = x.shape
         outShape[outShape.count - 1] = cell.n
-        return qwen35CustomAffine4QMVKernel(
+        let variant = Self.kernelVariant(cell)
+        let groups = Self.activeInputGroups(cell.m, variant: variant)
+        if Qwen35KernelConfigCache.enabled {
+            return qwen35CachedQMVKernel(table: false, variant: variant)(
+                [w, scales, biases, x],
+                Qwen35KernelLaunch(
+                    grid: (groups * 32, (cell.n / 8) * 2, 1),
+                    threadGroup: (32, 2, 1),
+                    outputShape: outShape.map(Int32.init),
+                    outputDType: .bfloat16))
+        }
+        return qwen35UncachedQMVKernel(table: false, variant: variant)(
             [w, scales, biases, x],
-            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / 8) * 2, 1),
+            grid: (groups * 32, (cell.n / 8) * 2, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [outShape],
             outputDTypes: [.bfloat16]
@@ -2367,6 +2747,122 @@ func qwen35FusedResidualRMSNorm(
     return (outputs[0], outputs[1])
 }
 
+/// E174 step 1: how many of a round's standalone chunk-sum fills are duplicates.
+///
+/// `Qwen35CustomQMV.matmul` calls `xsumsTable(x)` once per routed table-paying
+/// cell that found no published table. Several routed cells can read the SAME
+/// activation -- a normed activation feeding several projections is the usual
+/// transformer shape -- and each of them then fills an identical table. The
+/// sidecar's `take` already dedupes by activation identity, but only for tables
+/// a producer published; the standalone path has no memo at all.
+///
+/// UNTIMED INSTRUMENT. `MLX_E174_DEDUP_CENSUS=1` turns it on. Unset is the
+/// shipped path: the call site reads one `static let` Bool and does nothing
+/// else. It never changes arithmetic, dispatch, or token output on either arm,
+/// and it is not intended to be present during a timed leg.
+public enum Qwen35XSumsDedupCensus {
+    /// 22 UTF-8 bytes and an `MLX_` prefix, for the two reasons
+    /// `MLX_E120_QMV_ARM` documents: the runtime worker's environment allowlist
+    /// drops every `MLXFAST_*` name, and a literal longer than 15 bytes reaches
+    /// the binary's string table where `strings` can witness the arm.
+    public static let enabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_E174_DEDUP_CENSUS"] == "1"
+
+    /// `rollRound` runs from the per-round trace hook, so a census enabled
+    /// without `MLX_QWEN_MTP_TRACE=1` would never clear and would pin every
+    /// activation of the whole leg. One round touches 257 cells, so this bound
+    /// cannot fire on a rolling census and turns that mistake into a reset.
+    static let heldBound = 4096
+
+    private struct Shape: Hashable {
+        let k: Int
+        let m: Int
+    }
+
+    /// Two references to ONE array and one separately allocated array must key
+    /// as 2 distinct identities with exactly one 2x bucket. A build where
+    /// `ObjectIdentifier` cannot match or cannot separate activations reports
+    /// `FAIL` here, so an all-distinct census cannot be read as "no duplicates"
+    /// when the instrument was simply incapable of finding one.
+    public static let selfCheck: String = {
+        let a = MLXArray([Float(1), 2, 3, 4])
+        let alias = a
+        let other = MLXArray([Float(1), 2, 3, 4])
+        var counts: [ObjectIdentifier: Int] = [:]
+        for array in [a, alias, other] {
+            counts[ObjectIdentifier(array), default: 0] &+= 1
+        }
+        let pairs = counts.values.filter { $0 == 2 }.count
+        return counts.count == 2 && pairs == 1
+            ? "ok" : "FAIL(distinct=\(counts.count),pairs=\(pairs))"
+    }()
+
+    /// `xsumsTable(x)` reads its `k` and `m` out of `x` itself, so the table it
+    /// returns is a pure function of the activation and nothing else. Identity
+    /// alone is therefore the correct memo key; the cell shape is carried only
+    /// to report WHERE the duplicates sit.
+    nonisolated(unsafe) private static var callsPerActivation:
+        [ObjectIdentifier: Int] = [:]
+    /// Strong references for the CURRENT round only. A released `MLXArray` can
+    /// have its address reused by a later allocation, which would merge two
+    /// distinct activations into one identity and overstate the duplicate
+    /// fraction. Holding the round's activations makes `ObjectIdentifier`
+    /// unambiguous for as long as the census reads it.
+    nonisolated(unsafe) private static var held: [MLXArray] = []
+    nonisolated(unsafe) private static var shapeCalls: [Shape: Int] = [:]
+    nonisolated(unsafe) private static var shapeUniq: [Shape: Int] = [:]
+    private static let lock = NSLock()
+
+    public static func record(x: MLXArray, k: Int, m: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        if held.count >= heldBound { clearLocked() }
+        let shape = Shape(k: k, m: m)
+        shapeCalls[shape, default: 0] &+= 1
+        let key = ObjectIdentifier(x)
+        let previous = callsPerActivation[key] ?? 0
+        callsPerActivation[key] = previous &+ 1
+        if previous == 0 {
+            held.append(x)
+            shapeUniq[shape, default: 0] &+= 1
+            qwen35XSumsFillDistinct &+= 1
+        }
+    }
+
+    /// `selfcheck:calls/distinct;KxM:calls/distinct,...;Nx=<activations>,...`
+    /// for the round: the positive control, the totals, the per-cell-shape
+    /// split, and the histogram of how many fills share one activation. `off`
+    /// when the census is disabled.
+    public static func roundSummary() -> String {
+        guard enabled else { return "off" }
+        lock.lock()
+        defer { lock.unlock() }
+        let calls = shapeCalls.values.reduce(0, &+)
+        var histogram: [Int: Int] = [:]
+        for n in callsPerActivation.values { histogram[n, default: 0] &+= 1 }
+        let shapes = shapeCalls.keys
+            .sorted { ($0.k, $0.m) < ($1.k, $1.m) }
+            .map { "\($0.k)x\($0.m):\(shapeCalls[$0] ?? 0)/\(shapeUniq[$0] ?? 0)" }
+        let bars = histogram.keys.sorted().map { "\($0)x=\(histogram[$0] ?? 0)" }
+        return "\(selfCheck):\(calls)/\(callsPerActivation.count);"
+            + shapes.joined(separator: ",") + ";" + bars.joined(separator: ",")
+    }
+
+    public static func rollRound() {
+        guard enabled else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        clearLocked()
+    }
+
+    private static func clearLocked() {
+        callsPerActivation.removeAll(keepingCapacity: true)
+        held.removeAll(keepingCapacity: true)
+        shapeCalls.removeAll(keepingCapacity: true)
+        shapeUniq.removeAll(keepingCapacity: true)
+    }
+}
+
 /// Chunk-sum tables emitted by a producing kernel's epilogue, keyed by the
 /// identity of the activation tensor they describe.
 ///
@@ -2399,6 +2895,26 @@ enum Qwen35XSumsSidecar {
     nonisolated(unsafe) static var next = 0
     static let lock = NSLock()
 
+    /// E174 screen switch. `off` stops the producer emitting the table, so all
+    /// 257 routed table-paying cells take the standalone fill the shipped tree
+    /// pays for 130 of them. Arithmetic is unchanged: both arms read a table
+    /// written by the same fill body, and the `off` arm is the shipped
+    /// pre-sidecar dispatch. The contrast prices the whole sidecar channel -
+    /// 127 epilogues against 127 fills plus their host kernel records - which
+    /// bounds from above what extending the epilogue to the remaining 130
+    /// cells could pay, because those producers have strictly worse grids than
+    /// the served ones (FINDING 359).
+    ///
+    /// `MLX_` prefix and 22 UTF-8 bytes for the two reasons
+    /// `MLX_E120_QMV_ARM` documents: `sanitizedRuntimeWorkerEnvironment` drops
+    /// every `MLXFAST_*` name before the runtime worker sees it, and a literal
+    /// longer than 15 bytes is not stored inline in the `String` value, so it
+    /// reaches the binary's string table where `strings` can witness the arm
+    /// inside the built worker. Read once at process start; never varies with
+    /// the request, the prompt or the benchmark phase.
+    static let enabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_E174_XSUMS_SIDECAR"] != "off"
+
     /// True when the producer should emit the table for this activation.
     ///
     /// The consumer's `routable` test is strictly stronger (it also demands
@@ -2411,7 +2927,7 @@ enum Qwen35XSumsSidecar {
     /// published table can never be offered to a cell the consumer would have
     /// declined on shape.
     static func wants(_ x: MLXArray) -> Bool {
-        guard Qwen35CustomQMV.arm == .sumTable, x.ndim >= 2 else { return false }
+        guard enabled, Qwen35CustomQMV.arm == .sumTable, x.ndim >= 2 else { return false }
         let k = x.dim(-1)
         let rows = x.size / k
         return Qwen35CustomQMV.widths.contains(rows)
@@ -3564,11 +4080,30 @@ final class Qwen35DecoderLayer: Module {
         } else {
             r = selfAttn!(normedIn, mask: attentionMask, cache: cache)
         }
+        if Qwen35BandTimer.enabled {
+            eval(r)
+            let d = Qwen35BandTimer.lap()
+            if isLinear {
+                Qwen35BandTimer.gdnMixerNs &+= d
+            } else {
+                Qwen35BandTimer.faMixerNs &+= d
+            }
+        }
         let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
             x: hIn, r: r,
             weight: postAttentionLayerNorm.weight,
             eps: postAttentionLayerNorm.eps)
-        return (h, (mlp as! UnaryLayer)(postAttnNorm))
+        let mlpOut = (mlp as! UnaryLayer)(postAttnNorm)
+        if Qwen35BandTimer.enabled {
+            eval(h, mlpOut)
+            let d = Qwen35BandTimer.lap()
+            if isLinear {
+                Qwen35BandTimer.gdnMLPNs &+= d
+            } else {
+                Qwen35BandTimer.faMLPNs &+= d
+            }
+        }
+        return (h, mlpOut)
     }
 }
 
@@ -3595,6 +4130,44 @@ let qwen35DecodeLadderRungs: Set<Int> = {
         return parsed.isEmpty ? shipped : parsed
     }
 }()
+
+/// E182 research-only band timer for one target verify forward.
+///
+/// `MLX_E182_BAND_SYNC=1` drains the device at every mixer and MLP boundary of
+/// every layer, so each band accumulates real device time instead of enqueue
+/// time. The scored path has exactly one blocking sync per round; this adds
+/// 129 of them, removes all host/device overlap, and therefore inflates the
+/// round. A run with this variable set is ATTRIBUTION ONLY: its absolute round
+/// time is not comparable with a shipped-schedule run, and only the shape of
+/// each band against verify width M is meaningful.
+public enum Qwen35BandTimer {
+    public static let enabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_E182_BAND_SYNC"] == "1"
+
+    public nonisolated(unsafe) static var preNs: UInt64 = 0
+    public nonisolated(unsafe) static var gdnMixerNs: UInt64 = 0
+    public nonisolated(unsafe) static var gdnMLPNs: UInt64 = 0
+    public nonisolated(unsafe) static var faMixerNs: UInt64 = 0
+    public nonisolated(unsafe) static var faMLPNs: UInt64 = 0
+    public nonisolated(unsafe) static var forwards: Int = 0
+    nonisolated(unsafe) static var mark: UInt64 = 0
+
+    public static func reset() {
+        preNs = 0
+        gdnMixerNs = 0
+        gdnMLPNs = 0
+        faMixerNs = 0
+        faMLPNs = 0
+        forwards = 0
+    }
+
+    @inline(__always) static func lap() -> UInt64 {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let delta = now &- mark
+        mark = now
+        return delta
+    }
+}
 
 public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
@@ -3663,6 +4236,14 @@ public class Qwen35TextModelInner: Module {
         // whole graph in 118.7 ms of a 4043 ms GPU-bound block.
         let prefillLadder = inputs.dim(1) >= 512
         let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        if Qwen35BandTimer.enabled {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            eval(hiddenStates)
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            Qwen35BandTimer.preNs &+= t1 &- t0
+            Qwen35BandTimer.mark = t1
+            Qwen35BandTimer.forwards &+= 1
+        }
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
             // Boundary-fused chain: the residual boundary flows as an
             // UNMERGED (base, delta) pair, so each interior layer pays one
@@ -4331,6 +4912,32 @@ let qwen35RowTop32Resolved: (enabled: Bool, source: String) = {
 public nonisolated(unsafe) var qwen35RowTop32FusedDrafts: Int = 0
 public nonisolated(unsafe) var qwen35RowTop32ArgPartitionDrafts: Int = 0
 
+/// Chunk-sum fill census. `SidecarHits` counts routed table-paying cells that
+/// consumed a table a fused producer published; `StandaloneFills` counts the
+/// ones that still launched `qwen35_custom_affine4_g64_xsums_v1`. Their sum is
+/// the routed table-paying cell count, so the pair witnesses at run time how
+/// much of the 257-site fill surface the inherited fusion actually covers.
+public nonisolated(unsafe) var qwen35XSumsSidecarHits: Int = 0
+public nonisolated(unsafe) var qwen35XSumsStandaloneFills: Int = 0
+
+/// Distinct activations among those standalone fills, summed over rounds, so a
+/// per-round delta against `qwen35XSumsStandaloneFills` gives the round's
+/// duplicate fill count. Stays zero unless `MLX_E174_DEDUP_CENSUS=1`.
+public nonisolated(unsafe) var qwen35XSumsFillDistinct: Int = 0
+
+/// Launch-config cache census. `Misses` is also the number of distinct launch
+/// geometries the process has seen, because every miss inserts a new key, so
+/// the pair witnesses both the hit rate and the size of the geometry set. Both
+/// stay zero when the cache arm is off.
+public nonisolated(unsafe) var qwen35KernelConfigCacheHits: Int = 0
+public nonisolated(unsafe) var qwen35KernelConfigCacheMisses: Int = 0
+
+/// Derived-index geometry this process built, for the arm witness. Zero until
+/// `buildDerivedClusterIndex` runs, which happens once during the untimed warm.
+public nonisolated(unsafe) var qwen35DerivedClusterLeaves: Int = 0
+public nonisolated(unsafe) var qwen35DerivedClusterRowsPerLeafBuilt: Int = 0
+public nonisolated(unsafe) var qwen35DerivedClusterProbes: Int = 0
+
 /// `unset`, `0` or `1`, for the same trace line.
 public var qwen35RowTop32GateSource: String { qwen35RowTop32Resolved.source }
 
@@ -4624,6 +5231,23 @@ private let qwen35ProbeSortEnabled: Bool =
 /// overlap the proposal-side retrieval path restored here.
 private let qwen35DerivedClusterProbeFraction: Double = 0.15
 
+/// `MLX_E141_ROWS_PER_LEAF` widens or narrows the derived index's leaf without
+/// touching its probe fraction, so one binary can time two leaf widths. The
+/// width must stay a multiple of four and 32 rows already fill eight
+/// simdgroups. Unset takes the compiled default bit for bit, which is what a
+/// ranked host always runs: the runner sets no `MLX_` variable. The `MLX_`
+/// prefix is load-bearing, because the worker sanitizer drops `MLXFAST_*`.
+private let qwen35E141RowsPerLeafOverride: Int? = {
+    guard let raw = ProcessInfo.processInfo.environment["MLX_E141_ROWS_PER_LEAF"],
+          !raw.isEmpty
+    else { return nil }
+    guard let value = Int(raw), value >= 4, value <= 32, value % 4 == 0 else {
+        fatalError(
+            "MLX_E141_ROWS_PER_LEAF must be a multiple of 4 in [4, 32]; got \(raw)")
+    }
+    return value
+}()
+
 /// `[m, s, c]` squared distance from every row to every centre, formed as
 /// `||x||^2 - 2 x.c + ||c||^2` so no `[m, s, D]` difference tensor exists.
 private func qwen35ClusterSquaredDistance(
@@ -4826,7 +5450,7 @@ public func qwen35VerifyDraftTop32(trials: Int = 64, seed: UInt64 = 1) -> (Int, 
 /// function of the set `argPartition` chose, never of how it ordered that set.
 /// Returns (checked, mismatches, firstBadTrial). Never called on a scored path.
 public func qwen35VerifyProbeSort(
-    clusters: Int = 12_292, probes: Int = 3_073,
+    clusters: Int = 6_146, probes: Int = 922,
     trials: Int = 64, seed: UInt64 = 1
 ) -> (Int, Int, Int) {
     MLXRandom.seed(seed)
@@ -4863,7 +5487,7 @@ public func qwen35VerifyProbeSort(
 /// one rejected index -- the smallest possible wrong answer -- and requires the
 /// comparison to report it. A gate that cannot fail is not a gate.
 public func qwen35ProbeSortPositiveControl(
-    clusters: Int = 12_292, probes: Int = 3_073, seed: UInt64 = 7
+    clusters: Int = 6_146, probes: Int = 922, seed: UInt64 = 7
 ) -> Bool {
     MLXRandom.seed(seed)
     let sorter = makeQwen35ProbeSortKernel(clusters: clusters, probes: probes)
@@ -4888,7 +5512,7 @@ public func qwen35ProbeSortPositiveControl(
 /// held outside the timed region on both arms. Returns (sortedUs, kernelUs).
 /// Never called on a scored path.
 public func qwen35BenchProbeSort(
-    clusters: Int = 12_292, probes: Int = 3_073, iters: Int = 200
+    clusters: Int = 6_146, probes: Int = 922, iters: Int = 200
 ) -> (Double, Double) {
     MLXRandom.seed(5)
     let sorter = makeQwen35ProbeSortKernel(clusters: clusters, probes: probes)
@@ -4960,7 +5584,7 @@ private func qwen35RowTop32Reference(
 /// Offline equivalence gate for the fused row selection. Needs no checkpoint
 /// and no MTP head. Returns (checked, mismatches, firstBadTrial).
 public func qwen35VerifyRowTop32(
-    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    clusters: Int = 6_146, rowsPerCluster: Int = 16, probes: Int = 922,
     trials: Int = 64, seed: UInt64 = 1
 ) -> (Int, Int, Int) {
     MLXRandom.seed(seed)
@@ -4990,7 +5614,7 @@ public func qwen35VerifyRowTop32(
 /// and requires the comparison to report the difference. A gate that cannot
 /// fail is not a gate.
 public func qwen35RowTop32PositiveControl(
-    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    clusters: Int = 6_146, rowsPerCluster: Int = 16, probes: Int = 922,
     seed: UInt64 = 7
 ) -> Bool {
     MLXRandom.seed(seed)
@@ -5014,7 +5638,7 @@ public func qwen35RowTop32PositiveControl(
 /// Isolated micro-benchmark of the row selection, chain against fused kernel.
 /// Returns (chainUs, kernelUs) per call. Never called on a scored path.
 public func qwen35BenchRowTop32(
-    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    clusters: Int = 6_146, rowsPerCluster: Int = 16, probes: Int = 922,
     iters: Int = 200
 ) -> (Double, Double) {
     MLXRandom.seed(11)
@@ -5182,12 +5806,41 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
     private static let draftRerankCandidateCount = 32
-    // Derived cluster index. Eight rows per leaf and eight refinement passes
-    // are the screened settings; the centroid table stays 2-bit like the rows
-    // it indexes.
+    // Derived cluster index. Eight rows per leaf: 12,292 leaves, and at the
+    // 0.15 probe fraction 1,844 probes refine 14,752 rows.
+    //
+    // REVERTED FROM 16 ON OFFICIAL EVIDENCE (FINDING 323). Width 16 halves the
+    // leaf count and therefore the coarse centroid-pass bytes while holding the
+    // refined-row count at the same 14,752, so it is strictly cheaper to scan.
+    // It still lost: receipt 1509bf95 (commit f95d4bdb) measured +0.5291 % on
+    // the candidate leg against the byte-matched width-8 anchor 5a9f130a
+    // (commit 8ba6e738), 7 of 8 prompts the same sign, published 3.70784519 ->
+    // 3.68242218. Wider leaves select a worse set of rows at equal refinement
+    // cost, and the lost acceptance outweighs the cheaper coarse pass. On this
+    // axis selection quality is scarcer than bandwidth.
+    //
+    // The width must divide `compactDraftPaddedCount` (98,336) exactly, which
+    // both 8 and 16 do. Eight refinement passes are the screened setting and
+    // the centroid table stays 2-bit like the rows it indexes.
     private static let derivedClusterRowsPerLeaf = 8
     private static let derivedClusterIterations = 8
     private static let derivedClusterCentroidBits = 2
+
+    /// Leaf width of the derived index for THIS arm. The width must divide the
+    /// padded row count exactly: `qwen35BisectingPartition` splits a node into
+    /// whole leaves and leaves no room for a partial one, so an indivisible
+    /// override must stop the run instead of silently truncating the table.
+    private static var activeClusterRowsPerLeaf: Int {
+        guard let width = qwen35E141RowsPerLeafOverride else {
+            return derivedClusterRowsPerLeaf
+        }
+        guard compactDraftPaddedCount % width == 0 else {
+            fatalError(
+                "MLX_E141_ROWS_PER_LEAF=\(width) does not divide the padded draft "
+                + "row count \(compactDraftPaddedCount)")
+        }
+        return width
+    }
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
@@ -5639,7 +6292,7 @@ extension Qwen35TextModel: MTPCapable {
               let exactBiases = exact.biases
         else { return }
 
-        let rowsPerLeaf = Self.derivedClusterRowsPerLeaf
+        let rowsPerLeaf = Self.activeClusterRowsPerLeaf
         let leaves = Self.compactDraftPaddedCount / rowsPerLeaf
         let hidden = configuration.hiddenSize
         let rows = dequantized(
@@ -5687,6 +6340,9 @@ extension Qwen35TextModel: MTPCapable {
         _draftCentroidZ = centroidBiases
         _draftClusterPerm = clusterPerm
         _draftClusterShape = [leaves, rowsPerLeaf, probes]
+        qwen35DerivedClusterLeaves = leaves
+        qwen35DerivedClusterRowsPerLeafBuilt = rowsPerLeaf
+        qwen35DerivedClusterProbes = probes
     }
 
     /// The 32 shortlist candidates chosen by the cluster index, or nil when the
