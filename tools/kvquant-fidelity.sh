@@ -44,17 +44,18 @@ fi
 # The reference leg must run first so later legs have something to diff.
 # An empty bits field disables the policy entirely, which is the bf16 path.
 CONFIGS=(
-  "bf16::"
-  "q8-rot:8:1"
-  "q4-rot:4:1"
-  "q4-plain:4:0"
-  "q3-rot:3:1"
-  "q3-plain:3:0"
-  "q2-rot:2:1"
+  "bf16:::"
+  "q8-plain-slow:8:0:0"
+  "q8-rot-slow:8:1:0"
+  "q8-rot-fused:8:1:1"
+  "q4-plain-slow:4:0:0"
+  "q4-rot-slow:4:1:0"
+  "q4-rot-fused:4:1:1"
+  "q4-plain-fused:4:0:1"
 )
 
 run_config() {
-  local label="$1" bits="$2" rotate="$3" out="$4"
+  local label="$1" bits="$2" rotate="$3" fused="$4" out="$5"
   local env_args=()
   if [[ -n "$bits" ]]; then
     env_args+=("DARKBLOOM_KV_QUANT_BITS=$bits")
@@ -62,6 +63,8 @@ run_config() {
     # Quantize from the first token so short test prompts still exercise it.
     env_args+=("DARKBLOOM_KV_QUANT_MIN_OFFSET=0")
     env_args+=("DARKBLOOM_KV_QUANT_ROTATE=$rotate")
+    # 0 forces the decomposed path so the fused kernel can be A/B compared.
+    env_args+=("DARKBLOOM_KV_FUSED_SDPA=$fused")
   fi
 
   env ${env_args[@]+"${env_args[@]}"} "$BINARY" serve \
@@ -112,11 +115,12 @@ run_config() {
 }
 
 for entry in "${CONFIGS[@]}"; do
-  IFS=: read -r label bits rotate <<<"$entry"
-  if ! run_config "$label" "$bits" "$rotate" "$WORK/$label.txt"; then
+  IFS=: read -r label bits rotate fused <<<"$entry"
+  if ! run_config "$label" "$bits" "$rotate" "$fused" "$WORK/$label.txt"; then
     jq -nc --arg label "$label" --arg bits "${bits:-16}" \
-      --arg rotate "${rotate:-n/a}" \
-      '{label:$label, bits:$bits, rotate:$rotate, error:"leg failed"}'
+      --arg rotate "${rotate:-n/a}" --arg fused "${fused:-n/a}" \
+      '{label:$label, bits:$bits, rotate:$rotate, fused:$fused,
+        error:"leg failed"}'
     if [[ "$label" == "bf16" ]]; then
       echo "reference leg failed; the remaining legs have nothing to diff" >&2
       exit 1
@@ -145,10 +149,11 @@ for entry in "${CONFIGS[@]}"; do
   rate=$({ grep -o '[0-9.]* tok/s decode' "$WORK/$label.serve.log" || true; } |
     tail -1 | awk '{print $1}')
   jq -nc --arg label "$label" --arg bits "${bits:-16}" \
-    --arg rotate "${rotate:-n/a}" --argjson prefix "${prefix:-0}" \
+    --arg rotate "${rotate:-n/a}" --arg fused "${fused:-n/a}" \
+    --argjson prefix "${prefix:-0}" \
     --arg rate "${rate:-unknown}" \
     --argjson total "$(wc -c <"$WORK/bf16.txt" | tr -d ' ')" \
-    '{label:$label, bits:$bits, rotate:$rotate,
+    '{label:$label, bits:$bits, rotate:$rotate, fused:$fused,
       identical_prefix_chars:$prefix, reference_chars:$total,
       decode_tok_s:$rate}'
 done
