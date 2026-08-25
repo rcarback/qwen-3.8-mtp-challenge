@@ -2796,6 +2796,25 @@ final class Qwen35Attention: Module {
     // launches and two host ops from every head chain step.
     private var _qkvDenseW: MLXArray?
 
+    // Randomized Hadamard rotation for the quantized KV path. Underscore so
+    // it is never attached as a Module parameter: it is derived state, not a
+    // weight, and must not appear in a parameter walk or a checkpoint.
+    private var _kvRotation: Qwen35KVRotation?
+
+    /// Build and install the KV rotation, or clear it. The attention module
+    /// owns the head dimension, so a dimension mismatch is unrepresentable:
+    /// the caller passes intent, not a constructed rotation. Takes effect on
+    /// the next forward. Installing over a cache that already holds unrotated
+    /// rows corrupts that cache, so the caller must install before the first
+    /// write, which `Qwen36MTPBlockSession.begin` does.
+    func installKVRotation(
+        enabled: Bool, seed: UInt64 = Qwen35KVRotation.defaultSeed
+    ) {
+        _kvRotation = enabled
+            ? Qwen35KVRotation(headDimension: headDim, seed: seed)
+            : nil
+    }
+
     // Packed K/V concat for committed MTP-head history rows whose layer
     // outputs are dead. Kept separate from the full Q/K/V pack so those rows
     // never stream or compute the unused query+gate projection.
@@ -3204,15 +3223,26 @@ final class Qwen35Attention: Module {
         // REAL Copy of this function. Multiply 4-D (strided inputs are
         // copy-free in the compiled elementwise), then flatten the compiled
         // kernel's CONTIGUOUS output, which is a free view.
-        let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
+        // ROTATED QUANTIZED KV. The rotation binds to the cache, not to the
+        // module: a quantized cache is always rotated and an unquantized one
+        // never is, so `appendHistoryKV` -- which writes the unquantized MTP
+        // head history through this same module -- cannot mix bases. Scores
+        // are unchanged in exact arithmetic because the rotation is
+        // orthogonal and both sides carry it; values carry it too, so the
+        // output is rotated and the inverse below removes it.
+        let rotation = (cache is QuantizedKVCacheProtocol) ? _kvRotation : nil
+        var output = attentionWithCacheUpdate(
+            queries: rotation.map { $0.forward(queries) } ?? queries,
+            keys: rotation.map { $0.forward(keys) } ?? keys,
+            values: rotation.map { $0.forward(values) } ?? values,
             cache: cache,
             scale: scale,
             mask: mask
         )
-        .transposed(0, 2, 1, 3)
+        if let rotation {
+            output = rotation.inverse(output)
+        }
+        output = output.transposed(0, 2, 1, 3)
 
         return qwen35RoutedLinear(
             oProj, qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
