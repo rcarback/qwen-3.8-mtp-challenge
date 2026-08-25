@@ -32,6 +32,7 @@ struct Qwen35KVRotationTests {
 
     @Test("inverse undoes forward")
     func roundTrip() {
+        MLXRandom.seed(0x5157_454E)
         guard let rotation = Qwen35KVRotation(headDimension: 256) else {
             Issue.record("rotation construction failed")
             return
@@ -43,6 +44,7 @@ struct Qwen35KVRotationTests {
 
     @Test("the rotation preserves inner products")
     func preservesInnerProducts() {
+        MLXRandom.seed(0x5157_454E)
         guard let rotation = Qwen35KVRotation(headDimension: 256) else {
             Issue.record("rotation construction failed")
             return
@@ -59,6 +61,7 @@ struct Qwen35KVRotationTests {
 
     @Test("rotation flattens the per-group dynamic range of an outlier vector")
     func flattensOutliers() {
+        MLXRandom.seed(0x5157_454E)
         guard let rotation = Qwen35KVRotation(headDimension: 256) else {
             Issue.record("rotation construction failed")
             return
