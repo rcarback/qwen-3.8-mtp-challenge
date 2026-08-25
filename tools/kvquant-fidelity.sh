@@ -130,14 +130,19 @@ for entry in "${CONFIGS[@]}"; do
   if [[ "$label" == "bf16" ]]; then
     prefix=$(wc -c <"$WORK/bf16.txt" | tr -d ' ')
   else
-    prefix=$(cmp -l "$WORK/bf16.txt" "$WORK/$label.txt" 2>/dev/null |
+    # cmp -l exits 1 whenever the files differ, which is the expected result
+    # for every quantized leg. Under set -e and pipefail an assignment from a
+    # failing substitution kills the script with no message, so absorb the
+    # status here: a difference is this script's measurement, not its error.
+    prefix=$({ cmp -l "$WORK/bf16.txt" "$WORK/$label.txt" 2>/dev/null || true; } |
       head -1 | awk '{print $1-1}')
     if [[ -z "$prefix" ]]; then
       prefix=$(wc -c <"$WORK/bf16.txt" | tr -d ' ')
     fi
   fi
 
-  rate=$(grep -o '[0-9.]* tok/s decode' "$WORK/$label.serve.log" |
+  # grep exits 1 when the log has no rate line, which is not fatal either.
+  rate=$({ grep -o '[0-9.]* tok/s decode' "$WORK/$label.serve.log" || true; } |
     tail -1 | awk '{print $1}')
   jq -nc --arg label "$label" --arg bits "${bits:-16}" \
     --arg rotate "${rotate:-n/a}" --argjson prefix "${prefix:-0}" \
