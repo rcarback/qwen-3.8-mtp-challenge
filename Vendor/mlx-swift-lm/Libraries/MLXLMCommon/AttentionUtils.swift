@@ -6,6 +6,14 @@ import MLX
 /// This provides a single function that automatically routes to quantized or regular
 /// attention based on cache type, matching Python's `scaled_dot_product_attention`
 
+/// Whether the fused quantized decode kernel is enabled.
+///
+/// Reads `DARKBLOOM_KV_FUSED_SDPA` once. Set it to `0` to force the
+/// decomposed path. This only ever applies to a cache that is already
+/// quantized, which is itself opt-in, so a default run never reaches it.
+public let fusedQuantizedSDPADefault: Bool =
+    ProcessInfo.processInfo.environment["DARKBLOOM_KV_FUSED_SDPA"] != "0"
+
 /// Automatic attention with cache update
 ///
 /// This function matches Python's `scaled_dot_product_attention` in base.py:
@@ -56,14 +64,6 @@ import MLX
 /// Generic models must be v2-adapted — capture `positionOffsets` before
 /// dispatch and call `updateAndAttend` directly — before they can serve
 /// multi-row CBv2 batches. This fails loudly rather than mis-rotating.
-/// Whether the fused quantized decode kernel is enabled.
-///
-/// Reads `DARKBLOOM_KV_FUSED_SDPA` once. Set it to `0` to force the
-/// decomposed path. This only ever applies to a cache that is already
-/// quantized, which is itself opt-in, so a default run never reaches it.
-public let fusedQuantizedSDPADefault: Bool =
-    ProcessInfo.processInfo.environment["DARKBLOOM_KV_FUSED_SDPA"] != "0"
-
 public func attentionWithCacheUpdate(
     queries: MLXArray,
     keys: MLXArray,
