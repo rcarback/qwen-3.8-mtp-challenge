@@ -703,6 +703,10 @@ struct QuantizedBlockLoader {
       biases += group_stride;
     }
   }
+
+  void shift_dst(int offset) {
+    dst += offset;
+  }
 };
 
 template <
@@ -843,6 +847,10 @@ struct QuantizedBlockLoader<
       biases += n_groups * group_stride;
     }
   }
+
+  void shift_dst(int offset) {
+    dst += offset;
+  }
 };
 
 template <typename T>
@@ -947,7 +955,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    const bool pipeline = false>
 METAL_FUNC void qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1030,6 +1039,68 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
+      if constexpr (pipeline) {
+        // Double-buffered weight staging: the next K-tile is dequantized into
+        // the spare half of Ws while the current half is consumed by the MMA.
+        // The loads, the dequantization, the MMA and the stores keep their
+        // shipped order and operands; only the overlap changes, so every
+        // output bit is the single-buffered kernel's.
+        constexpr int tile_elems = BN * BK_padded;
+
+        if constexpr (kAlignedN.value) {
+          loader_w.load_unsafe();
+        } else {
+          loader_w.load_safe(short2(BK, tgp_bn));
+        }
+        loader_w.next();
+
+        int cur = 0;
+        for (int k = 0; k < K; k += BK) {
+          // Publishes the tile staged for this iteration, and retires the
+          // previous iteration's reads of the half we are about to overwrite.
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          if (k + BK < K) {
+            loader_w.shift_dst(cur == 0 ? tile_elems : -tile_elems);
+            if constexpr (kAlignedN.value) {
+              loader_w.load_unsafe();
+            } else {
+              loader_w.load_safe(short2(BK, tgp_bn));
+            }
+            loader_w.next();
+          }
+
+          threadgroup T* Wcur = Ws + cur * tile_elems;
+
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
+
+            volatile int compiler_barrier;
+
+            if constexpr (kAlignedM.value) {
+              Atile.load(x + kk1, K);
+            } else {
+              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<T, BK_padded, 1>(Wcur + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+
+            (void)compiler_barrier;
+          }
+
+          x += BK;
+          cur ^= 1;
+        }
+      } else {
       for (int k = 0; k < K; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (kAlignedN.value) {
@@ -1067,6 +1138,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
         x += BK;
         loader_w.next();
+      }
       }
 
       // Store results to device memory
@@ -1240,7 +1312,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[2 * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1260,7 +1332,7 @@ template <
         b_strides,
         tid);
   }
-  qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
+  qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN, true>(
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
