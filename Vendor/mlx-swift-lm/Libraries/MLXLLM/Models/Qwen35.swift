@@ -1312,13 +1312,17 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        let normedOut: MLXArray
         if S >= 2 {
+            if let fused = qwen35FusedGDNRmsSiluXSums(
+                x: out, gate: z, weight: norm.weight, eps: norm.eps)
+            {
+                return qwen35RoutedLinear(outProj, fused)
+            }
             let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
-            normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
-        } else {
-            normedOut = norm(out, gate: z)
+            let normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+            return qwen35RoutedLinear(outProj, normedOut.reshaped(B, S, -1))
         }
+        let normedOut = norm(out, gate: z)
         return qwen35RoutedLinear(outProj, normedOut.reshaped(B, S, -1))
     }
 }
@@ -2449,6 +2453,179 @@ enum Qwen35XSumsSidecar {
         }
         return hit
     }
+}
+
+// MARK: - GDN RMS + SiLU + xsums (E135)
+//
+// Remaining producer-side fill after the residual+RMSNorm fusion. Not
+// mlp.down (E134 FAILED). Not fa.o_proj (E133 REJECTED 3.66367). Not
+// model.norm (E129/E131). Not the E126 SwiGLU+post-norm bundle and not
+// fill-only into compiled post-norm (open rival leftover). This kernel
+// replaces MLXFast.rmsNorm(out) + compiled silu(gate)*rms with one
+// dispatch whose epilogue is the fill body, then publishes the flattened
+// [B, S, Hv*Dv] object `out_proj` consumes. Header-free, named source,
+// split launch. Serial S==1 stays on `norm(out, gate:)`.
+
+private let qwen35FusedGDNRmsSiluXSumsSource = """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint Dv = uint(x_shape[x_ndim - 1]);
+        uint Hv = x_ndim >= 2 ? uint(x_shape[x_ndim - 2]) : 1u;
+        uint K = Hv * Dv;
+        const uint xs_stride = threadgroups_per_grid.x <= 8u ? 8u : 16u;
+        ulong offset = ulong(row) * ulong(K);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        for (uint h = 0; h < Hv; ++h) {
+            ulong hoff = offset + ulong(h) * ulong(Dv);
+            float acc = 0.0f;
+            for (uint r_start = 0; r_start < Dv; r_start += lsize * n_reads) {
+                uint elem = r_start + thread_id * n_reads;
+                if (elem + n_reads <= Dv) {
+                    for (uint i = 0; i < n_reads; ++i) {
+                        float xi = float(x[hoff + elem + i]);
+                        acc += xi * xi;
+                    }
+                } else {
+                    for (uint i = 0; i < n_reads; ++i) {
+                        if (elem + i < Dv) {
+                            float xi = float(x[hoff + elem + i]);
+                            acc += xi * xi;
+                        }
+                    }
+                }
+            }
+            acc = simd_sum(acc);
+            if (simd_group == 0) {
+                local_sums[simd_thread] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_thread == 0) {
+                local_sums[simd_group] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                acc = simd_sum(local_sums[simd_thread]);
+                if (simd_thread == 0) {
+                    local_inv_mean[0] = metal::precise::rsqrt(
+                        acc / float(Dv) + eps);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float inv_mean = local_inv_mean[0];
+            for (uint r_start = 0; r_start < Dv; r_start += lsize * n_reads) {
+                uint elem = r_start + thread_id * n_reads;
+                if (elem + n_reads <= Dv) {
+                    for (uint i = 0; i < n_reads; ++i) {
+                        float xi = float(x[hoff + elem + i]);
+                        bfloat wi = weight[elem + i];
+                        bfloat nrm = wi * bfloat(xi * inv_mean);
+                        float g = float(gate[hoff + elem + i]);
+                        float sig = 1.0f / (1.0f + metal::exp(-g));
+                        float activated = g * sig;
+                        act[hoff + elem + i] = bfloat(activated * float(nrm));
+                    }
+                } else {
+                    for (uint i = 0; i < n_reads; ++i) {
+                        if (elem + i < Dv) {
+                            float xi = float(x[hoff + elem + i]);
+                            bfloat wi = weight[elem + i];
+                            bfloat nrm = wi * bfloat(xi * inv_mean);
+                            float g = float(gate[hoff + elem + i]);
+                            float sig = 1.0f / (1.0f + metal::exp(-g));
+                            float activated = g * sig;
+                            act[hoff + elem + i] = bfloat(activated * float(nrm));
+                        }
+                    }
+                }
+            }
+        }
+
+        uint axis_size = K;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            threadgroup_barrier(mem_flags::mem_device);
+            const uint xs_elem = r_start + thread_id * 16;
+            if (thread_id < lsize / 4 && xs_elem + 16 <= axis_size) {
+                const device bfloat16_t* xm = act + offset + xs_elem;
+                float s = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    const vec<bfloat16_t, 4> xv = *reinterpret_cast<
+                        const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+                    s += xv[0] + xv[1] + xv[2] + xv[3];
+                }
+                const uint xs_kb = xs_elem / 512;
+                const uint xs_lane = (xs_elem % 512) / 16;
+                xsums[(xs_kb * 32 + xs_lane) * xs_stride + row] = s;
+            }
+        }
+    """
+
+private let qwen35FusedGDNRmsSiluXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_gdn_rms_silu_xsums_v1",
+    inputNames: ["x", "gate", "weight", "eps"],
+    outputNames: ["act", "xsums"],
+    source: qwen35FusedGDNRmsSiluXSumsSource,
+    ensureRowContiguous: false
+)
+
+func qwen35FusedGDNRmsSiluXSums(
+    x: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float
+) -> MLXArray? {
+    guard Qwen35CustomQMV.arm == .sumTable else { return nil }
+    guard x.dtype == .bfloat16 else { return nil }
+    guard gate.dtype == .bfloat16 else { return nil }
+    guard x.ndim >= 3 else { return nil }
+    guard gate.shape == x.shape else { return nil }
+    let dv = x.dim(-1)
+    let hv = x.dim(-2)
+    guard dv > 0, hv > 0 else { return nil }
+    guard weight.size == dv else { return nil }
+    let k = hv * dv
+    let rows = x.size / k
+    guard Qwen35CustomQMV.widths.contains(rows) else { return nil }
+    guard Qwen35CustomQMV.tablePays(m: rows) else { return nil }
+    guard k % 512 == 0 else { return nil }
+    let xs = x.strides
+    let gs = gate.strides
+    guard xs.count >= 2, gs.count >= 2 else { return nil }
+    guard xs[xs.count - 1] == 1, gs[gs.count - 1] == 1 else { return nil }
+    guard xs[xs.count - 2] == dv, gs[gs.count - 2] == dv else { return nil }
+    if xs.count >= 3 {
+        guard xs[xs.count - 3] == k else { return nil }
+    }
+    if gs.count >= 3 {
+        guard gs[gs.count - 3] == k else { return nil }
+    }
+    let kBlocks = k / 512
+    let tableLen = kBlocks * 32 * Qwen35CustomQMV.sumsStride(rows)
+    let tableShape = [tableLen]
+    let grid = (rows * 1024, 1, 1)
+    let threadGroup = (1024, 1, 1)
+    let outputs = qwen35FusedGDNRmsSiluXSumsKernel(
+        [x, gate, weight, MLXArray(eps)],
+        grid: grid,
+        threadGroup: threadGroup,
+        outputShapes: [x.shape, tableShape],
+        outputDTypes: [.bfloat16, .float32]
+    )
+    let act4 = outputs[0]
+    let table = outputs[1]
+    var flatShape = act4.shape
+    let last = flatShape.removeLast()
+    let prev = flatShape.removeLast()
+    flatShape.append(prev * last)
+    let flat = act4.reshaped(flatShape)
+    Qwen35XSumsSidecar.publish(x: flat, table: table)
+    return flat
 }
 
 // MARK: - Dual independent RMSNorm (proposal-side pre-fc)
