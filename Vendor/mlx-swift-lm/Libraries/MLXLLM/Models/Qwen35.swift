@@ -3456,6 +3456,17 @@ public class Qwen35TextModelInner: Module {
     fileprivate let layers: [Qwen35DecoderLayer]
     let norm: RMSNorm
 
+    /// Install or clear the randomized Hadamard KV rotation on every
+    /// attention layer. This type is the only one that can see `layers`,
+    /// which is why the walk lives here. Layers without self-attention (the
+    /// gated-delta linear-attention layers) carry no KV cache and are skipped
+    /// by the optional chain.
+    func installKVRotation(enabled: Bool, seed: UInt64) {
+        for layer in layers {
+            layer.selfAttn?.installKVRotation(enabled: enabled, seed: seed)
+        }
+    }
+
     let ssmIdx: Int
     let faIdx: Int
 
@@ -5038,6 +5049,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let model: Qwen35TextModelInner
     let configuration: Qwen35TextConfiguration
 
+    public func installKVRotation(enabled: Bool, seed: UInt64) {
+        model.installKVRotation(enabled: enabled, seed: seed)
+    }
+
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
     // Declared DRAFT-ONLY vocabulary projection, carried by the declared MTP
@@ -5934,6 +5949,10 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     public let kvHeads: [Int]
 
     @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
+
+    public func installKVRotation(enabled: Bool, seed: UInt64) {
+        languageModel.installKVRotation(enabled: enabled, seed: seed)
+    }
 
     public init(_ args: Qwen35Configuration) {
         let textModel = Qwen35TextModel(args.textConfig)

@@ -75,6 +75,14 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// time rather than mid-decode.
     var decoderLayerCount: Int { get }
 
+    /// Install or clear the randomized Hadamard rotation on every
+    /// full-attention layer. Passing `enabled: false` restores the unrotated
+    /// path exactly. The rotation only takes effect on caches that conform to
+    /// `QuantizedKVCacheProtocol`, so an unquantized run is unaffected either
+    /// way. Must be called before the first write to a cache: installing over
+    /// rows already written in the other basis corrupts them.
+    func installKVRotation(enabled: Bool, seed: UInt64)
+
     /// The backbone's input embedding table, applied to token ids. A declared
     /// block drafter borrows it instead of shipping its own copy. Proposal
     /// side only.

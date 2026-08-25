@@ -291,17 +291,30 @@ public final class Qwen36MTPBlockSession {
     /// its place at long context, where decode is bandwidth-bound: the cache is
     /// 64 KiB per token, so at 262k every decode step reads ~17 GB, and 8-bit
     /// halves that.
-    public struct KVQuantization: Sendable {
+    public struct KVQuantization: Equatable, Sendable {
         public let groupSize: Int
         public let bits: Int
         /// Positions to keep in full precision before quantizing kicks in.
         /// Short prompts stay exact; only genuinely long context pays.
         public let minimumOffset: Int
+        /// Rotate keys, values, and queries into a randomized Hadamard basis
+        /// before quantizing. Defaults to on: it strictly reduces
+        /// quantization error and costs one O(d log d) transform per
+        /// projection. The switch exists for A/B measurement.
+        public let rotate: Bool
+        /// Sign-vector seed. Fixed by default so a snapshot written by one
+        /// process is readable by the next.
+        public let seed: UInt64
 
-        public init(groupSize: Int = 64, bits: Int = 8, minimumOffset: Int = 8192) {
+        public init(
+            groupSize: Int = 64, bits: Int = 8, minimumOffset: Int = 8192,
+            rotate: Bool = true, seed: UInt64 = Qwen35KVRotation.defaultSeed
+        ) {
             self.groupSize = groupSize
             self.bits = bits
             self.minimumOffset = minimumOffset
+            self.rotate = rotate
+            self.seed = seed
         }
 
         /// Read the policy from the process environment, or nil for the ranked
@@ -317,20 +330,28 @@ public final class Qwen36MTPBlockSession {
         /// reading one cannot leak phase identity. Absent variable means
         /// absent policy, which is what every ranked run sees.
         ///
-        ///     DARKBLOOM_KV_QUANT_BITS        4 or 8; anything else disables
+        ///     DARKBLOOM_KV_QUANT_BITS        2, 3, 4, 5, 6 or 8; anything
+        ///                                    else disables
         ///     DARKBLOOM_KV_QUANT_GROUP       group size, default 64
         ///     DARKBLOOM_KV_QUANT_MIN_OFFSET  seed length below which the
         ///                                    cache stays bf16, default 8192
+        ///     DARKBLOOM_KV_QUANT_ROTATE      0 disables the Hadamard
+        ///                                    rotation; anything else, or
+        ///                                    absent, leaves it enabled
         public static func fromEnvironment(
             _ environment: [String: String] = ProcessInfo.processInfo.environment
         ) -> KVQuantization? {
+            // MLX affine quantization implements 2, 3, 4, 5, 6 and 8 bits
+            // (Vendor/mlx-swift/Source/Cmlx/mlx/mlx/ops.cpp:4820). Anything
+            // else fails deep inside the kernel, so refuse it here.
             guard let raw = environment["DARKBLOOM_KV_QUANT_BITS"],
-                  let bits = Int(raw), bits == 4 || bits == 8
+                  let bits = Int(raw), [2, 3, 4, 5, 6, 8].contains(bits)
             else { return nil }
             let groupSize = environment["DARKBLOOM_KV_QUANT_GROUP"]
                 .flatMap(Int.init) ?? 64
             let minimumOffset = environment["DARKBLOOM_KV_QUANT_MIN_OFFSET"]
                 .flatMap(Int.init) ?? 8192
+            let rotate = environment["DARKBLOOM_KV_QUANT_ROTATE"] != "0"
             // A group size that does not divide the head dimension, or a
             // negative threshold, would fail deep inside the quantized
             // attention kernel with an opaque shape error. Refuse here instead.
@@ -338,7 +359,8 @@ public final class Qwen36MTPBlockSession {
                 return nil
             }
             return KVQuantization(
-                groupSize: groupSize, bits: bits, minimumOffset: minimumOffset)
+                groupSize: groupSize, bits: bits, minimumOffset: minimumOffset,
+                rotate: rotate)
         }
     }
 
@@ -1125,14 +1147,27 @@ public final class Qwen36MTPBlockSession {
         // quantization does not silently change ordinary interactive replies.
         if let kvQuantization, seedTokens.count >= kvQuantization.minimumOffset {
             cache = Self.quantizedFullAttentionCaches(cache, kvQuantization)
+            // Install BEFORE the seed prefill writes the first row. The
+            // rotation binds to the cache basis, so a mid-session change
+            // would leave rows in two different bases.
+            model.installKVRotation(
+                enabled: kvQuantization.rotate, seed: kvQuantization.seed)
             // Announce it. This path changes stored K/V values, so a run that
             // took it must never be mistaken for a bf16 run when its numbers
             // are compared against one.
             FileHandle.standardError.write(Data(
                 ("qwen-mtp: KV cache quantized to \(kvQuantization.bits)-bit "
                     + "group-\(kvQuantization.groupSize) for the 16 "
-                    + "full-attention layers (seed \(seedTokens.count) >= "
+                    + "full-attention layers, rotation "
+                    + (kvQuantization.rotate ? "on" : "off")
+                    + " (seed \(seedTokens.count) >= "
                     + "\(kvQuantization.minimumOffset))\n").utf8))
+        } else {
+            // Clear any basis left installed on a model instance reused from
+            // an earlier quantized session. Without this, a short prompt on a
+            // warm process would rotate into a bf16 cache and never rotate
+            // back out.
+            model.installKVRotation(enabled: false, seed: 0)
         }
         // Chunked: at or below `prefillChunkRange.upperBound` -- which the
         // ranked 512-token seed is -- this is one `callWithHidden` and the
