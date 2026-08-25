@@ -703,6 +703,13 @@ struct QuantizedBlockLoader {
       biases += group_stride;
     }
   }
+
+  // Retarget the threadgroup destination by delta elements. Used by the
+  // software-pipelined (double-buffered) kernel to alternate the staging
+  // buffer between loads; the device-side source walk is unaffected.
+  void shift_dst(const int delta) {
+    dst += delta;
+  }
 };
 
 template <
@@ -843,6 +850,10 @@ struct QuantizedBlockLoader<
       biases += n_groups * group_stride;
     }
   }
+
+  void shift_dst(const int delta) {
+    dst += delta;
+  }
 };
 
 template <typename T>
@@ -947,7 +958,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    const bool pipeline = false>
 METAL_FUNC void qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1030,6 +1042,72 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
+      if constexpr (pipeline) {
+        // Software-pipelined k-loop over a double-buffered Ws (the caller
+        // allocates 2 * BN * BK_padded elements). This mirrors the structure
+        // fp_quantized_nax's fp_qmm_t_impl already ships, including the const
+        // consuming pointer: without const the compiler must assume the
+        // loader's threadgroup writes may alias the mma's reads and serialises
+        // the two phases, which pays the doubled allocation for none of the
+        // overlap. The device load/dequant sequence and the per-element mma
+        // sequence are identical to the unpipelined loop.
+        constexpr int Ws_tile = BN * BK_padded;
+
+        if (K > 0) {
+          if constexpr (kAlignedN.value) {
+            loader_w.load_unsafe();
+          } else {
+            loader_w.load_safe(short2(BK, tgp_bn));
+          }
+          loader_w.next();
+          loader_w.shift_dst(Ws_tile);
+        }
+
+        short cur = 0;
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          if (k + BK < K) {
+            if constexpr (kAlignedN.value) {
+              loader_w.load_unsafe();
+            } else {
+              loader_w.load_safe(short2(BK, tgp_bn));
+            }
+            loader_w.next();
+            loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
+          }
+
+          const threadgroup T* Wk = Ws + cur * Ws_tile;
+
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
+
+            volatile int compiler_barrier;
+
+            if constexpr (kAlignedM.value) {
+              Atile.load(x + kk1, K);
+            } else {
+              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<T, BK_padded, 1>(Wk + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+
+            (void)compiler_barrier;
+          }
+
+          x += BK;
+          cur ^= 1;
+        }
+      } else {
       for (int k = 0; k < K; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (kAlignedN.value) {
@@ -1067,6 +1145,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
         x += BK;
         loader_w.next();
+      }
       }
 
       // Store results to device memory
@@ -1240,7 +1319,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[2 * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1260,7 +1339,7 @@ template <
         b_strides,
         tid);
   }
-  qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
+  qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN, true>(
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 

@@ -643,7 +643,7 @@ private func qwen35GatedDeltaReplayState(
 
     let T = k.dim(1)
     let outputs = kernel(
-        [k, v, g, beta, preparedState, MLXArray(T)],
+        [k, v, g, beta, preparedState, Qwen35SmallIntConst.array(T)],
         template: [
             ("StT", DType.float32),
             ("Dk", 128),
@@ -894,9 +894,64 @@ final class Qwen35GatedDeltaNet: Module {
     ) -> (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray) {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
+        let nKeep = convKernelSize - 1
+
+        // Packed-prework mixer gate on the SEED path. `processChunkStashingPrefix`
+        // already takes `qwen35PackedGDNPreworkKernel` at the verify widths
+        // S = 3...9; this ordinary chunk path still launched the unfused
+        // concat / conv1d / silu / split / rms / g-beta chain once per GDN layer,
+        // and the 512-row seed of all 48 GDN layers is charged inside the timed
+        // window. The kernel is position-local: one threadgroup per
+        // (row, logical head), a four-tap conv loop, and a Q/K RMS that reduces
+        // inside a 32-lane simd_sum, so `T` only bounds which rows copy into the
+        // conv state -- no reduction walks the sequence. That is why the
+        // S = 3...9 byte receipt carries to S = 512 without a new reduction
+        // order. The gate is the twin's, widened to S <= 512, closed on masked
+        // calls (the seed call is unmasked) and closed on the memo-g fallback so
+        // a missing mid kernel still lands on `gatedDeltaUpdate`. Any miss keeps
+        // the stock body byte for byte.
+        let mixerHit = MLXHardwareInfo.isCompiledDecodeSupported
+            && qwen35GatedDeltaMidKernel != nil
+            && mask == nil
+            && B == 1 && S >= 3 && S <= 512 && nKeep == 3
+            && numKHeads == 16 && numVHeads == 48
+            && headKDim == 128 && headVDim == 128
+            && qkv.dim(2) == 16 * 128 * 2 + 48 * 128
+            && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
+            && a.dtype == .bfloat16 && b.dtype == .bfloat16
+        if mixerHit {
+            let (qScaleConst, kScaleConst) = normScaleConstants(.bfloat16)
+            let outs = qwen35PackedGDNPreworkKernel(
+                [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
+                 qScaleConst,
+                 kScaleConst],
+                template: [
+                    ("Hk", numKHeads), ("Dk", headKDim),
+                    ("Hv", numVHeads), ("Dv", headVDim),
+                    ("NKeep", nKeep), ("C", qkv.dim(2)), ("T", S),
+                ],
+                grid: (32, S, 2 * numKHeads + numVHeads),
+                threadGroup: (32, 1, 1),
+                outputShapes: [
+                    [B, S, numKHeads, headKDim],
+                    [B, S, numKHeads, headKDim],
+                    [B, S, numVHeads, headVDim],
+                    [B, nKeep, qkv.dim(2)],
+                    [B, S, numVHeads],
+                    [B, S, numVHeads],
+                ],
+                outputDTypes: [
+                    .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
+                    .float32,
+                ]
+            )
+            let prepared = qwen35GatedDeltaPrepared(
+                q: outs[0], k: outs[1], v: outs[2],
+                g: outs[4], beta: outs[5], state: ssmState, mask: mask)
+            return (prepared.0, outs[3], prepared.1)
+        }
 
         let convInput = concatenated([convState, qkv], axis: 1)
-        let nKeep = convKernelSize - 1
         let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
         let convOut = silu(conv1d(convInput))
 
@@ -1222,7 +1277,7 @@ final class Qwen35GatedDeltaNet: Module {
             if state.dtype != .float32 { state = state.asType(.float32) }
 
             let outputs = midKernel(
-                [qNormed, kNormed, v, g, beta, state, MLXArray(S)],
+                [qNormed, kNormed, v, g, beta, state, Qwen35SmallIntConst.array(S)],
                 template: [
                     ("InT", dtype),
                     ("StT", DType.float32),
@@ -2331,6 +2386,63 @@ private let qwen35FusedResidualRMSNormXSumsKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+/// Input-independent `eps` buffer for the fused residual+RMSNorm kernel.
+///
+/// The wrapper below bound `MLXArray(eps)` on every call. The tower has 64
+/// layers with a fused residual boundary at almost every one, so a 512-token
+/// seed plus every decode and verify step rebuilt that one-element node dozens
+/// of times per forward -- pure host graph-build work whose bytes never change.
+/// `GatedDeltaNet.normScaleConstants` already memoises exactly this class of
+/// scalar for the q/k norm scales; this is the same memo for the residual
+/// boundary. The config carries a single `rmsNormEps`, so the cache holds one
+/// entry and a different `eps` simply rebuilds once and then sticks. The kernel
+/// reads identical float bits, so every output is bit-identical.
+/// Input-independent small-integer buffers for kernels that bind a length as a
+/// one-element operand.
+///
+/// The two compiled gated-delta wrappers pass `MLXArray(T)` / `MLXArray(S)`,
+/// where the value is the chunk length or the verify width. The tower has 48
+/// gated-delta layers, so each of those rebuilt a fresh one-element node 48
+/// times per forward for a value drawn from a handful of small integers. This
+/// is the same memo `GatedDeltaNet.normScaleConstants` already applies to the
+/// q/k norm scales, keyed by the value so the bytes and dtype are whatever
+/// `MLXArray(n)` produced. The key set is bounded by the trusted maximum draft
+/// block, and the cache refuses anything outside a small range so it cannot
+/// grow without bound.
+enum Qwen35SmallIntConst {
+    nonisolated(unsafe) static var cache = [Int: MLXArray]()
+    static let lock = NSLock()
+    static let maxCached = 64
+
+    static func array(_ n: Int) -> MLXArray {
+        guard n >= 0, n <= maxCached else { return MLXArray(n) }
+        lock.lock()
+        defer { lock.unlock() }
+        if let hit = cache[n] { return hit }
+        let made = MLXArray(n)
+        cache[n] = made
+        return made
+    }
+}
+
+enum Qwen35ResidualRMSNormEps {
+    nonisolated(unsafe) static var cachedEps: Float?
+    nonisolated(unsafe) static var cachedArray: MLXArray?
+    static let lock = NSLock()
+
+    static func array(for eps: Float) -> MLXArray {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cachedEps, cachedEps == eps, let cachedArray {
+            return cachedArray
+        }
+        let made = MLXArray(eps)
+        cachedEps = eps
+        cachedArray = made
+        return made
+    }
+}
+
 /// Wraps the fused residual+RMSNorm kernel.  Returns `(residual, normed)` where
 /// `residual = bf16(x + r)` and `normed = weight * RMSNorm(residual)` with the
 /// same arithmetic as the eager `postAttentionLayerNorm(x + r)`.
@@ -2346,7 +2458,7 @@ func qwen35FusedResidualRMSNorm(
         let k = x.dim(-1)
         let kBlocks = k / 512
         let outputs = qwen35FusedResidualRMSNormXSumsKernel(
-            [x, r, weight, MLXArray(eps)],
+            [x, r, weight, Qwen35ResidualRMSNormEps.array(for: eps)],
             grid: (nRows * 1024, 1, 1),
             threadGroup: (1024, 1, 1),
             outputShapes: [
@@ -2358,7 +2470,7 @@ func qwen35FusedResidualRMSNorm(
         return (outputs[0], outputs[1])
     }
     let outputs = qwen35FusedResidualRMSNormKernel(
-        [x, r, weight, MLXArray(eps)],
+        [x, r, weight, Qwen35ResidualRMSNormEps.array(for: eps)],
         grid: (nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [shape, shape],
@@ -2575,7 +2687,7 @@ func qwen35DualRMSNorm(
 ) -> (MLXArray, MLXArray) {
     let nRows = a.size / a.dim(-1)
     let outputs = qwen35DualRMSNormKernel(
-        [a, b, aWeight, bWeight, MLXArray(eps)],
+        [a, b, aWeight, bWeight, Qwen35ResidualRMSNormEps.array(for: eps)],
         grid: (2 * nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [a.shape, b.shape],
@@ -2730,6 +2842,23 @@ private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
         threadgroup float local_inv_mean[1];
         threadgroup float local_sums[simd_size];
 
+        // Pre-FC input reuse: the sum-of-squares pass and the output pass read
+        // the SAME immutable values -- a dequantized affine-4 embedding row or
+        // a BF16 hidden row. The first pass now keeps each value it already
+        // computed in thread-private slots, and the output pass takes them from
+        // there instead of re-reading the row and repeating the nibble extract
+        // and scale/bias expansion. At the gated width (5120 with 1024 threads
+        // x 4 reads = two chunks) every element a thread owns has a slot; the
+        // `< n_cache` guard keeps any other width correct by falling back to a
+        // recompute, so the kernel stays general. Bit-exact by construction:
+        // the stored float IS the float the second read would recompute from
+        // immutable bits via the same deterministic expression, and the
+        // accumulation order, reductions, barriers, norm weights, BF16 rounding
+        // and stores are all untouched.
+        constexpr uint n_cache = 8;
+        float xcache[n_cache];
+        uint cache_base = 0;
+
         float acc = 0.0f;
         for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
             uint elem = r_start + thread_id * n_reads;
@@ -2739,6 +2868,9 @@ private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
                         ? qwen35_embed_row_value(
                             e_weight, e_scales, e_biases, w_off, g_off, elem + i)
                         : float(b[in_off + elem + i]);
+                    if (cache_base + i < n_cache) {
+                        xcache[cache_base + i] = xi;
+                    }
                     acc += xi * xi;
                 }
             } else {
@@ -2749,10 +2881,14 @@ private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
                                 e_weight, e_scales, e_biases, w_off, g_off,
                                 elem + i)
                             : float(b[in_off + elem + i]);
+                        if (cache_base + i < n_cache) {
+                            xcache[cache_base + i] = xi;
+                        }
                         acc += xi * xi;
                     }
                 }
             }
+            cache_base += n_reads;
         }
 
         acc = simd_sum(acc);
@@ -2776,30 +2912,37 @@ private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float inv_mean = local_inv_mean[0];
+        cache_base = 0;
         for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
             uint elem = r_start + thread_id * n_reads;
             if (elem + n_reads <= axis_size) {
                 for (uint i = 0; i < n_reads; ++i) {
-                    float xi = is_a
-                        ? qwen35_embed_row_value(
-                            e_weight, e_scales, e_biases, w_off, g_off, elem + i)
-                        : float(b[in_off + elem + i]);
+                    float xi = (cache_base + i < n_cache)
+                        ? xcache[cache_base + i]
+                        : (is_a
+                            ? qwen35_embed_row_value(
+                                e_weight, e_scales, e_biases, w_off, g_off,
+                                elem + i)
+                            : float(b[in_off + elem + i]));
                     bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
                     concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
                 }
             } else {
                 for (uint i = 0; i < n_reads; ++i) {
                     if (elem + i < axis_size) {
-                        float xi = is_a
-                            ? qwen35_embed_row_value(
-                                e_weight, e_scales, e_biases, w_off, g_off,
-                                elem + i)
-                            : float(b[in_off + elem + i]);
+                        float xi = (cache_base + i < n_cache)
+                            ? xcache[cache_base + i]
+                            : (is_a
+                                ? qwen35_embed_row_value(
+                                    e_weight, e_scales, e_biases, w_off, g_off,
+                                    elem + i)
+                                : float(b[in_off + elem + i]));
                         bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
                         concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
                     }
                 }
             }
+            cache_base += n_reads;
         }
     """,
     header: """
@@ -2836,7 +2979,7 @@ func qwen35EmbedDualRMSNormConcat(
     outShape[outShape.count - 1] = b.dim(-1) * 2
     let outputs = qwen35EmbedDualRMSNormConcatKernel(
         [ids, embedWeight, embedScales, embedBiases, b, aWeight, bWeight,
-         MLXArray(eps)],
+         Qwen35ResidualRMSNormEps.array(for: eps)],
         grid: (2 * nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [outShape],
@@ -2856,7 +2999,7 @@ func qwen35DualRMSNormConcat(
     var outShape = a.shape
     outShape[outShape.count - 1] = a.dim(-1) + b.dim(-1)
     let outputs = qwen35DualRMSNormConcatKernel(
-        [a, b, aWeight, bWeight, MLXArray(eps)],
+        [a, b, aWeight, bWeight, Qwen35ResidualRMSNormEps.array(for: eps)],
         grid: (2 * nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [outShape],
