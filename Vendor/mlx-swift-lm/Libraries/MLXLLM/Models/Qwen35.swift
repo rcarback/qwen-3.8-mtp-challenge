@@ -2756,11 +2756,6 @@ private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
         }
 
         acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_thread] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
         if (simd_thread == 0) {
             local_sums[simd_group] = acc;
         }
