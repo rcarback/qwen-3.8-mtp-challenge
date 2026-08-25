@@ -870,7 +870,15 @@ public final class Qwen36MTPBlockSession {
     /// 0.32 -> 2.84585). The wasted-work term a reject does keep (the
     /// drafted head steps past the break) is already inside the marginal
     /// the rule prices.
-    private static let headStepCostRatio = 0.18
+    /// 0.10 on the tensor-unit verify (`Qwen35NaxQMV`). The bracket above
+    /// (0.14 / 0.15 / 0.32, optimum 0.18) was measured on the scalar wide QMV,
+    /// where the measured marginal step into widths 5..8 was 13 / 27 / 15 /
+    /// 10 ms -- 0.3..0.9 of a verify forward per extra row. With the per-row
+    /// work on the tensor units the marginal verify row is a fraction of a
+    /// millisecond and the draft's price is the head step, ~1.05 ms of a
+    /// ~32 ms forward (h ~ 0.035). 0.10 takes roughly half the distance from
+    /// the shipped constant toward that, keeping the cap at 7.
+    private static let headStepCostRatio = 0.10
 
     /// E68: the depth price as a per-position vector.
     ///
