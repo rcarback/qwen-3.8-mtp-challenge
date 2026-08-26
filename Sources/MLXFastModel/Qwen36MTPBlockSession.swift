@@ -193,7 +193,13 @@ public final class Qwen36MTPBlockSession {
         // ladder's cap of 4 left committed tokens on the table.
         draftPolicy = { [weak self] offeredDepth, _ in
             guard let self else { return Swift.min(offeredDepth, 1) }
-            return self.costModelDepth(offeredDepth: offeredDepth)
+            // C28 ARM D (ESTIMATOR_PLUS_ARGMAX): counted Beta posterior +
+            // exact argmax, STOCK price. No margin gates in this path
+            // (REFUT-QWEN-071 measured them non-composable with a ratio
+            // argmax in the E+R+P_M3 configuration; kept out here, noted in
+            // the dependency table).
+            return self.argmaxDepthStockPrice(
+                offeredDepth: offeredDepth, p: argmaxDecisionP())
         }
     }
 
@@ -1068,6 +1074,81 @@ public final class Qwen36MTPBlockSession {
     /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
     private static let segmentedStreakGate = 2
 
+
+    // ---- C28 FACTORIAL COMPONENT E (RL-d94699155704bc87) ----
+    // The CAND248 discounted-Beta estimator with observation counts,
+    // verbatim: gamma-discounted S/F counts, hierarchical shrinkage (an
+    // unreached rung inherits its parent posterior, decayed by RHO), censored
+    // update (positions deeper than the rejection are untouched), stop-token
+    // exception. Hardware-invariant: it prices EVIDENCE, not milliseconds.
+    private static let argmaxGamma = 0.99
+    private static let argmaxPriorN = 4.0
+    private static let argmaxRootPrior = 0.85
+    private static let argmaxRho = 0.95
+    private static let argmaxPCap = 0.995
+    private var argmaxS = [Double](repeating: 0, count: Qwen36MTPLimits.maxDepth)
+    private var argmaxF = [Double](repeating: 0, count: Qwen36MTPLimits.maxDepth)
+    private func argmaxPosterior() -> [Double] {
+        var mu = [Double](repeating: 0, count: argmaxS.count)
+        var parent = Self.argmaxRootPrior
+        for k in 0 ..< argmaxS.count {
+            let n = argmaxS[k] + argmaxF[k]
+            mu[k] = (argmaxS[k] + Self.argmaxPriorN * parent)
+                / (n + Self.argmaxPriorN)
+            parent = mu[k] * Self.argmaxRho
+        }
+        return mu
+    }
+    private func argmaxDecisionP() -> [Double] {
+        argmaxPosterior().map { Swift.min(Self.argmaxPCap, $0) }
+    }
+    private func argmaxObserve(_ k: Int, success: Bool) {
+        guard k >= 0, k < argmaxS.count else { return }
+        argmaxS[k] *= Self.argmaxGamma
+        argmaxF[k] *= Self.argmaxGamma
+        if success { argmaxS[k] += 1.0 } else { argmaxF[k] += 1.0 }
+    }
+    private func argmaxRecord(acceptedCount: Int, drafts: [Int]) {
+        let drafted = drafts.count
+        let stoppedEarly = acceptedCount > 0 && acceptedCount <= drafted
+            && stopTokens.contains(drafts[acceptedCount - 1])
+        for k in 0 ..< Swift.min(acceptedCount, argmaxS.count) {
+            argmaxObserve(k, success: true)
+        }
+        if acceptedCount < drafted, !stoppedEarly {
+            argmaxObserve(acceptedCount, success: false)
+        }
+    }
+
+    // ---- C28 FACTORIAL COMPONENT R (RL-d94699155704bc87) ----
+    // Exact argmax over EVERY legal depth INCLUDING the adaptive skip d=0,
+    // consuming the STOCK cost model through its own cumulative price --
+    // price(d) = Self.depthPrice.cumulative[d], the whole-round cost the
+    // shipped greedy walk already amortises (uniform: 1.0 + 0.18 d, the
+    // level bracketed on the ranked board; M5_SELECTED_PRIOR, not an M5
+    // measurement). With the uniform price the d=0/1 boundary
+    // (1+p0)/1.18 > 1  <=>  p0 > 0.18 coincides exactly with the shipped
+    // walk's first-step threshold, so the skip semantics are inherited, not
+    // invented. No hardware-fitted constant appears anywhere in this rule.
+    private func argmaxDepthStockPrice(offeredDepth: Int, p: [Double]) -> Int {
+        let cap = Swift.min(
+            Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
+            Self.segmentedVerifyDepthCap)
+        guard cap > 0 else { return 0 }
+        let price = Self.depthPrice.cumulative
+        var reach = 1.0
+        var value = 1.0
+        var best = 1.0
+        var bestDepth = 0
+        for d in 1 ... cap where d - 1 < p.count {
+            reach *= p[d - 1]
+            value += reach
+            let z = value / price[d]
+            if z > best { best = z; bestDepth = d }
+        }
+        return bestDepth
+    }
+
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
         // The width wall binds the SINGLE-CALL verify; a qualifying
@@ -1628,6 +1709,7 @@ public final class Qwen36MTPBlockSession {
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
         recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
+        argmaxRecord(acceptedCount: acceptedCount, drafts: drafts)
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only
             // rows on the accepted trajectory align with the serial leg.
