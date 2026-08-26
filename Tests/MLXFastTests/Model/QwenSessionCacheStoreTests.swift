@@ -302,4 +302,67 @@ struct QwenSessionCacheStoreTests {
             for: tokens, boundaries: [-5, 0, 25, 900], chunkSize: 10)
         #expect(keys.map(\.tokenCount) == [25])
     }
+
+    @Test("a checkpoint evicted from memory is still found on disk")
+    func diskSurvivesEviction() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("store-disk-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fingerprint = QwenPrefillDiskCache.Fingerprint(
+            weightsIdentity: "w1", chunkSize: 4096, kvPolicy: "bf16")
+
+        let store = QwenSessionCacheStore<Payload>(budgetBytes: 1 << 30)
+        store.attachDisk(root: root, fingerprint: fingerprint)
+
+        let tokens = Array(0 ..< 80)
+        let keys = QwenPrefillChunking.chainKeys(
+            for: tokens, boundaries: [40], chunkSize: 20)
+        try store.recordChunkPersisting(
+            key: keys[0].key,
+            entry: QwenPrefillDiskCache.CacheEntry(
+                tokens: Array(tokens.prefix(40)),
+                layerTags: ["MambaCache"], stateCounts: [1], offsets: [40],
+                arrays: ["L0.S0": MLXArray(converting: [1.0, 2.0])],
+                kvBytes: 16, recurrentBytes: 32,
+                seedTokenCount: 40, committedTokenCount: 40))
+
+        // A fresh store shares no memory with the first: only the disk can
+        // answer, which is the whole point of the feature.
+        let cold = QwenSessionCacheStore<Payload>(budgetBytes: 1 << 30)
+        cold.attachDisk(root: root, fingerprint: fingerprint)
+        let hit = try #require(
+            cold.diskChunkMatch(keys: keys, incoming: tokens))
+        #expect(hit.tokens == Array(tokens.prefix(40)))
+        #expect(hit.seedTokenCount == 40)
+    }
+
+    @Test("a disk hit whose tokens disagree is refused")
+    func diskTokenMismatchRefused() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("store-disk-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fingerprint = QwenPrefillDiskCache.Fingerprint(
+            weightsIdentity: "w1", chunkSize: 4096, kvPolicy: "bf16")
+        let store = QwenSessionCacheStore<Payload>(budgetBytes: 1 << 30)
+        store.attachDisk(root: root, fingerprint: fingerprint)
+
+        let tokens = Array(0 ..< 80)
+        let keys = QwenPrefillChunking.chainKeys(
+            for: tokens, boundaries: [40], chunkSize: 20)
+        // Store tokens that do NOT match the key's own prefix. The key is a
+        // hash; a collision must not be allowed to resume an unrelated cache,
+        // so the token comparison is load-bearing and not redundant.
+        try store.recordChunkPersisting(
+            key: keys[0].key,
+            entry: QwenPrefillDiskCache.CacheEntry(
+                tokens: Array(repeating: 999, count: 40),
+                layerTags: ["MambaCache"], stateCounts: [1], offsets: [40],
+                arrays: ["L0.S0": MLXArray(converting: [1.0])],
+                kvBytes: 16, recurrentBytes: 32,
+                seedTokenCount: 40, committedTokenCount: 40))
+
+        let cold = QwenSessionCacheStore<Payload>(budgetBytes: 1 << 30)
+        cold.attachDisk(root: root, fingerprint: fingerprint)
+        #expect(cold.diskChunkMatch(keys: keys, incoming: tokens) == nil)
+    }
 }

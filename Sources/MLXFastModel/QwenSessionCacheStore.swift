@@ -76,6 +76,8 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
     private var conversations: [String: Conversation] = [:]
     private var clock: UInt64 = 0
     private let lock = NSLock()
+    private var diskRoot: URL?
+    private var diskFingerprint: QwenPrefillDiskCache.Fingerprint?
 
     public init(
         budgetBytes: Int = QwenSessionCacheBudget.clampedDefault()
@@ -215,6 +217,63 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
             conversation.lastUsed = clock
             conversations[QwenPrefillChunking.namespace + entry.key] = conversation
             return (round, Array(incoming.dropFirst(round.tokenCount)))
+        }
+        return nil
+    }
+
+    /// Enable disk persistence for prefill checkpoints.
+    ///
+    /// Conversations are deliberately NOT persisted. A conversation holds a
+    /// live client's resume point and is meaningless after a restart, whereas
+    /// a checkpoint is content-addressed: it belongs to whichever stream
+    /// derives the same key next, including a stream that does not exist yet.
+    public func attachDisk(
+        root: URL, fingerprint: QwenPrefillDiskCache.Fingerprint
+    ) {
+        lock.lock(); defer { lock.unlock() }
+        diskRoot = root
+        diskFingerprint = fingerprint
+    }
+
+    /// Record a checkpoint to disk. In-memory recording stays the caller's job.
+    public func recordChunkPersisting(
+        key: String, entry: QwenPrefillDiskCache.CacheEntry
+    ) throws {
+        lock.lock()
+        let root = diskRoot
+        let fingerprint = diskFingerprint
+        lock.unlock()
+        guard let root, let fingerprint else { return }
+        try QwenPrefillDiskCache.write(
+            entry, key: key, fingerprint: fingerprint, root: root)
+    }
+
+    /// Deepest on-disk checkpoint whose tokens are a prefix of `incoming`.
+    ///
+    /// Walked in reverse for the same reason `chunkMatch` is: the first hit is
+    /// the deepest and leaves the least tail to prefill. The token comparison
+    /// is not redundant with the key -- the key is a hash, and a collision
+    /// would otherwise resume from an unrelated cache.
+    public func diskChunkMatch(
+        keys: [(key: String, tokenCount: Int)], incoming: [Int]
+    ) -> QwenPrefillDiskCache.CacheEntry? {
+        lock.lock()
+        let root = diskRoot
+        let fingerprint = diskFingerprint
+        lock.unlock()
+        guard let root, let fingerprint else { return nil }
+        for entry in keys.reversed() {
+            // `read` both throws and returns an optional, so `try?` yields a
+            // double optional. Flatten it explicitly rather than relying on
+            // shorthand shadowing inside a single guard.
+            let found = (try? QwenPrefillDiskCache.read(
+                key: entry.key, fingerprint: fingerprint, root: root)) ?? nil
+            guard let candidate = found else { continue }
+            guard candidate.tokens.count < incoming.count,
+                  candidate.tokens == Array(
+                      incoming.prefix(candidate.tokens.count))
+            else { continue }
+            return candidate
         }
         return nil
     }

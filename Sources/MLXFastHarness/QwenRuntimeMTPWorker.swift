@@ -36,6 +36,78 @@ struct QwenMTPRoundRequest: Equatable {
     let depth: Int
 }
 
+/// Cheap identity for the loaded weights.
+///
+/// Hashing 15 GB of weights on every start is not affordable, and is not what
+/// the guard needs: the question is whether the tree CHANGED, and name, size
+/// and modification time answer that for a local directory. FNV-1a rather
+/// than `Hasher` because this value must be stable across processes.
+func qwenWeightsIdentity(path: String) -> String {
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    func mix(_ bytes: some Sequence<UInt8>) {
+        for byte in bytes {
+            hash = (hash ^ UInt64(byte)) &* 0x100_0000_01b3
+        }
+    }
+    let manager = FileManager.default
+    let names = ((try? manager.contentsOfDirectory(atPath: path)) ?? []).sorted()
+    for name in names {
+        mix(Array(name.utf8))
+        let attributes = try? manager.attributesOfItem(
+            atPath: path + "/" + name)
+        let size = (attributes?[.size] as? Int) ?? 0
+        let modified = (attributes?[.modificationDate] as? Date)?
+            .timeIntervalSince1970 ?? 0
+        mix(Array(String(size).utf8))
+        mix(Array(String(Int(modified)).utf8))
+    }
+    return String(hash, radix: 36)
+}
+
+/// Stable string for the KV basis a checkpoint was written under.
+///
+/// Rows written at one bit width, group size, or rotation basis decode into
+/// plausible numbers under another rather than failing, so the basis has to be
+/// part of the fingerprint. `nil` is the bf16 path and gets its own name so it
+/// cannot collide with a quantized policy that happens to stringify short.
+func qwenKVPolicyIdentity() -> String {
+    guard let policy = Qwen36MTPBlockSession.KVQuantization.fromEnvironment()
+    else { return "bf16" }
+    return "b\(policy.bits)g\(policy.groupSize)"
+        + "m\(policy.minimumOffset)r\(policy.rotate ? 1 : 0)"
+        + "s\(policy.seed)"
+}
+
+/// Flatten a snapshot's heterogeneous per-layer caches into named arrays.
+///
+/// The layer stack mixes `ArraysCache` for the 48 gated-delta layers with
+/// attention KV caches for the other 16, and each carries a different number
+/// of state arrays. `layerTags` and `stateCounts` are what let the reader put
+/// them back in the right classes in the right order.
+func qwenMTPCacheEntry(
+    snapshot: Qwen36MTPBlockSession.SessionSnapshot, tokens: [Int]
+) throws -> QwenPrefillDiskCache.CacheEntry {
+    var arrays: [String: MLXArray] = [:]
+    var tags: [String] = []
+    var counts: [Int] = []
+    var offsets: [Int] = []
+    for (layer, cache) in snapshot.cache.enumerated() {
+        tags.append(try QwenPrefillDiskCache.tag(for: cache))
+        offsets.append(cache.offset)
+        let state = cache.state
+        counts.append(state.count)
+        for (index, array) in state.enumerated() {
+            arrays["L\(layer).S\(index)"] = array
+        }
+    }
+    return QwenPrefillDiskCache.CacheEntry(
+        tokens: tokens, layerTags: tags, stateCounts: counts, offsets: offsets,
+        arrays: arrays,
+        kvBytes: snapshot.kvBytes, recurrentBytes: snapshot.recurrentBytes,
+        seedTokenCount: snapshot.seedTokenCount,
+        committedTokenCount: snapshot.committedTokenCount)
+}
+
 /// Resume points, keyed by conversation, shared across session rebuilds.
 ///
 /// Deliberately OUTSIDE `QwenMTPWorkerState`: a reset replaces that struct
@@ -44,6 +116,24 @@ struct QwenMTPRoundRequest: Equatable {
 /// never populates it because no ranked request carries a `conversationId`.
 let qwenMTPResumeStore =
     QwenSessionCacheStore<Qwen36MTPBlockSession.SessionSnapshot>()
+
+/// Cache root and fingerprint for disk-persisted prefill checkpoints.
+///
+/// `DARKBLOOM_PREFILL_CACHE_DIR` is opt-in and off by default until the
+/// on-disk path is proven; attached once, before the request loop starts,
+/// because the fingerprint (weights identity, chunk size, KV basis) is fixed
+/// for the process lifetime and does not vary per request.
+func attachQwenMTPDiskCache(targetWeightsPath: String) {
+    guard let root = ProcessInfo.processInfo
+        .environment["DARKBLOOM_PREFILL_CACHE_DIR"], !root.isEmpty
+    else { return }
+    qwenMTPResumeStore.attachDisk(
+        root: URL(fileURLWithPath: root),
+        fingerprint: QwenPrefillDiskCache.Fingerprint(
+            weightsIdentity: qwenWeightsIdentity(path: targetWeightsPath),
+            chunkSize: QwenPrefillChunking.chunkSize,
+            kvPolicy: qwenKVPolicyIdentity()))
+}
 
 struct QwenMTPWorkerState {
     var began = false
@@ -246,6 +336,7 @@ extension QwenRuntime {
         try warmup.warmAllDepths(maxDepth: Qwen36MTPLimits.maxDepth)
         var session = try Qwen36MTPBlockSession(
             model: model, stopTokens: stopTokens)
+        attachQwenMTPDiskCache(targetWeightsPath: targetWeightsPath)
 
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
@@ -512,6 +603,12 @@ extension QwenRuntime {
                             state: checkpoint,
                             roundBytes: checkpoint.recurrentBytes,
                             kvBytes: checkpoint.kvBytes)
+                        if let entry = try? qwenMTPCacheEntry(
+                            snapshot: checkpoint, tokens: Array(seedTokens.prefix(stop)))
+                        {
+                            try? qwenMTPResumeStore.recordChunkPersisting(
+                                key: key, entry: entry)
+                        }
                     }
                     guard let token else {
                         throw MLXFastError.invalidInput(
@@ -546,6 +643,47 @@ extension QwenRuntime {
                         ("qwen-mtp: resumed \(hit.round.tokenCount) cached "
                             + "tokens from the shared prefix store, prefilling "
                             + "\(hit.tail.count)\n").utf8))
+                } else if let hit = qwenMTPResumeStore.diskChunkMatch(
+                    keys: chunkKeys, incoming: seedTokens) {
+                    // Disk checkpoint. Tried only after the in-memory
+                    // `chunkMatch` misses, so a warm process never pays the
+                    // read; a cold one pays a few hundred milliseconds of
+                    // safetensors load instead of minutes of prefill.
+                    //
+                    // Same environment the fingerprint was built from, and the
+                    // fingerprint already refused any checkpoint written under
+                    // a different policy, so this is guaranteed to be the
+                    // policy the rows were written at.
+                    let policy = Qwen36MTPBlockSession.KVQuantization.fromEnvironment()
+                    let quantization = policy.map {
+                        (groupSize: $0.groupSize, bits: $0.bits)
+                    }
+                    var caches: [any KVCache] = []
+                    for (layer, tag) in hit.layerTags.enumerated() {
+                        var state: [MLXArray] = []
+                        for slot in 0 ..< hit.stateCounts[layer] {
+                            guard let array = hit.arrays["L\(layer).S\(slot)"] else {
+                                throw MLXFastError.invalidInput(
+                                    "prefill checkpoint is missing array "
+                                        + "L\(layer).S\(slot)")
+                            }
+                            state.append(array)
+                        }
+                        caches.append(
+                            try QwenPrefillDiskCache.makeCache(
+                                tag: tag, state: state, offset: hit.offsets[layer],
+                                quantization: quantization))
+                    }
+                    try session.adoptRestoredCaches(
+                        caches,
+                        seedTokenCount: hit.seedTokenCount,
+                        committedTokenCount: hit.committedTokenCount)
+                    seedToken = try prefillCheckpointed(from: hit.tokens.count)
+                    resumedTokens = hit.tokens.count
+                    FileHandle.standardError.write(Data(
+                        ("qwen-mtp: resumed \(hit.tokens.count) cached "
+                            + "tokens from disk, prefilling "
+                            + "\(seedTokens.count - hit.tokens.count)\n").utf8))
                 } else {
                     if let conversationId = request.conversationId {
                         // A refused restore means the stored basis no longer

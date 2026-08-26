@@ -268,13 +268,17 @@ public final class Qwen36MTPBlockSession {
     /// The caches are `copy()` deep copies, per the vendored `KVCache.copy()`
     /// contract, so a retained snapshot is not disturbed by continued decoding.
     public struct SessionSnapshot {
-        let cache: [any KVCache]
+        // `cache`, `seedTokenCount` and `committedTokenCount` are `public`
+        // (unlike the other fields here) because the disk-persistence path in
+        // `MLXFastHarness` reads them to flatten a snapshot into
+        // `QwenPrefillDiskCache.CacheEntry` -- see `qwenMTPCacheEntry`.
+        public let cache: [any KVCache]
         let headHistoryCache: [any KVCache]?
         let pendingPrimary: Int?
         let pendingTop2: ([Int], [Double])?
         let pendingHidden: MLXArray?
-        let seedTokenCount: Int
-        let committedTokenCount: Int
+        public let seedTokenCount: Int
+        public let committedTokenCount: Int
         let positionAcceptEMA: [Double]
         /// Append-only attention KV. Charged ONCE per conversation: rounds of
         /// one conversation share this buffer.
@@ -378,6 +382,55 @@ public final class Qwen36MTPBlockSession {
             model.installKVRotation(enabled: false, seed: 0)
         }
         began = true
+    }
+
+    /// Adopt caches rebuilt from an on-disk checkpoint.
+    ///
+    /// This does NOT re-check the KV basis the way `restoreState` does, and
+    /// that is deliberate rather than an omission: a disk checkpoint is
+    /// verified against its fingerprint -- which carries the basis -- before a
+    /// single array is read, so the check has already happened one layer up.
+    /// A checkpoint that reaches here has passed it.
+    public func adoptRestoredCaches(
+        _ caches: [any KVCache], seedTokenCount: Int, committedTokenCount: Int
+    ) throws {
+        guard caches.count == cache.count else {
+            throw MLXFastError.invalidInput(
+                "prefill checkpoint has \(caches.count) layers; "
+                    + "session has \(cache.count)")
+        }
+        cache = caches
+        // No head history rides a disk checkpoint, so this mirrors what
+        // `restoreState` would do for a snapshot with none: clear it and let
+        // the head re-prime lazily rather than resume against rows that no
+        // longer exist.
+        headHistoryCache = nil
+        self.seedTokenCount = seedTokenCount
+        self.committedTokenCount = committedTokenCount
+        // Same optimistic-decaying prior the property is declared with --
+        // this session never observed any rounds under this checkpoint.
+        positionAcceptEMA = (0 ..< Qwen36MTPLimits.maxDepth)
+            .map { 0.85 * pow(0.98, Double($0)) }
+        began = true
+        pendingPrimary = nil
+        pendingTop2 = nil
+        pendingHidden = nil
+        // Backlogs and priming rows belong to a prefix this session never
+        // primed against; same reasoning as `restoreState`.
+        headHistoryBacklogHidden = []
+        headHistoryBacklogTokens = []
+        seedHiddenForPriming = nil
+        seedTokensForPriming = []
+        if let blockDrafter {
+            blockDraftCache = blockDrafter.makeCache()
+            pendingLayerHidden = nil
+        }
+        if let kvQuantization {
+            model.installKVRotation(
+                enabled: kvQuantization.rotate, seed: kvQuantization.seed)
+        } else {
+            model.installKVRotation(enabled: false, seed: 0)
+        }
     }
 
     public private(set) var seedTokenCount = 0
