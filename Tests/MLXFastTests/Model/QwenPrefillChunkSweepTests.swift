@@ -51,8 +51,21 @@ struct ChunkCostGrid {
         return low + (high - low) * dt
     }
 
+    /// Looks up a point the axes promise exists.
+    ///
+    /// `bracket` only ever returns coordinates drawn from `chunks` and
+    /// `depths`, which are built from the points themselves, so a miss means
+    /// the grid is ragged rather than rectangular. That is a programming
+    /// error, and it traps: returning zero instead would under-price the
+    /// missing corner and quietly bias every sum that crosses it.
     private func raw(chunk: Int, cached: Int) -> Double {
-        points.first { $0.chunk == chunk && $0.cached == cached }?.seconds ?? 0
+        guard let point = points.first(where: {
+            $0.chunk == chunk && $0.cached == cached
+        }) else {
+            fatalError("cost grid has no point at chunk \(chunk), "
+                + "cached \(cached); the grid must be rectangular")
+        }
+        return point.seconds
     }
 
     /// Returns the two grid values bracketing `value` and the fraction between
@@ -174,6 +187,85 @@ struct ChunkCostGridTests {
         #expect(grid.seconds(chunk: 8192, cached: 0) == 2.0)
         #expect(grid.seconds(chunk: 64, cached: 0) == 1.0)
         #expect(grid.seconds(chunk: 1024, cached: 99999) == 6.0)
+    }
+
+    /// The twenty points measured on a quiet host on 2026-08-26, seconds per
+    /// chunk, transcribed from the run recorded in
+    /// `docs/qwen-prefill-research-plan.md`.
+    ///
+    /// These are pinned so the conclusion drawn in that document is checkable
+    /// without a 29-minute re-measurement, and so a later edit to the surface
+    /// or the schedule cannot quietly change what the recorded numbers imply.
+    static let measured2026_08_26: [ChunkCostGrid.Point] = [
+        .init(chunk: 256, cached: 0, seconds: 2.345),
+        .init(chunk: 512, cached: 0, seconds: 4.758),
+        .init(chunk: 1024, cached: 0, seconds: 9.813),
+        .init(chunk: 2048, cached: 0, seconds: 20.253),
+        .init(chunk: 4096, cached: 0, seconds: 43.688),
+        .init(chunk: 256, cached: 2048, seconds: 2.470),
+        .init(chunk: 512, cached: 2048, seconds: 4.960),
+        .init(chunk: 1024, cached: 2048, seconds: 10.238),
+        .init(chunk: 2048, cached: 2048, seconds: 21.224),
+        .init(chunk: 4096, cached: 2048, seconds: 45.203),
+        .init(chunk: 256, cached: 8192, seconds: 2.633),
+        .init(chunk: 512, cached: 8192, seconds: 5.230),
+        .init(chunk: 1024, cached: 8192, seconds: 10.945),
+        .init(chunk: 2048, cached: 8192, seconds: 24.994),
+        .init(chunk: 4096, cached: 8192, seconds: 47.831),
+        .init(chunk: 256, cached: 16384, seconds: 2.820),
+        .init(chunk: 512, cached: 16384, seconds: 5.775),
+        .init(chunk: 1024, cached: 16384, seconds: 12.313),
+        .init(chunk: 2048, cached: 16384, seconds: 25.203),
+        .init(chunk: 4096, cached: 16384, seconds: 53.147),
+    ]
+
+    @Test("the recorded measurement still says what the document claims")
+    func recordedMeasurementSupportsTheConclusion() {
+        let grid = ChunkCostGrid(points: Self.measured2026_08_26)
+        let tokens = 11682
+
+        // The document's claim is that the widest chunk costs more per token
+        // than the narrowest at every measured depth. Check it on the points
+        // themselves rather than on the prose.
+        //
+        // The claim is deliberately about the endpoints and not about strict
+        // monotonicity, because the surface is not strictly monotonic: at
+        // depth 8192 chunk 512 reads slightly under chunk 256, and chunk 4096
+        // reads under chunk 2048. Asserting a clean rise here would assert
+        // something the measurement does not show.
+        for depth in [0, 2048, 8192, 16384] {
+            let perToken = [256, 512, 1024, 2048, 4096].map { width in
+                grid.seconds(chunk: width, cached: depth) / Double(width)
+            }
+            #expect(perToken.last! > perToken.first!)
+            #expect(perToken.max()! == perToken.dropFirst(3).max()!)
+        }
+
+        // The three caps the document asks the reader to act on stay inside
+        // the measured box, so their predictions are real sums, not clamped
+        // ones.
+        for cap in [1024, 2048, 4096] {
+            #expect(!grid.predictionLeavesGrid(
+                tokens: tokens, cap: cap, budget: Self.budget))
+        }
+        // Cap 8192 does not, which is exactly the row the document refuses to
+        // quote. Before `predictionLeavesGrid` existed the sum reported it as
+        // 84.76 s, or 0.702x, because two 8192-wide chunks were each priced at
+        // the 4096 edge. The flag is what stops that number being printed.
+        #expect(grid.predictionLeavesGrid(
+            tokens: tokens, cap: 8192, budget: Self.budget))
+
+        // The whole-prompt figures quoted in the document, to the two decimals
+        // it quotes them at.
+        let predicted = [1024, 2048, 4096].map { cap in
+            (grid.predictedSeconds(
+                tokens: tokens, cap: cap, budget: Self.budget) * 100)
+                .rounded() / 100
+        }
+        #expect(predicted == [120.81, 129.59, 130.84])
+        // Narrow wins: that is the finding, and it is what closed the sweep.
+        #expect(predicted[0] < predicted[1])
+        #expect(predicted[1] < predicted[2])
     }
 
     @Test("a prediction reports when its schedule leaves the measured box")
@@ -344,10 +436,10 @@ struct QwenPrefillChunkSweepTests {
             if cap == 1024 { baseline = predicted }
             if grid.predictionLeavesGrid(
                 tokens: 11682, cap: cap, budget: budget) {
-                print(String(
-                    format: "  %7d  %7d  %11@  %10@",
-                    cap, schedule.count,
-                    "unmeasured" as NSString, "--" as NSString))
+                // Numeric columns keep the numeric format; only the two cost
+                // columns change, because there is no cost to report.
+                print(String(format: "  %7d  %7d", cap, schedule.count)
+                    + "    unmeasured          --")
                 continue
             }
             print(String(

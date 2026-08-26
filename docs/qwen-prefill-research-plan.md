@@ -218,8 +218,15 @@ Appended-chunk cost against the fused attention path, seconds for one chunk of
 | 4096 | 10.666 | 11.036 | 11.677 | 12.975 |
 
 Values are milliseconds per token, so a column is directly comparable down its
-length. Cost rises with chunk width at every depth: 16 percent from chunk 256
-to chunk 4096 at depth 0, 18 percent at depth 16384. The prediction that the
+length. The widest chunk costs more per token than the narrowest at every
+depth: 16 percent more from chunk 256 to chunk 4096 at depth 0, 18 percent at
+depth 16384. The rise is not strictly monotonic. At depth 8192 chunk 512 reads
+0.7 percent under chunk 256, and chunk 4096 reads 4 percent under chunk 2048,
+which is the one point in the grid that breaks the order. That row is a
+candidate for a repeat sample if anyone revisits this, but it does not change
+the reading: every depth puts its most expensive point at chunk 2048 or wider,
+and no depth makes a wide chunk cheaper than the narrow ones. The prediction
+that the
 fused attention kernel would make wide chunks pay is refuted, and the
 mechanism is visible in the shape. Wider chunks do improve projection GEMM
 efficiency, which was the basis of the prediction, but attention within a
