@@ -591,18 +591,37 @@ extension QwenRuntime {
                 // Turn boundaries when the parent supplied them, fixed stride
                 // otherwise. The parent knows where its messages end; the
                 // worker only sees a flat token array and would have to guess.
-                let chunkKeys = (request.turnBoundaries?.isEmpty == false)
+                var chunkKeys = (request.turnBoundaries?.isEmpty == false)
                     ? QwenPrefillChunking.chainKeys(
                         for: seedTokens, boundaries: request.turnBoundaries!)
                     : QwenPrefillChunking.chainKeys(for: seedTokens)
+                // Divergence-learned boundary: the position where this prompt
+                // stops agreeing with a recently completed stream, which is
+                // exactly where the NEXT prompt sharing the same harness
+                // boilerplate will stop agreeing too. Inserted as a
+                // first-class boundary so the existing checkpoint, in-memory
+                // match, and disk match paths all see it: `prefixKey` derives
+                // the same running-FNV key `chainKeys` would at that position,
+                // so a checkpoint recorded here is found by any later request
+                // that discovers the same divergence.
+                if let boundary = qwenMTPResumeStore.learnedBoundary(
+                        incoming: seedTokens),
+                    let key = QwenPrefillChunking.prefixKey(
+                        for: seedTokens, count: boundary)
+                {
+                    chunkKeys = QwenPrefillChunking.insertingBoundary(
+                        boundary, key: key, into: chunkKeys)
+                }
 
                 /// Prefill `seedTokens` from absolute position `base`, taking a
                 /// checkpoint at every chunk boundary beyond it.
                 ///
-                /// Boundaries are absolute multiples of the chunk size, never
-                /// relative to `base`. A checkpoint is only reusable if the
-                /// next request lands on the same boundary, and the next
-                /// request will not share this one's resume position.
+                /// Boundaries are absolute positions -- stride multiples,
+                /// caller-supplied turn ends, or a divergence-learned
+                /// boundary -- never relative to `base`. A checkpoint is only
+                /// reusable if the next request lands on the same boundary,
+                /// and the next request will not share this one's resume
+                /// position.
                 func prefillCheckpointed(from base: Int) throws -> Int {
                     var position = base
                     var token: Int?
@@ -764,6 +783,11 @@ extension QwenRuntime {
                         roundBytes: snapshot.recurrentBytes,
                         kvBytes: snapshot.kvBytes)
                 }
+                // Retain this prompt's token stream (tokens only, ~8
+                // bytes/token) so the next request can discover where it
+                // diverges. Recorded after a successful prefill: a stream that
+                // failed to prefill proves nothing about a reusable boundary.
+                qwenMTPResumeStore.recordStream(tokens: seedTokens)
                 state.began = true
                 state.seedTokenCount = seedTokens.count
                 state.decodedTokenCount = 0
