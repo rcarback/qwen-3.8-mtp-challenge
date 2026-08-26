@@ -724,6 +724,9 @@ extension QwenRuntime {
                             state: session.snapshotState(),
                             roundBytes: hit.entry.recurrentBytes,
                             kvBytes: hit.entry.kvBytes)
+                        QwenPrefillCacheDiagnostics.log(
+                            "restore: key=\(hit.key) adopted, extending from "
+                                + "\(hit.entry.tokens.count) tokens")
                         seedToken = try prefillCheckpointed(
                             from: hit.entry.tokens.count)
                         resumedTokens = hit.entry.tokens.count
@@ -733,6 +736,8 @@ extension QwenRuntime {
                                 + "\(seedTokens.count - hit.entry.tokens.count)\n")
                                 .utf8))
                     } catch {
+                        QwenPrefillCacheDiagnostics.log(
+                            "restore: key=\(hit.key) FAILED: \(error)")
                         FileHandle.standardError.write(Data(
                             ("qwen-mtp: disk checkpoint \(hit.key) failed to "
                                 + "restore (\(error)); deleting it and "

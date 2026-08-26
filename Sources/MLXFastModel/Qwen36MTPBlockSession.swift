@@ -394,10 +394,18 @@ public final class Qwen36MTPBlockSession {
     public func adoptRestoredCaches(
         _ caches: [any KVCache], seedTokenCount: Int, committedTokenCount: Int
     ) throws {
-        guard caches.count == cache.count else {
+        // COUNT AGAINST THE MODEL, NOT AGAINST `cache`. A cold process has no
+        // caches at all -- `begin` is what calls `model.newCache` -- and a cold
+        // process is the only case this path exists for. Checking `cache.count`
+        // instead makes the guard satisfiable only in a warm session, which
+        // never reaches here because the in-memory match wins first.
+        let expectedLayerCount = cache.isEmpty
+            ? model.newCache(parameters: nil).count
+            : cache.count
+        guard caches.count == expectedLayerCount else {
             throw MLXFastError.invalidInput(
                 "prefill checkpoint has \(caches.count) layers; "
-                    + "session has \(cache.count)")
+                    + "the model has \(expectedLayerCount)")
         }
         cache = caches
         // No head history rides a disk checkpoint, so this mirrors what

@@ -261,6 +261,11 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
         let root = diskRoot
         let fingerprint = diskFingerprint
         lock.unlock()
+        QwenPrefillCacheDiagnostics.log(
+            "match: root=\(root?.path ?? "unattached") "
+                + "fingerprint=\(fingerprint?.token ?? "unattached") "
+                + "keys=\(keys.map { "\($0.key):\($0.tokenCount)" }) "
+                + "incoming=\(incoming.count)")
         guard let root, let fingerprint else { return nil }
         for entry in keys.reversed() {
             // `read` both throws and returns an optional, so `try?` yields a
@@ -268,11 +273,19 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
             // shorthand shadowing inside a single guard.
             let found = (try? QwenPrefillDiskCache.read(
                 key: entry.key, fingerprint: fingerprint, root: root)) ?? nil
+            QwenPrefillCacheDiagnostics.log(
+                "read: key=\(entry.key) hit=\(found != nil) "
+                    + "tokens=\(found?.tokens.count ?? 0)")
             guard let candidate = found else { continue }
             guard candidate.tokens.count < incoming.count,
                   candidate.tokens == Array(
                       incoming.prefix(candidate.tokens.count))
-            else { continue }
+            else {
+                QwenPrefillCacheDiagnostics.log(
+                    "read: key=\(entry.key) refused, tokens are not a prefix "
+                        + "of the incoming prompt")
+                continue
+            }
             return (entry.key, candidate)
         }
         return nil
@@ -461,5 +474,32 @@ public enum QwenPrefillChunking {
             keys.append((String(hash, radix: 36), index))
         }
         return keys
+    }
+}
+
+/// Diagnostic trail for the disk-persisted prefill checkpoint path.
+///
+/// WHY THIS EXISTS AS A FILE SINK. The disk path fails SOFT by design: a
+/// checkpoint that cannot be restored is deleted and the request falls back to
+/// a full prefill, so a permanently broken cache looks exactly like a cache
+/// that is merely cold. The worker reports those failures on its stderr, and
+/// `serve` does not surface worker stderr -- which is how a restore that
+/// rejected every cold checkpoint shipped and measured as "working".
+///
+/// Off unless `DARKBLOOM_PREFILL_CACHE_DEBUG_LOG` names a writable file, so
+/// the ranked path and ordinary local runs pay one environment read.
+public enum QwenPrefillCacheDiagnostics {
+    public static func log(_ message: String) {
+        guard let path = ProcessInfo.processInfo
+            .environment["DARKBLOOM_PREFILL_CACHE_DEBUG_LOG"], !path.isEmpty,
+            let data = (message + "\n").data(using: .utf8)
+        else { return }
+        if let handle = FileHandle(forWritingAtPath: path) {
+            defer { try? handle.close() }
+            handle.seekToEndOfFile()
+            handle.write(data)
+        } else {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
     }
 }
