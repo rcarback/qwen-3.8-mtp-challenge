@@ -26,8 +26,9 @@ third applies for a different reason than expected. The real finding was
 stated here as both large rows running far below what this hardware does on
 the same operation at a different shape. **That is refuted for the projection
 row.** Measured one shape per process on 2026-08-26 the projection GEMM runs
-within about 10 percent of a square reference of the same precision, and
-Opportunity 2 below is retracted. The attention row predates the kernel
+within about 10 percent of a square reference of the same precision, and an
+M sweep on the production shape finds throughput flat from M = 256 to M = 1024
+and lower at M = 4096 rather than climbing. Opportunity 2 below is retracted. The attention row predates the kernel
 fusion. Read the table above as a dated snapshot, not as current: its
 attention figure is the pre-fusion value, and the 81 percent projection share
 is derived by subtraction from a whole-model number measured before fusion
@@ -217,13 +218,43 @@ once per point on an instrument that spreads by 10 percent or more between
 runs, so it must not be quoted as evidence that shape is free. The bf16 pair,
 13.14 against 13.35, says the same thing at the same resolution.
 
-Two rows would settle the fine claim and neither was measured: `mlp.gate/up`
-in 4-bit at M = 1024 and M = 4096, isolated. `.local/gemm-points2.tsv` holds a
-header and nothing else, because `spotlightknowledged` has held the CPU above
-the quiet gate's threshold since the run was queued. Until those rows exist,
-the premise of this section, that the projection GEMM runs at a quarter of the
-machine, is refuted, and the weaker question of whether shape costs single-digit
-percent is open.
+**The M sweep, measured 2026-08-26, one point per process.** The two rows the
+paragraph above called for were measured after the host settled. They are the
+better instrument for the shape question, because they hold N, K, precision
+and call path fixed and vary only M, so they need no cross-shape comparison
+and carry no unequal pre-timing term.
+
+| M | ms | TFLOPS |
+| --- | --- | --- |
+| 256 | 3.773 | 12.10 |
+| 1024 | 14.936 | 12.22 |
+| 4096 | 69.064 | 10.57 |
+
+**Throughput does not rise with M. It is flat to M = 1024 and falls after.**
+The 12.10 to 12.22 step is 1 percent, which is flat at this instrument's
+resolution. The drop to 10.57 is 13 percent below the M = 1024 reading, which
+is at the edge of the run-to-run spread documented above, so read it as
+suggestive rather than established: the safe statement is that throughput
+certainly does not rise, and probably declines modestly, across a 16x change
+in M.
+
+That refutes the original table on its own axis. It reported 1.31, 2.97 and
+5.35 TFLOPS at M = 256, 1024 and 4096 for this exact shape, a 4x climb, and
+the claim that "larger prefill chunks make the GEMM four times more efficient"
+rested on it. Measured one point per process the climb is absent, and most of
+it was claimed over the 256-to-1024 interval where these points are flat to
+within 1 percent.
+
+This is also the first evidence on the chunk question that is neither
+position-confounded nor an end-to-end proxy. The chunk surface says wide chunks
+cost more per token; this says the GEMM efficiency gain that was supposed to
+pay for them does not exist. Two instruments with unrelated failure modes now
+agree on the direction, which is worth more than either alone.
+
+With those rows in hand the section's premise is refuted outright, and the
+weaker single-digit-percent question is answered as far as this instrument can
+answer it: no shape penalty is visible at the prefill shapes the model actually
+runs, and the largest M measured is the slowest, not the fastest.
 
 **The tiling target named in the old work item is not on the production path.**
 `Qwen35Ops.linear` (`Sources/MLXFastModel/Qwen35Ops.swift:33`) sends a weight
@@ -251,7 +282,9 @@ is known to be reachable there.
 tall-thin GEMM tiling work has no target on this machine. The one open thread
 is `qmm_nax` on the ranked M5, which this machine cannot measure at all.
 
-**Provenance note.** The four-row table above is `.local/gemm-points.tsv`.
+**Provenance note.** The four-row table above is `.local/gemm-points.tsv`, and
+the M sweep is `.local/gemm-points2.tsv` (M = 1024) and `.local/gemm-points3.tsv`
+(M = 4096), each measured in its own process behind the quiet gate.
 The 6.35 to 6.62 in-process range is `.local/gemm-baseline.txt` and
 `.local/gemm-quiesced.txt`. The fresh-process cluster (14.69, 14.60, 14.66,
 14.65, 14.74) and the 7.34 / 11.63 pair were read from console output during
@@ -384,6 +417,16 @@ corroborating its sign.
 Retiring the confound is cheap and needs no new apparatus: re-run the grid with
 the chunk loop reversed. Agreement between the two orders settles it. That was
 not done here.
+
+One piece of independent corroboration did arrive later, from the M sweep in
+Opportunity 2. Each of its points is measured in its own process, so it carries
+no position term at all, and it finds projection GEMM throughput flat from
+M = 256 to M = 1024 and lower at M = 4096. The prediction that wide chunks would
+pay for themselves through GEMM efficiency required that throughput rise with M.
+It does not. The chunk conclusion therefore rests on three readings with
+unrelated failure modes -- the confounded surface, the 1.8 percent
+separate-process pair, and the unconfounded M sweep -- which agree on direction
+while still disagreeing on size.
 
 One reading from this run must not be quoted: an early version of the
 prediction table reported cap 8192 at 84.76 s, or 0.702x, which would have
