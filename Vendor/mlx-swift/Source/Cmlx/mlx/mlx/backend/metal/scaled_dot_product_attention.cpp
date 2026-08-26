@@ -191,12 +191,19 @@ void sdpa_full_self_attention_metal(
 
   using namespace mlx::steel;
 
-  int wm = 4;
+  int bd = q.shape(-1);
+  // At bd=256, bf16/fp16 fit the full tile (BQ=32, BK=16, WM=4: 29,184
+  // bytes), but fp32 does not (BQ=32, BK=16, WM=4 needs 33,280 bytes for
+  // Q_smem alone) -- only fp32 needs the smaller tile below, keyed on
+  // itemsize so bf16/fp16 keep full occupancy.
+  const bool narrow_tile_bd256 = bd >= 256 && q.itemsize() >= 4;
+  int wm = narrow_tile_bd256 ? 2 : 4;
   int wn = 1;
 
-  int bd = q.shape(-1);
-  int bq = 32;
-  int bk = bd < 128 ? 32 : 16;
+  int bq = narrow_tile_bd256 ? 16 : 32;
+  // At bd=256, fp32 with BQ=16/BK=16 is still 37,120 bytes, over the 32 KiB
+  // limit; dropping BK to 8 brings it to 28,928.
+  int bk = bd < 128 ? 32 : (narrow_tile_bd256 ? 8 : 16);
 
   int B = q.shape(0);
   int H = q.shape(1);
@@ -622,8 +629,13 @@ bool ScaledDotProductAttention::use_fallback(
       query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
        query_head_dim == 256);
+  // Head dim 256 is what Qwen 3.8 uses. The kernel is template-generic in bd
+  // (see `bd = q.shape(-1)` in sdpa_full_self_attention_metal), so nothing but
+  // this list kept the fused path out of reach; excluding it sent every
+  // prefill down the unfused path that materializes the full score matrix.
   const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128);
+      (query_head_dim == 64 || query_head_dim == 80 ||
+       query_head_dim == 128 || query_head_dim == 256);
 
   const bool sdpa_full_supported_mask = !has_mask || has_arr_mask ||
       (query_sequence_length <= key_sequence_length && do_causal);

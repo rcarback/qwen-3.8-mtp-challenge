@@ -84,6 +84,63 @@ struct PrefillMatmulCostTests {
         print("")
     }
 
+    @Test("fused attention is reached at head dim 256")
+    func fusedAtHeadDim256() throws {
+        guard ProcessInfo.processInfo
+            .environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else { return }
+        // Head dim 128 IS on the fused list and 256 is not, so the two run
+        // different kernels today. Comparing them at matched FLOPs turns that
+        // dispatch difference into a number: the unfused path is several times
+        // slower per FLOP, and closing the gap is what this task delivers.
+        func attentionSeconds(headDim: Int, heads: Int, T: Int) -> Double {
+            let q = MLXRandom.normal([1, heads, T, headDim]).asType(.bfloat16)
+            let k = MLXRandom.normal([1, 4, T, headDim]).asType(.bfloat16)
+            let v = MLXRandom.normal([1, 4, T, headDim]).asType(.bfloat16)
+            eval(q, k, v)
+            return Self.timeIt {
+                [MLXFast.scaledDotProductAttention(
+                    queries: q, keys: k, values: v,
+                    scale: 1 / Float(headDim).squareRoot(), mask: .causal)]
+            }
+        }
+        // 48 heads at D=128 and 24 heads at D=256 do the same total work.
+        let fused = attentionSeconds(headDim: 128, heads: 48, T: 4096)
+        let target = attentionSeconds(headDim: 256, heads: 24, T: 4096)
+        print(String(
+            format: "\n  D=128 fused %.4f s | D=256 %.4f s | ratio %.2fx\n",
+            fused, target, target / fused))
+        #expect(target < fused * 1.5)
+    }
+
+    @Test("fused and unfused attention agree at head dim 256")
+    func fusedMatchesUnfused() throws {
+        guard ProcessInfo.processInfo
+            .environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else { return }
+        // Query length 8 or below takes the vector path and 9 or above takes
+        // the full path (`query_sequence_length > 8` at line 631), so this
+        // pair straddles the dispatch boundary the change moves.
+        let T = 64
+        let q = MLXRandom.normal([1, 24, T, 256]).asType(.float32)
+        let k = MLXRandom.normal([1, 4, T, 256]).asType(.float32)
+        let v = MLXRandom.normal([1, 4, T, 256]).asType(.float32)
+        eval(q, k, v)
+        let fused = MLXFast.scaledDotProductAttention(
+            queries: q, keys: k, values: v, scale: 1 / 16.0, mask: .causal)
+        // Reference: the same maths written in ops, which never dispatches the
+        // fused kernel whatever the head dim.
+        let kb = repeated(k, count: 6, axis: 1)
+        let vb = repeated(v, count: 6, axis: 1)
+        var scores = matmul(q, kb.transposed(0, 1, 3, 2)) * (1 / 16.0)
+        let causal = MLXArray(0 ..< T).reshaped([T, 1])
+            .< MLXArray(0 ..< T).reshaped([1, T])
+        scores = MLX.where(causal, MLXArray(-Float.infinity), scores)
+        let reference = matmul(softmax(scores, axis: -1), vb)
+        eval(fused, reference)
+        let error = abs(fused - reference).max().item(Float.self)
+        print(String(format: "\n  max abs error %.3e\n", error))
+        #expect(error < 1e-3)
+    }
+
     @Test("gated-delta depthwise conv1d cost")
     func convCost() throws {
         guard ProcessInfo.processInfo

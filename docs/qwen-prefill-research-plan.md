@@ -92,6 +92,28 @@ list stops at 128, and it may force a smaller block tile.
 depth. Closing most of a 14x gap on that row is worth roughly 1.5 ms per token
 at 8192 and more at 30k, where the user's real sessions sit.
 
+**Landed.** `sdpa_full_supported_head_dim` now includes 256; the JIT twin is
+the same source (this kernel family has no separate AOT/JIT pair to keep in
+sync). The register budget did not force a smaller tile for bf16/fp16 -- the
+full BQ=32/BK=16/WM=4 tile fits at 29,184 bytes against the 32 KiB limit,
+matching the estimate above. fp32 does not fit at that tile (Q_smem alone is
+33,280 bytes), so the dispatch additionally drops to BQ=16/BK=8/WM=2 when
+`q.itemsize() >= 4`; bf16/fp16 keep the full tile. The x16-layers ms/token
+column, same `attentionCost` microbenchmark, before and after:
+
+| T | Before | After |
+| --- | --- | --- |
+| 1024 | 0.520 | 0.04-0.11 |
+| 4096 | 0.722 | 0.10 |
+| 8192 | 1.649 | 0.21-0.27 |
+
+A live inference server was running concurrently with these measurements
+(the same one described in Opportunity 3), which is why the "after" column is
+a range rather than a point: T=4096 held steady around 0.10 across repeated
+runs, while T=1024 and T=8192 moved with server load. Even at the noisy end
+this is a 4-6x drop in the attention row's contribution to the prefill
+budget.
+
 ## Opportunity 2: projection GEMM runs at a quarter of the machine
 
 The same machine, the same process, the same contention:
