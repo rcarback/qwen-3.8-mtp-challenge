@@ -366,4 +366,22 @@ struct QwenSessionCacheStoreTests {
         cold.attachDisk(root: root, fingerprint: fingerprint)
         #expect(cold.diskChunkMatch(keys: keys, incoming: tokens) == nil)
     }
+
+    @Test("prefixKey at a chain boundary equals the chained key")
+    func prefixKeyMatchesChainedKeys() {
+        let tokens = Array(0 ..< 10_000)
+        let chain = QwenPrefillChunking.chainKeys(for: tokens, chunkSize: 4096)
+        // chainKeys yields complete chunks only: boundaries at 4096 and 8192.
+        #expect(chain.map(\.tokenCount) == [4096, 8192])
+        #expect(QwenPrefillChunking.prefixKey(for: tokens, count: 4096)
+            == chain[0].key)
+        #expect(QwenPrefillChunking.prefixKey(for: tokens, count: 8192)
+            == chain[1].key)
+        // A boundary between strides yields a key, and a DIFFERENT one.
+        let mid = QwenPrefillChunking.prefixKey(for: tokens, count: 5000)
+        #expect(mid != nil && mid != chain[0].key && mid != chain[1].key)
+        // Out-of-range boundaries are refused, not clamped.
+        #expect(QwenPrefillChunking.prefixKey(for: tokens, count: 0) == nil)
+        #expect(QwenPrefillChunking.prefixKey(for: tokens, count: 10_001) == nil)
+    }
 }

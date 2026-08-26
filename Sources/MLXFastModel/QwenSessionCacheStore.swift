@@ -451,6 +451,24 @@ public enum QwenPrefillChunking {
         return hash
     }
 
+    /// Key for a checkpoint at an arbitrary `count`-token boundary.
+    ///
+    /// By construction identical to the key `chainKeys` derives for a
+    /// boundary at the same position, because the chained hash is a running
+    /// FNV-1a over positions `0..<boundary`. That identity is the point: a
+    /// checkpoint recorded under a divergence-learned boundary by one
+    /// request is found by any later request that derives the same
+    /// boundary, through the existing key-based match paths, with no new
+    /// lookup machinery.
+    public static func prefixKey(for tokens: [Int], count: Int) -> String? {
+        guard count > 0, count <= tokens.count else { return nil }
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for position in 0 ..< count {
+            hash = Self.mix(hash, tokens[position])
+        }
+        return String(hash, radix: 36)
+    }
+
     /// One key per COMPLETE chunk, shallowest first.
     ///
     /// A partial trailing chunk gets no key: its boundary is wherever this
