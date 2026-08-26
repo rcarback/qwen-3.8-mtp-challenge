@@ -1068,6 +1068,36 @@ public final class Qwen36MTPBlockSession {
     /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
     private static let segmentedStreakGate = 2
 
+
+    // ---- C28 FACTORIAL COMPONENT R (RL-d94699155704bc87) ----
+    // Exact argmax over EVERY legal depth INCLUDING the adaptive skip d=0,
+    // consuming the STOCK cost model through its own cumulative price --
+    // price(d) = Self.depthPrice.cumulative[d], the whole-round cost the
+    // shipped greedy walk already amortises (uniform: 1.0 + 0.18 d, the
+    // level bracketed on the ranked board; M5_SELECTED_PRIOR, not an M5
+    // measurement). With the uniform price the d=0/1 boundary
+    // (1+p0)/1.18 > 1  <=>  p0 > 0.18 coincides exactly with the shipped
+    // walk's first-step threshold, so the skip semantics are inherited, not
+    // invented. No hardware-fitted constant appears anywhere in this rule.
+    private func argmaxDepthStockPrice(offeredDepth: Int, p: [Double]) -> Int {
+        let cap = Swift.min(
+            Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
+            Self.segmentedVerifyDepthCap)
+        guard cap > 0 else { return 0 }
+        let price = Self.depthPrice.cumulative
+        var reach = 1.0
+        var value = 1.0
+        var best = 1.0
+        var bestDepth = 0
+        for d in 1 ... cap where d - 1 < p.count {
+            reach *= p[d - 1]
+            value += reach
+            let z = value / price[d]
+            if z > best { best = z; bestDepth = d }
+        }
+        return bestDepth
+    }
+
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
         // The width wall binds the SINGLE-CALL verify; a qualifying
@@ -1114,33 +1144,23 @@ public final class Qwen36MTPBlockSession {
         // there would describe the next round's inputs, not this one's.
         if Self.traceRounds { snapshotScheduleSignal(widthCap: widthCap) }
         guard cap > 0 else { return 0 }
-        let price = Self.depthPrice
-        var reach = 1.0
-        var expected = 0.0
-        var depth = 0
-        while depth < cap {
-            var p = positionAcceptEMA[depth]
+        // C28 ARM C (ARGMAX_ONLY): the estimator, the margin gates and the
+        // price are all STOCK; only the DECISION RULE changes, greedy
+        // first-fail walk -> exact argmax over every legal depth (incl. the
+        // skip). The p vector is exactly what the walk would have consumed.
+        var p = [Double](repeating: 0, count: cap)
+        for depth in 0 ..< cap {
+            var q = positionAcceptEMA[depth]
             if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
                 let margin = tail.1[0] - tail.1[1]
-                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
-                p = Swift.min(p, conf)
+                q = Swift.min(q, 1.0 / (1.0 + exp(-margin / 2.0)))
             } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
                 let margin = tail.1[0] - tail.1[1]
-                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
-                p = Swift.min(p, conf2)
+                q = Swift.min(q, 1.0 / (1.0 + exp(-margin / 3.0)))
             }
-            reach *= p
-            let threshold = price.marginal[depth] * (1.0 + expected) /
-                price.cumulative[depth]
-            if Self.traceRounds {
-                scheduleTrace += String(
-                    format: "%d:%.6f/%.6f/%.6f;", depth, p, reach, threshold)
-            }
-            guard reach > threshold else { break }
-            expected += reach
-            depth += 1
+            p[depth] = q
         }
-        return depth
+        return argmaxDepthStockPrice(offeredDepth: offeredDepth, p: p)
     }
 
     /// Trace-gated record of the schedule's inputs and its extension walk.
