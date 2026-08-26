@@ -324,6 +324,8 @@ download_file() {
         rm -f "${partial}"
       fi
 
+      echo "${url}"
+
       curl_status=0
       curl \
         --fail \

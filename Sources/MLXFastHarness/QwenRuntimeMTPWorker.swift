@@ -36,6 +36,15 @@ struct QwenMTPRoundRequest: Equatable {
     let depth: Int
 }
 
+/// Resume points, keyed by conversation, shared across session rebuilds.
+///
+/// Deliberately OUTSIDE `QwenMTPWorkerState`: a reset replaces that struct
+/// wholesale, and the whole point of the store is to survive exactly that.
+/// Budget defaults to 64 GiB clamped to a quarter of physical RAM; a ranked run
+/// never populates it because no ranked request carries a `conversationId`.
+let qwenMTPResumeStore =
+    QwenSessionCacheStore<Qwen36MTPBlockSession.SessionSnapshot>()
+
 struct QwenMTPWorkerState {
     var began = false
     /// Set by `mtp_decode_warm`. The warm is input-independent, so the trusted
@@ -378,6 +387,36 @@ extension QwenRuntime {
                 throw error
             }
 
+        case "mtp_decode_snapshot":
+            // Record a resume point for the session as it stands, under the
+            // caller's token history.
+            //
+            // WHY THE PARENT DRIVES THIS. The worker knows its cache state but
+            // not the token history that names it: emitted tokens live on the
+            // parent side. Recording at `begin` alone would pin every resume
+            // point to a PROMPT boundary, so a conversation switch would re-run
+            // the whole previous reply. Recording at turn end keeps the resume
+            // point current, and the tail a switch must replay stays short.
+            guard state.began,
+                  let conversationId = request.conversationId,
+                  let tokens = request.seedTokens, !tokens.isEmpty
+            else {
+                throw MLXFastError.invalidInput(
+                    "MTP snapshot request is malformed or arrived before begin")
+            }
+            // Capturing state cannot fail: it copies caches the session
+            // already holds, so there is no error path to poison the session on.
+            let snapshot = session.snapshotState()
+            qwenMTPResumeStore.record(
+                conversation: conversationId,
+                tokens: tokens,
+                state: snapshot,
+                roundBytes: snapshot.recurrentBytes,
+                kvBytes: snapshot.kvBytes)
+            return RuntimeWorkerResponse(
+                id: request.id, nonce: sessionNonce, ok: true,
+                resumedTokens: tokens.count)
+
         case "mtp_decode_begin":
             guard !state.began,
                   request.id > 0,
@@ -410,7 +449,122 @@ extension QwenRuntime {
                 session.setSampling(nil)
             }
             do {
-                let seedToken = try session.begin(seedTokens: seedTokens)
+                // RESUME BEFORE PREFILL. `restoreState` reinstates the 48
+                // gated-delta layers' recurrent state, which is the thing
+                // `extend`'s own documentation says `trim()` cannot roll back --
+                // so restore-then-extend performs the rewind that a bare
+                // `extend` cannot. A miss falls through to an ordinary begin.
+                var seedToken: Int
+                var resumedTokens: Int?
+                // Content-addressed checkpoint keys for this prompt. Derived
+                // from the tokens alone, so a prompt shared with ANOTHER
+                // connection resolves to the same entries -- which is the case
+                // that matters when several agent sessions run at once and
+                // agree on their first several thousand tokens.
+                // Turn boundaries when the parent supplied them, fixed stride
+                // otherwise. The parent knows where its messages end; the
+                // worker only sees a flat token array and would have to guess.
+                let chunkKeys = (request.turnBoundaries?.isEmpty == false)
+                    ? QwenPrefillChunking.chainKeys(
+                        for: seedTokens, boundaries: request.turnBoundaries!)
+                    : QwenPrefillChunking.chainKeys(for: seedTokens)
+
+                /// Prefill `seedTokens` from absolute position `base`, taking a
+                /// checkpoint at every chunk boundary beyond it.
+                ///
+                /// Boundaries are absolute multiples of the chunk size, never
+                /// relative to `base`. A checkpoint is only reusable if the
+                /// next request lands on the same boundary, and the next
+                /// request will not share this one's resume position.
+                func prefillCheckpointed(from base: Int) throws -> Int {
+                    var position = base
+                    var token: Int?
+                    // Every chunk boundary strictly beyond `base`, then the end
+                    // of the prompt. The final segment is usually a partial
+                    // chunk and gets no checkpoint.
+                    var stops = chunkKeys.map(\.tokenCount).filter { $0 > base }
+                    if stops.last != seedTokens.count {
+                        stops.append(seedTokens.count)
+                    }
+                    for stop in stops {
+                        let segment = Array(seedTokens[position ..< stop])
+                        if segment.isEmpty { continue }
+                        if position == 0 {
+                            token = try session.begin(
+                                seedTokens: segment,
+                                expectedTotalTokens: seedTokens.count)
+                        } else {
+                            token = try session.extend(tokens: segment)
+                        }
+                        position = stop
+                        // Checkpoint only at a real boundary, and only when one
+                        // is not already retained -- concurrent conversations
+                        // sharing a prefix would otherwise each pay 144 MiB to
+                        // store the same state.
+                        guard let key = chunkKeys.first(
+                            where: { $0.tokenCount == stop })?.key,
+                            !qwenMTPResumeStore.hasChunk(key: key)
+                        else { continue }
+                        let checkpoint = session.snapshotState()
+                        qwenMTPResumeStore.recordChunk(
+                            key: key,
+                            tokens: Array(seedTokens.prefix(stop)),
+                            state: checkpoint,
+                            roundBytes: checkpoint.recurrentBytes,
+                            kvBytes: checkpoint.kvBytes)
+                    }
+                    guard let token else {
+                        throw MLXFastError.invalidInput(
+                            "chunked prefill produced no seed token for "
+                                + "\(seedTokens.count) tokens from \(base)")
+                    }
+                    return token
+                }
+
+                if let conversationId = request.conversationId,
+                   let hit = qwenMTPResumeStore.bestMatch(
+                       conversation: conversationId, incoming: seedTokens),
+                   (try? session.restoreState(hit.round.state)) != nil
+                {
+                    seedToken = try session.extend(tokens: hit.tail)
+                    resumedTokens = hit.round.tokenCount
+                    FileHandle.standardError.write(Data(
+                        ("qwen-mtp: resumed \(hit.round.tokenCount) cached "
+                            + "tokens, prefilling \(hit.tail.count)\n").utf8))
+                } else if let hit = qwenMTPResumeStore.chunkMatch(
+                    keys: chunkKeys, incoming: seedTokens),
+                    (try? session.restoreState(hit.round.state)) != nil
+                {
+                    // The conversation-scoped match missed but the prompt
+                    // shares a prefix with something already prefilled. This is
+                    // the ordinary case for a chat client, which re-renders its
+                    // history each turn and so never reproduces the exact token
+                    // stream the previous turn ended on.
+                    seedToken = try prefillCheckpointed(from: hit.round.tokenCount)
+                    resumedTokens = hit.round.tokenCount
+                    FileHandle.standardError.write(Data(
+                        ("qwen-mtp: resumed \(hit.round.tokenCount) cached "
+                            + "tokens from the shared prefix store, prefilling "
+                            + "\(hit.tail.count)\n").utf8))
+                } else {
+                    if let conversationId = request.conversationId {
+                        // A refused restore means the stored basis no longer
+                        // matches the running policy. Drop the whole
+                        // conversation so the next turn does not pay the same
+                        // failed match again.
+                        qwenMTPResumeStore.drop(conversation: conversationId)
+                    }
+                    seedToken = try prefillCheckpointed(from: 0)
+                }
+                if let conversationId = request.conversationId {
+                    let snapshot = session.snapshotState()
+                    qwenMTPResumeStore.record(
+                        conversation: conversationId,
+                        tokens: seedTokens,
+                        state: snapshot,
+                        roundBytes: snapshot.recurrentBytes,
+                        kvBytes: snapshot.kvBytes)
+                }
                 state.began = true
                 state.seedTokenCount = seedTokens.count
                 state.decodedTokenCount = 0
@@ -418,7 +572,8 @@ extension QwenRuntime {
                     id: request.id,
                     nonce: sessionNonce,
                     ok: true,
-                    seedToken: seedToken
+                    seedToken: seedToken,
+                    resumedTokens: resumedTokens
                 )
             } catch {
                 state.poisoned = true

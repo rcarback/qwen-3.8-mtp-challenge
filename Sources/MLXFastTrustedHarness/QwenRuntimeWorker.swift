@@ -910,6 +910,20 @@ struct RuntimeWorkerRequest: Codable {
     // non-positive temperature means greedy, which is the ranked path; the
     // worker calls `setSampling(nil)` explicitly in that case rather than
     // leaving a reused session's previous policy in place.
+    /// Conversation this request belongs to, for the worker-side resume-point
+    /// store. Absent means "do not consult or populate the store", which is what
+    /// every ranked run sends: the measured window is one begin and one decode
+    /// pass, so no ranked path can reach the store at all.
+    let conversationId: String?
+    /// Absolute token offsets the parent believes are TURN boundaries, so the
+    /// worker can checkpoint its prefill where the next request is actually
+    /// likely to diverge. A chat client grows its prompt by whole turns, so a
+    /// fixed-stride boundary lands mid-turn and strands the remainder.
+    ///
+    /// Advisory. The worker is free to ignore, thin, or supplement these, and
+    /// a wrong offset costs a checkpoint nobody matches -- never a wrong
+    /// resume, because every match re-verifies the tokens themselves.
+    let turnBoundaries: [Int]?
     let temperature: Double?
     let topP: Double?
     let samplingSeed: UInt64?
@@ -932,7 +946,9 @@ struct RuntimeWorkerRequest: Codable {
         verifyBlockTokens: [Int]? = nil,
         temperature: Double? = nil,
         topP: Double? = nil,
-        samplingSeed: UInt64? = nil
+        samplingSeed: UInt64? = nil,
+        conversationId: String? = nil,
+        turnBoundaries: [Int]? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -952,6 +968,8 @@ struct RuntimeWorkerRequest: Codable {
         self.temperature = temperature
         self.topP = topP
         self.samplingSeed = samplingSeed
+        self.conversationId = conversationId
+        self.turnBoundaries = turnBoundaries
     }
 
     init(from decoder: Swift.Decoder) throws {
@@ -1016,6 +1034,14 @@ struct RuntimeWorkerRequest: Codable {
             forKey: .temperature
         )
         topP = try container.decodeIfPresent(Double.self, forKey: .topP)
+        turnBoundaries = try container.decodeIfPresent(
+            [Int].self,
+            forKey: .turnBoundaries
+        )
+        conversationId = try container.decodeIfPresent(
+            String.self,
+            forKey: .conversationId
+        )
         samplingSeed = try container.decodeIfPresent(
             UInt64.self,
             forKey: .samplingSeed
@@ -1048,6 +1074,8 @@ struct RuntimeWorkerRequest: Codable {
         try container.encodeIfPresent(temperature, forKey: .temperature)
         try container.encodeIfPresent(topP, forKey: .topP)
         try container.encodeIfPresent(samplingSeed, forKey: .samplingSeed)
+        try container.encodeIfPresent(conversationId, forKey: .conversationId)
+        try container.encodeIfPresent(turnBoundaries, forKey: .turnBoundaries)
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
@@ -1073,6 +1101,8 @@ struct RuntimeWorkerRequest: Codable {
         case temperature
         case topP = "top_p"
         case samplingSeed = "sampling_seed"
+        case conversationId = "conversation_id"
+        case turnBoundaries = "turn_boundaries"
     }
 }
 
@@ -1123,6 +1153,11 @@ struct RuntimeWorkerResponse: Codable {
     let expectedTokenRank: Int?
     let topLogitMargin: Double?
     let seedToken: Int?
+    /// Tokens a `mtp_decode_begin` resumed from the worker's resume-point store
+    /// instead of prefilling. Absent means the store was not consulted (no
+    /// conversation id) or missed. Reported so a cache hit is VISIBLE: a silent
+    /// cache is one nobody can trust or debug.
+    let resumedTokens: Int?
     let tokens: [Int]?
     let expertStats: ExpertStreamingStats?
     let peakRamGB: Double?
@@ -1199,6 +1234,7 @@ struct RuntimeWorkerResponse: Codable {
         expectedTokenRank: Int? = nil,
         topLogitMargin: Double? = nil,
         seedToken: Int? = nil,
+        resumedTokens: Int? = nil,
         tokens: [Int]? = nil,
         expertStats: ExpertStreamingStats? = nil,
         peakRamGB: Double? = nil,
@@ -1242,6 +1278,7 @@ struct RuntimeWorkerResponse: Codable {
         self.expectedTokenRank = expectedTokenRank
         self.topLogitMargin = topLogitMargin
         self.seedToken = seedToken
+        self.resumedTokens = resumedTokens
         self.tokens = tokens
         self.expertStats = expertStats
         self.peakRamGB = peakRamGB
@@ -1317,6 +1354,7 @@ struct RuntimeWorkerResponse: Codable {
             forKey: .topLogitMargin
         )
         seedToken = try container.decodeIfPresent(Int.self, forKey: .seedToken)
+        resumedTokens = try container.decodeIfPresent(Int.self, forKey: .resumedTokens)
         tokens = try container.decodeIfPresent([Int].self, forKey: .tokens)
         expertStats = try container.decodeIfPresent(
             ExpertStreamingStats.self,
@@ -1465,6 +1503,7 @@ struct RuntimeWorkerResponse: Codable {
             forKey: .topLogitMargin
         )
         try container.encodeIfPresent(seedToken, forKey: .seedToken)
+        try container.encodeIfPresent(resumedTokens, forKey: .resumedTokens)
         try container.encodeIfPresent(tokens, forKey: .tokens)
         try container.encodeIfPresent(expertStats, forKey: .expertStats)
         try container.encodeIfPresent(peakRamGB, forKey: .peakRamGB)
@@ -1588,6 +1627,7 @@ struct RuntimeWorkerResponse: Codable {
         case expectedTokenRank = "expected_token_rank"
         case topLogitMargin = "top_logit_margin"
         case seedToken = "seed_token"
+        case resumedTokens = "resumed_tokens"
         case tokens
         case expertStats = "expert_stats"
         case peakRamGB = "peak_ram_gb"
@@ -2396,14 +2436,30 @@ final class RuntimeWorkerClient {
         seedTokens: [Int],
         temperature: Double? = nil,
         topP: Double? = nil,
-        seed: UInt64? = nil
+        seed: UInt64? = nil,
+        conversationId: String? = nil,
+        turnBoundaries: [Int]? = nil
     ) throws -> RuntimeWorkerResponse {
         try send(
             kind: "mtp_decode_begin",
             seedTokens: seedTokens,
             temperature: temperature,
             topP: topP,
-            samplingSeed: seed
+            samplingSeed: seed,
+            conversationId: conversationId,
+            turnBoundaries: turnBoundaries
+        )
+    }
+
+    /// Record a resume point for the live session under `conversationId`,
+    /// named by the full token history the parent holds.
+    func snapshotMTPDecode(
+        conversationId: String, tokens: [Int]
+    ) throws -> RuntimeWorkerResponse {
+        try send(
+            kind: "mtp_decode_snapshot",
+            seedTokens: tokens,
+            conversationId: conversationId
         )
     }
 
@@ -2534,7 +2590,9 @@ final class RuntimeWorkerClient {
         verifyBlockTokens: [Int]? = nil,
         temperature: Double? = nil,
         topP: Double? = nil,
-        samplingSeed: UInt64? = nil
+        samplingSeed: UInt64? = nil,
+        conversationId: String? = nil,
+        turnBoundaries: [Int]? = nil
     ) throws -> RuntimeWorkerResponse {
         guard process.isRunning else {
             throw MLXFastError.invalidInput("runtime worker exited before request \(kind): \(workerExitDiagnostic())")
@@ -2559,7 +2617,9 @@ final class RuntimeWorkerClient {
             verifyBlockTokens: verifyBlockTokens,
             temperature: temperature,
             topP: topP,
-            samplingSeed: samplingSeed
+            samplingSeed: samplingSeed,
+            conversationId: conversationId,
+            turnBoundaries: turnBoundaries
         )
         var data = try encoder.encode(request)
         guard data.count <= BufferedFileLineReader.defaultMaximumLineByteCount else {

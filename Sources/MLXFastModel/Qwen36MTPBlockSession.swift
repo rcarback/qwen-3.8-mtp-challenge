@@ -253,6 +253,133 @@ public final class Qwen36MTPBlockSession {
         } ?? rows
     }
 
+    // MARK: - resume points
+
+    /// Everything needed to resume decoding at a committed-token boundary.
+    ///
+    /// WHAT IS ON THE EXACTNESS SURFACE and what is not. `cache`,
+    /// `pendingPrimary`, `pendingTop2` and `pendingHidden` decide emitted
+    /// tokens, so they are captured and restored exactly. The head-side state
+    /// (`headHistoryCache`, the block drafter's cache) only PROPOSES: losing it
+    /// costs accept rate for a few rounds while it re-primes and cannot move an
+    /// emitted token. It is captured anyway because it is cheap next to the
+    /// target cache, but a restore that dropped it would still be correct.
+    ///
+    /// The caches are `copy()` deep copies, per the vendored `KVCache.copy()`
+    /// contract, so a retained snapshot is not disturbed by continued decoding.
+    public struct SessionSnapshot {
+        let cache: [any KVCache]
+        let headHistoryCache: [any KVCache]?
+        let pendingPrimary: Int?
+        let pendingTop2: ([Int], [Double])?
+        let pendingHidden: MLXArray?
+        let seedTokenCount: Int
+        let committedTokenCount: Int
+        let positionAcceptEMA: [Double]
+        /// Append-only attention KV. Charged ONCE per conversation: rounds of
+        /// one conversation share this buffer.
+        public let kvBytes: Int
+        /// Dense recurrent state. Charged per retained round -- it changes
+        /// every token and cannot be shared.
+        public let recurrentBytes: Int
+        /// The cache basis this snapshot was written under. Restoring it into
+        /// a session configured differently would reinterpret quantized,
+        /// possibly rotated rows under the wrong basis and produce silent
+        /// numerical garbage, so `restoreState` refuses the mismatch.
+        public let kvPolicy: KVQuantization?
+    }
+
+    private static func cacheBytes(
+        _ caches: [any KVCache]
+    ) -> (kv: Int, recurrent: Int) {
+        var kv = 0
+        var recurrent = 0
+        for entry in caches {
+            let bytes = entry.state.reduce(0) { $0 + $1.nbytes }
+            // The gated-delta layers carry dense recurrent state through an
+            // `ArraysCache`; the full-attention layers carry append-only KV.
+            if entry is ArraysCache {
+                recurrent += bytes
+            } else {
+                kv += bytes
+            }
+        }
+        return (kv, recurrent)
+    }
+
+    /// Capture a resume point. Safe to call between rounds.
+    public func snapshotState() -> SessionSnapshot {
+        let copies = cache.map { $0.copy() }
+        let bytes = Self.cacheBytes(cache)
+        return SessionSnapshot(
+            cache: copies,
+            headHistoryCache: headHistoryCache.map { caches in
+                caches.map { $0.copy() }
+            },
+            pendingPrimary: pendingPrimary,
+            pendingTop2: pendingTop2,
+            pendingHidden: pendingHidden,
+            seedTokenCount: seedTokenCount,
+            committedTokenCount: committedTokenCount,
+            positionAcceptEMA: positionAcceptEMA,
+            kvBytes: bytes.kv,
+            recurrentBytes: bytes.recurrent,
+            kvPolicy: kvQuantization)
+    }
+
+    /// Resume from a captured point, discarding whatever this session held.
+    ///
+    /// Copies AGAIN on the way in so the stored snapshot stays reusable: a
+    /// rewind may restore the same round more than once.
+    public func restoreState(_ snapshot: SessionSnapshot) throws {
+        // A snapshot carries raw cache rows. Reading rows written at one bit
+        // width, group size, or rotation basis as though they were written at
+        // another produces plausible-looking numerical garbage rather than an
+        // error, so refuse the restore instead of trusting it.
+        guard snapshot.kvPolicy == kvQuantization else {
+            throw MLXFastError.invalidInput(
+                "session snapshot was written under KV policy "
+                    + "\(String(describing: snapshot.kvPolicy)) but this "
+                    + "session runs \(String(describing: kvQuantization)); "
+                    + "restoring across a basis change would silently "
+                    + "reinterpret the cached rows")
+        }
+        cache = snapshot.cache.map { $0.copy() }
+        headHistoryCache = snapshot.headHistoryCache.map { caches in
+            caches.map { $0.copy() }
+        }
+        pendingPrimary = snapshot.pendingPrimary
+        pendingTop2 = snapshot.pendingTop2
+        pendingHidden = snapshot.pendingHidden
+        seedTokenCount = snapshot.seedTokenCount
+        committedTokenCount = snapshot.committedTokenCount
+        positionAcceptEMA = snapshot.positionAcceptEMA
+        // Backlogs and priming rows belong to the prefix that was just
+        // discarded. Clearing them makes the head re-prime lazily rather than
+        // append rows for tokens this session no longer holds.
+        headHistoryBacklogHidden = []
+        headHistoryBacklogTokens = []
+        seedHiddenForPriming = nil
+        seedTokensForPriming = []
+        // Same reasoning for the block drafter: its context rows describe the
+        // discarded prefix. A fresh cache re-primes from the next verify.
+        if let blockDrafter {
+            blockDraftCache = blockDrafter.makeCache()
+            pendingLayerHidden = nil
+        }
+        // A restored session skips `begin`, which is where the rotation is
+        // normally installed. The guard above has already established that the
+        // snapshot's basis matches this session's policy, so installing from
+        // the policy restores the basis the rows were written in.
+        if let kvQuantization {
+            model.installKVRotation(
+                enabled: kvQuantization.rotate, seed: kvQuantization.seed)
+        } else {
+            model.installKVRotation(enabled: false, seed: 0)
+        }
+        began = true
+    }
+
     public private(set) var seedTokenCount = 0
     public private(set) var committedTokenCount = 0
     public private(set) var roundCount = 0
@@ -412,9 +539,27 @@ public final class Qwen36MTPBlockSession {
 
     /// Clamp for the derived chunk. The UPPER bound is what keeps the scored
     /// path bit-identical: the ranked window seeds 512 tokens, so `begin` still
-    /// issues the exact single `callWithHidden` it always did. The lower bound
-    /// stops the derived size collapsing into dispatch-bound slivers at 262k.
-    public static let prefillChunkRange = 256 ... 4096
+    /// issues the exact single `callWithHidden` it always did. Any bound >= 512
+    /// preserves that. The lower bound stops the derived size collapsing into
+    /// dispatch-bound slivers at 262k.
+    ///
+    /// UPPER BOUND 1024, for PEAK MEMORY -- not for speed (2026-08-25).
+    /// Prefill does not amortize with chunk size: holding context depth fixed
+    /// at 8192, one appended chunk costs 13.38 / 13.14 / 13.41 ms per token at
+    /// 256 / 512 / 1024, so a 4x wider batch buys nothing. Above 1024 that
+    /// microbenchmark degrades (20.41 ms at 2048, 26.13 ms at 4096) as the
+    /// `chunk x cached` score matrix grows.
+    ///
+    /// THAT DEGRADATION DID NOT TRANSFER to whole-prompt prefill, and the
+    /// reason is worth keeping: total attention work is ~T^2/2 whatever the
+    /// chunk size, so chunking redistributes it rather than reducing it, and
+    /// the microbenchmark's larger chunks were simply doing more work per call
+    /// at a depth the real prefill spends little time at. End to end, dropping
+    /// 4096 -> 1024 moved a 20k prefill 302.0 s -> 296.4 s (-1.8%), and the 8k
+    /// reading (101.8 / 131.0 s -> 82.9 s) sits inside the spread of the two
+    /// baseline runs. So this bound is kept for the lower peak allocation at
+    /// shallow depth, and no speed claim is attached to it.
+    public static let prefillChunkRange = 256 ... 1024
 
     private static func prefillChunkSize(cached: Int) -> Int {
         let derived = prefillChunkProductBudget / max(cached, 1)
@@ -1136,16 +1281,25 @@ public final class Qwen36MTPBlockSession {
     /// round-top invariant is "every emitted token is in the cache and the
     /// pending primary is not", and the verify forward writes it.
     @discardableResult
-    public func begin(seedTokens: [Int]) throws -> Int {
+    /// `expectedTotalTokens` is the length of the WHOLE prompt when this call
+    /// carries only its first chunk. Chunked prefill would otherwise decide the
+    /// KV quantization policy from the first chunk alone and leave a long
+    /// prompt in bf16 -- silently changing both the memory profile and the
+    /// numerics relative to an unchunked prefill of the same prompt.
+    public func begin(
+        seedTokens: [Int], expectedTotalTokens: Int? = nil
+    ) throws -> Int {
         guard !began else { throw Qwen36MTPSessionError.alreadyBegun }
         guard !seedTokens.isEmpty else { throw Qwen36MTPSessionError.emptySeed }
+        let policyTokenCount = Swift.max(
+            seedTokens.count, expectedTotalTokens ?? 0)
         let tBegin0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         let cpuBegin0 = Self.traceRounds ? Self.threadCPUNanoseconds() : 0
         cache = model.newCache(parameters: nil)
         // Quantize only when the prompt is actually long enough to be worth the
         // accuracy cost. A short prompt keeps bf16 and stays exact, so enabling
         // quantization does not silently change ordinary interactive replies.
-        if let kvQuantization, seedTokens.count >= kvQuantization.minimumOffset {
+        if let kvQuantization, policyTokenCount >= kvQuantization.minimumOffset {
             cache = Self.quantizedFullAttentionCaches(cache, kvQuantization)
             // Install BEFORE the seed prefill writes the first row. The
             // rotation binds to the cache basis, so a mid-session change
@@ -1160,7 +1314,7 @@ public final class Qwen36MTPBlockSession {
                     + "group-\(kvQuantization.groupSize) for the 16 "
                     + "full-attention layers, rotation "
                     + (kvQuantization.rotate ? "on" : "off")
-                    + " (seed \(seedTokens.count) >= "
+                    + " (seed \(policyTokenCount) >= "
                     + "\(kvQuantization.minimumOffset))\n").utf8))
         } else {
             // Clear any basis left installed on a model instance reused from
@@ -1665,10 +1819,23 @@ public final class Qwen36MTPBlockSession {
     /// 0.18, fitted on the ranked M5. The block constants are expressed in the
     /// same unit as the shipped one -- multiplied by 0.18 / 0.232 -- so the
     /// price transfers with the native constant rather than carrying this
-    /// host's dispatch table into a ranked run. Raw local fit: 0.072 and
-    /// 0.177. Refit after any change to the head artifact or its precision.
-    private static let blockDraftForwardCostRatio = 0.06
-    private static let blockDraftRowCostRatio = 0.14
+    /// host's dispatch table into a ranked run.
+    ///
+    /// THE FORWARD TERM IS MEASURED, NOT FITTED (2026-08-24). An end-to-end
+    /// fit cannot separate a fixed per-round cost from every other fixed cost,
+    /// and it put the forward at 0.072 raw. `Qwen38DFlash2ProfileTests` times
+    /// the drafter's components directly on a 5-row block against the affine
+    /// 4-bit artifact: 13.76 ms of decoder layers, 2.81 ms of exact vocabulary
+    /// projection, 2.02 ms of selector walk and 0.50 ms of `fc`, so 19.09 ms
+    /// against a 108.2 ms serial round base -- 0.177 raw, not 0.072. The row
+    /// term measured 20.6 ms, 0.190 raw, which confirms the earlier fit.
+    ///
+    /// Under-pricing the forward made the rule over-draft: 3.74 rows per round
+    /// against the declared autoregressive head's 3.38, at a LOWER accept rate
+    /// (0.710 against 0.728), which is a strictly bad trade. Refit after any
+    /// change to the head artifact or its precision.
+    private static let blockDraftForwardCostRatio = 0.137
+    private static let blockDraftRowCostRatio = 0.147
 
     internal static func makeBlockDepthPrice() -> DepthPrice {
         var marginal = [Double](

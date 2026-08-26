@@ -47,8 +47,32 @@ enum OpenAIPromptRendering {
         </IMPORTANT>
         """
 
+    /// Character offsets at which a rendered TURN ends, in the order emitted.
+    ///
+    /// Every offset lands immediately after an `<|im_end|>\n`, which matters:
+    /// the tokenizer treats those as special tokens and always breaks on them,
+    /// so tokenizing a prefix that ends there yields the same tokens as the
+    /// corresponding prefix of the whole render. A boundary in the middle of
+    /// ordinary text would carry no such guarantee.
+    static func renderPromptWithTurnBoundaries(
+        messages: [ChatMessage], tools: [OrderedJSON]?
+    ) throws -> (prompt: String, turnEnds: [Int]) {
+        var turnEnds: [Int] = []
+        let prompt = try renderPrompt(
+            messages: messages, tools: tools, turnEnds: &turnEnds)
+        return (prompt, turnEnds)
+    }
+
     static func renderPrompt(
         messages: [ChatMessage], tools: [OrderedJSON]?
+    ) throws -> String {
+        var ignored: [Int] = []
+        return try renderPrompt(
+            messages: messages, tools: tools, turnEnds: &ignored)
+    }
+
+    private static func renderPrompt(
+        messages: [ChatMessage], tools: [OrderedJSON]?, turnEnds: inout [Int]
     ) throws -> String {
         guard !messages.isEmpty else {
             throw MLXFastError.invalidInput("no messages provided")
@@ -73,8 +97,10 @@ enum OpenAIPromptRendering {
                 out += "\n\n" + leadingSystem
             }
             out += "<|im_end|>\n"
+            turnEnds.append(out.count)
         } else if let leadingSystem, !leadingSystem.isEmpty {
             out += "<|im_start|>system\n" + leadingSystem + "<|im_end|>\n"
+            turnEnds.append(out.count)
         }
 
         for (index, message) in messages.enumerated() {
@@ -90,6 +116,7 @@ enum OpenAIPromptRendering {
                 }
             case "user":
                 out += "<|im_start|>user\n" + content + "<|im_end|>\n"
+                turnEnds.append(out.count)
             case "assistant":
                 // `reasoning_content` is never round-tripped by this server, so
                 // the think block is always empty and always pre-closed.
@@ -108,6 +135,7 @@ enum OpenAIPromptRendering {
                     }
                 }
                 out += "<|im_end|>\n"
+                turnEnds.append(out.count)
             case "tool":
                 // `chat_template.jinja:148`: `loop.previtem` is falsy on the
                 // very first message, so the leading `<|im_start|>user` is
@@ -124,6 +152,7 @@ enum OpenAIPromptRendering {
                     ? messages[index + 1].role : nil
                 if nextRole != "tool" {
                     out += "<|im_end|>\n"
+                    turnEnds.append(out.count)
                 }
             default:
                 throw MLXFastError.invalidInput(

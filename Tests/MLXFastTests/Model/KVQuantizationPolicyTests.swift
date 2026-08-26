@@ -50,4 +50,21 @@ struct KVQuantizationPolicyTests {
             "DARKBLOOM_KV_QUANT_GROUP": "32",
         ])?.groupSize == 32)
     }
+
+    @Test("policies compare by every field that changes the cache basis")
+    func policyIdentity() {
+        let base = Qwen36MTPBlockSession.KVQuantization(
+            groupSize: 64, bits: 4, minimumOffset: 8192, rotate: true)
+        #expect(base == Qwen36MTPBlockSession.KVQuantization(
+            groupSize: 64, bits: 4, minimumOffset: 8192, rotate: true))
+        #expect(base != Qwen36MTPBlockSession.KVQuantization(
+            groupSize: 64, bits: 3, minimumOffset: 8192, rotate: true))
+        #expect(base != Qwen36MTPBlockSession.KVQuantization(
+            groupSize: 32, bits: 4, minimumOffset: 8192, rotate: true))
+        #expect(base != Qwen36MTPBlockSession.KVQuantization(
+            groupSize: 64, bits: 4, minimumOffset: 8192, rotate: false))
+        #expect(base != Qwen36MTPBlockSession.KVQuantization(
+            groupSize: 64, bits: 4, minimumOffset: 8192, rotate: true,
+            seed: 1234))
+    }
 }

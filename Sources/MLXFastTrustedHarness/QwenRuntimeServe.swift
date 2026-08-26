@@ -160,6 +160,44 @@ extension QwenRuntime {
         }
     }
 
+    /// Bucket key for the worker's resume-point store: a hash of the leading
+    /// tokens, which a rewind or an edited tail does not disturb.
+    /// Token offsets for the given CHARACTER offsets, by tokenizing each
+    /// prefix.
+    ///
+    /// Reports every turn boundary it finds and applies no policy. How many of
+    /// these deserve a checkpoint depends on the chunk size, which is the
+    /// worker's to know: the trusted binary links no model code, and pushing
+    /// the decision down keeps it that way.
+    ///
+    /// The final offset is dropped. It sits at the end of the prompt, where a
+    /// checkpoint would leave no row to read the next token from.
+    static func tokenBoundaries(
+        forCharacterOffsets offsets: [Int], in prompt: String,
+        tokenizer: any Tokenizer, totalTokens: Int
+    ) -> [Int] {
+        var boundaries: [Int] = []
+        for offset in offsets where offset > 0 && offset < prompt.count {
+            let index = prompt.index(prompt.startIndex, offsetBy: offset)
+            let count = tokenizer.encode(
+                text: String(prompt[prompt.startIndex ..< index]),
+                addSpecialTokens: false).count
+            // Ordered so the `>` comparison comes first: written the other
+            // way, `< totalTokens, count >` parses as a generic argument list.
+            guard count > (boundaries.last ?? 0), count < totalTokens else {
+                continue
+            }
+            boundaries.append(count)
+        }
+        return boundaries
+    }
+
+    static func conversationKey(for tokens: [Int]) -> String {
+        var hasher = Hasher()
+        for token in tokens.prefix(128) { hasher.combine(token) }
+        return String(UInt(bitPattern: hasher.finalize()), radix: 36)
+    }
+
     private static func respondWithModelList(
         options: QwenServeOptions,
         responder: HTTPResponder
@@ -207,9 +245,11 @@ extension QwenRuntime {
         let tools = parseToolsFromRawBody(request.body)
 
         let prompt: String
+        let turnEnds: [Int]
         do {
-            prompt = try OpenAIPromptRendering.renderPrompt(
-                messages: decoded.messages, tools: tools)
+            (prompt, turnEnds) = try OpenAIPromptRendering
+                .renderPromptWithTurnBoundaries(
+                    messages: decoded.messages, tools: tools)
         } catch {
             responder.sendError(status: 400, message: "\(error)")
             return
@@ -224,6 +264,9 @@ extension QwenRuntime {
 
         let seedTokens = context.tokenizer.encode(
             text: prompt, addSpecialTokens: false)
+        let turnBoundaries = Self.tokenBoundaries(
+            forCharacterOffsets: turnEnds, in: prompt,
+            tokenizer: context.tokenizer, totalTokens: seedTokens.count)
         let streaming = decoded.stream ?? false
         let completionID = "chatcmpl-" + UUID().uuidString
             .replacingOccurrences(of: "-", with: "").prefix(24)
@@ -255,6 +298,7 @@ extension QwenRuntime {
             let outcome = try generate(
                 context: context,
                 seedTokens: seedTokens,
+                turnBoundaries: turnBoundaries,
                 decision: decision,
                 sampling: samplingFor(decoded),
                 budget: budget,
@@ -273,6 +317,21 @@ extension QwenRuntime {
             )
 
             context.record(prompt: seedTokens, emitted: outcome.emittedTokens)
+            // Refresh this conversation's resume point to the END of the turn.
+            // Recorded only at `begin`, a resume point pins to the prompt
+            // boundary and a later switch replays the whole reply; refreshed
+            // here, the tail a switch must replay is whatever arrives next.
+            //
+            // Best-effort by design: a failed snapshot costs a slower resume,
+            // never a wrong answer, so it must not fail the request that just
+            // succeeded.
+            let history = seedTokens + outcome.emittedTokens
+            if let snapshot = try? context.client.snapshotMTPDecode(
+                conversationId: Self.conversationKey(for: seedTokens),
+                tokens: history), snapshot.ok
+            {
+                serveNote("recorded resume point at \(history.count) tokens")
+            }
             FileHandle.standardError.write(Data(
                 (renderStatsBar(outcome.stats, depth: options.depth) + "\n").utf8))
 
@@ -326,6 +385,7 @@ extension QwenRuntime {
     private static func generate(
         context: ServeContext,
         seedTokens: [Int],
+        turnBoundaries: [Int],
         decision: ServePrefixDecision,
         sampling: (temperature: Double, topP: Double, seed: UInt64?)?,
         budget: Int,
@@ -345,11 +405,33 @@ extension QwenRuntime {
             // persists for the life of the session.
             begin = try context.client.extendMTPDecode(tokens: tail)
         case .restart:
+            // A restart is the expensive path -- a full re-prefill, ~200-300 s
+            // at 20k. Hand the worker a conversation key so it can consult its
+            // resume-point store first: an interrupt, a failed request, or a
+            // rewound message then costs the tail, not the prompt.
+            //
+            // The key is a stable PREFIX hash, not an identity. A collision is
+            // harmless by construction: the store re-verifies the full token
+            // prefix before resuming, so a wrong bucket simply misses and falls
+            // through to the ordinary prefill.
             begin = try context.client.beginMTPDecode(
                 seedTokens: seedTokens,
                 temperature: sampling?.temperature,
                 topP: sampling?.topP,
-                seed: sampling?.seed)
+                seed: sampling?.seed,
+                conversationId: Self.conversationKey(for: seedTokens),
+                turnBoundaries: turnBoundaries)
+        }
+        // Make the resume-point store VISIBLE. Without this a cache hit is
+        // indistinguishable from a lucky fast prefill, which is exactly how a
+        // cache silently stops working and nobody notices.
+        if let resumed = begin.resumedTokens {
+            serveNote(
+                "resumed \(resumed) tokens from the session store, "
+                    + "prefilled \(seedTokens.count - resumed)")
+        } else if case .restart = decision {
+            serveNote(
+                "no resume point: prefilling all \(seedTokens.count) tokens")
         }
         stats.seedPrefillSeconds = Date().timeIntervalSince(started)
         guard begin.ok, begin.seedToken != nil else {
@@ -367,6 +449,10 @@ extension QwenRuntime {
         var gate = OpenAIPromptRendering.ToolCallGate()
         var finishReason = "stop"
         var done = false
+        // Local diagnostic: the stats bar reports how many tokens a turn
+        // emitted but not why it stopped, and EOS, a stop string and an empty
+        // round are indistinguishable from the outside. Name the branch.
+        var exitCause = "budget-or-loop-end"
 
         while !done, emitted.count < budget {
             let response = try context.client.mtpDecodeRound(depth: depth)
@@ -381,11 +467,13 @@ extension QwenRuntime {
 
             for token in tokens {
                 if let eos = tokenizer.eosTokenId, token == eos {
+                    exitCause = "eos"
                     done = true
                     break
                 }
                 emitted.append(token)
                 if emitted.count >= budget {
+                    exitCause = "budget"
                     finishReason = "length"
                     done = true
                     break
@@ -398,6 +486,7 @@ extension QwenRuntime {
             full = tokenizer.decode(tokens: emitted, skipSpecialTokens: true)
 
             if let stop = firstStopHit(in: full, stopStrings: stopStrings) {
+                exitCause = "stop-string"
                 full = String(full[full.startIndex..<stop])
                 done = true
             }
@@ -407,7 +496,10 @@ extension QwenRuntime {
                 onDelta(admitted.delta)
             }
             if admitted.sawToolCall { finishReason = "tool_calls" }
-            if tokens.isEmpty { break }
+            if tokens.isEmpty {
+                exitCause = "empty-round"
+                break
+            }
         }
 
         stats.seconds = Date().timeIntervalSince(started)
@@ -429,6 +521,12 @@ extension QwenRuntime {
                 full.range(of: OpenAIPromptRendering.ToolCallGate.marker)?
                     .lowerBound ?? full.endIndex)])
 
+        serveNote(
+            "turn ended: cause=\(exitCause) finish=\(finishReason) "
+                + "emitted=\(emitted.count) rounds=\(stats.rounds) "
+                + "budget=\(budget) stops=\(stopStrings.count) "
+                + "raw=\(full.count)ch visible=\(visible.count)ch "
+                + "calls=\(calls.count) head=\(String(full.prefix(120)).debugDescription)")
         return ServeOutcome(
             text: visible,
             toolCalls: calls,
