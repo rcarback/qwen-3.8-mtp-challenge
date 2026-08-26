@@ -4391,12 +4391,173 @@ private let qwen35E87SelectTG = 1024
 /// highest indices until P is reached (the merge sort's stable tail breaks
 /// ties toward the higher index). T is found by two 8-bit histogram passes,
 /// the index cut by a popcount walk over a bitmap of the T-keyed indices.
-/// Thread `t` owns the contiguous index range [t*PT, t*PT+PT) and the final
-/// prefix scan is exclusive over `t`, so the emitted ids ascend globally.
+/// Each thread owns one contiguous index range, and those ranges ascend with
+/// thread id. The final prefix scan is exclusive over thread id, so the emitted
+/// ids ascend globally regardless of how the ranges are balanced.
 private func makeQwen35E87ProbeSelectKernel(clusters: Int, probes: Int)
     -> MLXFast.MLXFastKernel
 {
-    MLXFast.metalKernel(
+    // The scored head has 12,292 leaves.  The stock ceil partition assigns
+    // thirteen consecutive leaves to each of 1,024 threads, leaving the final
+    // 1,020 slots permanently out of range.  Keep the same threadgroup and the
+    // same ordered, contiguous ownership, but balance that pinned geometry as
+    // twelve leaves per thread plus one extra leaf for threads 0..<4.  Integer
+    // histograms and bitmap ORs are order-independent, while contiguous ranges
+    // in thread-id order preserve the final ascending compaction exactly.
+    // Every other geometry retains the stock ceil-partition algorithm.
+    let usesPinnedBalancedPartition =
+        clusters == 12_292 && probes == 1_844 && qwen35E87SelectTG == 1_024
+
+    let partitionDeclaration: String
+    let keyLoad: String
+    let highHistogram: String
+    let lowHistogram: String
+    let thresholdBitmap: String
+    let selectedCount: String
+    let selectedWrite: String
+
+    if usesPinnedBalancedPartition {
+        partitionDeclaration = """
+            constexpr uint MAIN_PT       = 12u;
+            constexpr uint EXTRA_THREADS = 4u;
+            static_assert(CLUSTERS == 12292u && PROBES == 1844u && TG == 1024u,
+                          "balanced E87 partition is pinned to the scored head");
+            static_assert(CLUSTERS == MAIN_PT * TG + EXTRA_THREADS,
+                          "balanced E87 partition must cover every cluster once");
+            const uint base = tid * MAIN_PT
+                + (tid < EXTRA_THREADS ? tid : EXTRA_THREADS);
+            """
+        keyLoad = """
+            for (uint j = 0; j < MAIN_PT; ++j) {
+                const uint i = base + j;
+                key[j] = qwen_e87_key16(float(score[i]));
+            }
+            if (tid < EXTRA_THREADS) {
+                const uint i = base + MAIN_PT;
+                key[MAIN_PT] = qwen_e87_key16(float(score[i]));
+            }
+            """
+        highHistogram = """
+            for (uint j = 0; j < MAIN_PT; ++j) {
+                atomic_fetch_add_explicit(
+                    &hist[uint(key[j]) >> 8], 1u, memory_order_relaxed);
+            }
+            if (tid < EXTRA_THREADS) {
+                atomic_fetch_add_explicit(
+                    &hist[uint(key[MAIN_PT]) >> 8], 1u, memory_order_relaxed);
+            }
+            """
+        lowHistogram = """
+            for (uint j = 0; j < MAIN_PT; ++j) {
+                if ((uint(key[j]) >> 8) == hi) {
+                    atomic_fetch_add_explicit(
+                        &hist[uint(key[j]) & 0xFFu], 1u, memory_order_relaxed);
+                }
+            }
+            if (tid < EXTRA_THREADS && (uint(key[MAIN_PT]) >> 8) == hi) {
+                atomic_fetch_add_explicit(
+                    &hist[uint(key[MAIN_PT]) & 0xFFu], 1u, memory_order_relaxed);
+            }
+            """
+        thresholdBitmap = """
+            for (uint j = 0; j < MAIN_PT; ++j) {
+                const uint i = base + j;
+                if (key[j] == T) {
+                    atomic_fetch_or_explicit(
+                        &bits[i >> 5], 1u << (i & 31u), memory_order_relaxed);
+                }
+            }
+            if (tid < EXTRA_THREADS) {
+                const uint i = base + MAIN_PT;
+                if (key[MAIN_PT] == T) {
+                    atomic_fetch_or_explicit(
+                        &bits[i >> 5], 1u << (i & 31u), memory_order_relaxed);
+                }
+            }
+            """
+        selectedCount = """
+            for (uint j = 0; j < MAIN_PT; ++j) {
+                const uint i = base + j;
+                if (key[j] > T || (key[j] == T && i >= idxThr)) { ++cnt; }
+            }
+            if (tid < EXTRA_THREADS) {
+                const uint i = base + MAIN_PT;
+                if (key[MAIN_PT] > T || (key[MAIN_PT] == T && i >= idxThr)) {
+                    ++cnt;
+                }
+            }
+            """
+        selectedWrite = """
+            for (uint j = 0; j < MAIN_PT; ++j) {
+                const uint i = base + j;
+                if (key[j] > T || (key[j] == T && i >= idxThr)) {
+                    probed[out++] = i;
+                }
+            }
+            if (tid < EXTRA_THREADS) {
+                const uint i = base + MAIN_PT;
+                if (key[MAIN_PT] > T || (key[MAIN_PT] == T && i >= idxThr)) {
+                    probed[out++] = i;
+                }
+            }
+            """
+    } else {
+        partitionDeclaration = "const uint base = tid * PT;"
+        keyLoad = """
+            for (uint j = 0; j < PT; ++j) {
+                const uint i = base + j;
+                key[j] = (i < CLUSTERS)
+                    ? qwen_e87_key16(float(score[i])) : ushort(0);
+            }
+            """
+        highHistogram = """
+            for (uint j = 0; j < PT; ++j) {
+                if (base + j < CLUSTERS) {
+                    atomic_fetch_add_explicit(
+                        &hist[uint(key[j]) >> 8], 1u, memory_order_relaxed);
+                }
+            }
+            """
+        lowHistogram = """
+            for (uint j = 0; j < PT; ++j) {
+                if (base + j < CLUSTERS && (uint(key[j]) >> 8) == hi) {
+                    atomic_fetch_add_explicit(
+                        &hist[uint(key[j]) & 0xFFu], 1u, memory_order_relaxed);
+                }
+            }
+            """
+        thresholdBitmap = """
+            for (uint j = 0; j < PT; ++j) {
+                const uint i = base + j;
+                if (i < CLUSTERS && key[j] == T) {
+                    atomic_fetch_or_explicit(
+                        &bits[i >> 5], 1u << (i & 31u), memory_order_relaxed);
+                }
+            }
+            """
+        selectedCount = """
+            for (uint j = 0; j < PT; ++j) {
+                const uint i = base + j;
+                if (i < CLUSTERS
+                    && (key[j] > T || (key[j] == T && i >= idxThr)))
+                {
+                    ++cnt;
+                }
+            }
+            """
+        selectedWrite = """
+            for (uint j = 0; j < PT; ++j) {
+                const uint i = base + j;
+                if (i < CLUSTERS
+                    && (key[j] > T || (key[j] == T && i >= idxThr)))
+                {
+                    probed[out++] = i;
+                }
+            }
+            """
+    }
+
+    return MLXFast.metalKernel(
         name: "qwen_mtp_e87_probe_select",
         inputNames: ["score"],
         outputNames: ["probed"],
@@ -4413,7 +4574,7 @@ private func makeQwen35E87ProbeSelectKernel(clusters: Int, probes: Int)
             const uint tid  = thread_position_in_threadgroup.x;
             const uint lane = thread_index_in_simdgroup;
             const uint sg   = simdgroup_index_in_threadgroup;
-            const uint base = tid * PT;
+            \(partitionDeclaration)
 
             threadgroup atomic_uint hist[256];
             threadgroup atomic_uint bits[WORDS];
@@ -4421,21 +4582,14 @@ private func makeQwen35E87ProbeSelectKernel(clusters: Int, probes: Int)
             threadgroup uint sgsum[NSIMD];
 
             ushort key[PT];
-            for (uint j = 0; j < PT; ++j) {
-                const uint i = base + j;
-                key[j] = (i < CLUSTERS) ? qwen_e87_key16(float(score[i])) : ushort(0);
-            }
+            \(keyLoad)
 
             // Pass 1: high byte.
             for (uint x = tid; x < 256u; x += TG) {
                 atomic_store_explicit(&hist[x], 0u, memory_order_relaxed);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint j = 0; j < PT; ++j) {
-                if (base + j < CLUSTERS) {
-                    atomic_fetch_add_explicit(&hist[uint(key[j]) >> 8], 1u, memory_order_relaxed);
-                }
-            }
+            \(highHistogram)
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (tid == 0) {
                 uint acc = 0u, b = 0u;
@@ -4455,11 +4609,7 @@ private func makeQwen35E87ProbeSelectKernel(clusters: Int, probes: Int)
                 atomic_store_explicit(&hist[x], 0u, memory_order_relaxed);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint j = 0; j < PT; ++j) {
-                if (base + j < CLUSTERS && (uint(key[j]) >> 8) == hi) {
-                    atomic_fetch_add_explicit(&hist[uint(key[j]) & 0xFFu], 1u, memory_order_relaxed);
-                }
-            }
+            \(lowHistogram)
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (tid == 0) {
                 uint acc = 0u, c = 0u;
@@ -4483,12 +4633,7 @@ private func makeQwen35E87ProbeSelectKernel(clusters: Int, probes: Int)
                     atomic_store_explicit(&bits[w], 0u, memory_order_relaxed);
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint j = 0; j < PT; ++j) {
-                    const uint i = base + j;
-                    if (i < CLUSTERS && key[j] == T) {
-                        atomic_fetch_or_explicit(&bits[i >> 5], 1u << (i & 31u), memory_order_relaxed);
-                    }
-                }
+                \(thresholdBitmap)
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (tid == 0) {
                     uint need = k2, thr = 0u;
@@ -4512,10 +4657,7 @@ private func makeQwen35E87ProbeSelectKernel(clusters: Int, probes: Int)
 
             // Compaction in ascending index order.
             uint cnt = 0u;
-            for (uint j = 0; j < PT; ++j) {
-                const uint i = base + j;
-                if (i < CLUSTERS && (key[j] > T || (key[j] == T && i >= idxThr))) { ++cnt; }
-            }
+            \(selectedCount)
             const uint incl = simd_prefix_inclusive_sum(cnt);
             if (lane == 31u) { sgsum[sg] = incl; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4525,12 +4667,7 @@ private func makeQwen35E87ProbeSelectKernel(clusters: Int, probes: Int)
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint out = sgsum[sg] + incl - cnt;
-            for (uint j = 0; j < PT; ++j) {
-                const uint i = base + j;
-                if (i < CLUSTERS && (key[j] > T || (key[j] == T && i >= idxThr))) {
-                    probed[out++] = i;
-                }
-            }
+            \(selectedWrite)
             """,
         header: qwen35E87KeyHeader,
         ensureRowContiguous: true
