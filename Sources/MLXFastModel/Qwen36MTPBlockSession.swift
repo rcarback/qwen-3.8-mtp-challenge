@@ -620,6 +620,21 @@ public final class Qwen36MTPBlockSession {
     /// reading (101.8 / 131.0 s -> 82.9 s) sits inside the spread of the two
     /// baseline runs. So this bound is kept for the lower peak allocation at
     /// shallow depth, and no speed claim is attached to it.
+    ///
+    /// RE-SWEEP ATTEMPTED AND ABANDONED (2026-08-26). The readings above were
+    /// taken before the fused attention path landed, so the cap was re-measured
+    /// end to end at caps 1024 / 2048 / 4096 / 8192 on a ~12000-token cold
+    /// prefill. Both attempts were discarded: the host screensaver
+    /// (`idleTime` 300) restarts every five idle minutes and takes 73-80% CPU
+    /// with GPU power spiking from a 0.3 W idle floor to 9.2 W, which put a
+    /// 30% spread on repeat samples of one configuration against a 2.8% spread
+    /// on a quiet machine. `caffeinate -d` does not suppress it, because the
+    /// screensaver idle timer is a separate clock from display sleep. The
+    /// partial data that was collected agreed on direction every time -- 1024
+    /// fastest, larger caps monotonically slower -- which matches the
+    /// microbenchmark above, so 1024 stands. Anyone re-running this must first
+    /// stop the screensaver at its source; a `pkill` watchdog is not enough,
+    /// because `loginwindow` respawns it within seconds.
     public static let prefillChunkRange = 256 ... 1024
 
     private static func prefillChunkSize(cached: Int) -> Int {

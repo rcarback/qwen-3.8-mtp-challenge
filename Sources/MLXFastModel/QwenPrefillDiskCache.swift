@@ -314,12 +314,19 @@ public enum QwenPrefillDiskCache {
 /// checkpoint, forever, at full KV-plus-recurrent size. Left unbounded that
 /// fills the volume out from under whatever else uses it.
 ///
-/// 32 GiB DEFAULT. A checkpoint's dominant cost is the flat 144 MiB of
-/// gated-delta recurrent state (see `QwenSessionCacheStore`'s doc comment for
-/// where that number comes from); 32 GiB holds on the order of 200
-/// checkpoints, comfortably more than the distinct system-prompt/turn-
-/// boundary combinations one server sees in practice, while still being an
-/// actual bound rather than "however much disk happens to be free."
+/// 32 GiB DEFAULT. A checkpoint is NOT the flat 144 MiB the in-memory store
+/// budgets against. That figure counts only the gated-delta recurrent state,
+/// which is constant in the prompt; on disk the attention KV rides along as
+/// real bytes rather than copy-on-write, and it grows with the context. A
+/// measured checkpoint at 5972 tokens is 520 MiB -- 144 MiB recurrent plus
+/// 373 MiB of KV -- so the KV term dominates everything past a few thousand
+/// tokens and a 50k-token checkpoint approaches 3 GiB.
+///
+/// So 32 GiB is on the order of 60 checkpoints of a mid-length session, or
+/// roughly 10 of a long one, not the 200 a flat-144-MiB reading suggests. It
+/// is still an actual bound rather than "however much disk happens to be
+/// free," which is the property that matters, but size it against the context
+/// lengths a given server actually sees.
 ///
 /// `DARKBLOOM_PREFILL_CACHE_MAX_BYTES` overrides it. It is the ONLY prefix
 /// that survives `sanitizedRuntimeWorkerEnvironment`'s allowlist -- an

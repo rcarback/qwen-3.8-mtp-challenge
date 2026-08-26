@@ -159,6 +159,38 @@ remains, look at the steel GEMM tile selection for tall-thin shapes in
 machine: `is_nax_available()` requires GPU generation 17 or higher, and an M4
 Max is generation 16. They do apply on the ranked M5 box.
 
+**Sweep result, 2026-08-26: attempted, abandoned, `prefillChunkRange` stays
+at `256 ... 1024`.** The re-sweep the work item calls for was run twice
+against the fused attention path, at caps 1024 / 2048 / 4096 / 8192, measuring
+cold prefill of a ~12000-token prompt through `serve`. Both attempts were
+discarded for measurement contamination, not for what they showed.
+
+The host screensaver is the cause. Its idle timer (`idleTime` 300) restarts it
+every five idle minutes, it takes 73 to 80 percent of a CPU, and GPU power
+spikes from a 0.3 W idle floor to 9.2 W while it runs. Repeat samples of one
+configuration spread 30 percent (cap 2048 read 145.84 s, 157.92 s and
+190.21 s) against a 2.8 percent spread on a quiet machine. Two host facts are
+worth carrying forward: `caffeinate -d` does not suppress the screensaver,
+because display sleep and the screensaver idle timer are separate clocks, and
+a `pkill` watchdog does not either, because `loginwindow` respawns it within
+seconds. A clean re-run must stop the screensaver at its source first.
+
+Every partial table agreed on direction: cap 1024 fastest, larger caps
+monotonically slower. That matches the microbenchmark recorded in the
+`prefillChunkRange` doc comment, so the bound stands and the work item is
+closed. The prediction that the fused attention fix would revive this knob is
+neither confirmed nor refuted; it remains open for a run on a quiet host.
+
+One artifact of the discarded data is still unexplained and worth a look if
+anyone resumes this: caps 4096 and 8192 both reported prefill 160.72 s, from
+two distinct runs 4.5 minutes apart. `prefillChunkSize` derives
+`prefillChunkProductBudget / cached` clamped to `[256, cap]` with `cached` as
+the running position, so the two caps take different chunk schedules and
+should not agree to 10 ms. The two candidates are a stale worker build
+(`swift build --product ...` has been observed reporting success in this
+repository without recompiling an edited file) or something structural that
+collapses both caps onto one schedule.
+
 ## Opportunity 3: the prefix cache is working, and disk persistence is next
 
 The restart at 20:10 activated chunked checkpointing, and the serve log shows
@@ -173,9 +205,25 @@ Turns that previously paid 250 to 450 seconds now pay 1 to 4 seconds. This is
 the largest single improvement available and it is already landed. Remaining
 work in this area, in order of value:
 
-1. **Disk persistence**, already requested. The cache does not survive a
-   restart today, and a restart currently costs the first turn of every session
-   a full prefill.
+1. **Disk persistence**, LANDED 2026-08-25. Checkpoints are written to
+   `DARKBLOOM_PREFILL_CACHE_DIR` as safetensors, guarded by a fingerprint over
+   the weights identity, the running worker binary, the chunk size and the KV
+   basis. Measured on a 5979-token prompt, restarting the server between runs:
+   prefill 70.70 s cold against 0.36 s from the checkpoint, byte-identical
+   output.
+
+   Two things are worth carrying forward from how this was verified. The first
+   working version rejected every cold restore, because the adopt path compared
+   the checkpoint's layer count against the session's own cache array, which is
+   empty until the first `begin` builds it. The unit tests passed because they
+   restored into a session that had already prefilled. Only a real restart
+   reaches the state the feature exists for.
+
+   The second is that the failure was silent. The disk path deletes an
+   unrestorable checkpoint and falls back to a full prefill, and it reports why
+   on worker stderr, which `serve` does not forward. A permanently broken cache
+   and a merely cold one produce the same log. `DARKBLOOM_PREFILL_CACHE_DEBUG_LOG`
+   now names a file that receives the match, read and restore trail.
 2. **Stride fill-in inside long turns.** Turn boundaries place no interior
    checkpoint, so a single 10,000-token tool result leaves a 10,000-token gap.
    Take the union of turn boundaries and stride boundaries.
