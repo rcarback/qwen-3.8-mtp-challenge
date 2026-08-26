@@ -177,6 +177,29 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
         conversations.removeValue(forKey: id)
     }
 
+    /// Best-effort persistence of the memo ring. Tokens are tokenizer-scoped
+    /// but deliberately NOT fingerprint-gated: a stale stream costs at worst
+    /// one useless 144 MiB checkpoint, while checkpoint RESTORE stays
+    /// separately fingerprint-gated in `QwenPrefillDiskCache.read`. Failure
+    /// to read or write degrades to an empty ring, never an error.
+    private func persistStreamsLocked() {
+        guard let root = diskRoot else { return }
+        if let data = try? JSONEncoder().encode(recentStreams) {
+            try? data.write(
+                to: root.appendingPathComponent("streams.json"),
+                options: .atomic)
+        }
+    }
+
+    private func loadStreamsLocked() {
+        guard let root = diskRoot,
+            let data = try? Data(contentsOf:
+                root.appendingPathComponent("streams.json")),
+            let streams = try? JSONDecoder().decode([[Int]].self, from: data)
+        else { return }
+        recentStreams = Array(streams.suffix(Self.maxRecentStreams))
+    }
+
     /// Retain a completed prompt stream for divergence discovery.
     ///
     /// A retained stream that is a prefix of the new one carries strictly
@@ -195,6 +218,7 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
             recentStreams.removeFirst(
                 recentStreams.count - Self.maxRecentStreams)
         }
+        persistStreamsLocked()
     }
 
     /// Deepest position at which `incoming` diverges from a retained stream,
@@ -296,6 +320,7 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         diskRoot = root
         diskFingerprint = fingerprint
+        loadStreamsLocked()
     }
 
     /// Record a checkpoint to disk. In-memory recording stays the caller's job.

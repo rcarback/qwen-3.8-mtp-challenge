@@ -464,4 +464,33 @@ struct QwenSessionCacheStoreTests {
             9000, key: "learned", into: base)
         #expect(deepest.map(\.tokenCount) == [4096, 8192, 9000])
     }
+
+    @Test("the stream memo ring survives a restart through the disk root")
+    func streamRingPersists() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-stream-ring-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fingerprint = QwenPrefillDiskCache.Fingerprint(
+            weightsIdentity: "w", chunkSize: 4096, kvPolicy: "none")
+
+        let first = QwenSessionCacheStore<Payload>(
+            budgetBytes: 1 * GiB, minimumLearnedBoundary: 8)
+        first.attachDisk(root: root, fingerprint: fingerprint)
+        first.recordStream(tokens: Array(0 ..< 100) + [1000])
+
+        // A fresh store on the same root: the "restarted process".
+        let second = QwenSessionCacheStore<Payload>(
+            budgetBytes: 1 * GiB, minimumLearnedBoundary: 8)
+        second.attachDisk(root: root, fingerprint: fingerprint)
+        #expect(second.learnedBoundary(
+            incoming: Array(0 ..< 100) + [2000]) == 100)
+
+        // A store with no disk attached still works, memo empty.
+        let detached = QwenSessionCacheStore<Payload>(
+            budgetBytes: 1 * GiB, minimumLearnedBoundary: 8)
+        #expect(detached.learnedBoundary(
+            incoming: Array(0 ..< 100) + [2000]) == nil)
+    }
 }
