@@ -28,7 +28,10 @@ the same operation at a different shape. **That is refuted for the projection
 row.** Measured one shape per process on 2026-08-26 the projection GEMM runs
 within about 10 percent of a square reference of the same precision, and an
 M sweep on the production shape finds throughput flat from M = 256 to M = 1024
-and lower at M = 4096 rather than climbing. Opportunity 2 below is retracted. The attention row predates the kernel
+and lower at M = 4096 rather than climbing. A constant-work aspect sweep then
+attributed that fall to output working-set size rather than to shape: at equal
+work the tall-thin shape is the fastest of four, so the tiling target the
+section named is retired too. Opportunity 2 below is retracted. The attention row predates the kernel
 fusion. Read the table above as a dated snapshot, not as current: its
 attention figure is the pre-fusion value, and the 81 percent projection share
 is derived by subtraction from a whole-model number measured before fusion
@@ -255,6 +258,58 @@ With those rows in hand the section's premise is refuted outright, and the
 weaker single-digit-percent question is answered as far as this instrument can
 answer it: no shape penalty is visible at the prefill shapes the model actually
 runs, and the largest M measured is the slowest, not the fastest.
+
+**The constant-work aspect sweep, measured 2026-08-26, one point per process.**
+The M sweep above leaves one reading ambiguous: throughput falls at M = 4096,
+but M and total work move together there, so the fall could be a shape term or
+a size term. These four points separate them. Every one holds M x N fixed at
+4,456,448 and K fixed at 5120, so all four do the same 45.63 GFLOP and differ
+only in aspect ratio.
+
+| Point | M | N | ms | TFLOPS |
+| --- | --- | --- | --- | --- |
+| `aspect512` | 512 | 8704 | 4.667 | 9.78 |
+| `aspect1024` | 1024 | 4352 | 5.099 | 8.95 |
+| `aspect2048` | 2048 | 2176 | 4.365 | 10.46 |
+| `aspect4096` | 4096 | 1088 | 3.731 | 12.23 |
+
+**At constant work the tall-thin shape is the fastest, not the slowest.** The
+spread is 1.37x and the M = 4096 point leads it. That inverts the premise of the
+tiling work item, which expected tall-thin shapes to tile badly and expected
+the loss to grow with M.
+
+Read against the M sweep, the two together attribute the M = 4096 penalty to
+working-set size rather than to shape. Both `aspect4096` and `gateup4096q4` run
+at M = 4096. The first writes a 4,456,448-element output and reads 12.23
+TFLOPS; the second writes a 71,303,168-element output, sixteen times larger,
+and reads 10.57. Shape is identical in the axis the tiling argument cares about
+and the throughputs differ by 16 percent, so the differing term is the output
+tile, not the geometry.
+
+Per-row cost across the `gateup` series says the same thing in the units the
+chunk question is asked in: 14.74, 14.59 and 16.86 microseconds per row at
+M = 256, 1024 and 4096, against output tiles of 8.5, 34.0 and 136.0 MB in bf16.
+Cost is flat while the tile stays small and rises once it does not.
+
+This is the mechanism the chunk conclusion was missing. Wide chunks were
+supposed to pay for themselves through GEMM efficiency rising with M. It does
+not rise, and the reason is now attributable: at the production N of 17408,
+growing M grows the output tile linearly until it stops being resident.
+`prefillChunkRange` at `256 ... 1024` sits inside the flat region, and 1024 is
+the last width measured before the tile crosses into the penalty.
+
+Two limits on these four points. Each is a single sample in its own process, so
+process isolation removes the position term but leaves no variance estimate.
+And the ordering of adjacent points is not resolved: `aspect1024` reads 8.95,
+below `aspect512` at 9.78, which is non-monotonic and unexplained. The 1.37x
+spread across the series is far outside the run-to-run spread documented above.
+The gap between any two neighbouring points is not.
+
+**Next measured target, revised.** Tall-thin tiling is retired as a target by
+the table above. If further GEMM work is done, the question these points raise
+is whether the output tile can be kept resident at production N -- splitting
+the `gate/up` projection along N so each piece writes a smaller tile is the
+cheap test, and it needs no kernel change to try.
 
 **The tiling target named in the old work item is not on the production path.**
 `Qwen35Ops.linear` (`Sources/MLXFastModel/Qwen35Ops.swift:33`) sends a weight
