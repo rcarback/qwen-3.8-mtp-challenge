@@ -1312,13 +1312,13 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        let normedOut: MLXArray
         if S >= 2 {
             let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
-            normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
-        } else {
-            normedOut = norm(out, gate: z)
+            return qwen35RoutedLinear(
+                outProj,
+                qwen35GatedDeltaPostNormMaybeXS(rmsOut, z, batch: B, seq: S))
         }
+        let normedOut = norm(out, gate: z)
         return qwen35RoutedLinear(outProj, normedOut.reshaped(B, S, -1))
     }
 }
@@ -1370,6 +1370,199 @@ private let qwen35CompiledFusedSwiGLU:
     }
     return body
 }()
+
+// MARK: - xsums fill fusion, part 2 (elementwise producers)
+// (lineage: 4c21f521 died pre-measurement to the runner's quiescence gate;
+// 63df4e64 measured the per-row geometry's occupancy tax, uniform
+// -0.7..-2.0% with drafts byte-identical -- v2 below is the chunked-grid fix.)
+//
+// The promoted `qwen35_fused_residual_rms_norm_xsums_v1` deleted 127 of the
+// 257 standalone chunk-sum fills per verify round -- the ones whose producer
+// was the fused norm. These two kernels take the next 112: the SwiGLU that
+// feeds every `down_proj` (64 fills) and the GDN post-norm gate that feeds
+// every `out_proj` (48 fills). Same construction as the promoted variant:
+// the producer's own arithmetic, then the BODY of
+// `qwen35_custom_affine4_g64_xsums_v1` verbatim over the bytes just written,
+// so the table is the standalone fill's bit pattern by construction.
+//
+// The producers' arithmetic is replicated at MLX's own node boundaries:
+// each elementwise op computes in float and rounds to BF16 exactly where the
+// compiled graph has a BF16 tensor boundary, and sigmoid uses the JIT
+// `Sigmoid` body (`1/(1+exp(|x|))`, sign-selected) with `precise::exp` --
+// verified bit-identical against the shipped compiled helpers over random
+// tensors at every routed width before wiring in (values AND tables).
+//
+// Publishing is gated exactly like the sidecar's `wants`: sumtable arm,
+// `tablePays` width, K % 512 == 0 -- plus rows <= 8, so the warm's width-9
+// pass and every prefill/serial shape keep the shipped kernels byte for
+// byte. A gated-off call falls back to the untouched compiled helper.
+
+private func qwen35ElementwiseXSFrame(axisDecl: String, compute: String) -> String {
+    // v2 geometry: one threadgroup per (row, 4096-element K-chunk) instead of
+    // one threadgroup looping a whole row. The first ranked draw of the
+    // per-row form (63df4e64) measured a UNIFORM -0.7..-2.0% on all seven
+    // drafting prompts with drafts byte-identical -- an occupancy tax from
+    // serializing the elementwise pass into M threadgroups. Chunking restores
+    // the parallel width; a 4096 chunk is a whole number of 512-element table
+    // blocks, so the epilogue's block math is unchanged.
+    """
+    constexpr uint n_reads = 4;
+    constexpr uint lsize = 1024;
+    uint row = threadgroup_position_in_grid.y;
+    uint thread_id = thread_position_in_threadgroup.x;
+    \(axisDecl)
+    const uint xs_stride = threadgroups_per_grid.y <= 8u ? 8u : 16u;
+    const uint r_start = uint(threadgroup_position_in_grid.x) * (lsize * n_reads);
+    if (r_start >= axis_size) { return; }
+    uint elem = r_start + thread_id * n_reads;
+    if (elem + n_reads <= axis_size) {
+        for (uint i = 0; i < n_reads; ++i) {
+            uint j = elem + i;
+            \(compute)
+        }
+    } else {
+        for (uint i = 0; i < n_reads; ++i) {
+            uint j = elem + i;
+            if (j < axis_size) {
+                \(compute)
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    const uint xs_elem = r_start + thread_id * 16;
+    if (thread_id < lsize / 4 && xs_elem + 16 <= axis_size) {
+        const device bfloat16_t* xm = outv + out_off + xs_elem;
+        float s = 0.0f;
+        for (int i = 0; i < 4; i++) {
+            const vec<bfloat16_t, 4> xv = *reinterpret_cast<
+                const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+            s += xv[0] + xv[1] + xv[2] + xv[3];
+        }
+        const uint xs_kb = xs_elem / 512;
+        const uint xs_lane = (xs_elem % 512) / 16;
+        xsums[(xs_kb * 32 + xs_lane) * xs_stride + row] = s;
+    }
+    """
+}
+
+// BF16 node-boundary sigmoid: the JIT `Sigmoid` body instantiated the way the
+// compiled graph rounds it -- exp result, denominator, quotient and the
+// 1 - y branch each pass through a BF16 tensor boundary.
+private let qwen35XSSigmoidBF16 = """
+                bfloat16_t e = bfloat16_t(metal::precise::exp(float(metal::abs(float(g)))));
+                bfloat16_t dn = bfloat16_t(1.0f + float(e));
+                bfloat16_t yb = bfloat16_t(1.0f / float(dn));
+                bfloat16_t sg = (float(g) < 0.0f) ? yb : bfloat16_t(1.0f - float(yb));
+"""
+
+private let qwen35FusedSwiGLUXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_swiglu_xsums_v1",
+    inputNames: ["y"],
+    outputNames: ["outv", "xsums"],
+    source: qwen35ElementwiseXSFrame(
+        axisDecl: """
+        uint axis_size = uint(y_shape[y_ndim - 1]) / 2;
+        ulong out_off = ulong(row) * ulong(axis_size);
+        """,
+        compute: """
+                bfloat16_t g = y[ulong(row) * ulong(2 * axis_size) + j];
+                bfloat16_t u = y[ulong(row) * ulong(2 * axis_size) + axis_size + j];
+        \(qwen35XSSigmoidBF16)
+                bfloat16_t sil = bfloat16_t(float(g) * float(sg));
+                outv[out_off + j] = bfloat16_t(float(sil) * float(u));
+        """),
+    ensureRowContiguous: true
+)
+
+private let qwen35GatedDeltaPostNormXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_gdn_postnorm_xsums_v1",
+    inputNames: ["x", "gate"],
+    outputNames: ["outv", "xsums"],
+    source: qwen35ElementwiseXSFrame(
+        axisDecl: """
+        uint axis_size = uint(x_shape[x_ndim - 1]);
+        ulong out_off = ulong(row) * ulong(axis_size);
+        """,
+        compute: """
+                float g32 = float(gate[out_off + j]);
+                float ye = 1.0f / (1.0f + metal::precise::exp(metal::abs(g32)));
+                float sgf = (g32 < 0.0f) ? ye : 1.0f - ye;
+                outv[out_off + j] = bfloat16_t((g32 * sgf) * float(x[out_off + j]));
+        """),
+    ensureRowContiguous: true
+)
+
+private func qwen35XSContiguous(_ a: MLXArray) -> Bool {
+    var expect = 1
+    let strides = a.strides
+    for i in stride(from: a.ndim - 1, through: 0, by: -1) {
+        if a.dim(i) != 1 {
+            if strides[i] != expect { return false }
+            expect *= a.dim(i)
+        }
+    }
+    return true
+}
+
+/// SwiGLU producer with the chunk-sum epilogue when its `down_proj` consumer
+/// will read the table; the untouched compiled helper otherwise.
+func qwen35FusedSwiGLUMaybeXS(_ y: MLXArray) -> MLXArray {
+    let twoK = y.dim(-1)
+    let k = twoK / 2
+    let rows = y.size / twoK
+    if Qwen35CustomQMV.arm == .sumTable,
+       rows >= Qwen35CustomQMV.minimumTableWidth, rows <= 8,
+       y.ndim >= 2, y.dim(-2) == rows, k % 512 == 0,
+       y.dtype == .bfloat16, qwen35XSContiguous(y)
+    {
+        let outs = qwen35FusedSwiGLUXSumsKernel(
+            [y],
+            grid: (((k + 4095) / 4096) * 1024, rows, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [
+                [rows, k],
+                [(k / 512) * 32 * Qwen35CustomQMV.sumsStride(rows)],
+            ],
+            outputDTypes: [.bfloat16, .float32]
+        )
+        var shape = y.shape
+        shape[shape.count - 1] = k
+        let out = outs[0].reshaped(shape)
+        Qwen35XSumsSidecar.publish(x: out, table: outs[1])
+        return out
+    }
+    return qwen35CompiledFusedSwiGLU(y)
+}
+
+/// GDN post-norm gate producer with the chunk-sum epilogue for its
+/// `out_proj` consumer; returns the `[B, S, -1]` object the routed linear
+/// consumes (the sidecar keys tables on tensor identity).
+func qwen35GatedDeltaPostNormMaybeXS(
+    _ x: MLXArray, _ gate: MLXArray, batch B: Int, seq S: Int
+) -> MLXArray {
+    let k = x.size / (B * S)
+    if Qwen35CustomQMV.arm == .sumTable, B == 1,
+       S >= Qwen35CustomQMV.minimumTableWidth, S <= 8,
+       k % 512 == 0, x.size == gate.size,
+       x.dtype == .bfloat16, gate.dtype == .bfloat16,
+       qwen35XSContiguous(x), qwen35XSContiguous(gate)
+    {
+        let outs = qwen35GatedDeltaPostNormXSumsKernel(
+            [x.reshaped(S, k), gate.reshaped(S, k)],
+            grid: (((k + 4095) / 4096) * 1024, S, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [
+                [S, k],
+                [(k / 512) * 32 * Qwen35CustomQMV.sumsStride(S)],
+            ],
+            outputDTypes: [.bfloat16, .float32]
+        )
+        let out = outs[0].reshaped([B, S, k])
+        Qwen35XSumsSidecar.publish(x: out, table: outs[1])
+        return out
+    }
+    return qwen35CompiledGatedDeltaPostNorm(x, gate).reshaped(B, S, -1)
+}
 
 // MARK: - Candidate-owned affine-4/group-64 QMV dispatch
 //
@@ -1977,7 +2170,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
-            return qwen35RoutedLinear(downProj, qwen35CompiledFusedSwiGLU(y))
+            return qwen35RoutedLinear(downProj, qwen35FusedSwiGLUMaybeXS(y))
         }
         return qwen35RoutedLinear(downProj, silu(gateProj(x)) * upProj(x))
     }
