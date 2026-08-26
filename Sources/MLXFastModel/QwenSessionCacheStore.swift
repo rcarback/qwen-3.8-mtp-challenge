@@ -265,6 +265,12 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
     /// conversation granularity is the RIGHT granularity here: a chunk
     /// checkpoint is exactly one round, so LRU over conversations is LRU over
     /// checkpoints.
+    ///
+    /// `kvBytes` is the caller's charge for this checkpoint. The worker
+    /// charges the DELTA since the previous boundary of the same prefill
+    /// chain (the attention KV is one shared copy-on-write buffer), and the
+    /// full depth for a checkpoint restored cold from disk (a standalone
+    /// buffer). The store does not interpret the value beyond summing it.
     public func recordChunk(
         key: String, tokens: [Int], state: Payload,
         roundBytes: Int, kvBytes: Int

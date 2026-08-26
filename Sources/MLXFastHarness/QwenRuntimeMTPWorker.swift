@@ -622,9 +622,22 @@ extension QwenRuntime {
                 /// reusable if the next request lands on the same boundary,
                 /// and the next request will not share this one's resume
                 /// position.
-                func prefillCheckpointed(from base: Int) throws -> Int {
+                func prefillCheckpointed(
+                    from base: Int, baseKvBytes: Int
+                ) throws -> Int {
                     var position = base
                     var token: Int?
+                    // The append-only attention KV is one shared
+                    // copy-on-write buffer, so a checkpoint's NEW bytes are
+                    // only the rows appended since the previous boundary in
+                    // this chain. Charging full depth per checkpoint ledgers
+                    // the shared prefix once per boundary and exhausts the
+                    // budget quadratically. When a boundary is skipped because
+                    // another stream already retained it, the delta accrues to
+                    // the next recorded checkpoint -- a conservative
+                    // overcharge, since the other stream's entry already paid
+                    // for the shared span.
+                    var previousKvBytes = baseKvBytes
                     // Every chunk boundary strictly beyond `base`, then the end
                     // of the prompt. The final segment is usually a partial
                     // chunk and gets no checkpoint.
@@ -657,7 +670,9 @@ extension QwenRuntime {
                             tokens: Array(seedTokens.prefix(stop)),
                             state: checkpoint,
                             roundBytes: checkpoint.recurrentBytes,
-                            kvBytes: checkpoint.kvBytes)
+                            kvBytes: Swift.max(
+                                0, checkpoint.kvBytes - previousKvBytes))
+                        previousKvBytes = checkpoint.kvBytes
                         if let entry = try? qwenMTPCacheEntry(
                             snapshot: checkpoint, tokens: Array(seedTokens.prefix(stop)))
                         {
@@ -692,7 +707,9 @@ extension QwenRuntime {
                     // the ordinary case for a chat client, which re-renders its
                     // history each turn and so never reproduces the exact token
                     // stream the previous turn ended on.
-                    seedToken = try prefillCheckpointed(from: hit.round.tokenCount)
+                    seedToken = try prefillCheckpointed(
+                        from: hit.round.tokenCount,
+                        baseKvBytes: hit.round.state.kvBytes)
                     resumedTokens = hit.round.tokenCount
                     FileHandle.standardError.write(Data(
                         ("qwen-mtp: resumed \(hit.round.tokenCount) cached "
@@ -747,7 +764,8 @@ extension QwenRuntime {
                             "restore: key=\(hit.key) adopted, extending from "
                                 + "\(hit.entry.tokens.count) tokens")
                         seedToken = try prefillCheckpointed(
-                            from: hit.entry.tokens.count)
+                            from: hit.entry.tokens.count,
+                            baseKvBytes: hit.entry.kvBytes)
                         resumedTokens = hit.entry.tokens.count
                         FileHandle.standardError.write(Data(
                             ("qwen-mtp: resumed \(hit.entry.tokens.count) "
@@ -762,7 +780,7 @@ extension QwenRuntime {
                                 + "restore (\(error)); deleting it and "
                                 + "re-prefilling\n").utf8))
                         qwenMTPResumeStore.dropDiskEntry(key: hit.key)
-                        seedToken = try prefillCheckpointed(from: 0)
+                        seedToken = try prefillCheckpointed(from: 0, baseKvBytes: 0)
                     }
                 } else {
                     if let conversationId = request.conversationId {
@@ -772,7 +790,7 @@ extension QwenRuntime {
                         // failed match again.
                         qwenMTPResumeStore.drop(conversation: conversationId)
                     }
-                    seedToken = try prefillCheckpointed(from: 0)
+                    seedToken = try prefillCheckpointed(from: 0, baseKvBytes: 0)
                 }
                 if let conversationId = request.conversationId {
                     let snapshot = session.snapshotState()
