@@ -403,16 +403,13 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
           }
         }
 
-        if (row + NKeep >= uint(T)) {
-          const uint state_row = row + NKeep - T;
-          const ulong raw_base = ulong(row) * ulong(qkv_strides[1])
-              + ulong(channel_base + lane * 4) * ulong(qkv_strides[2]);
-          const uint state_base = state_row * C + channel_base + lane * 4;
-          #pragma clang loop unroll(full)
-          for (uint i = 0; i < 4; ++i) {
-            conv_out[state_base + i] =
-                qkv[raw_base + ulong(i) * ulong(qkv_strides[2])];
-          }
+        // E139: skip packed conv_out stores. At S>=3 the last NKeep concat
+        // rows are qkv[S-NKeep:S], which is exactly what this copy wrote.
+        // Host takes the concat slice. conv_out stays in the 6-wide ABI so
+        // this is not a new Metal name; the buffer is unbound from the
+        // rollback path. The false guard keeps the symbol live for JIT.
+        if (false) {
+          conv_out[0] = InT(0);
         }
         """
     return MLXFast.metalKernel(
@@ -991,7 +988,9 @@ final class Qwen35GatedDeltaNet: Module {
             qNormed = outs[0]
             kNormed = outs[1]
             v = outs[2]
-            newConvState = outs[3]
+            // E139: concat slice is bit-identical to packed conv_out at S>=3
+            // (kernel copied qkv[S-nKeep:S]). Skip reading outs[3].
+            newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
             g = outs[4]
             beta = outs[5]
         } else {
