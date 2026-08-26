@@ -635,12 +635,43 @@ public final class Qwen36MTPBlockSession {
     /// microbenchmark above, so 1024 stands. Anyone re-running this must first
     /// stop the screensaver at its source; a `pkill` watchdog is not enough,
     /// because `loginwindow` respawns it within seconds.
-    public static let prefillChunkRange = 256 ... 1024
+    ///
+    /// RUNTIME OVERRIDE (2026-08-26). `DARKBLOOM_PREFILL_CHUNK_CAP` sets the
+    /// upper bound at process start. It exists so a sweep can hold ONE binary
+    /// across every sample: the previous attempt edited this constant and
+    /// rebuilt the worker per sample, which cost about 46 seconds each and put
+    /// a stale-build failure mode between the harness and its data. Unset, the
+    /// bound is the 1024 above and nothing moves. The resolver clamps to
+    /// [512, 16384] rather than honouring smaller values, because a bound
+    /// below 512 would stop the ranked 512-token seed being the single
+    /// `callWithHidden` the paragraph above depends on.
+    public static let prefillChunkCapDefault = 1024
+    public static let prefillChunkCapFloor = 512
+    public static let prefillChunkCapCeiling = 16384
+
+    /// Parses the cap override. Anything absent, unparseable, or outside the
+    /// safe band resolves to a usable value rather than trapping: a mistyped
+    /// environment variable must not take down a server.
+    static func resolveChunkCap(_ raw: String?) -> Int {
+        guard let raw, let value = Int(raw) else { return prefillChunkCapDefault }
+        return min(max(value, prefillChunkCapFloor), prefillChunkCapCeiling)
+    }
+
+    public static let prefillChunkRange: ClosedRange<Int> = 256
+        ... resolveChunkCap(
+            ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_CHUNK_CAP"])
+
+    /// The chunk schedule, as a pure function of its inputs, so a sweep can
+    /// derive a whole-prompt schedule without a process per cap.
+    static func prefillChunkSize(cached: Int, cap: Int, budget: Int) -> Int {
+        let derived = budget / max(cached, 1)
+        return min(max(derived, prefillChunkRange.lowerBound), cap)
+    }
 
     private static func prefillChunkSize(cached: Int) -> Int {
-        let derived = prefillChunkProductBudget / max(cached, 1)
-        return min(max(derived, prefillChunkRange.lowerBound),
-                   prefillChunkRange.upperBound)
+        prefillChunkSize(
+            cached: cached, cap: prefillChunkRange.upperBound,
+            budget: prefillChunkProductBudget)
     }
 
     /// Forward `tokens` into `cache` in chunks, returning the pre-norm hidden of
