@@ -92,24 +92,50 @@ struct PrefillMatmulCostTests {
         // different kernels today. Comparing them at matched FLOPs turns that
         // dispatch difference into a number: the unfused path is several times
         // slower per FLOP, and closing the gap is what this task delivers.
-        func attentionSeconds(headDim: Int, heads: Int, T: Int) -> Double {
+        //
+        // The two legs are measured sequentially, so contention that drifts
+        // between them (a concurrent process on the same GPU) can move the
+        // ratio even though each leg is individually a best-of-3. Interleave
+        // the legs instead and take the median of several complete ratio
+        // samples, so drift has to persist across the whole interleaved
+        // sequence to move the reported statistic.
+        func makeQKV(headDim: Int, heads: Int, T: Int) -> (MLXArray, MLXArray, MLXArray) {
             let q = MLXRandom.normal([1, heads, T, headDim]).asType(.bfloat16)
             let k = MLXRandom.normal([1, 4, T, headDim]).asType(.bfloat16)
             let v = MLXRandom.normal([1, 4, T, headDim]).asType(.bfloat16)
             eval(q, k, v)
-            return Self.timeIt {
-                [MLXFast.scaledDotProductAttention(
-                    queries: q, keys: k, values: v,
-                    scale: 1 / Float(headDim).squareRoot(), mask: .causal)]
-            }
+            return (q, k, v)
+        }
+        func attentionSeconds(
+            headDim: Int, q: MLXArray, k: MLXArray, v: MLXArray
+        ) -> Double {
+            let start = Date()
+            eval([MLXFast.scaledDotProductAttention(
+                queries: q, keys: k, values: v,
+                scale: 1 / Float(headDim).squareRoot(), mask: .causal)])
+            return Date().timeIntervalSince(start)
         }
         // 48 heads at D=128 and 24 heads at D=256 do the same total work.
-        let fused = attentionSeconds(headDim: 128, heads: 48, T: 4096)
-        let target = attentionSeconds(headDim: 256, heads: 24, T: 4096)
+        let (q128, k128, v128) = makeQKV(headDim: 128, heads: 48, T: 4096)
+        let (q256, k256, v256) = makeQKV(headDim: 256, heads: 24, T: 4096)
+        // Warm up both kernels once (JIT compile, allocator warmup) before
+        // any timed sample.
+        _ = attentionSeconds(headDim: 128, q: q128, k: k128, v: v128)
+        _ = attentionSeconds(headDim: 256, q: q256, k: k256, v: v256)
+
+        var ratios: [Double] = []
+        for _ in 0 ..< 5 {
+            let fused = attentionSeconds(headDim: 128, q: q128, k: k128, v: v128)
+            let target = attentionSeconds(headDim: 256, q: q256, k: k256, v: v256)
+            ratios.append(target / fused)
+        }
+        ratios.sort()
+        let median = ratios[ratios.count / 2]
         print(String(
-            format: "\n  D=128 fused %.4f s | D=256 %.4f s | ratio %.2fx\n",
-            fused, target, target / fused))
-        #expect(target < fused * 1.5)
+            format: "\n  ratios: %@\n  median ratio %.2fx\n",
+            ratios.map { String(format: "%.2fx", $0) }.joined(separator: ", "),
+            median))
+        #expect(median < 1.5)
     }
 
     @Test("fused and unfused attention agree at head dim 256")
@@ -139,6 +165,57 @@ struct PrefillMatmulCostTests {
         let error = abs(fused - reference).max().item(Float.self)
         print(String(format: "\n  max abs error %.3e\n", error))
         #expect(error < 1e-3)
+    }
+
+    @Test("fused bf16 attention agrees with fp32 reference at head dim 256 (production tile)")
+    func fusedMatchesUnfusedProductionTile() throws {
+        guard ProcessInfo.processInfo
+            .environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else { return }
+        // fusedMatchesUnfused above runs fp32, which at bd=256 takes the
+        // narrow fallback tile (BQ=16, BK=8, WM=2) -- fp32 does not fit the
+        // full tile. bf16, the dtype the model actually runs, takes the full
+        // production tile (BQ=32, BK=16, WM=4) instead. That tile has no
+        // numerical coverage without this test.
+        let T = 64
+        // Build the "true" values in fp32, then round down to bf16 for the
+        // fused call -- so the fused kernel exercises real bf16 rounding
+        // rather than values that happen to be exactly representable.
+        let qf = MLXRandom.normal([1, 24, T, 256]).asType(.float32)
+        let kf = MLXRandom.normal([1, 4, T, 256]).asType(.float32)
+        let vf = MLXRandom.normal([1, 4, T, 256]).asType(.float32)
+        eval(qf, kf, vf)
+        let q = qf.asType(.bfloat16)
+        let k = kf.asType(.bfloat16)
+        let v = vf.asType(.bfloat16)
+        eval(q, k, v)
+        let fused = MLXFast.scaledDotProductAttention(
+            queries: q, keys: k, values: v, scale: 1 / 16.0, mask: .causal)
+        // Reference computed in fp32 from the fp32 inputs (before the bf16
+        // rounding above), via ops -- never dispatches the fused kernel
+        // whatever the head dim, so it carries none of the fused kernel's
+        // rounding.
+        let kb = repeated(kf, count: 6, axis: 1)
+        let vb = repeated(vf, count: 6, axis: 1)
+        var scores = matmul(qf, kb.transposed(0, 1, 3, 2)) * (1 / 16.0)
+        let causal = MLXArray(0 ..< T).reshaped([T, 1])
+            .< MLXArray(0 ..< T).reshaped([1, T])
+        scores = MLX.where(causal, MLXArray(-Float.infinity), scores)
+        let reference = matmul(softmax(scores, axis: -1), vb)
+        let fusedF32 = fused.asType(.float32)
+        eval(fusedF32, reference)
+        let error = abs(fusedF32 - reference).max().item(Float.self)
+        print(String(format: "\n  max abs error (bf16 vs fp32 reference) %.3e\n", error))
+        // Bound, derived rather than fit to the measurement: bf16 has an
+        // 8-bit significand, so a single rounding carries relative error
+        // near 2^-8 ~ 3.9e-3. Q, K, and V are each rounded once on the way
+        // in; QK^T then sums D=256 products and A@V sums T=64 products, and
+        // treating those per-term roundings as uncorrelated gives error
+        // growth on the order of sqrt(reduction length) -- sqrt(256) = 16
+        // and sqrt(64) = 8. Output magnitude is O(1) (V ~ N(0,1), softmax
+        // weights sum to 1), so the expected order of magnitude is
+        // 3.9e-3 times a double-digit factor, i.e. a few 1e-2, not 1e-3
+        // (fp32's bound above) and not 1e-1.
+        #expect(error < 5e-2)
     }
 
     @Test("gated-delta depthwise conv1d cost")
