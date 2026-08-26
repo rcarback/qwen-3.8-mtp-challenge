@@ -470,8 +470,58 @@ Treat 1.8 percent as the supported size of the effect and the surface as
 corroborating its sign.
 
 Retiring the confound is cheap and needs no new apparatus: re-run the grid with
-the chunk loop reversed. Agreement between the two orders settles it. That was
-not done here.
+the chunk loop reversed. Agreement between the two orders settles it.
+
+**THE REVERSED-ORDER CONTROL WAS RUN ON 2026-08-26, AND THE TWO ORDERS DO NOT
+AGREE. THE INTEGRATED CONCLUSION ABOVE IS REFUTED.** Same twenty shapes, same
+process-per-run conditions, quiet gate passed, chunk loop descending
+(`MLXFAST_QWEN_CHUNK_SWEEP_REVERSED=1`).
+
+| cap | ascending | descending | mean | mean versus 1024 |
+| --- | --- | --- | --- | --- |
+| 1024 | 120.81 s | 117.54 s | 119.18 s | 1.000x |
+| 2048 | 129.59 s | 108.42 s | 119.00 s | 0.999x |
+| 4096 | 130.84 s | 109.55 s | 120.19 s | 1.009x |
+
+Each order reaches the opposite conclusion. Ascending makes cap 1024 the best
+and wide caps 8.3 percent worse. Descending makes cap 2048 the best and cap
+1024 8.4 percent worse. The effect flips sign with measurement order, which is
+the signature of an artifact rather than a property of the schedule.
+
+The per-cap shift confirms the mechanism rather than merely showing noise.
+Cap 1024 moved 2.7 percent between orders; caps 2048 and 4096 both moved 16.3
+percent. That is what position predicts and noise does not: the prediction for
+cap 1024 leans on grid points that sit in the middle of the chunk loop in both
+directions, so their position barely changes, while the wide caps lean on
+points that move from last to first. The size of each cap's shift tracks how
+far its own grid points travelled in the loop.
+
+Averaging the two orders cancels the chunk-axis position term, because the term
+enters with opposite sign in each. The averaged surface puts all three caps
+within 1.0 percent of one another. Note precisely what this does and does not
+cancel: the depth blocks run in the same order (0, 2048, 8192, 16384) in both
+passes, so the DEPTH-axis position term survives in the mean untouched. Only
+the chunk axis is controlled, which is the axis this question is about.
+
+**Best estimate of the chunk-width effect on whole-prompt prefill: about 1
+percent, direction unresolved.** The 8.3 percent figure must not be quoted. The
+separate-process pair remains the only unconfounded end-to-end reading, and at
+1.8 percent favouring narrow it is consistent with a small effect whose sign
+this grid cannot establish.
+
+The narrower per-point claim survives in weakened form. At fixed depth, the
+cost of a 4096-token chunk minus a 256-token chunk is +1.51, +1.39, +1.39 and
++1.96 ms/token ascending, against +1.04, +1.18, +0.60 and -0.65 descending.
+Three of four depths keep the sign at roughly half the magnitude, and the
+deepest inverts. So wide chunks probably do cost slightly more per token, and
+the integrated 8 percent claim built on that was position.
+
+**Consequence for `prefillChunkRange`.** The 256 ... 1024 bound is not refuted
+and is not vindicated. Nothing here shows it is wrong, and nothing shows it
+buys the 8 percent the surface claimed. Its surviving justification is the one
+its own doc comment already gives without a speed claim: lower peak allocation
+at shallow depth. Chunk-cap tuning should be treated as a closed question worth
+about 1 percent, and effort should go elsewhere.
 
 One piece of independent corroboration did arrive later, from the M sweep in
 Opportunity 2. Each of its points is measured in its own process, so it carries

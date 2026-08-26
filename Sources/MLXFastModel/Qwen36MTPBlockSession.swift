@@ -675,6 +675,21 @@ public final class Qwen36MTPBlockSession {
     /// stop the screensaver at its source; a `pkill` watchdog is not enough,
     /// because `loginwindow` respawns it within seconds.
     ///
+    /// THE MICROBENCHMARK THAT AGREEMENT POINTED AT IS REFUTED (2026-08-26).
+    /// The chunk cost surface was re-run with the chunk loop descending
+    /// (`MLXFAST_QWEN_CHUNK_SWEEP_REVERSED=1`). It reverses: ascending order
+    /// makes cap 1024 best and wide caps 8.3% worse, descending order makes
+    /// cap 2048 best and cap 1024 8.4% worse. Averaging the two orders cancels
+    /// the chunk-axis position term and puts caps 1024, 2048 and 4096 within
+    /// 1.0% of each other. So "1024 fastest, larger caps monotonically slower"
+    /// was measurement order, and the partial end-to-end data above agreed
+    /// with it because that data carries the same confound.
+    ///
+    /// THIS BOUND STANDS ANYWAY, ON THE ALLOCATION ARGUMENT ONLY. No speed
+    /// claim attaches to it -- reread the paragraph above that already said
+    /// so. Do not re-tune the cap expecting to find percent: the controlled
+    /// estimate of the whole effect is about 1%.
+    ///
     /// RUNTIME OVERRIDE (2026-08-26). `DARKBLOOM_PREFILL_CHUNK_CAP` sets the
     /// upper bound at process start. It exists so a sweep can hold ONE binary
     /// across every sample: the previous attempt edited this constant and
