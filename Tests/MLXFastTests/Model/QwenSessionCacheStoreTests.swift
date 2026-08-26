@@ -384,4 +384,64 @@ struct QwenSessionCacheStoreTests {
         #expect(QwenPrefillChunking.prefixKey(for: tokens, count: 0) == nil)
         #expect(QwenPrefillChunking.prefixKey(for: tokens, count: 10_001) == nil)
     }
+
+    @Test("a second agent's divergence from a recorded stream becomes a boundary")
+    func learnedBoundaryFromDivergence() {
+        let store = QwenSessionCacheStore<Payload>(
+            budgetBytes: 1 * GiB, minimumLearnedBoundary: 8)
+        let shared = Array(0 ..< 100)            // harness boilerplate
+        let agentA = shared + [1000, 1001]
+        let agentB = shared + [2000, 2001, 2002]
+        let agentC = shared + [3000]
+
+        // Cold store: nothing to diverge from.
+        #expect(store.learnedBoundary(incoming: agentA) == nil)
+
+        store.recordStream(tokens: agentA)
+        // B diverges from A exactly where the shared boilerplate ends.
+        #expect(store.learnedBoundary(incoming: agentB) == 100)
+
+        store.recordStream(tokens: agentB)
+        // C agrees with both streams up to the same boundary.
+        #expect(store.learnedBoundary(incoming: agentC) == 100)
+    }
+
+    @Test("learned boundaries below the minimum are not worth 144 MiB")
+    func learnedBoundaryThreshold() {
+        let store = QwenSessionCacheStore<Payload>(
+            budgetBytes: 1 * GiB, minimumLearnedBoundary: 50)
+        store.recordStream(tokens: Array(0 ..< 100))
+        // Diverges at 30, below the 50-token floor.
+        #expect(store.learnedBoundary(
+            incoming: Array(0 ..< 30) + [9999]) == nil)
+        // Diverges at 60, above it.
+        #expect(store.learnedBoundary(
+            incoming: Array(0 ..< 60) + [9999]) == 60)
+    }
+
+    @Test("a prompt contained in a stream learns no boundary")
+    func learnedBoundaryNeverAtPromptEnd() {
+        let store = QwenSessionCacheStore<Payload>(
+            budgetBytes: 1 * GiB, minimumLearnedBoundary: 8)
+        store.recordStream(tokens: Array(0 ..< 100))
+        // Incoming is a strict prefix of the stream: LCP == incoming.count,
+        // which leaves no next token to read after a resume. Refused.
+        #expect(store.learnedBoundary(incoming: Array(0 ..< 40)) == nil)
+    }
+
+    @Test("a stream that extends a retained one supersedes it; the ring is capped")
+    func streamRingSupersedesAndCaps() {
+        let store = QwenSessionCacheStore<Payload>(
+            budgetBytes: 1 * GiB, minimumLearnedBoundary: 4)
+        store.recordStream(tokens: Array(0 ..< 50))
+        store.recordStream(tokens: Array(0 ..< 80))    // supersedes the 50
+        #expect(store.recentStreamCountForTesting == 1)
+
+        // 20 unrelated streams overflow the 16-slot ring.
+        for base in 0 ..< 20 {
+            store.recordStream(
+                tokens: Array((base + 1) * 10_000 ..< (base + 1) * 10_000 + 10))
+        }
+        #expect(store.recentStreamCountForTesting == 16)
+    }
 }

@@ -79,10 +79,26 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
     private var diskRoot: URL?
     private var diskFingerprint: QwenPrefillDiskCache.Fingerprint?
 
+    /// Recently completed prompt token streams, newest last. Tokens only, no
+    /// model state: the ring exists so a later request can discover WHERE it
+    /// diverges from an earlier stream -- which is the one position worth a
+    /// checkpoint, because two agent harnesses that share boilerplate agree
+    /// up to exactly that point. ~160 KB per 20k-token stream.
+    private var recentStreams: [[Int]] = []
+    /// Computed, not stored: a generic type cannot hold a static stored
+    /// property (the same constraint that puts `QwenPrefillChunking.namespace`
+    /// on the enum rather than here).
+    private static var maxRecentStreams: Int { 16 }
+    /// Floor below which a learned boundary is not worth the flat 144 MiB of
+    /// recurrent state a checkpoint there would retain.
+    private let minimumLearnedBoundary: Int
+
     public init(
-        budgetBytes: Int = QwenSessionCacheBudget.clampedDefault()
+        budgetBytes: Int = QwenSessionCacheBudget.clampedDefault(),
+        minimumLearnedBoundary: Int = 1024
     ) {
         self.budgetBytes = Swift.max(0, budgetBytes)
+        self.minimumLearnedBoundary = Swift.max(1, minimumLearnedBoundary)
     }
 
     public var currentBytes: Int {
@@ -159,6 +175,53 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
     public func drop(conversation id: String) {
         lock.lock(); defer { lock.unlock() }
         conversations.removeValue(forKey: id)
+    }
+
+    /// Retain a completed prompt stream for divergence discovery.
+    ///
+    /// A retained stream that is a prefix of the new one carries strictly
+    /// less divergence information, so it is superseded rather than kept as
+    /// a duplicate. The ring is FIFO-capped: divergence learning only needs
+    /// the streams the CURRENT mix of agents is producing.
+    public func recordStream(tokens: [Int]) {
+        guard !tokens.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+        recentStreams.removeAll { stream in
+            stream.count <= tokens.count
+                && stream[...] == tokens.prefix(stream.count)
+        }
+        recentStreams.append(tokens)
+        if recentStreams.count > Self.maxRecentStreams {
+            recentStreams.removeFirst(
+                recentStreams.count - Self.maxRecentStreams)
+        }
+    }
+
+    /// Deepest position at which `incoming` diverges from a retained stream,
+    /// or nil when none is worth a checkpoint.
+    ///
+    /// The LCP of two prompts that share harness boilerplate IS the boundary
+    /// future requests will agree up to. Refused when the LCP reaches
+    /// `incoming.count` -- a checkpoint there would leave no next token to
+    /// read, the same invariant `bestMatch` and `chunkMatch` enforce -- and
+    /// when it is under `minimumLearnedBoundary`.
+    public func learnedBoundary(incoming: [Int]) -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        var best = 0
+        for stream in recentStreams {
+            let limit = Swift.min(stream.count, incoming.count)
+            var lcp = 0
+            while lcp < limit, stream[lcp] == incoming[lcp] { lcp += 1 }
+            guard lcp < incoming.count else { continue }
+            best = Swift.max(best, lcp)
+        }
+        return best >= minimumLearnedBoundary ? best : nil
+    }
+
+    /// Test-only visibility into the memo ring size.
+    public var recentStreamCountForTesting: Int {
+        lock.lock(); defer { lock.unlock() }
+        return recentStreams.count
     }
 
     /// True when a prefill checkpoint is already retained under `key`.
