@@ -2083,24 +2083,21 @@ private let qwen35AttentionQKRMSRoPEKernel = MLXFast.metalKernel(
                 bfloat weight = is_query
                     ? q_weight[ulong(element) * weight_stride]
                     : k_weight[ulong(element) * weight_stride];
-                normalized[element] = weight * rms_value;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // The stock RoPE primitive copies dimensions 64...255 unchanged before
-        // rotating nontraditional pairs (i, i + 32).  Here the final output is
-        // new storage, so only the pass-through tail needs an explicit copy.
-        for (uint i = 0; i < n_reads; ++i) {
-            uint element = first + i;
-            if (element >= rotary_dimensions && element < axis_size) {
-                if (is_query) {
-                    q_out[output_base + ulong(element)] = normalized[element];
+                const bfloat out_value = weight * rms_value;
+                // E140: skip unused threadgroup stores of the RoPE tail.
+                // Dimensions 64...255 are copied unchanged; write them
+                // straight to q_out/k_out. Only 0...63 live in
+                // `normalized[]` for the pair rotate below.
+                if (element < rotary_dimensions) {
+                    normalized[element] = out_value;
+                } else if (is_query) {
+                    q_out[output_base + ulong(element)] = out_value;
                 } else {
-                    k_out[output_base + ulong(element)] = normalized[element];
+                    k_out[output_base + ulong(element)] = out_value;
                 }
             }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (thread_id < rotary_pairs / n_reads) {
             for (uint i = 0; i < n_reads; ++i) {
