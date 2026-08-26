@@ -38,7 +38,7 @@ while read -r label mode M N K; do
   line=$(MLXFAST_RUN_MLX_RUNTIME_TESTS=1 \
     MLXFAST_GEMM_M="$M" MLXFAST_GEMM_N="$N" MLXFAST_GEMM_K="$K" \
     MLXFAST_GEMM_MODE="$mode" \
-    swift test --force-resolved-versions --filter singleGemmPoint 2>&1 |
+    swift test --force-resolved-versions --filter singleGemmPoint </dev/null 2>&1 |
     grep '^GEMMPOINT' | head -1)
   if [ -z "$line" ]; then
     echo "no measurement for $label" >&2

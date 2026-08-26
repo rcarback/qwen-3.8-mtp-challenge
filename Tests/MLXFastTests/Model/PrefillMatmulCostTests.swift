@@ -26,14 +26,28 @@ struct PrefillMatmulCostTests {
 
     /// Drops the MLX allocator cache and waits for the GPU to go idle.
     ///
-    /// The suite is serialized and every test shares one allocator, so a block
-    /// that allocates heavily leaves the next block measuring a degraded
-    /// machine. This was not hypothetical: running `gemmCost` and `peakCost`
-    /// in one process read the square bf16 reference at 6.35 TFLOPS, against
-    /// 14.66, 14.65 and 14.74 for the same block measured in isolation. The
-    /// contamination depressed the CONTROL and left the model shapes looking
-    /// healthy, which is the direction that would have closed the
-    /// investigation early. Call this between measurement blocks.
+    /// THIS DOES NOT FIX THE CONTAMINATION IT WAS WRITTEN FOR. Read that
+    /// first, because the mechanism this helper assumes was refuted.
+    ///
+    /// The problem is real: running `gemmCost` and `peakCost` in one process
+    /// reads the square bf16 reference at 6.35 TFLOPS against roughly 14.7 for
+    /// the same block measured first in a fresh process. It depresses the
+    /// CONTROL and leaves the model shapes looking healthy, which is the
+    /// direction that closes an investigation early, so it is worth knowing
+    /// about.
+    ///
+    /// The allocator was the first theory and it is wrong. This helper was
+    /// added to test it and changed nothing: the re-measured control still
+    /// read 6.62. A process-boundary A/B/C then showed the effect does not
+    /// survive a new process, which rules out GPU clock and thermal state, and
+    /// does survive `clearCache`, which rules out the allocator. The actual
+    /// mechanism is unidentified.
+    ///
+    /// So do not call this and believe a number. The only instrument that
+    /// controls the effect is `singleGemmPoint`, which measures one shape per
+    /// process. This is kept because dropping a large cache between blocks is
+    /// still worth doing on its own terms, not because it makes an in-process
+    /// table trustworthy. It does not.
     private static func quiesce() {
         Memory.clearCache()
         // A synchronous evaluation flushes anything still queued, so the next

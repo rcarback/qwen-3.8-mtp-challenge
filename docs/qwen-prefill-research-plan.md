@@ -126,7 +126,7 @@ runs, while T=1024 and T=8192 moved with server load. Even at the noisy end
 this is a 4-6x drop in the attention row's contribution to the prefill
 budget.
 
-## Opportunity 2: projection GEMM runs at a quarter of the machine
+## Opportunity 2: projection GEMM runs at a quarter of the machine (refuted)
 
 The same machine, the same process, the same contention:
 
@@ -144,14 +144,17 @@ grid is lopsided and each threadgroup reloads a long K.
 
 Note the trend. Throughput rises with M -- 1.31, 2.97 and 5.35 TFLOPS at
 M = 256, 1024 and 4096 for the 4-bit `mlp.gate/up`. **Larger prefill chunks make
-the GEMM four times more efficient.** The reason the chunk-size sweep found
+the GEMM four times more efficient.** (Refuted. See the attribution below.) The reason the chunk-size sweep found
 nothing is that the unfused attention path (opportunity 1) makes large chunks
 more expensive at exactly the same rate, and the two cancel.
 
 **Every number in the table above is an artifact. Do not quote it.**
-Re-measured on 2026-08-26 the same shapes read three to nine times higher, and
-the ordering the table rests on inverts. Two independent defects produced it,
-and both are recorded here because the second is easy to repeat.
+Re-measured on 2026-08-26 the same shapes read three to nine times higher.
+The trend the table rests on, throughput rising with M, is neither confirmed
+nor inverted here: it was never re-measured in isolation, because the only
+data that shows an inversion is itself in-process data this section rules
+inadmissible. Two independent defects produced the table, and both are
+recorded here because the second is easy to repeat.
 
 The first was already flagged in "Open question" below: those readings were
 taken while the server was serving live traffic and the machine was swapping
@@ -174,8 +177,11 @@ dominates the measurement.
 **GEMM gap attribution, 2026-08-26. There is no tall-thin gap.** Measured one
 shape per process with `tools/gemm-point-sweep.sh`, `tools/host-quiet-gate.sh`
 passed before every point, no server running. Every point below uses the same
-call shape, so the projection and the square reference are directly
-comparable.
+call shape, `[1, M, K]` against a transposed `[N, K]`, which is a closer
+control than the block this replaced. It is not a complete control: the
+projection point allocates about 181 MB of inputs before the timed region
+against the square point's 67 MB, and this section's own governing finding is
+that pre-timing work moves the number by an unidentified mechanism.
 
 | Point | mode | M | N | K | ms | TFLOPS |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -184,12 +190,31 @@ comparable.
 | `mlp.gate/up` | bf16 | 256 | 17408 | 5120 | 3.472 | 13.14 |
 | `mlp.gate/up` | 4-bit g64 | 256 | 17408 | 5120 | 3.773 | 12.10 |
 
-The production projection at its real prefill shape runs at 12.10 TFLOPS
-against a square 4-bit reference of 12.16, which is 99.5 percent of it. The
-bf16 pair agrees: 13.14 against 13.35, within 2 percent. Quantization costs
-about 9 percent and shape costs nothing measurable. The premise of this
-section, that the projection GEMM runs at a quarter of the machine, does not
-survive isolated measurement.
+Read these four points at the resolution they carry, which is coarse. Each
+row is one measurement in one process. Best-of-three inside `timeIt` does
+nothing about the between-process term, and the spread of that term is visible
+on this page: the same square bf16 shape reads 13.35 here and 14.69 to 14.74
+in the fresh-process cluster above, and one isolated point read 7.34 and then
+11.63 on consecutive runs.
+
+What the four points support is the coarse claim, and it is enough to close
+the work item: **the 3.9x gap the old table reported is not real.** Both legs
+now land within about 10 percent of each other, and a 3.9x effect sits far
+outside any spread shown here. What they do not support is a fine claim. The
+honest statement of the shape term is that no shape penalty larger than
+roughly 15 percent is present at M = 256, and that anything smaller was not
+resolved. The 12.10 against 12.16 reading is a 0.5 percent difference measured
+once per point on an instrument that spreads by 10 percent or more between
+runs, so it must not be quoted as evidence that shape is free. The bf16 pair,
+13.14 against 13.35, says the same thing at the same resolution.
+
+Two rows would settle the fine claim and neither was measured: `mlp.gate/up`
+in 4-bit at M = 1024 and M = 4096, isolated. `.local/gemm-points2.tsv` holds a
+header and nothing else, because `spotlightknowledged` has held the CPU above
+the quiet gate's threshold since the run was queued. Until those rows exist,
+the premise of this section, that the projection GEMM runs at a quarter of the
+machine, is refuted, and the weaker question of whether shape costs single-digit
+percent is open.
 
 **The tiling target named in the old work item is not on the production path.**
 `Qwen35Ops.linear` (`Sources/MLXFastModel/Qwen35Ops.swift:33`) sends a weight
@@ -203,24 +228,36 @@ have measured a path production does not execute.
 
 For the record, the quantized path reaches `qmm` with fixed tiles.
 `QuantizedMatmul::eval_gpu` (`quantized.cpp:1418`) sees M = 256 above the
-vector limit, so it is a matrix-matrix product; the weights are transposed and
+vector limit, so it is a matrix-matrix product. The weights are transposed and
 the batch is 1, so it calls `qmm_splitk` (`:776`). There `split_k` computes as
 `max(1, 512 / (544 * 8))` = 1, which falls straight through to `qmm` (`:682`)
 with `bm = 32, bn = 32, wm = 2, wn = 2`. Those tiles do not depend on M. The
 `qmm_nax` variant (`:473`) does carry 64 x 64 x 64 tiles, but
 `is_nax_available()` requires GPU generation 17 and this M4 Max is generation
-16, so it is reachable only on the ranked M5 box.
+16, so it is reachable only on the ranked M5 box. The other guard on that
+path, `K % 64 == 0`, is satisfied by both production shapes, so the M5 thread
+is known to be reachable there.
 
 **Follow-on work: closed.** No gap survives isolated measurement, so the
 tall-thin GEMM tiling work has no target on this machine. The one open thread
 is `qmm_nax` on the ranked M5, which this machine cannot measure at all.
+
+**Provenance note.** The four-row table above is `.local/gemm-points.tsv`.
+The 6.35 to 6.62 in-process range is `.local/gemm-baseline.txt` and
+`.local/gemm-quiesced.txt`. The fresh-process cluster (14.69, 14.60, 14.66,
+14.65, 14.74) and the 7.34 / 11.63 pair were read from console output during
+the A/B/C process-boundary experiment and were not tee'd to a file, so they
+are unverifiable after the fact. Treat them as testimony, not as data, and
+re-measure before resting anything on them.
 
 **Method note.** Any future measurement in `PrefillMatmulCostTests` must run
 one shape per process. `tools/gemm-point-sweep.sh` does this and gates on a
 quiet host before each point. A table produced by a loop inside one test is not
 evidence, whatever it shows.
 
-**These two opportunities are therefore one opportunity.** Fix the attention
+**These two opportunities are therefore one opportunity.** (Refuted. The
+re-sweep below found the chunk knob dead for a different reason, and the GEMM
+half of the pairing does not exist.) Fix the attention
 kernel first, then re-run the chunk sweep. The knob that reads as dead today
 should come back to life, because the term that was cancelling it will be gone.
 

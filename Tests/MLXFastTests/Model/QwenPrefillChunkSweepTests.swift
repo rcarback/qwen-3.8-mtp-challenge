@@ -436,7 +436,7 @@ struct QwenPrefillChunkSweepTests {
             if cap == 1024 { baseline = predicted }
             if grid.predictionLeavesGrid(
                 tokens: 11682, cap: cap, budget: budget) {
-                // Numeric columns keep the numeric format; only the two cost
+                // Numeric columns keep the numeric format. Only the two cost
                 // columns change, because there is no cost to report.
                 print(String(format: "  %7d  %7d", cap, schedule.count)
                     + "    unmeasured          --")
