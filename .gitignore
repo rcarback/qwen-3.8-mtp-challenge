@@ -59,3 +59,9 @@ correctness_prompts/*gpqa_reference_cases*.json
 
 # Local-only working docs (not part of the benchmark)
 local-docs/
+
+# Local measurement scratch: prompts, token streams, downloaded/derived MTP
+# heads, serve logs. Hundreds of MB of model files live here and a blanket
+# `git add` has swallowed them before.
+.local/
+score.baseline-*.json
