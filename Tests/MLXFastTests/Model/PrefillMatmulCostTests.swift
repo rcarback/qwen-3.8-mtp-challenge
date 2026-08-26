@@ -24,6 +24,19 @@ struct PrefillMatmulCostTests {
         return best
     }
 
+    /// The warning that must precede any table this suite prints in-process.
+    ///
+    /// Position inside the process moves these numbers by more than most of
+    /// the effects they are used to measure, and no helper in this file fixes
+    /// that. The reader of a printed table will not open the doc comment on
+    /// `quiesce()`, so the table says it itself.
+    private static func printInProcessWarning() {
+        print("\n  NOT EVIDENCE: measured in-process, so every row carries a"
+            + " position term\n  larger than the effects below."
+            + " Use tools/gemm-point-sweep.sh for a\n  number you intend to"
+            + " quote.")
+    }
+
     /// Drops the MLX allocator cache and waits for the GPU to go idle.
     ///
     /// THIS DOES NOT FIX THE CONTAMINATION IT WAS WRITTEN FOR. Read that
@@ -80,6 +93,15 @@ struct PrefillMatmulCostTests {
               let kRaw = env["MLXFAST_GEMM_K"], let K = Int(kRaw)
         else { return }
         let mode = env["MLXFAST_GEMM_MODE"] ?? "q4"
+        // Refuse an unknown mode rather than measure one thing and label it
+        // another. Without this, MLXFAST_GEMM_MODE=bfloat16 falls into the
+        // quantized branch and prints a 4-bit measurement under a bf16 label,
+        // which is the one way this instrument could produce a confidently
+        // wrong number instead of no number.
+        guard mode == "bf16" || mode == "q4" else {
+            Issue.record("MLXFAST_GEMM_MODE must be bf16 or q4, got \(mode)")
+            return
+        }
         let x = MLXRandom.normal([1, M, K]).asType(.bfloat16)
         let w = MLXRandom.normal([N, K]).asType(.bfloat16)
         let flops = 2.0 * Double(M) * Double(N) * Double(K)
@@ -114,6 +136,7 @@ struct PrefillMatmulCostTests {
             ("attn.q", 6144, 5120),
         ]
         Self.quiesce()
+        Self.printInProcessWarning()
         print("\nGEMM cost, 4-bit affine g64 vs bf16 (best of 3)")
         print("  shape            T      q4 ms   q4 TFLOPS   bf16 ms  bf16 TFLOPS  ratio")
         for (name, outF, inF) in shapes {
@@ -145,6 +168,7 @@ struct PrefillMatmulCostTests {
         guard ProcessInfo.processInfo
             .environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else { return }
         // 24 query heads, 4 KV heads, head_dim 256, 16 full-attention layers.
+        Self.printInProcessWarning()
         print("\nFull attention (24q/4kv heads, D=256), one layer")
         print("      T   seconds   ms/token   x16 layers ms/token")
         for T in [1024, 4096, 8192] {
@@ -307,6 +331,7 @@ struct PrefillMatmulCostTests {
         // ~9x PyTorch MPS at groups=256; this runs at groups=10240, in 48
         // layers, so it is worth pricing directly rather than assuming.
         let width = 10240
+        Self.printInProcessWarning()
         print("\nGDN depthwise conv1d (groups 10240, k=4), one layer")
         print("      T   seconds   ms/token   x48 layers ms/token")
         for T in [256, 1024, 4096] {
@@ -331,6 +356,7 @@ struct PrefillMatmulCostTests {
         // A square GEMM far above the model shapes means the gap is dispatch
         // or shape; a square GEMM at the same level means the machine is.
         Self.quiesce()
+        Self.printInProcessWarning()
         print("\nSquare bf16 GEMM reference")
         print("      N     ms    TFLOPS")
         for N in [1024, 2048, 4096] {

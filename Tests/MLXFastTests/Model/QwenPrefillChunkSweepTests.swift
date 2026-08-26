@@ -397,9 +397,18 @@ struct QwenPrefillChunkSweepTests {
             }
             // ONE timed sample, not a best-of-N. The timed call advances
             // the cache, so a second sample would price a deeper position and
-            // silently answer a different question. The quiet gate is what
-            // makes a single sample usable, and Task 4 confirms the conclusion
-            // end to end rather than trusting this surface alone.
+            // silently answer a different question.
+            //
+            // Know what that single sample does and does not control. The
+            // quiet gate holds host contention down, which is real but
+            // partial. It does nothing about position inside this process,
+            // and this loop walks chunk width and depth in the same
+            // direction it walks position. Nothing corroborates this surface
+            // end to end: the planned confirmation was dropped and never
+            // run. The nearest independent reading is the separate-process
+            // pair in the `prefillChunkRange` doc comment. A reversed-order
+            // pass of this same loop is the cheap control that would settle
+            // it.
             let start = Date()
             let hidden = forward(
                 input: LMInput.Text(tokens: tokens(chunk, offset: cached)),

@@ -22,9 +22,16 @@ The projection row is by subtraction from the whole-model 13.4 ms; every other
 row is measured directly.
 
 Two of the three strategies in the original question do not apply, and the
-third applies for a different reason than expected. The real finding is that
-both large rows run far below what this hardware does on the same operation at
-a different shape.
+third applies for a different reason than expected. The real finding was
+stated here as both large rows running far below what this hardware does on
+the same operation at a different shape. **That is refuted for the projection
+row.** Measured one shape per process on 2026-08-26 the projection GEMM runs
+within about 10 percent of a square reference of the same precision, and
+Opportunity 2 below is retracted. The attention row predates the kernel
+fusion. Read the table above as a dated snapshot, not as current: its
+attention figure is the pre-fusion value, and the 81 percent projection share
+is derived by subtraction from a whole-model number measured before fusion
+landed.
 
 ## What the measurements rule out
 
@@ -44,8 +51,10 @@ budget. Do not start there.
 **Chunk sizing is exhausted.** `Qwen36MTPBlockSession.prefillChunkRange`
 already records the sweep: 13.38, 13.14 and 13.41 ms per token at chunk sizes
 256, 512 and 1024. End to end, moving 4096 to 1024 shifted a 20k prefill by
-1.8%. There is no headroom left in the knob as the code stands. See the second
-opportunity below for why that is a symptom rather than a dead end.
+1.8%. There is no headroom left in the knob as the code stands. That is a dead
+end rather than a symptom: the quiet-host re-sweep of 2026-08-26, recorded
+below, refutes the prediction that fusing attention would revive the knob, and
+the second opportunity it was supposed to be a symptom of does not exist.
 
 **Quantization is not the tax.** At the model's real projection shapes, 4-bit
 affine group-64 matmul and bf16 matmul run at the same speed. The measured
@@ -349,6 +358,32 @@ chunk schedule over the surface: cap 1024 is 120.81 s, cap 2048 is 129.59 s
 (1.073x), cap 4096 is 130.84 s (1.083x). `prefillChunkRange` stays at
 `256 ... 1024` and the work item is closed by measurement rather than by
 abandonment.
+
+**Read that surface with the defect named in Opportunity 2 in mind, because it
+has it.** The twenty points are measured in one process, one sample each, in
+loop order `for cached in depths { for chunk in chunkWidths }`. Process
+position therefore rises with chunk width inside every depth block, and with
+depth across blocks, so both axes of the surface are confounded with the term
+Opportunity 2 identifies as dominant. The direction of the confound is the
+direction of the conclusion: narrow chunks are measured early and read fast,
+wide chunks are measured late and read slow. The magnitudes make this material
+rather than pedantic. The position effect measured on this machine was a factor
+of 2.3 on a fixed shape, and the whole effect reported here is 16 to 18
+percent. A position term an order of magnitude weaker than the documented one
+would produce this surface by itself.
+
+The conclusion is not thereby wrong, and it is not left unsupported. The
+independent evidence is the separate-process end-to-end pair recorded in the
+`prefillChunkRange` doc comment: moving cap 4096 to 1024 shifted a 20k prefill
+from 302.0 s to 296.4 s, the same direction as the surface. That reading is
+1.8 percent where the integrated surface says 8.3 percent, and it is the only
+number in this branch on the chunk question that is not position-confounded.
+Treat 1.8 percent as the supported size of the effect and the surface as
+corroborating its sign.
+
+Retiring the confound is cheap and needs no new apparatus: re-run the grid with
+the chunk loop reversed. Agreement between the two orders settles it. That was
+not done here.
 
 One reading from this run must not be quoted: an early version of the
 prediction table reported cap 8192 at 84.76 s, or 0.702x, which would have

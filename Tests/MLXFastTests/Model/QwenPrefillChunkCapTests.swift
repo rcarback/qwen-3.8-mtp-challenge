@@ -55,8 +55,14 @@ struct QwenPrefillChunkCapTests {
 
     @Test("the shipped range still reads 256 through 1024 with no override")
     func shippedRange() {
-        // The test process sets no override, so this pins the default that the
-        // server and the ranked path both take.
+        // `prefillChunkRange` is a `static let` resolved once from the
+        // environment, so this test can only pin the default when the
+        // environment actually carries no override. Check the premise instead
+        // of assuming it: a developer running the suite mid-sweep, with
+        // DARKBLOOM_PREFILL_CHUNK_CAP exported in the shell, would otherwise
+        // read a correct override as a regression.
+        guard ProcessInfo.processInfo
+            .environment["DARKBLOOM_PREFILL_CHUNK_CAP"] == nil else { return }
         #expect(Session.prefillChunkRange.lowerBound == 256)
         #expect(Session.prefillChunkRange.upperBound == 1024)
     }

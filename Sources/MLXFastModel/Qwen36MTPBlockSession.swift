@@ -657,15 +657,26 @@ public final class Qwen36MTPBlockSession {
         return min(max(value, prefillChunkCapFloor), prefillChunkCapCeiling)
     }
 
-    public static let prefillChunkRange: ClosedRange<Int> = 256
+    /// The narrowest chunk the schedule will derive, at any depth or cap.
+    public static let prefillChunkMinimum = 256
+
+    public static let prefillChunkRange: ClosedRange<Int> = prefillChunkMinimum
         ... resolveChunkCap(
             ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_CHUNK_CAP"])
 
     /// The chunk schedule, as a pure function of its inputs, so a sweep can
     /// derive a whole-prompt schedule without a process per cap.
+    ///
+    /// It reads `prefillChunkMinimum`, a compile-time constant, and NOT
+    /// `prefillChunkRange.lowerBound`, which is derived from the environment.
+    /// The two are numerically identical today, because only the upper bound
+    /// is resolved at runtime. Taking the constant keeps that an accident of
+    /// the current configuration rather than a dependency: this function is
+    /// what the sweep replays to reconstruct a schedule, so it must not drift
+    /// from the production one through a knob.
     static func prefillChunkSize(cached: Int, cap: Int, budget: Int) -> Int {
         let derived = budget / max(cached, 1)
-        return min(max(derived, prefillChunkRange.lowerBound), cap)
+        return min(max(derived, prefillChunkMinimum), cap)
     }
 
     private static func prefillChunkSize(cached: Int) -> Int {

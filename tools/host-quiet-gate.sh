@@ -13,10 +13,17 @@
 # floor -- including on the terminal this harness prints into, which makes the
 # gate refuse partly because of its own output. Compositing a desktop is not
 # contention for a prefill that pulls the GPU to full power. The screensaver
-# was never dangerous because it used a CPU; it was dangerous because it drove
-# GPU power from 0.3 W to 9.2 W. So the GPU is sampled over a window, which
-# catches a PERIODIC spike that a single reading would miss, and the CPU check
-# is kept only for a genuine compute hog outside the windowing stack.
+# was never dangerous because it used a CPU. It was dangerous because it drove
+# GPU power from 0.3 W to 9.2 W. So the GPU is sampled over a window, and the
+# CPU check is kept only for a genuine compute hog outside the windowing stack.
+#
+# Be honest about which check stops which hazard. An eight-second window sees a
+# 300-second screensaver cycle about three percent of the time, so the window is
+# NOT what defends against that spike -- the idleTime assertion at the top is,
+# because it is a state check rather than a sample. What the window does catch
+# is sustained load, which it does well: it refused at 11.5 W and 17.6 W in
+# negative testing. Both checks are needed and neither substitutes for the
+# other.
 set -uo pipefail
 
 fail() {
@@ -48,12 +55,22 @@ if [ -n "$busy" ]; then
 fi
 
 if ! command -v macmon >/dev/null 2>&1; then
-  fail "macmon is absent, so the GPU cannot be checked; install it with 'brew install macmon'"
+  fail "macmon is absent, so the GPU cannot be checked. Install it with 'brew install macmon'"
 fi
 
-# Sample across a window rather than once. A single reading cannot distinguish
-# a quiet machine from one between spikes, which is exactly the shape of the
-# five-minute screensaver cycle that spoiled two earlier sweeps.
+# Check these here, by name. Both are used below and both fail closed when
+# absent, but they fail with a message about macmon giving zero samples or a
+# peak of 0W, which sends the reader after the wrong tool.
+if ! command -v jq >/dev/null 2>&1; then
+  fail "jq is absent, so the macmon samples cannot be parsed. Install it with 'brew install jq'"
+fi
+if ! command -v bc >/dev/null 2>&1; then
+  fail "bc is absent, so the thresholds cannot be compared. Install it with 'brew install bc'"
+fi
+
+# Sample across a window rather than once, to catch sustained load that a
+# single reading could land either side of. See the header for why this window
+# is not the defence against the five-minute screensaver cycle.
 peak_power=0
 peak_temp=0
 power_samples=0
