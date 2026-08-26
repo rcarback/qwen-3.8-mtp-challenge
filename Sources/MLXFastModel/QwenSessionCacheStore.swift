@@ -256,7 +256,7 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
     /// would otherwise resume from an unrelated cache.
     public func diskChunkMatch(
         keys: [(key: String, tokenCount: Int)], incoming: [Int]
-    ) -> QwenPrefillDiskCache.CacheEntry? {
+    ) -> (key: String, entry: QwenPrefillDiskCache.CacheEntry)? {
         lock.lock()
         let root = diskRoot
         let fingerprint = diskFingerprint
@@ -273,9 +273,21 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
                   candidate.tokens == Array(
                       incoming.prefix(candidate.tokens.count))
             else { continue }
-            return candidate
+            return (entry.key, candidate)
         }
         return nil
+    }
+
+    /// Remove a checkpoint from disk. Best-effort: called when a restored
+    /// checkpoint fails to rebuild into live caches, so the malformed file is
+    /// not hit again on the next request or after a restart.
+    public func dropDiskEntry(key: String) {
+        lock.lock()
+        let root = diskRoot
+        lock.unlock()
+        guard let root else { return }
+        _ = try? FileManager.default.removeItem(
+            at: QwenPrefillDiskCache.url(key: key, root: root))
     }
 
     /// Evict until the budget is met: whole conversations, least recently used

@@ -74,6 +74,30 @@ struct QwenPrefillDiskCacheTests {
             key: "abc", fingerprint: other, root: root) == nil)
     }
 
+    @Test("metadata whose arrays disagree in length reads as nil rather than trapping")
+    func truncatedMetadataRefused() throws {
+        let root = scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fingerprint = QwenPrefillDiskCache.Fingerprint(
+            weightsIdentity: "w1", chunkSize: 4096, kvPolicy: "bf16")
+        let entry = sampleEntry()
+        try QwenPrefillDiskCache.write(
+            entry, key: "abc", fingerprint: fingerprint, root: root)
+
+        // Corrupt the written file in place: drop the last `stateCounts`
+        // entry so it is shorter than `layerTags`. `read` must reject this
+        // rather than hand back arrays the worker would then index
+        // out-of-bounds.
+        let target = QwenPrefillDiskCache.url(key: "abc", root: root)
+        let (arrays, metadata) = try MLX.loadArraysAndMetadata(url: target)
+        var corrupted = metadata
+        corrupted["stateCounts"] = "1"  // was "1,2" -- now shorter than layerTags
+        try MLX.save(arrays: arrays, metadata: corrupted, url: target)
+
+        #expect(try QwenPrefillDiskCache.read(
+            key: "abc", fingerprint: fingerprint, root: root) == nil)
+    }
+
     @Test("an absent key reads as nil rather than throwing")
     func missingKey() throws {
         let root = scratch()
@@ -117,5 +141,95 @@ struct QwenPrefillDiskCacheTests {
             _ = try QwenPrefillDiskCache.makeCache(
                 tag: "SomeFutureCache", state: [], offset: 0)
         }
+    }
+
+    @Test("a ChunkedKVCache or RotatingKVCache entry is refused rather than guessed")
+    func chunkedAndRotatingRefused() {
+        // `chunkSize`/`startPosition` and `keep`/`step` are construction
+        // parameters, not restorable state -- guessing them would be the
+        // same silent mis-restore this file exists to prevent.
+        #expect(throws: MLXFastError.self) {
+            _ = try QwenPrefillDiskCache.makeCache(
+                tag: "ChunkedKVCache", state: [], offset: 0)
+        }
+        #expect(throws: MLXFastError.self) {
+            _ = try QwenPrefillDiskCache.makeCache(
+                tag: "RotatingKVCache", state: [], offset: 0)
+        }
+    }
+
+    @Test("restoreCaches rebuilds every layer from a CacheEntry")
+    func restoreCachesRoundTrip() throws {
+        let entry = sampleEntry()
+        let caches = try QwenPrefillDiskCache.restoreCaches(
+            from: entry, quantization: nil)
+        #expect(caches.count == entry.layerTags.count)
+        #expect(caches[0] is MambaCache)
+        #expect(caches[1] is KVCacheSimple)
+        #expect(caches[0].offset == 4)
+        #expect(caches[1].offset == 4)
+    }
+
+    @Test("restoreCaches throws on a missing array instead of trapping")
+    func restoreCachesMissingArray() {
+        let entry = QwenPrefillDiskCache.CacheEntry(
+            tokens: [1, 2], layerTags: ["KVCacheSimple"], stateCounts: [2],
+            offsets: [2], arrays: ["L0.S0": MLXArray(converting: [1.0])],
+            kvBytes: 0, recurrentBytes: 0, seedTokenCount: 2,
+            committedTokenCount: 2)
+        #expect(throws: MLXFastError.self) {
+            _ = try QwenPrefillDiskCache.restoreCaches(
+                from: entry, quantization: nil)
+        }
+    }
+
+    @Test("a write over budget evicts the oldest checkpoints first")
+    func evictsOverBudget() throws {
+        let root = scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fingerprint = QwenPrefillDiskCache.Fingerprint(
+            weightsIdentity: "w1", chunkSize: 4096, kvPolicy: "bf16")
+        let entry = sampleEntry()
+
+        // "first" is written with room to spare so it is not evicted on its
+        // own write. Its on-disk size then becomes the budget for "second":
+        // one checkpoint fits, two do not, so the write of "second" must
+        // evict "first" (the older file) to get back under budget.
+        try QwenPrefillDiskCache.write(
+            entry, key: "first", fingerprint: fingerprint, root: root,
+            budgetBytes: QwenPrefillDiskBudget.defaultBytes)
+        let firstAttributes = try FileManager.default.attributesOfItem(
+            atPath: QwenPrefillDiskCache.url(key: "first", root: root).path)
+        let firstSize = try #require(firstAttributes[.size] as? Int)
+
+        try QwenPrefillDiskCache.write(
+            entry, key: "second", fingerprint: fingerprint, root: root,
+            budgetBytes: firstSize)
+
+        #expect(try QwenPrefillDiskCache.read(
+            key: "first", fingerprint: fingerprint, root: root) == nil)
+        #expect(try QwenPrefillDiskCache.read(
+            key: "second", fingerprint: fingerprint, root: root) != nil)
+    }
+
+    @Test("a write under budget keeps every checkpoint")
+    func keepsUnderBudget() throws {
+        let root = scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fingerprint = QwenPrefillDiskCache.Fingerprint(
+            weightsIdentity: "w1", chunkSize: 4096, kvPolicy: "bf16")
+        let entry = sampleEntry()
+
+        try QwenPrefillDiskCache.write(
+            entry, key: "first", fingerprint: fingerprint, root: root,
+            budgetBytes: QwenPrefillDiskBudget.defaultBytes)
+        try QwenPrefillDiskCache.write(
+            entry, key: "second", fingerprint: fingerprint, root: root,
+            budgetBytes: QwenPrefillDiskBudget.defaultBytes)
+
+        #expect(try QwenPrefillDiskCache.read(
+            key: "first", fingerprint: fingerprint, root: root) != nil)
+        #expect(try QwenPrefillDiskCache.read(
+            key: "second", fingerprint: fingerprint, root: root) != nil)
     }
 }

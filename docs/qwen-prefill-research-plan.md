@@ -88,13 +88,25 @@ dispatch gate. Both forms must change together: the AOT source under
 JIT mode. Confirm the register budget at D = 256 first; that is the reason the
 list stops at 128, and it may force a smaller block tile.
 
+**Editable-surface note.**
+`Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/scaled_dot_product_attention.cpp`
+is not in `benchmark.json`'s `editablePaths`: all 89 entries under
+`backend/metal` sit beneath `kernels/`, and this file is one level up from
+that. The dispatch-gate change described above therefore applies to the local
+server only and would not be packaged by `yukon submit`.
+
 **Expected gain.** Attention is 12% of the budget at depth 8192 and grows with
 depth. Closing most of a 14x gap on that row is worth roughly 1.5 ms per token
 at 8192 and more at 30k, where the user's real sessions sit.
 
-**Landed.** `sdpa_full_supported_head_dim` now includes 256; the JIT twin is
-the same source (this kernel family has no separate AOT/JIT pair to keep in
-sync). The register budget did not force a smaller tile for bf16/fp16 -- the
+**Landed.** `sdpa_full_supported_head_dim` now includes 256. The edited file,
+`scaled_dot_product_attention.cpp`, is a dispatch host with no separate
+AOT/JIT pair of its own to keep in sync -- but that is true of this ONE
+dispatch file, not of the steel attention kernel family it dispatches into:
+`backend/metal/kernels/steel/attn/` and its JIT twin
+`mlx-generated/steel_attention*.cpp` do form an AOT/JIT pair, same as every
+other kernel family in this repository. The register budget did not force a
+smaller tile for bf16/fp16 -- the
 full BQ=32/BK=16/WM=4 tile fits at 29,184 bytes against the 32 KiB limit,
 matching the estimate above. fp32 does not fit at that tile (Q_smem alone is
 33,280 bytes), so the dispatch additionally drops to BQ=16/BK=8/WM=2 when

@@ -114,7 +114,15 @@ public enum QwenPrefillDiskCache {
         let cache: BaseKVCache
         switch tag {
         case "MambaCache": cache = MambaCache()
-        case "ChunkedKVCache": cache = ChunkedKVCache()
+        case "ChunkedKVCache":
+            // `chunkSize` and `startPosition` are construction parameters,
+            // not restorable state -- guessing them here is exactly the
+            // silent mis-restore this file exists to prevent. Unreachable
+            // for the pinned model (it never builds one), so refuse rather
+            // than guess.
+            throw MLXFastError.invalidInput(
+                "prefill checkpoint holds a ChunkedKVCache, which cannot be "
+                    + "rebuilt without its original chunkSize/startPosition")
         case "ArraysCache": cache = ArraysCache(size: state.count)
         case "QuantizedKVCache":
             guard let quantization else {
@@ -124,7 +132,13 @@ public enum QwenPrefillDiskCache {
             }
             cache = QuantizedKVCache(
                 groupSize: quantization.groupSize, bits: quantization.bits)
-        case "RotatingKVCache": cache = RotatingKVCache(maxSize: 512)
+        case "RotatingKVCache":
+            // `keep` and `step` are construction parameters, not restorable
+            // state -- same reasoning as `ChunkedKVCache` above. Unreachable
+            // for the pinned model.
+            throw MLXFastError.invalidInput(
+                "prefill checkpoint holds a RotatingKVCache, which cannot be "
+                    + "rebuilt without its original keep/step")
         case "KVCacheSimple": cache = KVCacheSimple()
         default:
             throw MLXFastError.invalidInput(
@@ -137,8 +151,38 @@ public enum QwenPrefillDiskCache {
         return cache
     }
 
+    /// Rebuild every layer's cache from a restored `CacheEntry`.
+    ///
+    /// Pulled out of the worker's request dispatch so the length-validation
+    /// and failure paths are unit-testable without a live session: a missing
+    /// array, an unknown tag, or a layer-count disagreement throws here
+    /// rather than trapping or silently mis-restoring, and the caller decides
+    /// what to do about it (fall back to a full prefill).
+    public static func restoreCaches(
+        from entry: CacheEntry, quantization: (groupSize: Int, bits: Int)?
+    ) throws -> [any KVCache] {
+        var caches: [any KVCache] = []
+        for (layer, tag) in entry.layerTags.enumerated() {
+            var state: [MLXArray] = []
+            for slot in 0 ..< entry.stateCounts[layer] {
+                guard let array = entry.arrays["L\(layer).S\(slot)"] else {
+                    throw MLXFastError.invalidInput(
+                        "prefill checkpoint is missing array "
+                            + "L\(layer).S\(slot)")
+                }
+                state.append(array)
+            }
+            caches.append(
+                try makeCache(
+                    tag: tag, state: state, offset: entry.offsets[layer],
+                    quantization: quantization))
+        }
+        return caches
+    }
+
     public static func write(
-        _ entry: CacheEntry, key: String, fingerprint: Fingerprint, root: URL
+        _ entry: CacheEntry, key: String, fingerprint: Fingerprint, root: URL,
+        budgetBytes: Int = QwenPrefillDiskBudget.clampedDefault()
     ) throws {
         try FileManager.default.createDirectory(
             at: root, withIntermediateDirectories: true)
@@ -155,15 +199,62 @@ public enum QwenPrefillDiskCache {
             "seedTokenCount": String(entry.seedTokenCount),
             "committedTokenCount": String(entry.committedTokenCount),
         ]
-        // Write beside the target and move into place. A reader that opens a
+        // Write beside the target and swap into place. A reader that opens a
         // half-written checkpoint would see a valid fingerprint over truncated
         // rows, which is exactly the silent corruption this guards against.
+        //
+        // The staging name carries a UUID: two processes sharing one cache
+        // root derive the SAME key for the same tokens, and a name derived
+        // only from the key would let them collide on the same staging file
+        // mid-write. `replaceItemAt` (rather than `removeItem` + `moveItem`)
+        // makes the swap atomic, so a reader never observes a moment with
+        // neither file present.
         let target = url(key: key, root: root)
-        let staging = target.deletingPathExtension()
-            .appendingPathExtension("partial.safetensors")
-        try MLX.save(arrays: arrays, metadata: metadata, url: staging)
-        _ = try? FileManager.default.removeItem(at: target)
-        try FileManager.default.moveItem(at: staging, to: target)
+        let staging = root.appendingPathComponent(
+            "\(key).\(UUID().uuidString).partial.safetensors")
+        do {
+            try MLX.save(arrays: arrays, metadata: metadata, url: staging)
+            _ = try FileManager.default.replaceItemAt(target, withItemAt: staging)
+        } catch {
+            // `MLX.save` throwing mid-write (disk full) or a failed swap must
+            // not leave the staging file behind forever.
+            _ = try? FileManager.default.removeItem(at: staging)
+            throw error
+        }
+        evictToBudget(root: root, budgetBytes: budgetBytes)
+    }
+
+    /// Evict least-recently-modified checkpoints until `root` is back under
+    /// `budgetBytes`.
+    ///
+    /// Best-effort: a directory listing or delete failure just leaves the
+    /// root over budget until the next successful write retries it, rather
+    /// than turning a housekeeping sweep into a request failure.
+    static func evictToBudget(root: URL, budgetBytes: Int) {
+        let manager = FileManager.default
+        guard let entries = try? manager.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey])
+        else { return }
+        var files = entries.compactMap {
+            fileURL -> (url: URL, size: Int, modified: Date)? in
+            guard fileURL.pathExtension == "safetensors",
+                  !fileURL.lastPathComponent.contains(".partial.")
+            else { return nil }
+            let values = try? fileURL.resourceValues(
+                forKeys: [.contentModificationDateKey, .fileSizeKey])
+            return (
+                fileURL, values?.fileSize ?? 0,
+                values?.contentModificationDate ?? .distantPast)
+        }
+        var total = files.reduce(0) { $0 + $1.size }
+        guard total > budgetBytes else { return }
+        files.sort { $0.modified < $1.modified }
+        for file in files where total > budgetBytes {
+            if (try? manager.removeItem(at: file.url)) != nil {
+                total -= file.size
+            }
+        }
     }
 
     public static func read(
@@ -184,21 +275,65 @@ public enum QwenPrefillDiskCache {
               let seed = metadata["seedTokenCount"].flatMap(Int.init),
               let committed = metadata["committedTokenCount"].flatMap(Int.init)
         else { return nil }
+        let layerTags = tags.isEmpty ? [] : tags.components(separatedBy: ",")
+        let stateCounts = counts.isEmpty
+            ? []
+            : counts.components(separatedBy: ",").compactMap(Int.init)
+        let layerOffsets = offsets.isEmpty
+            ? []
+            : offsets.components(separatedBy: ",").compactMap(Int.init)
+        // `stateCounts` and `offsets` are parsed with `compactMap(Int.init)`,
+        // which silently drops an unparseable entry -- so a corrupt metadata
+        // string can produce arrays SHORTER than `layerTags`. The worker
+        // indexes both by the `layerTags` enumeration; a short array there is
+        // an out-of-bounds trap, not a catchable error. Treat any length
+        // disagreement as a miss, the same way a fingerprint mismatch is.
+        guard stateCounts.count == layerTags.count,
+              layerOffsets.count == layerTags.count
+        else { return nil }
         var payload = arrays
         payload.removeValue(forKey: "tokens")
         return CacheEntry(
             tokens: tokensArray.asArray(Int32.self).map(Int.init),
-            layerTags: tags.isEmpty ? [] : tags.components(separatedBy: ","),
-            stateCounts: counts.isEmpty
-                ? []
-                : counts.components(separatedBy: ",").compactMap(Int.init),
-            offsets: offsets.isEmpty
-                ? []
-                : offsets.components(separatedBy: ",").compactMap(Int.init),
+            layerTags: layerTags,
+            stateCounts: stateCounts,
+            offsets: layerOffsets,
             arrays: payload,
             kvBytes: kvBytes,
             recurrentBytes: recurrentBytes,
             seedTokenCount: seed,
             committedTokenCount: committed)
+    }
+}
+
+/// Disk budget for persisted prefill checkpoints, and its override.
+///
+/// WHY A BUDGET AT ALL. `QwenSessionCacheStore`'s in-memory pool is clamped
+/// to a quarter of physical RAM; its disk twin has no natural backstop --
+/// every distinct chunk boundary the server ever prefills writes another
+/// checkpoint, forever, at full KV-plus-recurrent size. Left unbounded that
+/// fills the volume out from under whatever else uses it.
+///
+/// 32 GiB DEFAULT. A checkpoint's dominant cost is the flat 144 MiB of
+/// gated-delta recurrent state (see `QwenSessionCacheStore`'s doc comment for
+/// where that number comes from); 32 GiB holds on the order of 200
+/// checkpoints, comfortably more than the distinct system-prompt/turn-
+/// boundary combinations one server sees in practice, while still being an
+/// actual bound rather than "however much disk happens to be free."
+///
+/// `DARKBLOOM_PREFILL_CACHE_MAX_BYTES` overrides it. It is the ONLY prefix
+/// that survives `sanitizedRuntimeWorkerEnvironment`'s allowlist -- an
+/// `MLXFAST_`-prefixed name would be stripped at spawn and look applied
+/// while silently doing nothing.
+public enum QwenPrefillDiskBudget {
+    public static let defaultBytes = 32 * 1024 * 1024 * 1024
+
+    public static func clampedDefault(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Int {
+        guard let raw = environment["DARKBLOOM_PREFILL_CACHE_MAX_BYTES"],
+              let value = Int(raw), value >= 0
+        else { return defaultBytes }
+        return value
     }
 }

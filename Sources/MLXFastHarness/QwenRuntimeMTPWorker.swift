@@ -36,13 +36,30 @@ struct QwenMTPRoundRequest: Equatable {
     let depth: Int
 }
 
-/// Cheap identity for the loaded weights.
+/// Cheap identity for the running BUILD: the loaded weights tree plus the
+/// worker binary itself.
+///
+/// WHY THE BINARY IS PART OF THIS. A persisted prefill checkpoint stores
+/// per-layer cache rows -- the output of the attention path -- so kernel
+/// numerics propagate into every stored row. A checkpoint written by one
+/// binary and read back by another (a kernel, model, or transform edit)
+/// silently splices old numerics into a new run; this repo's own guidance
+/// puts near-tie argmax flips at roughly the magnitude a fused-vs-unfused
+/// attention kernel can differ by. A hand-bumped "kernel generation" constant
+/// would rot the first time an edit forgets to bump it, so instead this folds
+/// in the running worker binary's own size and modification time: any edit
+/// that changes the binary's bytes changes both, so every kernel, model, or
+/// transform edit invalidates the cache by construction -- no bump required.
+/// It over-invalidates on a no-op rebuild (same source, new mtime); that
+/// costs one re-prefill, against a failure mode that is silent and
+/// unbounded.
 ///
 /// Hashing 15 GB of weights on every start is not affordable, and is not what
-/// the guard needs: the question is whether the tree CHANGED, and name, size
-/// and modification time answer that for a local directory. FNV-1a rather
-/// than `Hasher` because this value must be stable across processes.
-func qwenWeightsIdentity(path: String) -> String {
+/// the guard needs: the question is whether the tree (or the binary) CHANGED,
+/// and name, size and modification time answer that. FNV-1a rather than
+/// `Hasher` because this value must be stable across processes -- `Hasher` is
+/// randomly reseeded per process, so its keys would not survive a restart.
+func qwenBuildIdentity(weightsPath: String) -> String {
     var hash: UInt64 = 0xcbf2_9ce4_8422_2325
     func mix(_ bytes: some Sequence<UInt8>) {
         for byte in bytes {
@@ -50,16 +67,35 @@ func qwenWeightsIdentity(path: String) -> String {
         }
     }
     let manager = FileManager.default
-    let names = ((try? manager.contentsOfDirectory(atPath: path)) ?? []).sorted()
+    let names = ((try? manager.contentsOfDirectory(atPath: weightsPath)) ?? [])
+        .sorted()
     for name in names {
         mix(Array(name.utf8))
         let attributes = try? manager.attributesOfItem(
-            atPath: path + "/" + name)
+            atPath: weightsPath + "/" + name)
         let size = (attributes?[.size] as? Int) ?? 0
         let modified = (attributes?[.modificationDate] as? Date)?
             .timeIntervalSince1970 ?? 0
         mix(Array(String(size).utf8))
         mix(Array(String(Int(modified)).utf8))
+    }
+    // The running worker binary's own size and mtime. A component that
+    // silently vanishes when the path cannot be resolved is the exact
+    // failure this function exists to prevent, so fold in an explicit
+    // marker rather than skipping it.
+    let binaryPath = CommandLine.arguments.first
+        ?? ProcessInfo.processInfo.arguments.first
+    if let binaryPath,
+       let attributes = try? manager.attributesOfItem(atPath: binaryPath)
+    {
+        let size = (attributes[.size] as? Int) ?? 0
+        let modified = (attributes[.modificationDate] as? Date)?
+            .timeIntervalSince1970 ?? 0
+        mix(Array("bin:\(binaryPath)".utf8))
+        mix(Array(String(size).utf8))
+        mix(Array(String(Int(modified)).utf8))
+    } else {
+        mix(Array("bin:unresolved".utf8))
     }
     return String(hash, radix: 36)
 }
@@ -130,7 +166,7 @@ func attachQwenMTPDiskCache(targetWeightsPath: String) {
     qwenMTPResumeStore.attachDisk(
         root: URL(fileURLWithPath: root),
         fingerprint: QwenPrefillDiskCache.Fingerprint(
-            weightsIdentity: qwenWeightsIdentity(path: targetWeightsPath),
+            weightsIdentity: qwenBuildIdentity(weightsPath: targetWeightsPath),
             chunkSize: QwenPrefillChunking.chunkSize,
             kvPolicy: qwenKVPolicyIdentity()))
 }
@@ -654,36 +690,56 @@ extension QwenRuntime {
                     // fingerprint already refused any checkpoint written under
                     // a different policy, so this is guaranteed to be the
                     // policy the rows were written at.
-                    let policy = Qwen36MTPBlockSession.KVQuantization.fromEnvironment()
-                    let quantization = policy.map {
-                        (groupSize: $0.groupSize, bits: $0.bits)
-                    }
-                    var caches: [any KVCache] = []
-                    for (layer, tag) in hit.layerTags.enumerated() {
-                        var state: [MLXArray] = []
-                        for slot in 0 ..< hit.stateCounts[layer] {
-                            guard let array = hit.arrays["L\(layer).S\(slot)"] else {
-                                throw MLXFastError.invalidInput(
-                                    "prefill checkpoint is missing array "
-                                        + "L\(layer).S\(slot)")
-                            }
-                            state.append(array)
+                    //
+                    // Unlike the two in-memory branches above, a failure here
+                    // must not poison the worker: a malformed on-disk
+                    // checkpoint (missing array, unknown tag, layer-count
+                    // disagreement) is data corruption the process did not
+                    // cause and cannot fix by refusing every later request. So
+                    // this is scoped to its own `do`, matching the `try?`-and-
+                    // fall-through shape of the two branches above it: any
+                    // failure deletes the offending file and falls through to
+                    // a full prefill instead of escaping to the outer `catch`.
+                    do {
+                        let policy = Qwen36MTPBlockSession.KVQuantization
+                            .fromEnvironment()
+                        let quantization = policy.map {
+                            (groupSize: $0.groupSize, bits: $0.bits)
                         }
-                        caches.append(
-                            try QwenPrefillDiskCache.makeCache(
-                                tag: tag, state: state, offset: hit.offsets[layer],
-                                quantization: quantization))
+                        let caches = try QwenPrefillDiskCache.restoreCaches(
+                            from: hit.entry, quantization: quantization)
+                        try session.adoptRestoredCaches(
+                            caches,
+                            seedTokenCount: hit.entry.seedTokenCount,
+                            committedTokenCount: hit.entry.committedTokenCount)
+                        // Record the restored state in memory too, so a
+                        // second identical request in this process resumes
+                        // from RAM instead of paying the disk read again.
+                        // Captured HERE, before the further prefill below,
+                        // because the record is keyed on `hit.entry.tokens`
+                        // and must describe the session at exactly that many
+                        // committed tokens.
+                        qwenMTPResumeStore.recordChunk(
+                            key: hit.key, tokens: hit.entry.tokens,
+                            state: session.snapshotState(),
+                            roundBytes: hit.entry.recurrentBytes,
+                            kvBytes: hit.entry.kvBytes)
+                        seedToken = try prefillCheckpointed(
+                            from: hit.entry.tokens.count)
+                        resumedTokens = hit.entry.tokens.count
+                        FileHandle.standardError.write(Data(
+                            ("qwen-mtp: resumed \(hit.entry.tokens.count) "
+                                + "cached tokens from disk, prefilling "
+                                + "\(seedTokens.count - hit.entry.tokens.count)\n")
+                                .utf8))
+                    } catch {
+                        FileHandle.standardError.write(Data(
+                            ("qwen-mtp: disk checkpoint \(hit.key) failed to "
+                                + "restore (\(error)); deleting it and "
+                                + "re-prefilling\n").utf8))
+                        qwenMTPResumeStore.dropDiskEntry(key: hit.key)
+                        seedToken = try prefillCheckpointed(from: 0)
                     }
-                    try session.adoptRestoredCaches(
-                        caches,
-                        seedTokenCount: hit.seedTokenCount,
-                        committedTokenCount: hit.committedTokenCount)
-                    seedToken = try prefillCheckpointed(from: hit.tokens.count)
-                    resumedTokens = hit.tokens.count
-                    FileHandle.standardError.write(Data(
-                        ("qwen-mtp: resumed \(hit.tokens.count) cached "
-                            + "tokens from disk, prefilling "
-                            + "\(seedTokens.count - hit.tokens.count)\n").utf8))
                 } else {
                     if let conversationId = request.conversationId {
                         // A refused restore means the stored basis no longer

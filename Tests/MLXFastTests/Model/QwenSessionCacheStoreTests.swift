@@ -332,8 +332,9 @@ struct QwenSessionCacheStoreTests {
         cold.attachDisk(root: root, fingerprint: fingerprint)
         let hit = try #require(
             cold.diskChunkMatch(keys: keys, incoming: tokens))
-        #expect(hit.tokens == Array(tokens.prefix(40)))
-        #expect(hit.seedTokenCount == 40)
+        #expect(hit.key == keys[0].key)
+        #expect(hit.entry.tokens == Array(tokens.prefix(40)))
+        #expect(hit.entry.seedTokenCount == 40)
     }
 
     @Test("a disk hit whose tokens disagree is refused")
