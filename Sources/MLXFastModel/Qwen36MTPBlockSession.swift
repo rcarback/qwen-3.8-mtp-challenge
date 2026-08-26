@@ -1068,6 +1068,52 @@ public final class Qwen36MTPBlockSession {
     /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
     private static let segmentedStreakGate = 2
 
+
+    // ---- C28 FACTORIAL COMPONENT E (RL-d94699155704bc87) ----
+    // The CAND248 discounted-Beta estimator with observation counts,
+    // verbatim: gamma-discounted S/F counts, hierarchical shrinkage (an
+    // unreached rung inherits its parent posterior, decayed by RHO), censored
+    // update (positions deeper than the rejection are untouched), stop-token
+    // exception. Hardware-invariant: it prices EVIDENCE, not milliseconds.
+    private static let argmaxGamma = 0.99
+    private static let argmaxPriorN = 4.0
+    private static let argmaxRootPrior = 0.85
+    private static let argmaxRho = 0.95
+    private static let argmaxPCap = 0.995
+    private var argmaxS = [Double](repeating: 0, count: Qwen36MTPLimits.maxDepth)
+    private var argmaxF = [Double](repeating: 0, count: Qwen36MTPLimits.maxDepth)
+    private func argmaxPosterior() -> [Double] {
+        var mu = [Double](repeating: 0, count: argmaxS.count)
+        var parent = Self.argmaxRootPrior
+        for k in 0 ..< argmaxS.count {
+            let n = argmaxS[k] + argmaxF[k]
+            mu[k] = (argmaxS[k] + Self.argmaxPriorN * parent)
+                / (n + Self.argmaxPriorN)
+            parent = mu[k] * Self.argmaxRho
+        }
+        return mu
+    }
+    private func argmaxDecisionP() -> [Double] {
+        argmaxPosterior().map { Swift.min(Self.argmaxPCap, $0) }
+    }
+    private func argmaxObserve(_ k: Int, success: Bool) {
+        guard k >= 0, k < argmaxS.count else { return }
+        argmaxS[k] *= Self.argmaxGamma
+        argmaxF[k] *= Self.argmaxGamma
+        if success { argmaxS[k] += 1.0 } else { argmaxF[k] += 1.0 }
+    }
+    private func argmaxRecord(acceptedCount: Int, drafts: [Int]) {
+        let drafted = drafts.count
+        let stoppedEarly = acceptedCount > 0 && acceptedCount <= drafted
+            && stopTokens.contains(drafts[acceptedCount - 1])
+        for k in 0 ..< Swift.min(acceptedCount, argmaxS.count) {
+            argmaxObserve(k, success: true)
+        }
+        if acceptedCount < drafted, !stoppedEarly {
+            argmaxObserve(acceptedCount, success: false)
+        }
+    }
+
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
         // The width wall binds the SINGLE-CALL verify; a qualifying
@@ -1115,11 +1161,15 @@ public final class Qwen36MTPBlockSession {
         if Self.traceRounds { snapshotScheduleSignal(widthCap: widthCap) }
         guard cap > 0 else { return 0 }
         let price = Self.depthPrice
+        // C28 ARM B (ESTIMATOR_ONLY): the walk, the price, the margin gates
+        // and the skip semantics are all STOCK; only the acceptance estimate
+        // feeding the walk changes, EMA -> counted Beta posterior.
+        let posterior = argmaxDecisionP()
         var reach = 1.0
         var expected = 0.0
         var depth = 0
         while depth < cap {
-            var p = positionAcceptEMA[depth]
+            var p = posterior[depth]
             if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
                 let margin = tail.1[0] - tail.1[1]
                 let conf = 1.0 / (1.0 + exp(-margin / 2.0))
@@ -1628,6 +1678,7 @@ public final class Qwen36MTPBlockSession {
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
         recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
+        argmaxRecord(acceptedCount: acceptedCount, drafts: drafts)
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only
             // rows on the accepted trajectory align with the serial leg.
