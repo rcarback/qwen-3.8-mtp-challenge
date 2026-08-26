@@ -56,7 +56,13 @@ struct QwenNumericAgreementHarness {
 
         let session = try Qwen36MTPBlockSession(model: model, stopTokens: [])
         let start = Date()
-        var emitted = [try session.begin(seedTokens: seed)]
+        // `expectedTotalTokens` is what the KV-quantization policy gate reads
+        // (`policyTokenCount`), so omitting it pins the policy length to the
+        // seed and silently keeps DARKBLOOM_KV_QUANT_BITS from ever engaging.
+        // The worker passes it for the same reason.
+        var emitted = [try session.begin(
+            seedTokens: seed,
+            expectedTotalTokens: seed.count + decodeTokens)]
         var rounds = 0
         var drafted = 0
         var accepted = 0
