@@ -56,16 +56,30 @@ fi
 # five-minute screensaver cycle that spoiled two earlier sweeps.
 peak_power=0
 peak_temp=0
+power_samples=0
+temp_samples=0
 while read -r p t; do
-  [ -z "$p" ] && continue
-  over=$(echo "$p > $peak_power" | bc -l 2>/dev/null || echo 0)
-  [ "$over" = "1" ] && peak_power=$p
-  over=$(echo "$t > $peak_temp" | bc -l 2>/dev/null || echo 0)
-  [ "$over" = "1" ] && peak_temp=$t
+  # A field that arrives as "null" or empty must not be silently treated as
+  # zero: that would make its threshold vacuous and pass a hot GPU on the
+  # strength of the OTHER field. Count valid samples per field and require
+  # both below.
+  case "$p" in '' | null) : ;; *)
+    power_samples=$((power_samples + 1))
+    over=$(echo "$p > $peak_power" | bc -l 2>/dev/null || echo 0)
+    [ "$over" = "1" ] && peak_power=$p
+    ;;
+  esac
+  case "$t" in '' | null) : ;; *)
+    temp_samples=$((temp_samples + 1))
+    over=$(echo "$t > $peak_temp" | bc -l 2>/dev/null || echo 0)
+    [ "$over" = "1" ] && peak_temp=$t
+    ;;
+  esac
 done < <(macmon pipe -s 8 -i 1000 2>/dev/null |
   jq -r '"\(.gpu_power) \(.temp.gpu_temp_avg)"')
 
-[ "$peak_power" = "0" ] && fail "macmon produced no samples"
+[ "$power_samples" -ge 4 ] || fail "macmon gave only $power_samples gpu_power samples of 8"
+[ "$temp_samples" -ge 4 ] || fail "macmon gave only $temp_samples gpu_temp samples of 8"
 
 ok=$(echo "$peak_power < 2.0 && $peak_temp < 53.0" | bc -l 2>/dev/null || echo 0)
 [ "$ok" = "1" ] || fail "gpu not idle over 8s: peak ${peak_power}W ${peak_temp}C"

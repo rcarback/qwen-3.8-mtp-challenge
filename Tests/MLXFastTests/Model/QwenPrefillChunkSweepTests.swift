@@ -224,17 +224,25 @@ struct QwenPrefillChunkSweepTests {
             }).reshaped([1, count])
         }
 
-        // `callWithHidden` returns an unlabeled tuple with no `.hidden`
-        // member, so this measurement uses `callWithHiddenNormedAndLayers`
-        // with an empty layer capture list instead, exactly as
-        // `QwenPrefillScalingTests.swift` does: it returns
-        // `Qwen35ForwardOutput`, which does publish `.hidden`.
+        // Production `forwardPrefill` calls `callWithHidden`, so this
+        // measurement calls it too. The protocol returns an UNLABELED
+        // `(logits, pre-norm hidden)` pair, which is why `.hidden` does not
+        // resolve; the element is `.1`. The sibling
+        // `callWithHiddenNormedAndLayers` would also work and is what
+        // `QwenPrefillScalingTests.swift` uses, but it returns the POST-norm
+        // hidden, and pricing a forward the server does not run is exactly the
+        // ambiguity this instrument exists to remove.
+        //
+        // Evaluating the hidden forces the 64-layer backbone and leaves the
+        // vocabulary projection as dead graph, which is what production
+        // prefill does as well: MLX is lazy, and no prefill chunk evaluates
+        // logits it will not read.
         func forward(
             input: LMInput.Text, cache: [any KVCache]
         ) -> MLXArray {
-            model.callWithHiddenNormedAndLayers(
-                input: input, cache: cache, nConfirmed: 0, layerIDs: []
-            ).hidden
+            model.callWithHidden(
+                input: input, cache: cache, nConfirmed: 0
+            ).1
         }
 
         /// Seconds for ONE appended chunk of `chunk` tokens onto a cache that
