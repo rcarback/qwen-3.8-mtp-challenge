@@ -97,6 +97,25 @@ struct ChunkCostGrid {
         Self.schedule(tokens: tokens, cap: cap, budget: budget)
             .reduce(0) { $0 + seconds(chunk: $1.chunk, cached: $1.cached) }
     }
+
+    /// Whether a cap's schedule asks the surface for a point it never
+    /// measured.
+    ///
+    /// This matters because `seconds(chunk:cached:)` clamps outside the grid
+    /// instead of extrapolating. A clamped lookup is not an error, but summing
+    /// clamped lookups IS: a schedule of 8192-wide chunks priced against a
+    /// grid that stops at 4096 charges 8192 tokens the cost of 4096 and halves
+    /// the total by construction. The bias runs toward wide chunks, which is
+    /// the direction a chunk-width hypothesis wants to be true, so the
+    /// prediction must say when it has left the measured box rather than
+    /// return a confident number.
+    func predictionLeavesGrid(tokens: Int, cap: Int, budget: Int) -> Bool {
+        guard let widest = chunks.last, let deepest = depths.last else {
+            return true
+        }
+        return Self.schedule(tokens: tokens, cap: cap, budget: budget)
+            .contains { $0.chunk > widest || $0.cached > deepest }
+    }
 }
 
 @Suite
@@ -155,6 +174,30 @@ struct ChunkCostGridTests {
         #expect(grid.seconds(chunk: 8192, cached: 0) == 2.0)
         #expect(grid.seconds(chunk: 64, cached: 0) == 1.0)
         #expect(grid.seconds(chunk: 1024, cached: 99999) == 6.0)
+    }
+
+    @Test("a prediction reports when its schedule leaves the measured box")
+    func predictionOutsideGridIsFlagged() {
+        let grid = ChunkCostGrid(points: [
+            .init(chunk: 256, cached: 0, seconds: 1.0),
+            .init(chunk: 4096, cached: 0, seconds: 16.0),
+            .init(chunk: 256, cached: 16384, seconds: 2.0),
+            .init(chunk: 4096, cached: 16384, seconds: 32.0),
+        ])
+        // Caps inside the measured chunk span stay inside the box: the
+        // deepest prompt below is 11682 tokens, under the 16384 depth edge.
+        for cap in [1024, 2048, 4096] {
+            #expect(!grid.predictionLeavesGrid(
+                tokens: 11682, cap: cap, budget: Self.budget))
+        }
+        // A cap above the widest measured chunk does not, and the clamp would
+        // otherwise price those chunks at the 4096 cost.
+        #expect(grid.predictionLeavesGrid(
+            tokens: 11682, cap: 8192, budget: Self.budget))
+        // Depth counts too: a prompt longer than the deepest measured row
+        // leaves the box even at an in-range cap.
+        #expect(grid.predictionLeavesGrid(
+            tokens: 40000, cap: 1024, budget: Self.budget))
     }
 
     @Test("a whole-prompt prediction sums the schedule over the surface")
@@ -299,6 +342,14 @@ struct QwenPrefillChunkSweepTests {
             let predicted = grid.predictedSeconds(
                 tokens: 11682, cap: cap, budget: budget)
             if cap == 1024 { baseline = predicted }
+            if grid.predictionLeavesGrid(
+                tokens: 11682, cap: cap, budget: budget) {
+                print(String(
+                    format: "  %7d  %7d  %11@  %10@",
+                    cap, schedule.count,
+                    "unmeasured" as NSString, "--" as NSString))
+                continue
+            }
             print(String(
                 format: "  %7d  %7d  %11.2f  %10.3fx",
                 cap, schedule.count, predicted,

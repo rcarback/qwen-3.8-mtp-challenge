@@ -178,8 +178,9 @@ seconds. A clean re-run must stop the screensaver at its source first.
 Every partial table agreed on direction: cap 1024 fastest, larger caps
 monotonically slower. That matches the microbenchmark recorded in the
 `prefillChunkRange` doc comment, so the bound stands and the work item is
-closed. The prediction that the fused attention fix would revive this knob is
-neither confirmed nor refuted; it remains open for a run on a quiet host.
+closed. The prediction that the fused attention fix would revive this knob was
+neither confirmed nor refuted by these discarded runs. The quiet-host re-run
+recorded below refutes it.
 
 One artifact of the discarded data is still unexplained and worth a look if
 anyone resumes this: caps 4096 and 8192 both reported prefill 160.72 s, from
@@ -190,6 +191,60 @@ should not agree to 10 ms. The two candidates are a stale worker build
 (`swift build --product ...` has been observed reporting success in this
 repository without recompiling an edited file) or something structural that
 collapses both caps onto one schedule.
+
+**Re-sweep result, 2026-08-26 (quiet host): the prediction is refuted and the
+bound stands.** The run above was repeated on a host held quiet by
+`tools/host-quiet-gate.sh`, which refuses to start a measurement while the
+screensaver idle timer is armed, while `legacyScreenSaver` is running, or
+while GPU power peaks above 2.0 W over an eight-second window. The gate read
+`gpu peak 0.08W 45.5C` before this measurement started.
+
+The instrument changed as well as the host. The chunk cap became a runtime
+value (`DARKBLOOM_PREFILL_CHUNK_CAP`, floor 512, ceiling 16384), so one binary
+serves every sample and the stale-build candidate above is removed by
+construction rather than argued away. Cost is measured in process, per
+appended chunk, against `callWithHidden` — the same backbone forward the
+server runs.
+
+Appended-chunk cost against the fused attention path, seconds for one chunk of
+`chunk` tokens appended at depth `cached`:
+
+| chunk | cached 0 | cached 2048 | cached 8192 | cached 16384 |
+|---|---|---|---|---|
+| 256 | 9.160 | 9.647 | 10.284 | 11.015 |
+| 512 | 9.293 | 9.687 | 10.216 | 11.279 |
+| 1024 | 9.583 | 9.998 | 10.688 | 12.025 |
+| 2048 | 9.889 | 10.363 | 12.204 | 12.306 |
+| 4096 | 10.666 | 11.036 | 11.677 | 12.975 |
+
+Values are milliseconds per token, so a column is directly comparable down its
+length. Cost rises with chunk width at every depth: 16 percent from chunk 256
+to chunk 4096 at depth 0, 18 percent at depth 16384. The prediction that the
+fused attention kernel would make wide chunks pay is refuted, and the
+mechanism is visible in the shape. Wider chunks do improve projection GEMM
+efficiency, which was the basis of the prediction, but attention within a
+chunk is quadratic in the chunk width, and fusing the kernel lowered the
+constant on that term without removing the term. The quadratic growth outruns
+the GEMM saving across the whole measured range.
+
+Whole-prompt prediction for an 11682-token prompt, summing each cap's real
+chunk schedule over the surface: cap 1024 is 120.81 s, cap 2048 is 129.59 s
+(1.073x), cap 4096 is 130.84 s (1.083x). `prefillChunkRange` stays at
+`256 ... 1024` and the work item is closed by measurement rather than by
+abandonment.
+
+One reading from this run must not be quoted: an early version of the
+prediction table reported cap 8192 at 84.76 s, or 0.702x, which would have
+read as a 30 percent win. It is an artifact of the instrument. The surface is
+measured out to chunk 4096 and clamps outside the measured box instead of
+extrapolating, which is the correct choice for a lookup. Summing clamped
+lookups is not: a schedule of 8192-wide chunks charges 8192 tokens the cost of
+4096 and halves the total by construction. The bias runs toward wide chunks,
+which is the direction the hypothesis wanted, so the prediction now reports
+`unmeasured` for any cap whose schedule leaves the grid
+(`ChunkCostGrid.predictionLeavesGrid`). Deciding whether a cap above 4096 pays
+needs those points measured, not interpolated, and the table above gives no
+reason to expect it would.
 
 ## Opportunity 3: the prefix cache is working, and disk persistence is next
 
