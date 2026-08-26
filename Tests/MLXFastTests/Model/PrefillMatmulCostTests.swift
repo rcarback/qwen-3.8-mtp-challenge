@@ -24,6 +24,70 @@ struct PrefillMatmulCostTests {
         return best
     }
 
+    /// Drops the MLX allocator cache and waits for the GPU to go idle.
+    ///
+    /// The suite is serialized and every test shares one allocator, so a block
+    /// that allocates heavily leaves the next block measuring a degraded
+    /// machine. This was not hypothetical: running `gemmCost` and `peakCost`
+    /// in one process read the square bf16 reference at 6.35 TFLOPS, against
+    /// 14.66, 14.65 and 14.74 for the same block measured in isolation. The
+    /// contamination depressed the CONTROL and left the model shapes looking
+    /// healthy, which is the direction that would have closed the
+    /// investigation early. Call this between measurement blocks.
+    private static func quiesce() {
+        Memory.clearCache()
+        // A synchronous evaluation flushes anything still queued, so the next
+        // timed block does not absorb the tail of the previous one.
+        eval([MLXArray([1.0])])
+    }
+
+    /// Measures ONE GEMM shape and exits, so nothing precedes it in the
+    /// process.
+    ///
+    /// Sequential in-process blocks are not comparable on this machine. The
+    /// square bf16 reference reads 14.69, 14.60 and 14.66 TFLOPS when its
+    /// block runs first in a fresh process, and 6.35 to 6.62 when any other
+    /// measurement block ran before it. The effect survives
+    /// `Memory.clearCache()` and does NOT survive a process boundary: a fresh
+    /// process reads 14.60 immediately after a heavy GEMM run in a separate
+    /// process, which rules out GPU clock or thermal state. Whatever the
+    /// mechanism, position in the process is the dominant term, and it is
+    /// larger than every effect this suite tries to measure.
+    ///
+    /// `tools/gemm-point-sweep.sh` drives this one point per process.
+    /// Shape comes from the environment: MLXFAST_GEMM_M, _N, _K and _MODE
+    /// (`q4` or `bf16`).
+    @Test("one GEMM point, alone in its process")
+    func singleGemmPoint() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
+              let mRaw = env["MLXFAST_GEMM_M"], let M = Int(mRaw),
+              let nRaw = env["MLXFAST_GEMM_N"], let N = Int(nRaw),
+              let kRaw = env["MLXFAST_GEMM_K"], let K = Int(kRaw)
+        else { return }
+        let mode = env["MLXFAST_GEMM_MODE"] ?? "q4"
+        let x = MLXRandom.normal([1, M, K]).asType(.bfloat16)
+        let w = MLXRandom.normal([N, K]).asType(.bfloat16)
+        let flops = 2.0 * Double(M) * Double(N) * Double(K)
+        let dt: Double
+        if mode == "bf16" {
+            eval(x, w)
+            dt = Self.timeIt { [matmul(x, w.T)] }
+        } else {
+            let (wq, scales, biases) = quantized(w, groupSize: 64, bits: 4)
+            eval(x, wq, scales, biases ?? scales)
+            dt = Self.timeIt {
+                [quantizedMM(
+                    x, wq, scales: scales, biases: biases,
+                    transpose: true, groupSize: 64, bits: 4)]
+            }
+        }
+        // One machine-readable line, so the driver does not parse a table.
+        print(String(
+            format: "GEMMPOINT\t%@\t%d\t%d\t%d\t%.4f\t%.3f",
+            mode, M, N, K, 1000 * dt, flops / dt / 1e12))
+    }
+
     @Test("quantized versus dense GEMM at Qwen 3.8 projection shapes")
     func gemmCost() throws {
         guard ProcessInfo.processInfo
@@ -35,17 +99,19 @@ struct PrefillMatmulCostTests {
             ("gdn.in_qkv", 10240, 5120),
             ("attn.q", 6144, 5120),
         ]
+        Self.quiesce()
         print("\nGEMM cost, 4-bit affine g64 vs bf16 (best of 3)")
         print("  shape            T      q4 ms   q4 TFLOPS   bf16 ms  bf16 TFLOPS  ratio")
         for (name, outF, inF) in shapes {
             for T in [256, 1024, 4096] {
+                Self.quiesce()
                 let x = MLXRandom.normal([1, T, inF]).asType(.bfloat16)
                 let w = MLXRandom.normal([outF, inF]).asType(.bfloat16)
                 let (wq, scales, biases) = quantized(w, groupSize: 64, bits: 4)
-                eval(x, w, wq, scales, biases)
+                eval(x, w, wq, scales, biases ?? scales)
                 let flops = 2.0 * Double(T) * Double(outF) * Double(inF)
                 let q4 = Self.timeIt {
-                    [quantizedMatmul(
+                    [quantizedMM(
                         x, wq, scales: scales, biases: biases,
                         transpose: true, groupSize: 64, bits: 4)]
                 }
@@ -250,6 +316,7 @@ struct PrefillMatmulCostTests {
         // pressure -- which move both legs together -- cannot fake the answer.
         // A square GEMM far above the model shapes means the gap is dispatch
         // or shape; a square GEMM at the same level means the machine is.
+        Self.quiesce()
         print("\nSquare bf16 GEMM reference")
         print("      N     ms    TFLOPS")
         for N in [1024, 2048, 4096] {
@@ -260,6 +327,61 @@ struct PrefillMatmulCostTests {
             let flops = 2.0 * Double(N) * Double(N) * Double(N)
             print(String(format: "  %5d  %6.2f  %8.2f",
                          N, 1000 * dt, flops / dt / 1e12))
+        }
+        print("")
+
+        // The bf16 reference above cannot attribute the projection gap on its
+        // own. A projection is BOTH quantized and tall-thin, and those are
+        // separate costs: dequantization work per output element, and a shape
+        // that may under-fill the tile. Comparing a 4-bit tall-thin GEMM
+        // against a bf16 square one measures their sum and names neither.
+        //
+        // This square 4-bit reference holds the quantization fixed and varies
+        // only the shape, so the difference between it and the projection
+        // figures is attributable to shape alone. The difference between it
+        // and the bf16 square above is attributable to quantization alone.
+        Self.quiesce()
+        print("Square 4-bit affine g64 GEMM reference")
+        print("      N     ms    TFLOPS")
+        for N in [1024, 2048, 4096] {
+            let a = MLXRandom.normal([N, N]).asType(.bfloat16)
+            let b = MLXRandom.normal([N, N]).asType(.bfloat16)
+            let (bq, scales, biases) = quantized(b, groupSize: 64, bits: 4)
+            eval(a, bq, scales, biases ?? scales)
+            let dt = Self.timeIt {
+                [quantizedMM(
+                    a, bq, scales: scales, biases: biases,
+                    transpose: true, groupSize: 64, bits: 4)]
+            }
+            let flops = 2.0 * Double(N) * Double(N) * Double(N)
+            print(String(format: "  %5d  %6.2f  %8.2f",
+                         N, 1000 * dt, flops / dt / 1e12))
+        }
+        print("")
+
+        // The production projections run at M = 256 with N = 17408, which is
+        // 68 tiles of N for every 8 tiles of M at the kernel's fixed 32x32
+        // tiling. This sweep holds the total work constant and varies only the
+        // aspect ratio, so a tall-thin penalty shows up as a fall along the
+        // row and nothing else can explain it.
+        Self.quiesce()
+        print("Constant-work aspect sweep, 4-bit affine g64, K = 5120")
+        print("      M        N     ms    TFLOPS")
+        let work = 256 * 17408
+        for M in [256, 512, 1024, 2048, 4096] {
+            let N = work / M
+            let x = MLXRandom.normal([1, M, 5120]).asType(.bfloat16)
+            let w = MLXRandom.normal([N, 5120]).asType(.bfloat16)
+            let (wq, scales, biases) = quantized(w, groupSize: 64, bits: 4)
+            eval(x, wq, scales, biases ?? scales)
+            let dt = Self.timeIt {
+                [quantizedMM(
+                    x, wq, scales: scales, biases: biases,
+                    transpose: true, groupSize: 64, bits: 4)]
+            }
+            let flops = 2.0 * Double(M) * Double(N) * 5120.0
+            print(String(format: "  %5d  %7d  %6.2f  %8.2f",
+                         M, N, 1000 * dt, flops / dt / 1e12))
         }
         print("")
     }

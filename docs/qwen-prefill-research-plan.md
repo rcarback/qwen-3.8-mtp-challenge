@@ -148,14 +148,87 @@ the GEMM four times more efficient.** The reason the chunk-size sweep found
 nothing is that the unfused attention path (opportunity 1) makes large chunks
 more expensive at exactly the same rate, and the two cancel.
 
+**Every number in the table above is an artifact. Do not quote it.**
+Re-measured on 2026-08-26 the same shapes read three to nine times higher, and
+the ordering the table rests on inverts. Two independent defects produced it,
+and both are recorded here because the second is easy to repeat.
+
+The first was already flagged in "Open question" below: those readings were
+taken while the server was serving live traffic and the machine was swapping
+9.0 GB. The second is new. Position inside the measuring process dominates
+every number this suite produces. The square bf16 reference reads 14.69, 14.60,
+14.66, 14.65 and 14.74 TFLOPS when its block runs first in a fresh process, and
+6.35 to 6.62 when any other measurement block ran before it in the same
+process. The effect survives `Memory.clearCache()`. It does not survive a
+process boundary: a fresh process reads 14.60 immediately after a heavy GEMM
+run in a separate process, which rules out GPU clock and thermal state. One
+isolated aspect-sweep point read 7.34 and then 11.63 TFLOPS on consecutive
+runs.
+
+That defect defeats the argument the table was resting on. The claim was that
+the ratio is trustworthy because both legs ran under identical conditions. They
+did not: the square reference ran first in the process and the projections ran
+later, so the control sat at a privileged position on the very gradient that
+dominates the measurement.
+
+**GEMM gap attribution, 2026-08-26. There is no tall-thin gap.** Measured one
+shape per process with `tools/gemm-point-sweep.sh`, `tools/host-quiet-gate.sh`
+passed before every point, no server running. Every point below uses the same
+call shape, so the projection and the square reference are directly
+comparable.
+
+| Point | mode | M | N | K | ms | TFLOPS |
+| --- | --- | --- | --- | --- | --- | --- |
+| Square reference | bf16 | 4096 | 4096 | 4096 | 10.298 | 13.35 |
+| Square reference | 4-bit g64 | 4096 | 4096 | 4096 | 11.304 | 12.16 |
+| `mlp.gate/up` | bf16 | 256 | 17408 | 5120 | 3.472 | 13.14 |
+| `mlp.gate/up` | 4-bit g64 | 256 | 17408 | 5120 | 3.773 | 12.10 |
+
+The production projection at its real prefill shape runs at 12.10 TFLOPS
+against a square 4-bit reference of 12.16, which is 99.5 percent of it. The
+bf16 pair agrees: 13.14 against 13.35, within 2 percent. Quantization costs
+about 9 percent and shape costs nothing measurable. The premise of this
+section, that the projection GEMM runs at a quarter of the machine, does not
+survive isolated measurement.
+
+**The tiling target named in the old work item is not on the production path.**
+`Qwen35Ops.linear` (`Sources/MLXFastModel/Qwen35Ops.swift:33`) sends a weight
+with scales to `quantizedMM` and only a dense weight to `matmul`. Every
+production projection is 4-bit affine group-64, so all of them enter
+`quantized.cpp` and none reach `GEMM_TPARAM_MACRO` in
+`backend/metal/matmul.cpp`. The `max(M, N)` masking in that macro is real, but
+it governs dense GEMMs, and dense attention now goes through the fused SDPA
+kernel. The probe that was planned against it was not run, because it would
+have measured a path production does not execute.
+
+For the record, the quantized path reaches `qmm` with fixed tiles.
+`QuantizedMatmul::eval_gpu` (`quantized.cpp:1418`) sees M = 256 above the
+vector limit, so it is a matrix-matrix product; the weights are transposed and
+the batch is 1, so it calls `qmm_splitk` (`:776`). There `split_k` computes as
+`max(1, 512 / (544 * 8))` = 1, which falls straight through to `qmm` (`:682`)
+with `bm = 32, bn = 32, wm = 2, wn = 2`. Those tiles do not depend on M. The
+`qmm_nax` variant (`:473`) does carry 64 x 64 x 64 tiles, but
+`is_nax_available()` requires GPU generation 17 and this M4 Max is generation
+16, so it is reachable only on the ranked M5 box.
+
+**Follow-on work: closed.** No gap survives isolated measurement, so the
+tall-thin GEMM tiling work has no target on this machine. The one open thread
+is `qmm_nax` on the ranked M5, which this machine cannot measure at all.
+
+**Method note.** Any future measurement in `PrefillMatmulCostTests` must run
+one shape per process. `tools/gemm-point-sweep.sh` does this and gates on a
+quiet host before each point. A table produced by a loop inside one test is not
+evidence, whatever it shows.
+
 **These two opportunities are therefore one opportunity.** Fix the attention
 kernel first, then re-run the chunk sweep. The knob that reads as dead today
 should come back to life, because the term that was cancelling it will be gone.
 
 **Work item.** After the attention fix, re-sweep `prefillChunkRange` upward
-against `prefillChunkProductBudget`. Then, if a gap to the square reference
-remains, look at the steel GEMM tile selection for tall-thin shapes in
-`backend/metal/matmul.cpp`. The `_nax` variants are not relevant on this
+against `prefillChunkProductBudget`. Both halves of this work item are
+now closed by measurement. See "GEMM gap attribution" below: there is no gap
+to the square reference, and `backend/metal/matmul.cpp` is not on the
+production path. The `_nax` variants are not relevant on this
 machine: `is_nax_available()` requires GPU generation 17 or higher, and an M4
 Max is generation 16. They do apply on the ranked M5 box.
 
