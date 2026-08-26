@@ -444,4 +444,24 @@ struct QwenSessionCacheStoreTests {
         }
         #expect(store.recentStreamCountForTesting == 16)
     }
+
+    @Test("a learned boundary merges into the key list shallowest-first")
+    func insertingBoundaryKeepsOrder() {
+        let base = [(key: "a", tokenCount: 4096), (key: "b", tokenCount: 8192)]
+        let merged = QwenPrefillChunking.insertingBoundary(
+            5000, key: "learned", into: base)
+        #expect(merged.map(\.tokenCount) == [4096, 5000, 8192])
+        #expect(merged[1].key == "learned")
+
+        // Coinciding with an existing boundary: the existing entry already
+        // serves it (identical key by construction), so nothing changes.
+        let unchanged = QwenPrefillChunking.insertingBoundary(
+            8192, key: "b", into: base)
+        #expect(unchanged.map(\.tokenCount) == [4096, 8192])
+
+        // Deeper than every stride boundary -- the agent-divergence case.
+        let deepest = QwenPrefillChunking.insertingBoundary(
+            9000, key: "learned", into: base)
+        #expect(deepest.map(\.tokenCount) == [4096, 8192, 9000])
+    }
 }

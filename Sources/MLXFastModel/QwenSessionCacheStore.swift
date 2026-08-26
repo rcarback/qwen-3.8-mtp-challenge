@@ -532,6 +532,25 @@ public enum QwenPrefillChunking {
         return String(hash, radix: 36)
     }
 
+    /// Insert a learned boundary into a shallowest-first key list.
+    ///
+    /// A boundary that coincides with an existing stride or turn boundary is
+    /// refused: `prefixKey` derives the identical key there, so the existing
+    /// entry already serves it. Order is preserved because `chunkMatch` and
+    /// `diskChunkMatch` walk the list in reverse and treat the first hit as
+    /// the deepest.
+    public static func insertingBoundary(
+        _ boundary: Int, key: String,
+        into keys: [(key: String, tokenCount: Int)]
+    ) -> [(key: String, tokenCount: Int)] {
+        guard !keys.contains(where: { $0.tokenCount == boundary })
+        else { return keys }
+        var merged = keys
+        merged.append((key: key, tokenCount: boundary))
+        merged.sort { $0.tokenCount < $1.tokenCount }
+        return merged
+    }
+
     /// One key per COMPLETE chunk, shallowest first.
     ///
     /// A partial trailing chunk gets no key: its boundary is wherever this
