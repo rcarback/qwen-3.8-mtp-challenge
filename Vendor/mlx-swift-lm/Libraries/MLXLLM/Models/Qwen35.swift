@@ -4616,13 +4616,16 @@ private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
 private let qwen35ProbeSortEnabled: Bool =
     ProcessInfo.processInfo.environment["MLX_E87_PROBE_SORT"] != "0"
 
-/// Fraction of leaves probed per draft step. 0.15 probes 1,844 of the 12,292
-/// leaves and scores 14,752 coarse rows instead of 24,584, a 40 % cut while
-/// the exact affine-4 rerank and 32-row shortlist stay unchanged. The isolated
-/// ranked receipt `02742bf0` promoted this cut on the same cluster/index
-/// lineage; the later wide-QMV launch overlay removed the literal but does not
-/// overlap the proposal-side retrieval path restored here.
-private let qwen35DerivedClusterProbeFraction: Double = 0.15
+/// Fraction of leaves probed per draft step. 0.10 probes 1,230 of the 12,292
+/// leaves and scores 9,840 coarse rows, a further 33 % cut below the 0.15 the
+/// isolated ranked receipt `02742bf0` promoted; the exact affine-4 rerank and
+/// 32-row shortlist stay unchanged. Measured 2026-08-25 on an idle M5 Pro at
+/// the 512-token window, same binary, env-toggled, 3 rounds per arm: the
+/// candidate leg is monotone in the fraction (0.22 > 0.15 > 0.10, zero
+/// overlap, 0.023 % spread on the 0.10 arm) while acceptance pays only
+/// 0.8628 -> 0.8608 and effective draft length is unchanged at 6.367. The
+/// shortlist quality curve is saturated: 0.22 buys ZERO acceptance over 0.15.
+private let qwen35DerivedClusterProbeFraction: Double = 0.10
 
 /// `[m, s, c]` squared distance from every row to every centre, formed as
 /// `||x||^2 - 2 x.c + ||c||^2` so no `[m, s, D]` difference tensor exists.
