@@ -1247,6 +1247,55 @@ template <
         b_strides,
         tid);
   }
+
+  // The host launcher is fixed at a 64x64 output tile. For complete aligned
+  // BF16 affine-4 contractions, reinterpret its equal-area grid as 128x32:
+  // paired host M groups become the lower/upper halves of the logical N grid.
+  // The physical threadgroup remains four simdgroups, while WM=4/WN=1 keeps
+  // each simdgroup's 32x32 NAX output tile identical to the shipped geometry.
+  // Every group remains active and each dequantized 32-column weight tile is
+  // reused across twice as many rows. All other calls retain the stock path.
+  constexpr bool supports_retile =
+      !batched && aligned_N && group_size == 64 && bits == 4 && BM == 64 &&
+      BK == 64 && BN == 64 && WM == 2 && WN == 2 &&
+      metal::is_same_v<T, bfloat>;
+  if constexpr (supports_retile) {
+    constexpr int retile_bm = 2 * BM;
+    const bool use_retile =
+        M >= retile_bm && M % retile_bm == 0 && K > 0 && N > 0 && N < K &&
+        K % BK == 0 && N % BN == 0 &&
+        (M / retile_bm) * (N / BN) >= 64 && K / BK >= 16;
+    if (use_retile) {
+      uint3 retile_tid = tid;
+      retile_tid.x +=
+          (tid.y & 1u) * static_cast<uint>(N / BN);
+      retile_tid.y >>= 1;
+      qmm_t_nax_tgp_impl<
+          T,
+          group_size,
+          bits,
+          aligned_N,
+          2 * BM,
+          BK,
+          BN / 2,
+          2 * WM,
+          WN / 2>(
+          w,
+          scales,
+          biases,
+          x,
+          y,
+          Ws,
+          K,
+          N,
+          M,
+          retile_tid,
+          lid,
+          simd_gid,
+          simd_lid);
+      return;
+    }
+  }
   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
