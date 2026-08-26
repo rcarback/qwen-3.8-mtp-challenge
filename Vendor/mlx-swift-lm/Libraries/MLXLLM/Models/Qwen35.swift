@@ -345,8 +345,13 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
           const InT conv = static_cast<InT>(acc);
           const InT act = conv * qwen35_prework_sigmoid(conv);
           activated[i] = act;
-          const float value = static_cast<float>(act);
-          sumsq += value * value;
+          // Q/K RMS is the only consumer of sumsq. V heads (48 of 80
+          // threadgroups) never enter that block; skip the four unused
+          // squares so the V path is conv+SiLU+store only.
+          if (is_q || is_k) {
+            const float value = static_cast<float>(act);
+            sumsq += value * value;
+          }
         }
 
         if (is_q || is_k) {
