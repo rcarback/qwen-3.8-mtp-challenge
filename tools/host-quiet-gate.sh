@@ -46,8 +46,19 @@ fi
 # Compute hogs only. WindowServer, the terminal emulator, and the browser
 # render process are excluded BY NAME because they are windowing-stack load
 # whose GPU cost the sampled window below measures directly and far better.
+#
+# MATCH THE WHOLE COMMAND, NOT $2 (fixed 2026-08-26). `comm=` prints a full
+# path, and awk splits it on whitespace, so any bundle whose name contains a
+# space arrives as several fields. "/Applications/Google Chrome.app/.../Google
+# Chrome Helper (Renderer)" therefore had $2 == "/Applications/Google", and the
+# `Renderer` exclusion could never match it -- inverting the guard from "never
+# veto on the browser" to "always veto on the browser" for the one entry in the
+# list whose path has a space. Every other excluded name is space-free, which is
+# why this survived. Reconstruct the command from the first field's offset and
+# test that.
 busy=$(ps -Ao pcpu=,comm= -r | head -12 |
-  awk '$1 > 40.0 && $2 !~ /mlxfast|swift|clang|ld$|WindowServer|ghostty|Terminal|iTerm|Renderer|plugin-container|claude/ { print $2 " " $1 }')
+  awk '{ cmd = substr($0, index($0, $2)) }
+       $1 > 40.0 && cmd !~ /mlxfast|swift|clang|ld$|WindowServer|ghostty|Terminal|iTerm|Renderer|plugin-container|claude|Google Chrome|launchd/ { print cmd " " $1 }')
 if [ -n "$busy" ]; then
   echo "host-quiet-gate: unrelated compute over 40% CPU:" >&2
   echo "$busy" >&2

@@ -403,12 +403,12 @@ struct QwenPrefillChunkSweepTests {
             // quiet gate holds host contention down, which is real but
             // partial. It does nothing about position inside this process,
             // and this loop walks chunk width and depth in the same
-            // direction it walks position. Nothing corroborates this surface
-            // end to end: the planned confirmation was dropped and never
-            // run. The nearest independent reading is the separate-process
-            // pair in the `prefillChunkRange` doc comment. A reversed-order
-            // pass of this same loop is the cheap control that would settle
-            // it.
+            // direction it walks position. The nearest independent reading
+            // is the separate-process pair in the `prefillChunkRange` doc
+            // comment. The reversed-order control that settles the position
+            // question is built in below: set
+            // MLXFAST_QWEN_CHUNK_SWEEP_REVERSED=1 and compare the two
+            // surfaces.
             let start = Date()
             let hidden = forward(
                 input: LMInput.Text(tokens: tokens(chunk, offset: cached)),
@@ -417,10 +417,25 @@ struct QwenPrefillChunkSweepTests {
             return Date().timeIntervalSince(start)
         }
 
-        let chunkWidths = [256, 512, 1024, 2048, 4096]
+        // THE REVERSED-ORDER CONTROL. Position inside the process biases
+        // every point by an amount that grows with when it ran, and the
+        // forward loop walks chunk width in the same direction it walks
+        // position, so the bias and the conclusion point the same way.
+        // Reversing the chunk loop measures the SAME shapes and moves the
+        // position tax to the other end of the sweep. The two orders
+        // therefore bracket the truth: if narrow chunks still win when they
+        // are measured last, position did not produce the result; if the
+        // ordering flips, the surface was artifact. Set
+        // MLXFAST_QWEN_CHUNK_SWEEP_REVERSED=1 for the control pass. The
+        // header line records which order produced the numbers, because a
+        // surface whose order is not on its face cannot be compared later.
+        let reversed = env["MLXFAST_QWEN_CHUNK_SWEEP_REVERSED"] == "1"
+        var chunkWidths = [256, 512, 1024, 2048, 4096]
+        if reversed { chunkWidths.reverse() }
         let depths = [0, 2048, 8192, 16384]
         var points: [ChunkCostGrid.Point] = []
-        print("\nAppended-chunk cost, fused attention path")
+        print("\nAppended-chunk cost, fused attention path"
+            + " (chunk order: \(reversed ? "descending" : "ascending"))")
         print("     chunk    cached   seconds   ms/token")
         for cached in depths {
             for chunk in chunkWidths {
