@@ -1613,6 +1613,78 @@ private let qwen35CustomAffine4QMVTableKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// Proposal-head-only M=1 affine-4/group-64 QMV with eight scalar results per
+/// SIMDgroup.  MLX's stock geometry uses two SIMDgroups to produce eight rows,
+/// so each 10,240-element activation row is streamed twice per output tile.
+/// This kernel loads it once and applies the incumbent's exact per-row
+/// arithmetic to eight independent scalar accumulators.  Unlike the rejected
+/// M6 RPS8 experiment, there are no vector-valued multi-input accumulators.
+private let qwen35ProposalFCQMVRPS8Kernel = MLXFast.metalKernel(
+    name: "qwen35_mtp_fc_affine4_g64_qmv_rps8_v1",
+    inputNames: ["w", "scales", "biases", "x"],
+    outputNames: ["y"],
+    source: """
+        const int qmv_k = x_shape[x_ndim - 1];
+        const int qmv_n = w_shape[0];
+        const uint qmv_lid = thread_index_in_simdgroup;
+        const int qmv_out_row = int(threadgroup_position_in_grid.y) * 8;
+        const int qmv_w_stride = qmv_k / 2;
+        const int qmv_g_stride = qmv_k / 64;
+
+        float result[8] = {0.0f};
+        for (int k = 0; k < qmv_k; k += 512) {
+            const device bfloat16_t* xm = x + k + int(qmv_lid) * 16;
+            float xv[16];
+            float sum = 0.0f;
+            for (int i = 0; i < 4; i++) {
+                const vec<bfloat16_t, 4> v = *reinterpret_cast<
+                    const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+                sum += v[0] + v[1] + v[2] + v[3];
+                xv[4 * i] = float(v[0]);
+                xv[4 * i + 1] = float(v[1]) / 16.0f;
+                xv[4 * i + 2] = float(v[2]) / 256.0f;
+                xv[4 * i + 3] = float(v[3]) / 4096.0f;
+            }
+
+            for (int r = 0; r < 8; r++) {
+                const int row = qmv_out_row + r;
+                const device uint16_t* ws =
+                    reinterpret_cast<const device uint16_t*>(
+                        reinterpret_cast<const device uint8_t*>(w)
+                        + row * qmv_w_stride + k / 2
+                        + int(qmv_lid) * 8);
+                float accum = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    accum +=
+                        xv[4 * i] * (ws[i] & 0x000f)
+                        + xv[4 * i + 1] * (ws[i] & 0x00f0)
+                        + xv[4 * i + 2] * (ws[i] & 0x0f00)
+                        + xv[4 * i + 3] * (ws[i] & 0xf000);
+                }
+                const int group =
+                    row * qmv_g_stride + k / 64 + int(qmv_lid) / 4;
+                const float scale = scales[group];
+                const float bias = biases[group];
+                result[r] += scale * accum + sum * bias;
+            }
+        }
+
+        for (int r = 0; r < 8; r++) {
+            result[r] = simd_sum(result[r]);
+            if (qmv_lid == 0) {
+                y[qmv_out_row + r] = bfloat16_t(result[r]);
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Research arm for the proposal-only `mtp.fc` M=1 matvec.  The spelling is
+/// deliberately forwarded by the trusted worker's `MLX_` allowlist so paired
+/// local runs can restore the stock `QuantizedLinear` call without rebuilding.
+private let qwen35ProposalFCRPS8Enabled =
+    ProcessInfo.processInfo.environment["MLX_E132_MTP_FC_RPS8"] != "0"
+
 /// Produces the activation chunk-sum table consumed by
 /// `qwen35CustomAffine4QMVTableKernel`.
 ///
@@ -1916,6 +1988,46 @@ func qwen35RoutedLinear(_ layer: Linear, _ x: MLXArray) -> MLXArray {
     return qwen35RoutedQuantizedMM(
         x, q.weight, scales: q.scales, biases: z,
         groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+}
+
+/// Candidate-only route for the quantized projection at the entrance to the
+/// MTP proposal head.  Every other M=1 matvec, including the serial target
+/// path, stays on MLX's stock launcher.
+func qwen35ProposalFC(_ layer: Linear, _ x: MLXArray) -> MLXArray {
+    guard qwen35ProposalFCRPS8Enabled,
+          let q = layer as? QuantizedLinear, q.bias == nil,
+          let z = q.biases,
+          q.mode == .affine, q.bits == 4, q.groupSize == 64,
+          x.dtype == .bfloat16, x.ndim >= 2,
+          q.weight.dtype == .uint32,
+          q.scales.dtype == .bfloat16, z.dtype == .bfloat16,
+          x.dim(-1) == 10_240,
+          x.size / x.dim(-1) == 1,
+          x.dim(-2) == 1,
+          q.weight.ndim == 2,
+          q.weight.dim(0) == 5_120,
+          q.weight.dim(1) == x.dim(-1) / 8,
+          q.scales.shape == z.shape,
+          q.scales.dim(0) == q.weight.dim(0),
+          q.scales.dim(1) == x.dim(-1) / q.groupSize,
+          Qwen35CustomQMV.rowContiguous(x, rowStride: x.dim(-1)),
+          Qwen35CustomQMV.rowContiguous(
+              q.weight, rowStride: x.dim(-1) / 8),
+          Qwen35CustomQMV.rowContiguous(
+              q.scales, rowStride: x.dim(-1) / q.groupSize),
+          Qwen35CustomQMV.rowContiguous(
+              z, rowStride: x.dim(-1) / q.groupSize)
+    else { return layer(x) }
+
+    var outShape = x.shape
+    outShape[outShape.count - 1] = q.weight.dim(0)
+    return qwen35ProposalFCQMVRPS8Kernel(
+        [q.weight, q.scales, z, x],
+        grid: (32, q.weight.dim(0) / 8, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [outShape],
+        outputDTypes: [.bfloat16]
+    )[0]
 }
 
 final class Qwen35FusedMLP: Module, UnaryLayer {
