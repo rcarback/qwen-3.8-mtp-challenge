@@ -643,7 +643,7 @@ private func qwen35GatedDeltaReplayState(
 
     let T = k.dim(1)
     let outputs = kernel(
-        [k, v, g, beta, preparedState, MLXArray(T)],
+        [k, v, g, beta, preparedState, Qwen35SmallIntConst.array(T)],
         template: [
             ("StT", DType.float32),
             ("Dk", 128),
@@ -1222,7 +1222,7 @@ final class Qwen35GatedDeltaNet: Module {
             if state.dtype != .float32 { state = state.asType(.float32) }
 
             let outputs = midKernel(
-                [qNormed, kNormed, v, g, beta, state, MLXArray(S)],
+                [qNormed, kNormed, v, g, beta, state, Qwen35SmallIntConst.array(S)],
                 template: [
                     ("InT", dtype),
                     ("StT", DType.float32),
@@ -2331,6 +2331,63 @@ private let qwen35FusedResidualRMSNormXSumsKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+/// Input-independent `eps` buffer for the fused residual+RMSNorm kernel.
+///
+/// The wrapper below bound `MLXArray(eps)` on every call. The tower has 64
+/// layers with a fused residual boundary at almost every one, so a 512-token
+/// seed plus every decode and verify step rebuilt that one-element node dozens
+/// of times per forward -- pure host graph-build work whose bytes never change.
+/// `GatedDeltaNet.normScaleConstants` already memoises exactly this class of
+/// scalar for the q/k norm scales; this is the same memo for the residual
+/// boundary. The config carries a single `rmsNormEps`, so the cache holds one
+/// entry and a different `eps` simply rebuilds once and then sticks. The kernel
+/// reads identical float bits, so every output is bit-identical.
+/// Input-independent small-integer buffers for kernels that bind a length as a
+/// one-element operand.
+///
+/// The two compiled gated-delta wrappers pass `MLXArray(T)` / `MLXArray(S)`,
+/// where the value is the chunk length or the verify width. The tower has 48
+/// gated-delta layers, so each of those rebuilt a fresh one-element node 48
+/// times per forward for a value drawn from a handful of small integers. This
+/// is the same memo `GatedDeltaNet.normScaleConstants` already applies to the
+/// q/k norm scales, keyed by the value so the bytes and dtype are whatever
+/// `MLXArray(n)` produced. The key set is bounded by the trusted maximum draft
+/// block, and the cache refuses anything outside a small range so it cannot
+/// grow without bound.
+enum Qwen35SmallIntConst {
+    nonisolated(unsafe) static var cache = [Int: MLXArray]()
+    static let lock = NSLock()
+    static let maxCached = 64
+
+    static func array(_ n: Int) -> MLXArray {
+        guard n >= 0, n <= maxCached else { return MLXArray(n) }
+        lock.lock()
+        defer { lock.unlock() }
+        if let hit = cache[n] { return hit }
+        let made = MLXArray(n)
+        cache[n] = made
+        return made
+    }
+}
+
+enum Qwen35ResidualRMSNormEps {
+    nonisolated(unsafe) static var cachedEps: Float?
+    nonisolated(unsafe) static var cachedArray: MLXArray?
+    static let lock = NSLock()
+
+    static func array(for eps: Float) -> MLXArray {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cachedEps, cachedEps == eps, let cachedArray {
+            return cachedArray
+        }
+        let made = MLXArray(eps)
+        cachedEps = eps
+        cachedArray = made
+        return made
+    }
+}
+
 /// Wraps the fused residual+RMSNorm kernel.  Returns `(residual, normed)` where
 /// `residual = bf16(x + r)` and `normed = weight * RMSNorm(residual)` with the
 /// same arithmetic as the eager `postAttentionLayerNorm(x + r)`.
@@ -2346,7 +2403,7 @@ func qwen35FusedResidualRMSNorm(
         let k = x.dim(-1)
         let kBlocks = k / 512
         let outputs = qwen35FusedResidualRMSNormXSumsKernel(
-            [x, r, weight, MLXArray(eps)],
+            [x, r, weight, Qwen35ResidualRMSNormEps.array(for: eps)],
             grid: (nRows * 1024, 1, 1),
             threadGroup: (1024, 1, 1),
             outputShapes: [
@@ -2358,7 +2415,7 @@ func qwen35FusedResidualRMSNorm(
         return (outputs[0], outputs[1])
     }
     let outputs = qwen35FusedResidualRMSNormKernel(
-        [x, r, weight, MLXArray(eps)],
+        [x, r, weight, Qwen35ResidualRMSNormEps.array(for: eps)],
         grid: (nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [shape, shape],
@@ -2575,7 +2632,7 @@ func qwen35DualRMSNorm(
 ) -> (MLXArray, MLXArray) {
     let nRows = a.size / a.dim(-1)
     let outputs = qwen35DualRMSNormKernel(
-        [a, b, aWeight, bWeight, MLXArray(eps)],
+        [a, b, aWeight, bWeight, Qwen35ResidualRMSNormEps.array(for: eps)],
         grid: (2 * nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [a.shape, b.shape],
@@ -2836,7 +2893,7 @@ func qwen35EmbedDualRMSNormConcat(
     outShape[outShape.count - 1] = b.dim(-1) * 2
     let outputs = qwen35EmbedDualRMSNormConcatKernel(
         [ids, embedWeight, embedScales, embedBiases, b, aWeight, bWeight,
-         MLXArray(eps)],
+         Qwen35ResidualRMSNormEps.array(for: eps)],
         grid: (2 * nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [outShape],
@@ -2856,7 +2913,7 @@ func qwen35DualRMSNormConcat(
     var outShape = a.shape
     outShape[outShape.count - 1] = a.dim(-1) + b.dim(-1)
     let outputs = qwen35DualRMSNormConcatKernel(
-        [a, b, aWeight, bWeight, MLXArray(eps)],
+        [a, b, aWeight, bWeight, Qwen35ResidualRMSNormEps.array(for: eps)],
         grid: (2 * nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [outShape],
