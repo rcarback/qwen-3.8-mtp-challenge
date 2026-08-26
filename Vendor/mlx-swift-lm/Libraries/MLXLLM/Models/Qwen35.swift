@@ -350,27 +350,18 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         }
 
         if (is_q || is_k) {
-          threadgroup float local_inv_mean[1];
-          threadgroup float local_sums[32];
+          // Single simdgroup launch (threadgroup 32x1x1): simd_sum is the
+          // full reduction. The copied multi-simdgroup local_sums dance
+          // was three extra threadgroup barriers per Q/K head per row.
           sumsq = simd_sum(sumsq);
-          local_sums[lane] = 0.0f;
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if (lane == 0) {
-            local_sums[0] = sumsq;
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          sumsq = simd_sum(local_sums[lane]);
-          if (lane == 0) {
-            local_inv_mean[0] = metal::precise::rsqrt(sumsq / Dk + 1e-6f);
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
+          const float inv_mean = metal::precise::rsqrt(sumsq / Dk + 1e-6f);
 
           const InT scale = is_q ? q_scale : k_scale;
           const uint output_base = (row * Hk + head) * Dk + lane * 4;
           #pragma clang loop unroll(full)
           for (uint i = 0; i < 4; ++i) {
             const InT rms = InT(1) * static_cast<InT>(
-                static_cast<float>(activated[i]) * local_inv_mean[0]);
+                static_cast<float>(activated[i]) * inv_mean);
             const InT value = scale * rms;
             if (is_q) {
               q_out[output_base + i] = value;
