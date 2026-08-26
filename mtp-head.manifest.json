@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:Pepedesigner/qwen38-mtp-head-v1@b3d74ac755039294135ae927e6ea3f7a77fc37d8",
+  "sha256": "fb5c737e746714ed9a1ee4347a3f4f50d89201511cf31b48490ffd5e9d334602",
+  "bytes": 849400361,
   "max_bytes": 2147483648,
-  "note": "xsums fill fusion on eb5eadc: the fused residual+RMSNorm kernel gains an emitSums variant whose epilogue is the BODY of qwen35_custom_affine4_g64_xsums_v1 verbatim, run over the normed bytes it has just stored (device barrier, same vec<bfloat16_t,4> loads, same three BF16 adds per group of four, same ascending float accumulation onto 0.0f, same (k_block*32+lane)*stride+row address), so the table is the standalone fill's bit pattern by construction. A weak-identity sidecar hands that table to Qwen35CustomQMV.matmul, deleting 127 of the 257 standalone xsums fill dispatches per verify round (mlp.gate_up 64, gdn.in_proj 47, fa.qkv 16); the other 130 keep xsumsTable unchanged. Only the sumtable arm at M=4...9 publishes, so M=1 (the serial leg) and prefill run the shipped kernel byte for byte. Widths 2...9, IPG table, tablePays>=4, 0.15, skip-probesort kept. Head tensors remain pinned. No remote code. resample-2 (54d42a3 diagnose: 6/7 active prompts faster, schedule identical, reprice 3.72612 > frontier 3.71960)"
+  "note": "Trained MTP head block v4: on-policy structural-replay fine-tune of the organizer bf16 block over an 18-domain, ~25-window corpus (~3500 drafting rounds), the domain-expanded successor to v3. Single bare-name bf16 model.safetensors, same tensor set/layout as the pinned organizer head. Unlike v3 (which measured 0.68-0.78 on its training domains but only 0.37-0.45 on unseen domains), v4 generalizes: Swift paired acceptance on 17 held-out hard-prose windows spans 0.48-0.80 (mean ~0.66, several at 0.73-0.80) with the training-domain edges retained. Manifest-only change; no source edits versus promoted tip 0863b06."
 }
