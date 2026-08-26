@@ -314,7 +314,13 @@ public final class Qwen36MTPBlockSession {
     /// Capture a resume point. Safe to call between rounds.
     public func snapshotState() -> SessionSnapshot {
         let copies = cache.map { $0.copy() }
-        let bytes = Self.cacheBytes(cache)
+        if Self.snapshotStateBF16 {
+            for entry in copies {
+                guard let arrays = entry as? ArraysCache else { continue }
+                arrays.state = arrays.state.map { $0.asType(.bfloat16) }
+            }
+        }
+        let bytes = Self.cacheBytes(copies)
         return SessionSnapshot(
             cache: copies,
             headHistoryCache: headHistoryCache.map { caches in
@@ -349,6 +355,16 @@ public final class Qwen36MTPBlockSession {
                     + "reinterpret the cached rows")
         }
         cache = snapshot.cache.map { $0.copy() }
+        // A snapshot written under DARKBLOOM_STATE_SNAPSHOT_BF16 carries bf16
+        // recurrent state; the live recurrence runs fp32. Detected by dtype
+        // rather than by the current environment so a bf16 snapshot restores
+        // correctly even in a process where the switch is off.
+        for entry in cache {
+            guard let arrays = entry as? ArraysCache else { continue }
+            arrays.state = arrays.state.map {
+                $0.dtype == .bfloat16 ? $0.asType(.float32) : $0
+            }
+        }
         headHistoryCache = snapshot.headHistoryCache.map { caches in
             caches.map { $0.copy() }
         }
@@ -408,6 +424,16 @@ public final class Qwen36MTPBlockSession {
                     + "the model has \(expectedLayerCount)")
         }
         cache = caches
+        // A snapshot written under DARKBLOOM_STATE_SNAPSHOT_BF16 carries bf16
+        // recurrent state; the live recurrence runs fp32. Detected by dtype
+        // rather than by the current environment so a bf16 snapshot restores
+        // correctly even in a process where the switch is off.
+        for entry in cache {
+            guard let arrays = entry as? ArraysCache else { continue }
+            arrays.state = arrays.state.map {
+                $0.dtype == .bfloat16 ? $0.asType(.float32) : $0
+            }
+        }
         // No head history rides a disk checkpoint, so this mirrors what
         // `restoreState` would do for a snapshot with none: clear it and let
         // the head re-prime lazily rather than resume against rows that no
@@ -479,6 +505,19 @@ public final class Qwen36MTPBlockSession {
     /// its place at long context, where decode is bandwidth-bound: the cache is
     /// 64 KiB per token, so at 262k every decode step reads ~17 GB, and 8-bit
     /// halves that.
+    /// Store gated-delta recurrent state in SNAPSHOTS at bf16.
+    ///
+    /// `DARKBLOOM_STATE_SNAPSHOT_BF16=1` enables it. The live state stays
+    /// fp32 -- only the copy written into a snapshot is converted, and it is
+    /// converted back to fp32 on restore, so the delta-rule recurrence never
+    /// iterates at reduced precision; the loss lands once per resume.
+    /// Whether that loss is acceptable is an empirical question the
+    /// agreement harness answers (`QwenNumericAgreementHarness`); default
+    /// off, and the ranked path never sets it.
+    static let snapshotStateBF16: Bool =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_STATE_SNAPSHOT_BF16"] == "1"
+
     public struct KVQuantization: Equatable, Sendable {
         public let groupSize: Int
         public let bits: Int
