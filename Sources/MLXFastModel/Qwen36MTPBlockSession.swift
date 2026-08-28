@@ -3388,7 +3388,12 @@ public final class Qwen36MTPBlockSession {
     }
 }
 
-/// Compiled bounds for the native-MTP track. Deliberately not env-overridable.
+/// Bounds for the native-MTP track, resolved once at process start.
+///
+/// NOT independently settable. `maxDepth` follows
+/// `MLXFastConstants.qwenMTPMaxDraftDepth`, which the trusted parent resolves
+/// from the same environment name in the same way; there is no knob here that
+/// could let the worker's mirror disagree with the parent's bound.
 public enum Qwen36MTPLimits {
     /// Single source of truth is `MLXFastConstants.qwenMTPMaxDepth`: the trusted
     /// parent bounds the same quantity and links no model code.
