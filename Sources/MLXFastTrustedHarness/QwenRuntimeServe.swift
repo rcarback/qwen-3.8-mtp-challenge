@@ -374,6 +374,66 @@ extension QwenRuntime {
         var emittedTokens: [Int]
     }
 
+    /// The serve round loop's text stage: decode the reply so far, test it
+    /// against the stop strings, and hand the caller whatever is safe to
+    /// stream.
+    ///
+    /// It exists as a type so it can be driven by a fake decoder in a test.
+    /// The loop it came from could only be exercised with a real tokenizer, a
+    /// real worker and a real model, which is why the quadratic cost inside it
+    /// went unmeasured for so long.
+    struct ServeRoundText {
+        struct Outcome {
+            var full: String
+            var delta: String
+            var hitStop: Bool
+            var sawToolCall: Bool
+            var decodeSeconds: Double
+            var stopSeconds: Double
+            var gateSeconds: Double
+        }
+
+        let stopStrings: [String]
+        let streaming: Bool
+        private var gate = OpenAIPromptRendering.ToolCallGate()
+
+        init(stopStrings: [String], streaming: Bool) {
+            self.stopStrings = stopStrings
+            self.streaming = streaming
+        }
+
+        /// `decode` yields the WHOLE reply so far, not an increment: Qwen uses
+        /// byte-level byte-pair encoding, so a token can carry a fragment of a
+        /// multi-byte character and decoding tokens singly produces
+        /// replacement characters at the seams.
+        mutating func advance(decode: () -> String) -> Outcome {
+            let decodeStarted = Date()
+            var full = decode()
+            let decodeSeconds = Date().timeIntervalSince(decodeStarted)
+
+            let stopStarted = Date()
+            let stopHit = QwenRuntime.firstStopHit(
+                in: full, stopStrings: stopStrings)
+            let stopSeconds = Date().timeIntervalSince(stopStarted)
+            if let stop = stopHit {
+                full = String(full[full.startIndex ..< stop])
+            }
+
+            let gateStarted = Date()
+            let admitted = gate.admit(full)
+            let gateSeconds = Date().timeIntervalSince(gateStarted)
+
+            return Outcome(
+                full: full,
+                delta: streaming ? admitted.delta : "",
+                hitStop: stopHit != nil,
+                sawToolCall: admitted.sawToolCall,
+                decodeSeconds: decodeSeconds,
+                stopSeconds: stopSeconds,
+                gateSeconds: gateSeconds)
+        }
+    }
+
     /// Read the sampling knobs off the request. Absent or zero temperature is
     /// greedy, which is the session's untouched argmax path.
     private static func samplingFor(
@@ -449,7 +509,8 @@ extension QwenRuntime {
         // in round 1's `tokens` and appending it here would emit it twice.
         var emitted: [Int] = []
         var full = ""
-        var gate = OpenAIPromptRendering.ToolCallGate()
+        var stage = ServeRoundText(
+            stopStrings: stopStrings, streaming: onDelta != nil)
         var finishReason = "stop"
         var done = false
         // Local diagnostic: the stats bar reports how many tokens a turn
@@ -485,31 +546,23 @@ extension QwenRuntime {
                 }
             }
 
-            // Decode the whole prefix each round: Qwen uses byte-level BPE, so a
-            // token can carry a fragment of a multi-byte character and decoding
-            // tokens singly produces replacement characters at the seams.
-            let decodeStarted = Date()
-            full = tokenizer.decode(tokens: emitted, skipSpecialTokens: true)
-            stats.detokenizeSeconds += Date().timeIntervalSince(decodeStarted)
-
-            let stopStarted = Date()
-            let stopHit = firstStopHit(in: full, stopStrings: stopStrings)
-            stats.stopScanSeconds += Date().timeIntervalSince(stopStarted)
-            if let stop = stopHit {
+            let text = stage.advance {
+                tokenizer.decode(tokens: emitted, skipSpecialTokens: true)
+            }
+            stats.detokenizeSeconds += text.decodeSeconds
+            stats.stopScanSeconds += text.stopSeconds
+            stats.gateSeconds += text.gateSeconds
+            full = text.full
+            if text.hitStop {
                 exitCause = "stop-string"
-                full = String(full[full.startIndex..<stop])
                 done = true
             }
-
-            let gateStarted = Date()
-            let admitted = gate.admit(full)
-            stats.gateSeconds += Date().timeIntervalSince(gateStarted)
-            if let onDelta, !admitted.delta.isEmpty {
+            if let onDelta, !text.delta.isEmpty {
                 let emitStarted = Date()
-                onDelta(admitted.delta)
+                onDelta(text.delta)
                 stats.streamEmitSeconds += Date().timeIntervalSince(emitStarted)
             }
-            if admitted.sawToolCall { finishReason = "tool_calls" }
+            if text.sawToolCall { finishReason = "tool_calls" }
             if tokens.isEmpty {
                 exitCause = "empty-round"
                 break
@@ -549,7 +602,7 @@ extension QwenRuntime {
             emittedTokens: emitted)
     }
 
-    private static func firstStopHit(
+    static func firstStopHit(
         in text: String, stopStrings: [String]
     ) -> String.Index? {
         var earliest: String.Index?
