@@ -58,4 +58,86 @@ struct QwenServeRoundTextTests {
         _ = stage.advance { decoder.next() }
         #expect(stage.advance { decoder.next() }.delta == " au")
     }
+
+    /// The pre-optimization gate, kept verbatim as the oracle. If the fast
+    /// gate ever disagrees with it on any input, the fast gate is wrong.
+    private struct NaiveGate {
+        static let marker = "<tool_call>"
+        var emitted = 0
+        var stopped = false
+
+        mutating func admit(_ full: String) -> (delta: String, sawToolCall: Bool) {
+            if stopped { return ("", true) }
+            if let marker = full.range(of: Self.marker) {
+                let safe = full.distance(
+                    from: full.startIndex, to: marker.lowerBound)
+                let delta = slice(full, from: emitted, to: safe)
+                emitted = max(emitted, safe)
+                stopped = true
+                return (delta, true)
+            }
+            var held = 0
+            for length in stride(
+                from: min(Self.marker.count - 1, full.count),
+                through: 1, by: -1)
+            {
+                if full.hasSuffix(String(Self.marker.prefix(length))) {
+                    held = length
+                    break
+                }
+            }
+            let safe = full.count - held
+            guard safe > emitted else { return ("", false) }
+            let delta = slice(full, from: emitted, to: safe)
+            emitted = safe
+            return (delta, false)
+        }
+
+        private func slice(_ text: String, from: Int, to: Int) -> String {
+            guard to > from, to <= text.count else { return "" }
+            let start = text.index(text.startIndex, offsetBy: from)
+            let end = text.index(text.startIndex, offsetBy: to)
+            return String(text[start ..< end])
+        }
+    }
+
+    /// Prefix sequences that exercise every branch: plain growth, a partial
+    /// marker that resolves, a partial marker that does not, multi-byte
+    /// characters, a seam repair, an empty reply, a marker at position zero,
+    /// and a string that SHRINKS.
+    ///
+    /// The shrinking case is not hypothetical. A stop-string hit truncates
+    /// `full` before the gate sees it, so the gate can be handed a string
+    /// shorter than the count it already emitted; any implementation that
+    /// walks backward by `emitted` traps there.
+    private static let gateCorpora: [[String]] = [
+        ["", "a", "ab", "abc"],
+        ["ok <", "ok <t", "ok <to", "ok <tool_call>", "ok <tool_call>{}"],
+        ["x<", "x<y", "x<yz"],
+        ["caf\u{FFFD}", "café", "café au lait"],
+        ["\u{1F600}", "\u{1F600}\u{1F601}", "\u{1F600}\u{1F601} hi"],
+        ["<tool_call>", "<tool_call>{}"],
+        [""],
+        ["a long enough reply to matter", "ab"],
+        ["hello world", "he", ""],
+        ["ok x<tool_call>", "ok x<tool_call>{}"],
+    ]
+
+    @Test("the fast gate agrees with the naive gate on every corpus")
+    func gateMatchesTheNaiveOracle() {
+        for corpus in Self.gateCorpora {
+            var fast = OpenAIPromptRendering.ToolCallGate()
+            var naive = NaiveGate()
+            for (step, full) in corpus.enumerated() {
+                let fastResult = fast.admit(full)
+                let naiveResult = naive.admit(full)
+                #expect(
+                    fastResult.delta == naiveResult.delta,
+                    "delta differs at step \(step) of \(corpus)")
+                #expect(
+                    fastResult.sawToolCall == naiveResult.sawToolCall,
+                    "sawToolCall differs at step \(step) of \(corpus)")
+            }
+        }
+    }
 }

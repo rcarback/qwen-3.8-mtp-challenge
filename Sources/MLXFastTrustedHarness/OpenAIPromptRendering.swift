@@ -297,40 +297,71 @@ enum OpenAIPromptRendering {
     /// round before the server decides the reply is a tool call.
     struct ToolCallGate {
         static let marker = "<tool_call>"
+        private static let markerCount = marker.count
         private var emitted = 0
         private(set) var stopped = false
 
+        /// WHY THIS SHAPE. `admit` receives the WHOLE reply so far, once per
+        /// decode round, so anything that walks the string from its start is
+        /// quadratic in the reply length. The previous version walked from
+        /// `startIndex` up to five times per call: `range(of:)` over the whole
+        /// string, `full.count`, a second `count` inside `slice`, and two
+        /// `index(_:offsetBy:)` walks. This version walks forward once, for
+        /// the `count` that `emitted` is expressed in, and everything else is
+        /// bounded by the marker length or by the size of the new text.
+        ///
+        /// The marker search starts `markerCount` characters before the
+        /// emitted cursor rather than at `startIndex`. That is not a heuristic:
+        /// the hold-back below never advances `emitted` past the start of a
+        /// possible marker, so a marker can never begin earlier than that, and
+        /// the back-off covers a marker straddling the cursor.
         mutating func admit(_ full: String) -> (delta: String, sawToolCall: Bool) {
             if stopped { return ("", true) }
-            if let marker = full.range(of: Self.marker) {
-                let safe = full.distance(
-                    from: full.startIndex, to: marker.lowerBound)
-                let delta = slice(full, from: emitted, to: safe)
-                emitted = max(emitted, safe)
+            let total = full.count
+            let pending = Swift.max(0, total - emitted)
+            // Walk BACKWARD from the end. `pending` is a handful of characters
+            // per round; `emitted` is the whole reply.
+            let cursor = full.index(full.endIndex, offsetBy: -pending)
+            // Clamp against what is IN FRONT OF THE CURSOR, not against
+            // `emitted`. The gate can be handed a string SHORTER than what it
+            // already emitted: a stop-string hit truncates `full` before the
+            // gate sees it (QwenRuntimeServe.swift, the stop branch), so
+            // `emitted` may exceed `total`. Backing off by `emitted` would
+            // then index before `startIndex` and trap.
+            let searchBack = Swift.min(Self.markerCount, total - pending)
+            let searchFrom = full.index(cursor, offsetBy: -searchBack)
+
+            if let marker = full.range(
+                of: Self.marker, range: searchFrom ..< full.endIndex)
+            {
                 stopped = true
+                guard cursor < marker.lowerBound else {
+                    emitted = Swift.max(emitted, total - pending)
+                    return ("", true)
+                }
+                let delta = String(full[cursor ..< marker.lowerBound])
+                emitted = full.distance(
+                    from: full.startIndex, to: marker.lowerBound)
                 return (delta, true)
             }
+
             // Longest suffix of `full` that is a proper prefix of the marker.
             var held = 0
-            for length in stride(from: min(Self.marker.count - 1, full.count),
-                                 through: 1, by: -1) {
+            for length in stride(
+                from: Swift.min(Self.markerCount - 1, total),
+                through: 1, by: -1)
+            {
                 if full.hasSuffix(String(Self.marker.prefix(length))) {
                     held = length
                     break
                 }
             }
-            let safe = full.count - held
+            let safe = total - held
             guard safe > emitted else { return ("", false) }
-            let delta = slice(full, from: emitted, to: safe)
+            let end = full.index(full.endIndex, offsetBy: -held)
+            let delta = String(full[cursor ..< end])
             emitted = safe
             return (delta, false)
-        }
-
-        private func slice(_ text: String, from: Int, to: Int) -> String {
-            guard to > from, to <= text.count else { return "" }
-            let start = text.index(text.startIndex, offsetBy: from)
-            let end = text.index(text.startIndex, offsetBy: to)
-            return String(text[start..<end])
         }
     }
 }
