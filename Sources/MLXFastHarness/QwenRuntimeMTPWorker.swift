@@ -31,6 +31,11 @@ import Tokenizers  // required for #huggingFaceTokenizerLoader() macro expansion
 nonisolated(unsafe) private var qwenMTPDecodeCeiling =
     MLXFastConstants.experimentalDFlashMaxConfiguredTotalTokens
 
+/// One stderr line per lookup round. Off by default; `serve` forwards worker
+/// stderr, so this is where a turn's lookup behaviour becomes visible.
+let qwenLookupTraceEnabled = ProcessInfo.processInfo
+    .environment["DARKBLOOM_QWEN_LOOKUP_TRACE"] == "1"
+
 /// Validated `mtp_decode_round` request.
 struct QwenMTPRoundRequest: Equatable {
     let depth: Int
@@ -364,14 +369,45 @@ extension QwenRuntime {
         let stopTokens = resolveQwenMTPStopTokens(
             directory: targetURL, tokenizer: context.tokenizer)
 
+        // PROMPT-LOOKUP DRAFTING, LOCAL SERVE FORK ONLY.
+        //
+        // Enablement lives HERE and not in the session, and that placement is
+        // the whole safety argument: this file is outside `benchmark.json`
+        // `editablePaths`, so a submission cannot package it, and the session's
+        // lookup branch is unreachable without an installed index.
+        //
+        // The ranked and gate verbs must not run with this set. The trusted
+        // driver bounds a round's ACTUAL drafts by `qwenMTPMaxDraftDepth`
+        // (`QwenRuntimeMTPDriver.requireStructurallySound`), so a wide round
+        // fails the ledger there by design. This flag is for `serve` only.
+        let lookupConfiguration =
+            NGramPromptLookupConfiguration.fromEnvironment()
+        if let lookupConfiguration {
+            fputs(
+                "mlxfast-worker: qwen-mtp prompt-lookup drafting ENABLED "
+                    + "ladder=\(lookupConfiguration.ladder) "
+                    + "thresholds=\(lookupConfiguration.ladderThresholds) "
+                    + "(serve only; the ranked and gate verbs will reject a "
+                    + "round wider than \(MLXFastConstants.qwenMTPMaxDraftDepth))\n",
+                stderr)
+        }
         // Warm every legal round shape on throwaway cache state, before the
         // hello. The real begin request performs the trusted allocator clear and
         // re-warms the working set it frees.
         let warmup = try Qwen36MTPBlockSession(
             model: model, stopTokens: stopTokens)
+        // Installed BEFORE the warm so `warmAllDepths` compiles the ladder
+        // verify widths. The warm session is discarded, but the Metal pipeline
+        // cache it fills is process-global.
+        warmup.lookupIndex = lookupConfiguration.map {
+            NGramPromptLookupIndex(configuration: $0)
+        }
         try warmup.warmAllDepths(maxDepth: Qwen36MTPLimits.maxDepth)
         var session = try Qwen36MTPBlockSession(
             model: model, stopTokens: stopTokens)
+        session.lookupIndex = lookupConfiguration.map {
+            NGramPromptLookupIndex(configuration: $0)
+        }
         attachQwenMTPDiskCache(targetWeightsPath: targetWeightsPath)
 
         let decoder = JSONDecoder()
@@ -421,6 +457,12 @@ extension QwenRuntime {
                     do {
                         session = try Qwen36MTPBlockSession(
                             model: model, stopTokens: stopTokens)
+                        // A fresh index for a fresh conversation. The old one
+                        // describes a token history this session no longer
+                        // holds.
+                        session.lookupIndex = lookupConfiguration.map {
+                            NGramPromptLookupIndex(configuration: $0)
+                        }
                         // `warmed` is carried, not cleared. Leaving it false
                         // makes the next begin re-run the allocator clear and
                         // `warmAllDepths`, measured at 14.8s against a 0.37s
@@ -806,6 +848,12 @@ extension QwenRuntime {
                 // diverges. Recorded after a successful prefill: a stream that
                 // failed to prefill proves nothing about a reusable boundary.
                 qwenMTPResumeStore.recordStream(tokens: seedTokens)
+                // THE WHOLE PROMPT, whichever resume branch produced the
+                // caches. `session.begin` may have seen only the suffix that
+                // followed a restored checkpoint, so accumulating inside the
+                // session would index a history with its front missing.
+                // `seedTokens` is always complete.
+                session.resetLookupHistory(seedTokens)
                 state.began = true
                 state.seedTokenCount = seedTokens.count
                 state.decodedTokenCount = 0
@@ -858,6 +906,7 @@ extension QwenRuntime {
                         "MTP extend overflowed the session seed count")
                 }
                 state.seedTokenCount = nextSeedCount
+                session.appendLookupHistory(extendTokens)
                 return RuntimeWorkerResponse(
                     id: request.id,
                     nonce: sessionNonce,
@@ -922,6 +971,17 @@ extension QwenRuntime {
                             + "top2Logits=\(result.perRowTop2Logits.count)")
                 }
                 state.decodedTokenCount = nextCount
+                if qwenLookupTraceEnabled, session.lastRoundUsedLookup {
+                    fputs(
+                        "mlxfast-worker: lookup round rows="
+                            + "\(result.declaredRows) "
+                            + "accepted=\(result.acceptedDraftCount) "
+                            + "rejected=\(result.rejectedDraftCount) "
+                            + "session_rounds=\(session.lookupRoundCount) "
+                            + "session_accept=\(session.lookupAcceptedTotal)"
+                            + "/\(session.lookupProposedTotal)\n",
+                        stderr)
+                }
                 return RuntimeWorkerResponse(
                     id: request.id,
                     nonce: sessionNonce,

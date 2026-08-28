@@ -253,6 +253,45 @@ public final class Qwen36MTPBlockSession {
         } ?? rows
     }
 
+    // MARK: prompt-lookup drafting (LOCAL SERVE FORK)
+    //
+    // Nil unless something installs an index, and nothing in this file ever
+    // does: enablement lives in `Sources/MLXFastHarness/QwenRuntimeMTPWorker`,
+    // which is outside `benchmark.json` `editablePaths` and therefore outside
+    // what a submission packages. The truth is stronger than "unreachable":
+    // `NGramPromptLookupIndex` lives in `Sources/MLXFastCore`, which is also
+    // outside `editablePaths`, so a packaged tree does not merely fail to
+    // reach the branch below -- it cannot COMPILE this file at all without
+    // that type in scope. This is a known local-fork-only defect (this branch
+    // is not meant to be submitted); see the report for what moving the type
+    // into `MLXFastModel` or a compile-time guard would take.
+    //
+    // The index only PROPOSES. Like the head, nothing routed through it can
+    // move an emitted token: the target verify decides every one. That is also
+    // why no snapshot carries it -- losing it costs accept rate for a few
+    // rounds and cannot change output.
+    public var lookupIndex: NGramPromptLookupIndex?
+    /// Whether the round that just finished drafted from the lookup source.
+    public private(set) var lastRoundUsedLookup = false
+    public private(set) var lookupRoundCount = 0
+    public private(set) var lookupProposedTotal = 0
+    public private(set) var lookupAcceptedTotal = 0
+
+    /// Rebuild the lookup history from a complete token stream.
+    ///
+    /// The caller supplies the WHOLE prompt. `begin` cannot do this itself: a
+    /// session that resumed its caches from a checkpoint was handed only the
+    /// suffix that followed the resume point, so accumulating inside `begin`
+    /// and `extend` would index a history with the front missing.
+    public func resetLookupHistory(_ tokens: [Int]) {
+        lookupIndex?.reset(to: tokens)
+    }
+
+    /// Append input tokens the session has just consumed.
+    public func appendLookupHistory(_ tokens: [Int]) {
+        lookupIndex?.append(tokens)
+    }
+
     // MARK: - resume points
 
     /// Everything needed to resume decoding at a committed-token boundary.
@@ -1298,6 +1337,36 @@ public final class Qwen36MTPBlockSession {
                 Self.clearRecurrentRollback(warmCache)
             }
         }
+        // LOOKUP LADDER WIDTHS. A lookup-sourced round verifies widths the
+        // head can never reach, so the loop above never compiled them. Same
+        // body as that loop: the verify at `nConfirmed: 1`, the two top-2
+        // reduction kernels at that row count, and the prefix replay a partial
+        // acceptance runs. Warmed only when an index is installed, so a session
+        // without one pays nothing at all.
+        if let lookupIndex {
+            for width in Self.lookupWarmWidths(
+                ladder: lookupIndex.configuration.ladder,
+                sweptMaxDepth: maxDepth)
+            {
+                let block = Array(repeating: 0, count: width)
+                let (wideLogits, _, wideNormed) =
+                    model.callWithHiddenAndNormed(
+                        input: LMInput.Text(
+                            tokens: MLXArray(block).reshaped([1, width])),
+                        cache: warmCache, nConfirmed: 1)
+                let (wideIDs, wideValues) = Self.linearTopTwoRows(wideLogits)
+                var wideBundle: [MLXArray] = [wideLogits, wideIDs, wideValues]
+                if let wideNormed { wideBundle.append(wideNormed) }
+                eval(wideBundle)
+                eval(warmCache.flatMap { $0.state })
+                precondition(model.replayRecurrentPrefix(
+                    cache: warmCache, committedRows: width - 1))
+                for entry in warmCache where !(entry is ArraysCache) {
+                    if entry.isTrimmable { _ = entry.trim(1) }
+                }
+                eval(warmCache.flatMap { $0.state })
+            }
+        }
 
         // A K>=2 round can reject its very first draft, which replays T=1.
         // Width 2 stays on the validated eager K1 path, so compile this last
@@ -1681,6 +1750,71 @@ public final class Qwen36MTPBlockSession {
     public var draftPolicy: (_ offeredDepth: Int, _ round: Int) -> Int = {
         offeredDepth, _ in
         Swift.min(offeredDepth, 1)
+    }
+
+    // MARK: - draft source (LOCAL SERVE FORK)
+
+    /// Where this round's drafts come from.
+    ///
+    /// `.none` is a one-token serial forward, whether because the parent
+    /// offered depth 0 or because the schedule declined the offer. `.head` is
+    /// the shipped autoregressive or block drafter. `.lookup` is the local
+    /// serve fork's prompt-lookup source, which carries its own host-side
+    /// tokens and runs no proposal forward at all.
+    enum DraftSource: Equatable {
+        case none
+        case head(Int)
+        case lookup([Int])
+    }
+
+    /// Choose this round's draft source.
+    ///
+    /// A LOOKUP PROPOSAL WINS whenever one exists. The arithmetic behind that:
+    /// a head round at depth 4 costs about `V * (1 + 4 * headStepCostRatio)`
+    /// and commits about 3 tokens at the accept rates this pool shows, roughly
+    /// 45 ms per token. The lowest lookup rung costs one 4-row verify, 79.4 ms,
+    /// and pays from a single accepted draft. Confidence is controlled by the
+    /// index's matched-suffix thresholds, not by competing with the head here.
+    ///
+    /// A rejected lookup draft costs one wasted verify row -- it cannot change
+    /// an emitted token, because the target verifies every drafted row and the
+    /// accept walk takes only the correct prefix. Degraded lookup quality is
+    /// therefore a throughput regression here, never a correctness one.
+    ///
+    /// `lookupProposal` is an autoclosure so the SERIAL CONTROL never evaluates
+    /// it. Depth 0 is the denominator this track divides by; its compute stream
+    /// must stay exactly what it was.
+    static func resolveDraftSource(
+        offeredDepth: Int,
+        headDraftCount: Int,
+        lookupProposal: @autoclosure () -> NGramPromptLookupIndex.Proposal?
+    ) -> DraftSource {
+        guard offeredDepth != Qwen36MTPLimits.serialControlDepth else {
+            return .none
+        }
+        if let proposal = lookupProposal(),
+           !proposal.tokens.isEmpty,
+           proposal.tokens.count <= Qwen36MTPLimits.maxLookupDepth
+        {
+            return .lookup(proposal.tokens)
+        }
+        return headDraftCount == 0 ? .none : .head(headDraftCount)
+    }
+
+    /// Verify widths a lookup round can dispatch that the head's own warm loop
+    /// never compiles.
+    ///
+    /// Filtered against the width the head loop ACTUALLY SWEPT, not against
+    /// the trusted constant `Qwen36MTPLimits.maxDepth`. `warmAllDepths`
+    /// dispatches three ways: a headless session warms `maxDepth: 0`, a
+    /// block-drafter session also warms `maxDepth: 0` (plus its own block
+    /// shapes), and only a native-head session sweeps the full range. Filtering
+    /// against the constant would leave the low rungs cold on the first two --
+    /// `for width in 1 ... 1` compiles width 1 only -- and the first lookup
+    /// proposal on those sessions would pay a Metal pipeline compile inside a
+    /// live request.
+    static func lookupWarmWidths(ladder: [Int], sweptMaxDepth: Int) -> [Int] {
+        ladder.map { $0 + 1 }.filter { $0 > sweptMaxDepth + 1 }
     }
 
     /// Consecutive fully-accepted DRAFTING rounds. Kept as a public-ish
@@ -2362,12 +2496,34 @@ public final class Qwen36MTPBlockSession {
         // that matters -- the draft loop, the declared row count, the per-row
         // readouts and the rollback all key off it, so a policy change needs no
         // other edit to stay ledger-correct.
-        let draftCount = draftPolicy(depth, roundCount)
+        let headDraftCount = draftPolicy(depth, roundCount)
         precondition(
-            draftCount >= 0 && draftCount <= depth
-                && draftCount <= Qwen36MTPLimits.maxDepth,
-            "draftPolicy returned \(draftCount) for an offer of \(depth); a "
+            headDraftCount >= 0 && headDraftCount <= depth
+                && headDraftCount <= Qwen36MTPLimits.maxDepth,
+            "draftPolicy returned \(headDraftCount) for an offer of \(depth); a "
                 + "round may propose 0 ... min(offer, maxDepth) drafts")
+        // The primary commits unconditionally, so it belongs in the lookup
+        // history BEFORE the suffix match runs: the match is against the
+        // context this round's drafts would continue.
+        lookupIndex?.append(primary)
+        let draftSource = Self.resolveDraftSource(
+            offeredDepth: depth,
+            headDraftCount: headDraftCount,
+            lookupProposal: lookupIndex?.propose())
+        let lookupDrafts: [Int]
+        let draftCount: Int
+        switch draftSource {
+        case .none:
+            lookupDrafts = []
+            draftCount = 0
+        case .head(let count):
+            lookupDrafts = []
+            draftCount = count
+        case .lookup(let tokens):
+            lookupDrafts = tokens
+            draftCount = tokens.count
+        }
+        lastRoundUsedLookup = !lookupDrafts.isEmpty
 
         // A STOP TOKEN IS COMMITTED LIKE ANY OTHER TOKEN, and this round keeps
         // drafting past it. The parent owns the decode window: its loop runs to
@@ -2377,6 +2533,17 @@ public final class Qwen36MTPBlockSession {
         // `248044`. Ending the round here instead nilled the pendings and killed
         // the session for good -- the next round threw `.notBegun` -- which
         // capped both legs of every local window at 301 tokens.
+
+        // A LOOKUP ROUND RUNS NO HEAD FORWARD, so the head never sees this
+        // round's (pendingHidden, primary) transition through its flush. Queue
+        // it exactly as the non-drafting branch below does, or the head's
+        // committed history acquires a hole and its next proposal drafts from
+        // a prefix it never read. Pure array retention, no GPU work. A block
+        // drafter consumes neither half of this backlog, so it takes nothing.
+        if !lookupDrafts.isEmpty, blockDrafter == nil {
+            headHistoryBacklogHidden.append(hidden)
+            headHistoryBacklogTokens.append(primary)
+        }
 
         // NO DRAFTS THIS ROUND. Two ways to get here and they are not the same
         // thing. Depth 0 is THE TRUE SERIAL CONTROL -- the parent offered
@@ -2506,7 +2673,7 @@ public final class Qwen36MTPBlockSession {
         //     (`logitsStart: 1`), so the path is one token shorter than the
         //     block and lines up with the verify rows directly.
         var blockDraftPath: MLXArray?
-        if let blockDrafter, let blockDraftCache {
+        if lookupDrafts.isEmpty, let blockDrafter, let blockDraftCache {
             guard let context = pendingLayerHidden else {
                 throw Qwen36MTPSessionError.blockDrafterMismatch(
                     "no target context is queued for the drafter at round "
@@ -2536,7 +2703,7 @@ public final class Qwen36MTPBlockSession {
         var validHistoryOffset = 0
         // 1b. AUTOREGRESSIVE DRAFTING against the pinned native head. Skipped
         //     entirely when a block drafter proposed above.
-        if blockDraftPath == nil {
+        if blockDraftPath == nil, lookupDrafts.isEmpty {
             if let existing = headHistoryCache {
                 headCache = existing
             } else {
@@ -2639,10 +2806,20 @@ public final class Qwen36MTPBlockSession {
         //    discard only the draft token instead of re-forwarding the primary.
         let snapshot = Self.snapshotRecurrent(cache)
         if Self.traceRounds { tSnapshotDone = DispatchTime.now().uptimeNanoseconds }
-        let verifyTokens = concatenated(
-            [MLXArray([Int32(primary)]).reshaped([1, 1])]
-                + (blockDraftPath.map { [$0] } ?? draftIdArrays),
-            axis: 1)
+        // A lookup round's drafts are already host integers, so the block is
+        // ONE array rather than a device concat of per-draft scalars -- there
+        // is nothing on the device to wait for and nothing to stitch.
+        let verifyTokens: MLXArray
+        if lookupDrafts.isEmpty {
+            verifyTokens = concatenated(
+                [MLXArray([Int32(primary)]).reshaped([1, 1])]
+                    + (blockDraftPath.map { [$0] } ?? draftIdArrays),
+                axis: 1)
+        } else {
+            verifyTokens = MLXArray(
+                [Int32(primary)] + lookupDrafts.map(Int32.init)
+            ).reshaped([1, lookupDrafts.count + 1])
+        }
         // nConfirmed: 1 at every drafting width. K=1 writes its promoted eager
         // primary checkpoint; K>=2 keeps exact recurrence inputs so a partial
         // accept can replay only its committed prefix without a repair forward.
@@ -2691,17 +2868,32 @@ public final class Qwen36MTPBlockSession {
         // the closure on the greedy path, so no op enters the graph there.
         let sampledSelection: (accept: MLXArray?, corrected: MLXArray)? =
             sampling.map { policy in
-                Self.buildSampledSelection(
-                    verifyLogits,
-                    draftIDs: blockDraftPath.map { path in
+                // The lookup source is deterministic given the history, so its
+                // proposal distribution is the same point mass the greedy head
+                // presents and the standard speculative-sampling reduction
+                // holds unchanged: accept with probability p(d), resample from
+                // the residual. Lifting the host integers into scalar arrays is
+                // the only difference, and it happens only when sampling is on.
+                let ids: [MLXArray]
+                if lookupDrafts.isEmpty {
+                    ids = blockDraftPath.map { path in
                         (0 ..< draftCount).map { path[0..., $0 ..< ($0 + 1)] }
-                    } ?? draftIdArrays,
+                    } ?? draftIdArrays
+                } else {
+                    ids = lookupDrafts.map { MLXArray([Int32($0)]) }
+                }
+                return Self.buildSampledSelection(
+                    verifyLogits,
+                    draftIDs: ids,
                     sampling: policy,
                     acceptKey: nextKey(), drawKey: nextKey())
             }
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
-        bundle.append(contentsOf: blockDraftPath.map { [$0] } ?? draftIdArrays)
+        if lookupDrafts.isEmpty {
+            bundle.append(
+                contentsOf: blockDraftPath.map { [$0] } ?? draftIdArrays)
+        }
         if let sampledSelection {
             bundle.append(sampledSelection.corrected)
             if let accept = sampledSelection.accept { bundle.append(accept) }
@@ -2709,8 +2901,10 @@ public final class Qwen36MTPBlockSession {
         eval(cache.flatMap { $0.innerState() } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
-        let drafts = blockDraftPath.map { $0.asArray(Int32.self).map(Int.init) }
-            ?? draftIdArrays.map { Int($0.item(Int32.self)) }
+        let drafts = lookupDrafts.isEmpty
+            ? (blockDraftPath.map { $0.asArray(Int32.self).map(Int.init) }
+                ?? draftIdArrays.map { Int($0.item(Int32.self)) })
+            : lookupDrafts
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
@@ -2856,7 +3050,7 @@ public final class Qwen36MTPBlockSession {
                 $0[0..., 0 ..< (acceptedCount + 1), 0...]
             })
         }
-        if blockDraftPath == nil {
+        if blockDraftPath == nil, blockDrafter == nil {
             Self.trimTrimmable(headCache, to: validHistoryOffset)
             if acceptedCount > 0 {
                 // Keep accepted post-norm rows as one contiguous block. The backlog
@@ -2878,9 +3072,21 @@ public final class Qwen36MTPBlockSession {
                     contentsOf: drafts.prefix(acceptedCount))
             }
         }
-        fullAcceptStreak =
-            acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
-        recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
+        // A LOOKUP ROUND IS NOT EVIDENCE ABOUT THE HEAD. Its acceptance
+        // describes how repetitive the text is, not how well the head predicts,
+        // and the per-position EMAs and the full-accept streak are both inputs
+        // to the HEAD's depth schedule. Folding a lookup outcome into them
+        // would make a repetitive stretch widen the head's rounds and a novel
+        // one narrow them, for reasons that have nothing to do with the head.
+        if lookupDrafts.isEmpty {
+            fullAcceptStreak =
+                acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
+            recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
+        } else {
+            lookupRoundCount += 1
+            lookupProposedTotal += drafts.count
+            lookupAcceptedTotal += acceptedCount
+        }
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only
             // rows on the accepted trajectory align with the serial leg.
@@ -2961,6 +3167,13 @@ public final class Qwen36MTPBlockSession {
         // installs lazy recurrent roots; only the next GPU graph consumes
         // them. The rare generic-repair path ran its own second eval.
         // `pendingHidden` is likewise device-only until the next round.
+
+        // The primary already went in before the suffix match; these are the
+        // accepted drafts. A rejected draft is never committed and must never
+        // enter the history: it is not part of the stream this session emitted.
+        if committed.count > 1 {
+            lookupIndex?.append(Array(committed.dropFirst()))
+        }
 
         return Qwen36MTPRoundResult(
             tokens: committed,
@@ -3440,4 +3653,20 @@ public enum Qwen36MTPLimits {
     /// `MLXFastConstants.qwenMTPSerialControlDepth` for why this is 0 and not 1.
     public static let serialControlDepth =
         MLXFastConstants.qwenMTPSerialControlDepth
+
+    /// The widest a LOOKUP-sourced round may draft.
+    ///
+    /// Deliberately a SEPARATE number from `maxDepth`, and deliberately not
+    /// derived from it. `maxDepth` is the trusted maximum: it is mirrored in
+    /// the contract fixture, the ranked workflow, the manifest and the box
+    /// wrapper's row accounting, and `QwenMTPDepthFreedomTests` pins all five
+    /// to 8. Raising it here would silently re-tune what the ranked ledger
+    /// accepts.
+    ///
+    /// This bound governs only the LOCAL SERVE FORK's prompt-lookup source,
+    /// which is excluded from the ranked track outright. It is 31 because 31
+    /// drafts plus the primary is a 32-row verify, the widest MEASURED point
+    /// on the cost sweep, where a row costs about 10.5 ms against a 53.3 ms
+    /// serial step.
+    public static let maxLookupDepth = 31
 }
