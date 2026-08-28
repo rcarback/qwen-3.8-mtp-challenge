@@ -1,5 +1,9 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/gpu/copy.h"
@@ -15,6 +19,74 @@
 namespace mlx::core {
 
 namespace {
+
+// --- BMPROBE: opt-in row-tile (bm) knob for the qmm_t microbenchmark. ---
+//
+// Shipped behaviour is unchanged when MLX_QMM_BM is unset: bm stays 32 and the
+// kernel name keeps its historical spelling. The probe times a 16-row
+// accumulator tile against the shipped 32-row one, so the bm value is folded
+// into the JIT kernel name -- the library cache in jit_kernels.cpp is keyed on
+// that name alone, and without the suffix the second arm would silently reuse
+// the first arm's compiled pipeline. Only qmm() and qmm_splitk() consult this;
+// the gather_qmm family is untouched.
+// Read fresh on every dispatch, never cached: the probe flips arms inside one
+// process so that thermal drift hits both equally, and a cached value would
+// pin the whole run to whichever arm ran first.
+inline int qmm_probe_bm() {
+  const char* e = std::getenv("MLX_QMM_BM");
+  if (e == nullptr) {
+    return 32;
+  }
+  int v = std::atoi(e);
+  return (v == 16 || v == 32) ? v : 32;
+}
+
+// When set, the bm suffix is omitted from the kernel name while bm still drives
+// the launch grid. That deliberately reproduces the name-collision hazard: the
+// cache serves whichever pipeline was compiled first, so results go wrong. It
+// is the falsification control for "are the two arms really two kernels".
+inline bool qmm_probe_collide() {
+  const char* e = std::getenv("MLX_QMM_BM_COLLIDE");
+  return e != nullptr && std::string(e) == "1";
+}
+
+inline bool qmm_probe_debug() {
+  const char* e = std::getenv("MLX_QMM_BM_DEBUG");
+  return e != nullptr && std::string(e) == "1";
+}
+
+inline void qmm_probe_suffix(std::string& kname, int bm) {
+  if (!qmm_probe_collide()) {
+    kname += "_bm_";
+    kname += std::to_string(bm);
+  }
+}
+
+// Reports the compiled pipeline's static threadgroup allocation. qmm_t sizes
+// Xs as BM * BK_padded elements, so a BM=16 build reserves 1280 fewer bytes
+// than a BM=32 build: an observable property of the compiled binary, not of
+// the caller.
+inline void qmm_probe_report(
+    const std::string& kname,
+    MTL::ComputePipelineState* kernel,
+    int bm,
+    int M,
+    int N,
+    int K) {
+  if (!qmm_probe_debug()) {
+    return;
+  }
+  fprintf(
+      stderr,
+      "[bmprobe] kernel=%s bm=%d M=%d N=%d K=%d tgmem=%lu maxtg=%lu\n",
+      kname.c_str(),
+      bm,
+      M,
+      N,
+      K,
+      (unsigned long)kernel->staticThreadgroupMemoryLength(),
+      (unsigned long)kernel->maxTotalThreadsPerThreadgroup());
+}
 
 template <typename... Args>
 auto get_quantized_kernel_wrapped(
@@ -717,7 +789,7 @@ void qmm(
 
   int wm = 2;
   int wn = 2;
-  int bm = 32;
+  int bm = qmm_probe_bm();
   int bn = 32;
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
@@ -737,6 +809,7 @@ void qmm(
       bits,
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0");
+  qmm_probe_suffix(kname, bm);
   std::string template_def;
   MTL::ComputePipelineState* kernel;
   if (transpose) {
@@ -749,11 +822,25 @@ void qmm(
         group_size,
         bits,
         aligned,
-        batched);
+        batched,
+        bm,
+        32,
+        bn);
   } else {
     kernel = get_quantized_kernel_wrapped(
-        d, kname, "qmm_n", mode, type_string, group_size, bits, batched);
+        d,
+        kname,
+        "qmm_n",
+        mode,
+        type_string,
+        group_size,
+        bits,
+        batched,
+        bm,
+        32,
+        bn);
   }
+  qmm_probe_report(kname, kernel, bm, M, N, K);
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -788,7 +875,7 @@ void qmm_splitk(
     const Stream& s,
     const std::string& mode) {
   // Choose split_k to target ~512 threadgroups
-  int bm = 32, bn = 32;
+  int bm = qmm_probe_bm(), bn = 32;
   int n_tiles = (N + bn - 1) / bn;
   int m_tiles = (M + bm - 1) / bm;
   int current_tgs = n_tiles * m_tiles;
@@ -842,8 +929,20 @@ void qmm_splitk(
       "_b_",
       bits,
       aligned ? "_alN_true" : "_alN_false");
+  qmm_probe_suffix(kname, bm);
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qmm_t_splitk", mode, type_string, group_size, bits, aligned);
+      d,
+      kname,
+      "qmm_t_splitk",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      aligned,
+      bm,
+      32,
+      bn);
+  qmm_probe_report(kname, kernel, bm, M, N, K);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
