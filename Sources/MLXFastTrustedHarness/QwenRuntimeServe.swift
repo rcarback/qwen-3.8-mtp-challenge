@@ -397,6 +397,19 @@ extension QwenRuntime {
         let streaming: Bool
         private var gate = OpenAIPromptRendering.ToolCallGate()
 
+        /// The decoded text has exactly two consumers: the stop-string scan
+        /// and the streaming delta. With neither present nothing reads it
+        /// until the turn ends, so the whole stage collapses to one call at
+        /// the end. That is exact, not an approximation: the final string is
+        /// a decode of the same token array either way, `firstStopHit` is
+        /// unreachable with no stop strings, and the gate's only remaining
+        /// effect is `sawToolCall`, which latches identically whether it sees
+        /// the reply once or in pieces.
+        var runsPerRound: Bool { streaming || !stopStrings.isEmpty }
+
+        private var lastFull = ""
+        private var ranAtLeastOnce = false
+
         init(stopStrings: [String], streaming: Bool) {
             self.stopStrings = stopStrings
             self.streaming = streaming
@@ -407,6 +420,13 @@ extension QwenRuntime {
         /// multi-byte character and decoding tokens singly produces
         /// replacement characters at the seams.
         mutating func advance(decode: () -> String) -> Outcome {
+            guard runsPerRound else {
+                return Outcome(
+                    full: lastFull, delta: "", hitStop: false,
+                    sawToolCall: false, decodeSeconds: 0, stopSeconds: 0,
+                    gateSeconds: 0)
+            }
+            ranAtLeastOnce = true
             let decodeStarted = Date()
             var full = decode()
             let decodeSeconds = Date().timeIntervalSince(decodeStarted)
@@ -423,6 +443,7 @@ extension QwenRuntime {
             let admitted = gate.admit(full)
             let gateSeconds = Date().timeIntervalSince(gateStarted)
 
+            lastFull = full
             return Outcome(
                 full: full,
                 delta: streaming ? admitted.delta : "",
@@ -430,6 +451,31 @@ extension QwenRuntime {
                 sawToolCall: admitted.sawToolCall,
                 decodeSeconds: decodeSeconds,
                 stopSeconds: stopSeconds,
+                gateSeconds: gateSeconds)
+        }
+
+        /// One last pass for a stage that skipped the loop. A stage that ran
+        /// per round already holds its final text and re-running the gate on
+        /// it would be a second sighting of the same marker.
+        mutating func finish(decode: () -> String) -> Outcome {
+            guard !ranAtLeastOnce else {
+                return Outcome(
+                    full: lastFull, delta: "", hitStop: false,
+                    sawToolCall: gate.stopped, decodeSeconds: 0,
+                    stopSeconds: 0, gateSeconds: 0)
+            }
+            ranAtLeastOnce = true
+            let decodeStarted = Date()
+            let full = decode()
+            let decodeSeconds = Date().timeIntervalSince(decodeStarted)
+            let gateStarted = Date()
+            let admitted = gate.admit(full)
+            let gateSeconds = Date().timeIntervalSince(gateStarted)
+            lastFull = full
+            return Outcome(
+                full: full, delta: "", hitStop: false,
+                sawToolCall: admitted.sawToolCall,
+                decodeSeconds: decodeSeconds, stopSeconds: 0,
                 gateSeconds: gateSeconds)
         }
     }
@@ -568,6 +614,14 @@ extension QwenRuntime {
                 break
             }
         }
+
+        let finalText = stage.finish {
+            tokenizer.decode(tokens: emitted, skipSpecialTokens: true)
+        }
+        stats.detokenizeSeconds += finalText.decodeSeconds
+        stats.gateSeconds += finalText.gateSeconds
+        full = finalText.full
+        if finalText.sawToolCall { finishReason = "tool_calls" }
 
         stats.seconds = Date().timeIntervalSince(started)
         stats.emittedTokens = emitted.count

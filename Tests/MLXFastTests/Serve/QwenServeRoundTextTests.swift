@@ -140,4 +140,39 @@ struct QwenServeRoundTextTests {
             }
         }
     }
+
+    @Test("a non-streaming request with no stop strings decodes once")
+    func skipsThePerRoundDecode() {
+        var stage = QwenRuntime.ServeRoundText(
+            stopStrings: [], streaming: false)
+        #expect(!stage.runsPerRound)
+        var calls = 0
+        for _ in 0 ..< 5 {
+            _ = stage.advance { calls += 1; return "text" }
+        }
+        #expect(calls == 0)
+        let final = stage.finish { calls += 1; return "text <tool_call>{}" }
+        #expect(calls == 1)
+        #expect(final.sawToolCall)
+        #expect(final.full == "text <tool_call>{}")
+    }
+
+    @Test("streaming or stop strings keep the per-round decode")
+    func keepsThePerRoundDecodeWhenNeeded() {
+        #expect(QwenRuntime.ServeRoundText(
+            stopStrings: [], streaming: true).runsPerRound)
+        #expect(QwenRuntime.ServeRoundText(
+            stopStrings: ["END"], streaming: false).runsPerRound)
+    }
+
+    @Test("finish is idempotent for a stage that already ran per round")
+    func finishDoesNotRedecodeAfterAPerRoundStage() {
+        var stage = QwenRuntime.ServeRoundText(
+            stopStrings: [], streaming: true)
+        _ = stage.advance { "hello" }
+        var calls = 0
+        let final = stage.finish { calls += 1; return "hello" }
+        #expect(calls == 0)
+        #expect(final.full == "hello")
+    }
 }
