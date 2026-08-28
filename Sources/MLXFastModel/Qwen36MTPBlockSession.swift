@@ -2285,9 +2285,14 @@ public final class Qwen36MTPBlockSession {
             throw Qwen36MTPSessionError.invalidDepth(depth)
         }
         roundCount += 1
-        // Local-only phase trace (MLXFAST_QWEN_MTP_TRACE=1): three boundaries
-        // split a round into head-chain graph build, verify graph build, and
-        // the single blocking eval's GPU wall. Never on in a ranked run.
+        // Local-only phase trace (MLX_QWEN_MTP_TRACE=1, see :1714): three
+        // boundaries split a round into head-chain graph build, verify graph
+        // build, and the single blocking eval's GPU wall. Never on in a ranked
+        // run. THE `MLX_` PREFIX IS LOAD-BEARING: the worker environment is a
+        // strict allowlist admitting only DARKBLOOM_, DYLD_, LC_, METAL_,
+        // MLX_ and MTL_ (QwenRuntimeWorker.swift:2783-2790), so a name spelled
+        // MLXFAST_ would be dropped at spawn and the trace would look enabled
+        // while doing nothing.
         let tRound0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         let cpuRound0 = Self.traceRounds ? Self.threadCPUNanoseconds() : 0
         var tDraftBuilt: UInt64 = 0
@@ -2392,7 +2397,17 @@ public final class Qwen36MTPBlockSession {
             let serialLastRow = serialLogits[
                 0..., (serialLogits.dim(1) - 1) ..< serialLogits.dim(1), 0...]
             let (tailIDs, tailValues) = Self.linearTopTwoRows(serialLastRow)
-            eval(cache.flatMap { $0.state } + [tailIDs, tailValues])
+            // ROOTS, NOT THE TRIMMED VIEW. `state` on the 16 full-attention
+            // layers returns `keys[.ellipsis, ..<offset, 0...]` whenever the
+            // offset is below the allocated depth, which is every round but
+            // one in 256 (KVCache.swift:443-454, step 256). Those slices exist
+            // only to be evaluated and discarded. `innerState()` returns the
+            // same roots without them, and the barrier wants the roots: the
+            // slice depends on the root, so evaluating the root forces
+            // strictly more of the graph, and no host read is taken from these
+            // arrays. The 48 recurrent layers are unaffected -- `state` and
+            // `innerState()` are the same expression there.
+            eval(cache.flatMap { $0.innerState() } + [tailIDs, tailValues])
             let readTail = (
                 tailIDs.asArray(Int32.self).map { Int($0) },
                 tailValues.asArray(Float.self).map { Double($0) }
@@ -2645,7 +2660,7 @@ public final class Qwen36MTPBlockSession {
             bundle.append(sampledSelection.corrected)
             if let accept = sampledSelection.accept { bundle.append(accept) }
         }
-        eval(cache.flatMap { $0.state } + bundle)
+        eval(cache.flatMap { $0.innerState() } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = blockDraftPath.map { $0.asArray(Int32.self).map(Int.init) }
@@ -2753,7 +2768,7 @@ public final class Qwen36MTPBlockSession {
                     0..., (repairLogits.dim(1) - 1) ..< repairLogits.dim(1),
                     0...]
                 let (tailIDs, tailValues) = Self.linearTopTwoRows(repairLastRow)
-                eval(cache.flatMap { $0.state } + [tailIDs, tailValues])
+                eval(cache.flatMap { $0.innerState() } + [tailIDs, tailValues])
                 let ids = tailIDs.asArray(Int32.self).map { Int($0) }
                 let values = tailValues.asArray(Float.self).map { Double($0) }
                 // Greedy: top-2 first ID == row argmax; no separate argMax

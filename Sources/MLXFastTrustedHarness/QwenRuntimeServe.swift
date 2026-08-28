@@ -374,6 +374,184 @@ extension QwenRuntime {
         var emittedTokens: [Int]
     }
 
+    /// The serve round loop's text stage: decode the reply so far, test it
+    /// against the stop strings, and hand the caller whatever is safe to
+    /// stream.
+    ///
+    /// It exists as a type so it can be driven by a fake decoder in a test.
+    /// The loop it came from could only be exercised with a real tokenizer, a
+    /// real worker and a real model, which is why the quadratic cost inside it
+    /// went unmeasured for so long.
+    struct ServeRoundText {
+        struct Outcome {
+            var full: String
+            var delta: String
+            var hitStop: Bool
+            var sawToolCall: Bool
+            var decodeSeconds: Double
+            var stopSeconds: Double
+            var gateSeconds: Double
+        }
+
+        let stopStrings: [String]
+        let streaming: Bool
+        private var gate = OpenAIPromptRendering.ToolCallGate()
+
+        /// The decoded text has exactly two consumers: the stop-string scan
+        /// and the streaming delta. With neither present nothing reads it
+        /// until the turn ends, so the whole stage collapses to one call at
+        /// the end. That is exact, not an approximation: the final string is
+        /// a decode of the same token array either way, `firstStopHit` is
+        /// unreachable with no stop strings, and the gate's only remaining
+        /// effect is `sawToolCall`, which latches identically whether it sees
+        /// the reply once or in pieces.
+        var runsPerRound: Bool { streaming || !stopStrings.isEmpty }
+
+        private var lastFull = ""
+        private var ranAtLeastOnce = false
+
+        init(stopStrings: [String], streaming: Bool) {
+            self.stopStrings = stopStrings
+            self.streaming = streaming
+        }
+
+        /// `decode` yields the WHOLE reply so far, not an increment: Qwen uses
+        /// byte-level byte-pair encoding, so a token can carry a fragment of a
+        /// multi-byte character and decoding tokens singly produces
+        /// replacement characters at the seams.
+        mutating func advance(decode: () -> String) -> Outcome {
+            guard runsPerRound else {
+                return Outcome(
+                    full: lastFull, delta: "", hitStop: false,
+                    sawToolCall: false, decodeSeconds: 0, stopSeconds: 0,
+                    gateSeconds: 0)
+            }
+            ranAtLeastOnce = true
+            let decodeStarted = Date()
+            var full = decode()
+            let decodeSeconds = Date().timeIntervalSince(decodeStarted)
+
+            let stopStarted = Date()
+            let stopHit = QwenRuntime.firstStopHit(
+                in: full, stopStrings: stopStrings)
+            let stopSeconds = Date().timeIntervalSince(stopStarted)
+            if let stop = stopHit {
+                full = String(full[full.startIndex ..< stop])
+            }
+
+            let gateStarted = Date()
+            let admitted = gate.admit(full)
+            let gateSeconds = Date().timeIntervalSince(gateStarted)
+
+            lastFull = full
+            return Outcome(
+                full: full,
+                delta: streaming ? admitted.delta : "",
+                hitStop: stopHit != nil,
+                sawToolCall: admitted.sawToolCall,
+                decodeSeconds: decodeSeconds,
+                stopSeconds: stopSeconds,
+                gateSeconds: gateSeconds)
+        }
+
+        /// One last pass for a stage that skipped the loop. A stage that ran
+        /// per round already holds its final text and re-running the gate on
+        /// it would be a second sighting of the same marker.
+        mutating func finish(decode: () -> String) -> Outcome {
+            guard !ranAtLeastOnce else {
+                return Outcome(
+                    full: lastFull, delta: "", hitStop: false,
+                    sawToolCall: gate.stopped, decodeSeconds: 0,
+                    stopSeconds: 0, gateSeconds: 0)
+            }
+            ranAtLeastOnce = true
+            let decodeStarted = Date()
+            let full = decode()
+            let decodeSeconds = Date().timeIntervalSince(decodeStarted)
+            let gateStarted = Date()
+            let admitted = gate.admit(full)
+            let gateSeconds = Date().timeIntervalSince(gateStarted)
+            lastFull = full
+            return Outcome(
+                full: full, delta: "", hitStop: false,
+                sawToolCall: admitted.sawToolCall,
+                decodeSeconds: decodeSeconds, stopSeconds: 0,
+                gateSeconds: gateSeconds)
+        }
+    }
+
+    /// Whole-prefix decode, computed from a bounded token suffix.
+    ///
+    /// The whole-prefix decode at `QwenRuntimeServe`'s round loop is quadratic
+    /// in the reply length. It cannot become a per-token decode, because Qwen
+    /// uses byte-level byte-pair encoding and a character can straddle tokens.
+    /// It CAN become a suffix decode plus a splice: re-decode the last
+    /// `window` tokens each round and freeze everything before that as
+    /// `committedText`, so only a bounded tail is ever re-decoded. The
+    /// default `window` is sixteen.
+    ///
+    /// `window` alone is a MARGIN, not a proof: a character spans at most
+    /// four bytes, so a large-enough window makes it likely that
+    /// `tokens.count - window` lands after any in-progress character, but
+    /// "likely" is not exact -- a boundary can still fall inside a
+    /// multi-byte sequence for any window size, including the default.
+    /// CORRECTNESS instead comes from checking the candidate commit itself:
+    /// decoding a slice that ends mid-character renders a trailing
+    /// replacement character (U+FFFD), so a commit is only ever frozen when
+    /// its decode does not end in one (see `text(for:decode:)`). A rejected
+    /// candidate is not an error -- the pending decode below still spans the
+    /// whole reply, so the round costs a larger-than-ideal re-decode rather
+    /// than a wrong answer, and the next call (a longer `tokens`) tries
+    /// again at a larger boundary.
+    ///
+    /// The committed prefix is only ever extended by the part of a suffix
+    /// decode that a LATER decode can no longer change, which is everything
+    /// except the last `window` tokens' worth of text. Nothing is committed
+    /// until it is out of reach of a seam repair.
+    struct IncrementalDetokenizer {
+        let window: Int
+        /// Text for `tokens[0 ..< committedTokens]`, known stable.
+        private var committedText = ""
+        private var committedTokens = 0
+
+        init(window: Int = 16) {
+            self.window = Swift.max(1, window)
+        }
+
+        mutating func text(
+            for tokens: [Int],
+            decode: (ArraySlice<Int>) -> String
+        ) -> String {
+            guard !tokens.isEmpty else { return "" }
+            // Everything from `committedTokens` on is re-decoded each call, so
+            // the committed point must never advance past `tokens.count -
+            // window`; beyond that a later token could still repair a seam.
+            let safeCommit = Swift.max(0, tokens.count - window)
+            if safeCommit > committedTokens {
+                let candidate = decode(tokens[0 ..< safeCommit])
+                // A token-count margin alone does not guarantee `safeCommit`
+                // lands on a character boundary: it only bounds how far a
+                // FUTURE token can still repair a seam, not whether THIS
+                // slice, decoded alone, already ends mid-character. Decoding
+                // an incomplete trailing byte sequence renders one or more
+                // trailing replacement characters (the same signal
+                // `QwenRuntimeServe.generate`'s round loop comment already
+                // relies on above), so a trailing replacement character
+                // means this candidate is not yet safe to freeze. Skip the
+                // commit and retry at the next call's larger boundary rather
+                // than caching a wrong interpretation permanently -- the
+                // pending decode below still covers the full reply either
+                // way, so this only costs extra re-decoding, never a wrong
+                // answer.
+                if !candidate.hasSuffix("\u{FFFD}") {
+                    committedText = candidate
+                    committedTokens = safeCommit
+                }
+            }
+            return committedText + decode(tokens[committedTokens...])
+        }
+    }
+
     /// Read the sampling knobs off the request. Absent or zero temperature is
     /// greedy, which is the session's untouched argmax path.
     private static func samplingFor(
@@ -449,7 +627,9 @@ extension QwenRuntime {
         // in round 1's `tokens` and appending it here would emit it twice.
         var emitted: [Int] = []
         var full = ""
-        var gate = OpenAIPromptRendering.ToolCallGate()
+        var stage = ServeRoundText(
+            stopStrings: stopStrings, streaming: onDelta != nil)
+        var detokenizer = IncrementalDetokenizer()
         var finishReason = "stop"
         var done = false
         // Local diagnostic: the stats bar reports how many tokens a turn
@@ -458,7 +638,9 @@ extension QwenRuntime {
         var exitCause = "budget-or-loop-end"
 
         while !done, emitted.count < budget {
+            let roundStarted = Date()
             let response = try context.client.mtpDecodeRound(depth: depth)
+            stats.workerRoundSeconds += Date().timeIntervalSince(roundStarted)
             guard response.ok, let tokens = response.tokens else {
                 throw MLXFastError.invalidInput(
                     "the MTP worker failed a decode round: "
@@ -483,27 +665,40 @@ extension QwenRuntime {
                 }
             }
 
-            // Decode the whole prefix each round: Qwen uses byte-level BPE, so a
-            // token can carry a fragment of a multi-byte character and decoding
-            // tokens singly produces replacement characters at the seams.
-            full = tokenizer.decode(tokens: emitted, skipSpecialTokens: true)
-
-            if let stop = firstStopHit(in: full, stopStrings: stopStrings) {
+            let text = stage.advance {
+                detokenizer.text(for: emitted) {
+                    tokenizer.decode(tokens: Array($0), skipSpecialTokens: true)
+                }
+            }
+            stats.detokenizeSeconds += text.decodeSeconds
+            stats.stopScanSeconds += text.stopSeconds
+            stats.gateSeconds += text.gateSeconds
+            full = text.full
+            if text.hitStop {
                 exitCause = "stop-string"
-                full = String(full[full.startIndex..<stop])
                 done = true
             }
-
-            let admitted = gate.admit(full)
-            if let onDelta, !admitted.delta.isEmpty {
-                onDelta(admitted.delta)
+            if let onDelta, !text.delta.isEmpty {
+                let emitStarted = Date()
+                onDelta(text.delta)
+                stats.streamEmitSeconds += Date().timeIntervalSince(emitStarted)
             }
-            if admitted.sawToolCall { finishReason = "tool_calls" }
+            if text.sawToolCall { finishReason = "tool_calls" }
             if tokens.isEmpty {
                 exitCause = "empty-round"
                 break
             }
         }
+
+        let finalText = stage.finish {
+            detokenizer.text(for: emitted) {
+                tokenizer.decode(tokens: Array($0), skipSpecialTokens: true)
+            }
+        }
+        stats.detokenizeSeconds += finalText.decodeSeconds
+        stats.gateSeconds += finalText.gateSeconds
+        full = finalText.full
+        if finalText.sawToolCall { finishReason = "tool_calls" }
 
         stats.seconds = Date().timeIntervalSince(started)
         stats.emittedTokens = emitted.count
@@ -538,7 +733,7 @@ extension QwenRuntime {
             emittedTokens: emitted)
     }
 
-    private static func firstStopHit(
+    static func firstStopHit(
         in text: String, stopStrings: [String]
     ) -> String.Index? {
         var earliest: String.Index?
