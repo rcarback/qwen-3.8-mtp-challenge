@@ -5204,6 +5204,129 @@ public func qwen35VerifySelectedRerankOrderInvariance(
     return (trials, mismatches, firstBad, setMismatches, controlChanged)
 }
 
+/// Time one MTP head draft step and one compact draft projection, separating
+/// host graph build from device execution, on randomly initialised weights of
+/// the pinned Qwen 3.8 geometry.
+///
+/// WHY RANDOM WEIGHTS ARE ENOUGH. Both halves are dense reads over fixed
+/// shapes; neither the head layer nor the vocabulary projection has any
+/// value-dependent branch or sparsity. What the checkpoint adds is 15 GB of
+/// load time, which is why the real-weights instrument exists separately and
+/// this one does not need it.
+///
+/// WHY BUILD AND EVAL ARE SEPARATED. MLX builds the graph on the host and
+/// executes it on the device. In a debug build the host half is inflated by an
+/// order of magnitude, so a single fused number cannot tell an expensive kernel
+/// from an expensive host. The caller runs this in both configurations and
+/// compares.
+///
+/// Returns medians over `iterations`, in seconds.
+public func qwen35BenchMTPHeadStep(
+    iterations: Int = 32, historyRows: Int = 2_048
+) -> (
+    headBuild: Double, headEval: Double,
+    projectionBuild: Double, projectionEval: Double
+) {
+    let configurationJSON = """
+        {"model_type": "qwen3_5_text", "hidden_size": 5120,
+         "num_hidden_layers": 64, "intermediate_size": 17408,
+         "num_attention_heads": 24, "num_key_value_heads": 4,
+         "head_dim": 256, "vocab_size": 248320, "rms_norm_eps": 1e-6,
+         "mtp_num_hidden_layers": 1, "tie_word_embeddings": false,
+         "partial_rotary_factor": 0.25, "rope_theta": 100000.0}
+        """
+    guard let args = try? JSONDecoder().decode(
+        Qwen35TextConfiguration.self,
+        from: Data(configurationJSON.utf8))
+    else {
+        preconditionFailure(
+            "qwen35BenchMTPHeadStep: pinned head configuration failed to decode")
+    }
+
+    // The pinned head is bfloat16. `Qwen35MTPModule` initialises float32
+    // weights, and the fused pre-fc kernel refuses anything else, so cast the
+    // whole module once.
+    //
+    // `map:` IS SPELLED OUT ON PURPOSE: `mapParameters(map:isLeaf:)` takes two
+    // closures, and Swift matches an unlabeled trailing closure by scanning
+    // backward, which would bind this one to `isLeaf` and fail to compile.
+    let mtp = Qwen35MTPModule(args)
+    mtp.update(
+        parameters: mtp.mapParameters(map: { $0.asType(.bfloat16) }))
+
+    // A small vocabulary: the embedding is a gather of one row, so the row
+    // count does not enter the per-step cost, while the guards the fused
+    // pre-fc kernel checks are all about dtype, group size and width.
+    let embedWeight = MLXRandom.normal([4_096, args.hiddenSize])
+        .asType(.bfloat16)
+    let embedTokens = QuantizedEmbedding(
+        weight: embedWeight, groupSize: 64, bits: 4, mode: .affine)
+
+    // The compact draft projection, at the shape `makeCompactDraftHead`
+    // produces: 98,336 padded rows of affine 4-bit group-64.
+    let projectionWeight = MLXRandom.normal([98_336, args.hiddenSize])
+        .asType(.bfloat16)
+    let projection = QuantizedLinear(
+        weight: projectionWeight, bias: nil,
+        groupSize: 64, bits: 4, mode: .affine)
+
+    let cache: [any KVCache] = [KVCacheSimple()]
+
+    func step(rows: Int) -> MLXArray {
+        let hidden = MLXRandom.normal([1, rows, args.hiddenSize])
+            .asType(.bfloat16)
+        let ids = MLXArray((0 ..< rows).map { Int32(($0 * 7_919) % 4_096) })
+            .reshaped([1, rows])
+        return mtp(
+            hidden: hidden, nextTokenIds: ids,
+            embedTokens: embedTokens, cache: cache)
+    }
+
+    // Fill the head cache to `historyRows` and warm every kernel before timing.
+    eval(step(rows: historyRows))
+    eval(step(rows: 1))
+    eval(projection(MLXRandom.normal([1, 1, args.hiddenSize])
+        .asType(.bfloat16)))
+
+    var headBuilds: [Double] = []
+    var headEvals: [Double] = []
+    var projectionBuilds: [Double] = []
+    var projectionEvals: [Double] = []
+    headBuilds.reserveCapacity(iterations)
+    headEvals.reserveCapacity(iterations)
+    projectionBuilds.reserveCapacity(iterations)
+    projectionEvals.reserveCapacity(iterations)
+
+    for _ in 0 ..< iterations {
+        let t0 = Date()
+        let hidden = step(rows: 1)
+        let t1 = Date()
+        eval(hidden)
+        let t2 = Date()
+        let logits = projection(hidden)
+        let t3 = Date()
+        eval(logits)
+        let t4 = Date()
+
+        headBuilds.append(t1.timeIntervalSince(t0))
+        headEvals.append(t2.timeIntervalSince(t1))
+        projectionBuilds.append(t3.timeIntervalSince(t2))
+        projectionEvals.append(t4.timeIntervalSince(t3))
+
+        // Keep the history at its measured depth: one step appended one row.
+        if cache[0].isTrimmable { _ = cache[0].trim(1) }
+    }
+
+    func median(_ values: [Double]) -> Double {
+        let sorted = values.sorted()
+        return sorted[sorted.count / 2]
+    }
+
+    return (
+        median(headBuilds), median(headEvals),
+        median(projectionBuilds), median(projectionEvals))
+}
+
 /// One backbone forward's published outputs.
 ///
 /// `hidden` is PRE-norm and `normed` is the same rows after `model.norm`, the
