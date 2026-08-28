@@ -241,9 +241,12 @@ struct QwenPhaseBreakdownTests {
                 tapedLayers, Double(tapeBytes) / 1_048_576))
         }
 
+        let ladderBand = ProcessInfo.processInfo
+            .environment["MLX_QWEN_MTP_LADDER_MAXWIDTH"] ?? "<unset, 9>"
         print("\n[qmv arm] MLX_E120_QMV_ARM="
             + (ProcessInfo.processInfo.environment["MLX_E120_QMV_ARM"]
-                ?? "<unset, shipped sumtable>"))
+                ?? "<unset, shipped sumtable>")
+            + "  [ladder band] MLX_QWEN_MTP_LADDER_MAXWIDTH=\(ladderBand)")
 
         widthSweep(
             "decode @ depth ~2k", cache: cache,

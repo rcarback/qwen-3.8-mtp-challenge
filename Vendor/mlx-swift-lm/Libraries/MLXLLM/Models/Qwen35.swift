@@ -3758,6 +3758,28 @@ let qwen35DecodeLadderRungs: Set<Int> = {
     }
 }()
 
+/// Parse the decode ladder's upper width bound. Pure and total: an absent,
+/// empty, non-integer or non-positive value yields the shipped bound.
+///
+/// Separated from the environment read so the contract can be tested without
+/// a device, weights, or a process environment.
+func qwen35ParseLadderMaxWidth(_ raw: String?) -> Int {
+    let shipped = 9
+    guard let raw, !raw.isEmpty, let parsed = Int(raw), parsed > 0
+    else { return shipped }
+    return parsed
+}
+
+/// Largest input width at which the decode ladder fires rungs.
+///
+/// The shipped value 9 is the ranked track's maximum verify width
+/// (`qwenMTPMaxDraftDepth` 8, plus the primary row), which is why the ladder
+/// was never wired above it. A local fork that verifies wider rounds has no
+/// ladder at all between 10 and the prefill threshold, so the bound is now
+/// overridable. Unset reproduces the previous condition exactly.
+let qwen35DecodeLadderMaxWidth: Int = qwen35ParseLadderMaxWidth(
+    ProcessInfo.processInfo.environment["MLX_QWEN_MTP_LADDER_MAXWIDTH"])
+
 public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
@@ -3871,7 +3893,8 @@ public class Qwen35TextModelInner: Module {
         // blocks and the best arm was 0.94 sigma, because the host enqueues the
         // whole graph in 118.7 ms of a 4043 ms GPU-bound block.
         let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        let ladderActive =
+            inputs.dim(1) <= qwen35DecodeLadderMaxWidth || prefillLadder
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
             // Boundary-fused chain: the residual boundary flows as an
             // UNMERGED (base, delta) pair, so each interior layer pays one
