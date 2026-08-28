@@ -1316,13 +1316,14 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        let normedOut: MLXArray
-        if S >= 2 {
-            let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
-            normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
-        } else {
-            normedOut = norm(out, gate: z)
-        }
+        // The fused pair at every width, including 1. It is the expression
+        // `Qwen3NextRMSNormGated` evaluates: the same `MLXFast.rmsNorm`, then
+        // `silu(gate.asType(.float32))` written out as `gate32 *
+        // sigmoid(gate32)` — which is what `silu` compiles to — then the same
+        // fp32 product and the same cast back. Two launches replace six.
+        // `qwen35VerifyGatedPostNorm` is the byte-equality receipt.
+        let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+        let normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
         return qwen35RoutedLinear(outProj, normedOut.reshaped(B, S, -1))
     }
 }
@@ -5401,6 +5402,71 @@ public func qwen35CompiledGBetaNegativeControl(
         !MLX.all(MLX.equal(g, gDamaged)).item(Bool.self),
         MLX.all(MLX.equal(beta, betaDamaged)).item(Bool.self)
     )
+}
+
+/// Byte-equality receipt for the fused gated post-norm pair against
+/// `Qwen3NextRMSNormGated`, the module the width-1 path used to call.
+///
+/// The module runs `MLXFast.rmsNorm`, then `silu(gate.asType(.float32))`,
+/// then `(g * x.asType(.float32)).asType(dtype)` (Qwen3Next.swift:32-36).
+/// `silu` compiles to `x * sigmoid(x)` (Activations.swift:1049-1053), which is
+/// what `qwen35CompiledGatedDeltaPostNorm` writes out. Same expression, same
+/// dtypes, two launches instead of six.
+///
+/// Returns `(trials, bad, firstBad)`.
+public func qwen35VerifyGatedPostNorm(
+    widths: [Int] = [1, 2, 3, 9], trials: Int = 8, seed: UInt64 = 1
+) -> (trials: Int, bad: Int, firstBad: Int) {
+    MLXRandom.seed(seed)
+    let heads = 48
+    let headDim = 128
+    let norm = Qwen3NextRMSNormGated(dimensions: headDim, eps: 1e-6)
+    norm.apply { $0.asType(.bfloat16) }
+    var run = 0
+    var bad = 0
+    var firstBad = -1
+    for width in widths {
+        for _ in 0 ..< trials {
+            let out = MLXRandom.normal([1, width, heads, headDim])
+                .asType(.bfloat16)
+            let z = MLXRandom.normal([1, width, heads, headDim])
+                .asType(.bfloat16)
+            eval(out, z)
+            let fused = qwen35CompiledGatedDeltaPostNorm(
+                MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps), z)
+            let module = norm(out, gate: z)
+            eval(fused, module)
+            if !MLX.all(MLX.equal(fused, module)).item(Bool.self) {
+                bad += 1
+                if firstBad < 0 { firstBad = run }
+            }
+            run += 1
+        }
+    }
+    return (run, bad, firstBad)
+}
+
+/// Negative control for `qwen35VerifyGatedPostNorm`. Shifts one gate element,
+/// which must change the fused output, and requires the comparison against an
+/// unshifted fused output to report it.
+public func qwen35GatedPostNormNegativeControl(seed: UInt64 = 7) -> Bool {
+    MLXRandom.seed(seed)
+    let heads = 48
+    let headDim = 128
+    let norm = Qwen3NextRMSNormGated(dimensions: headDim, eps: 1e-6)
+    norm.apply { $0.asType(.bfloat16) }
+    let out = MLXRandom.normal([1, 1, heads, headDim]).asType(.bfloat16)
+    let z = MLXRandom.normal([1, 1, heads, headDim]).asType(.bfloat16)
+    eval(out, z)
+    var host = z.asType(.float32).asArray(Float.self)
+    host[0] += 4
+    let damaged = MLXArray(host)
+        .reshaped([1, 1, heads, headDim]).asType(.bfloat16)
+    let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+    let clean = qwen35CompiledGatedDeltaPostNorm(normed, z)
+    let dirty = qwen35CompiledGatedDeltaPostNorm(normed, damaged)
+    eval(clean, dirty)
+    return !MLX.all(MLX.equal(clean, dirty)).item(Bool.self)
 }
 
 /// One backbone forward's published outputs.

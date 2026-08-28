@@ -179,4 +179,16 @@ struct QwenForwardStreamTests {
         #expect(control.gMoved, "the comparison cannot detect a changed g")
         #expect(control.betaHeld, "beta must not depend on a")
     }
+
+    /// Receipt for Task 3: the fused post-norm pair equals the module form
+    /// bit for bit, including at width 1 where the module used to run.
+    @Test("fused gated post-norm equals the module form")
+    func gatedPostNormIsByteExact() {
+        let (trials, bad, firstBad) = qwen35VerifyGatedPostNorm()
+        #expect(trials == 32)
+        #expect(bad == 0, "first mismatching trial: \(firstBad)")
+        #expect(
+            qwen35GatedPostNormNegativeControl(),
+            "the comparison cannot detect a changed gate")
+    }
 }
