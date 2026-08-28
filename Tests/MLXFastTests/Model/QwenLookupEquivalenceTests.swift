@@ -101,6 +101,21 @@ struct QwenLookupEquivalenceTests {
             session.resetLookupHistory(seed)
             var leg = Leg()
             let started = Date()
+            // The evidence for `committed[0]` (this round's primary) is the
+            // TAIL row of the PREVIOUS round -- the same row that decided the
+            // primary in the first place -- not anything in this round's own
+            // `perRowTop2Logits`. Verify row `i` is the target's distribution
+            // over the token that follows verify input `i`, and the verify
+            // block is `[primary] + drafts`, so `perRowTop2Logits[k - 1]` is
+            // the evidence for `committed[k]` when `k >= 1`; `committed[0]`
+            // takes whatever the carry holds. The tail/bonus row -- always the
+            // LAST entry of `perRowTop2Logits`, in every one of the full
+            // acceptance, promoted partial-reject, and generic-repair branches
+            // -- is the evidence for the NEXT round's primary, so it becomes
+            // the next carry. Seeded with `.infinity` for the very first
+            // round's primary: that evidence came from `begin`, which this
+            // test does not read.
+            var marginCarry = Double.infinity
             while leg.tokens.count < 192 {
                 let result = try session.generateRound(depth: 8)
                 leg.rounds += 1
@@ -113,9 +128,17 @@ struct QwenLookupEquivalenceTests {
                 #expect(result.perRowTop2Logits.count == result.declaredRows)
                 for (index, token) in result.tokens.enumerated() {
                     leg.tokens.append(token)
-                    let row = result.perRowTop2Logits[index]
-                    leg.margins.append(
-                        row.count >= 2 ? row[0] - row[1] : .infinity)
+                    if index == 0 {
+                        leg.margins.append(marginCarry)
+                    } else {
+                        let row = result.perRowTop2Logits[index - 1]
+                        leg.margins.append(
+                            row.count >= 2 ? row[0] - row[1] : .infinity)
+                    }
+                }
+                if let tailRow = result.perRowTop2Logits.last {
+                    marginCarry = tailRow.count >= 2
+                        ? tailRow[0] - tailRow[1] : .infinity
                 }
                 if result.tokens.isEmpty { break }
             }
