@@ -191,4 +191,28 @@ struct QwenForwardStreamTests {
             qwen35GatedPostNormNegativeControl(),
             "the comparison cannot detect a changed gate")
     }
+
+    /// Receipt for Task 4: the epsilon scalar is built once per distinct
+    /// value, and the memoized array carries the same value the fresh one did.
+    @Test("fused residual norm epsilon scalar is memoized")
+    func epsScalarIsMemoized() {
+        let eps: Float = 1.0e-6
+        let before = qwen35EpsScalarMisses
+        let first = qwen35EpsScalar(eps)
+        let afterFirst = qwen35EpsScalarMisses
+        let second = qwen35EpsScalar(eps)
+        let afterSecond = qwen35EpsScalarMisses
+        #expect(afterFirst - before == 1)
+        #expect(afterSecond - afterFirst == 0)
+
+        eval(first, second)
+        #expect(MLX.all(MLX.equal(first, second)).item(Bool.self))
+        #expect(MLX.all(MLX.equal(first, MLXArray(eps))).item(Bool.self))
+
+        // A different value is a different entry, not a silent alias.
+        let other = qwen35EpsScalar(1.0e-5)
+        eval(other)
+        #expect(qwen35EpsScalarMisses - afterSecond == 1)
+        #expect(!MLX.all(MLX.equal(first, other)).item(Bool.self))
+    }
 }

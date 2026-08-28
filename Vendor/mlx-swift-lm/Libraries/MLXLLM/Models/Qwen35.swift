@@ -2336,6 +2336,29 @@ private let qwen35FusedResidualRMSNormXSumsKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+/// Input-independent epsilon scalars for the fused residual+RMSNorm kernel.
+///
+/// `MLXArray(eps)` built a fresh scalar node on every call: 127 of them per
+/// width-1 forward, one per residual boundary, every one holding the same
+/// `rmsNormEps`. The value is weight-derived and never varies with the
+/// request, so it is memoized on the same terms as `negExpALog` and
+/// `normScaleConstants` above. `qwen35EpsScalarMisses` counts the builds so a
+/// test can prove the memo is live; it advances only on a miss.
+public nonisolated(unsafe) var qwen35EpsScalarMisses = 0
+private nonisolated(unsafe) var qwen35EpsScalars: [UInt32: MLXArray] = [:]
+private let qwen35EpsScalarLock = NSLock()
+
+func qwen35EpsScalar(_ eps: Float) -> MLXArray {
+    let key = eps.bitPattern
+    qwen35EpsScalarLock.lock()
+    defer { qwen35EpsScalarLock.unlock() }
+    if let cached = qwen35EpsScalars[key] { return cached }
+    let value = MLXArray(eps)
+    qwen35EpsScalars[key] = value
+    qwen35EpsScalarMisses += 1
+    return value
+}
+
 /// Wraps the fused residual+RMSNorm kernel.  Returns `(residual, normed)` where
 /// `residual = bf16(x + r)` and `normed = weight * RMSNorm(residual)` with the
 /// same arithmetic as the eager `postAttentionLayerNorm(x + r)`.
@@ -2351,7 +2374,7 @@ func qwen35FusedResidualRMSNorm(
         let k = x.dim(-1)
         let kBlocks = k / 512
         let outputs = qwen35FusedResidualRMSNormXSumsKernel(
-            [x, r, weight, MLXArray(eps)],
+            [x, r, weight, qwen35EpsScalar(eps)],
             grid: (nRows * 1024, 1, 1),
             threadGroup: (1024, 1, 1),
             outputShapes: [
@@ -2363,7 +2386,7 @@ func qwen35FusedResidualRMSNorm(
         return (outputs[0], outputs[1])
     }
     let outputs = qwen35FusedResidualRMSNormKernel(
-        [x, r, weight, MLXArray(eps)],
+        [x, r, weight, qwen35EpsScalar(eps)],
         grid: (nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [shape, shape],
