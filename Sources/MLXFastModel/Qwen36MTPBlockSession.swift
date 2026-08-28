@@ -1332,6 +1332,35 @@ public final class Qwen36MTPBlockSession {
                 Self.clearRecurrentRollback(warmCache)
             }
         }
+        // LOOKUP LADDER WIDTHS. A lookup-sourced round verifies widths the
+        // head can never reach, so the loop above never compiled them. Same
+        // body as that loop: the verify at `nConfirmed: 1`, the two top-2
+        // reduction kernels at that row count, and the prefix replay a partial
+        // acceptance runs. Warmed only when an index is installed, so a session
+        // without one pays nothing at all.
+        if let lookupIndex {
+            for width in Self.lookupWarmWidths(
+                ladder: lookupIndex.configuration.ladder)
+            {
+                let block = Array(repeating: 0, count: width)
+                let (wideLogits, _, wideNormed) =
+                    model.callWithHiddenAndNormed(
+                        input: LMInput.Text(
+                            tokens: MLXArray(block).reshaped([1, width])),
+                        cache: warmCache, nConfirmed: 1)
+                let (wideIDs, wideValues) = Self.linearTopTwoRows(wideLogits)
+                var wideBundle: [MLXArray] = [wideLogits, wideIDs, wideValues]
+                if let wideNormed { wideBundle.append(wideNormed) }
+                eval(wideBundle)
+                eval(warmCache.flatMap { $0.state })
+                precondition(model.replayRecurrentPrefix(
+                    cache: warmCache, committedRows: width - 1))
+                for entry in warmCache where !(entry is ArraysCache) {
+                    if entry.isTrimmable { _ = entry.trim(1) }
+                }
+                eval(warmCache.flatMap { $0.state })
+            }
+        }
 
         // A K>=2 round can reject its very first draft, which replays T=1.
         // Width 2 stays on the validated eager K1 path, so compile this last

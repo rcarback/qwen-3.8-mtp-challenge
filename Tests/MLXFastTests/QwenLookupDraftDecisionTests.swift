@@ -92,3 +92,28 @@ struct QwenLookupDraftDecisionTests {
         #expect(Session.lookupWarmWidths(ladder: [10, 20]) == [11, 21])
     }
 }
+
+@Suite
+struct QwenLookupWarmSurfaceTests {
+    @Test("the shape warm covers every ladder width above the head's own")
+    func theShapeWarmCoversEveryLadderWidth() throws {
+        let session = try String(
+            contentsOfFile: "Sources/MLXFastModel/Qwen36MTPBlockSession.swift",
+            encoding: .utf8)
+        #expect(
+            session.contains("Self.lookupWarmWidths("),
+            Comment(rawValue: "warmAllDepthShapes does not compile the "
+                + "lookup ladder widths; the first lookup round would pay a "
+                + "pipeline compile inside the request"))
+        #expect(
+            session.contains("ladder: lookupIndex.configuration.ladder"),
+            Comment(rawValue: "the lookup warm does not read the installed "
+                + "index's own ladder, so an overridden ladder would leave "
+                + "its widths cold"))
+        // The warm must compile the wide verify SHAPE, not only the forward:
+        // the top-2 reduction kernels are specialised per row count and the
+        // prefix replay is what a partial acceptance runs.
+        #expect(session.contains("Self.linearTopTwoRows(wideLogits)"))
+        #expect(session.contains("committedRows: width - 1"))
+    }
+}
