@@ -129,6 +129,39 @@ public let fusedQuantizedSDPADefault: Bool =
 /// Generic models must be v2-adapted — capture `positionOffsets` before
 /// dispatch and call `updateAndAttend` directly — before they can serve
 /// multi-row CBv2 batches. This fails loudly rather than mis-rotating.
+/// Shipped upper bound of the wide-decode exactness chunk: the widest verify
+/// block the shipped draft-depth ceiling of 8 can ask for is 9 rows.
+public let wideDecodeExactnessDefaultMaxQueryRows = 9
+
+/// Largest bound the override may select: the widest verify block the runtime
+/// has a QMV width plan for is 16 rows.
+public let wideDecodeExactnessHardCapQueryRows = 16
+
+/// Pure, total parser for the wide-decode chunk bound.
+///
+/// MIRROR, DELIBERATELY. `MLXFastConstants.parseMaxDraftDepth` owns the
+/// trusted ceiling `d`; this owns the query-row bound `d + 1` that the chunk
+/// above must cover. The two live in packages that cannot import each other --
+/// `MLXLMCommon` is a vendored dependency of the harness, not a client of it
+/// -- so the arithmetic is restated here and pinned by a test that runs both
+/// parsers over the same inputs and asserts `rows == depth + 1`.
+///
+/// Both read the same `MLX_`-prefixed name, which
+/// `sanitizedRuntimeWorkerEnvironment` forwards to the runtime worker, so the
+/// parent process and the worker process resolve the same number.
+public func parseWideDecodeExactnessMaxQueryRows(_ raw: String?) -> Int {
+    guard let raw else { return wideDecodeExactnessDefaultMaxQueryRows }
+    let trimmed = raw.trimmingCharacters(in: .whitespaces)
+    guard let depth = Int(trimmed), depth >= 1,
+          depth + 1 <= wideDecodeExactnessHardCapQueryRows
+    else { return wideDecodeExactnessDefaultMaxQueryRows }
+    return depth + 1
+}
+
+/// Read once at process start. Never varies with the request or the prompt.
+public let wideDecodeExactnessMaxQueryRows = parseWideDecodeExactnessMaxQueryRows(
+    ProcessInfo.processInfo.environment["MLX_QWEN_MTP_MAX_DRAFT_DEPTH"])
+
 public func attentionWithCacheUpdate(
     queries: MLXArray,
     keys: MLXArray,
@@ -208,44 +241,57 @@ public func attentionWithCacheUpdate(
         )
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
-        // WIDE-DECODE EXACTNESS CHUNK (B == 1, causal, 6 <= qL <= 9): the
-        // fused sdpa vector path serves qL * gqa <= 32; above it the dispatch
-        // changes kernel family and the accumulation order of every score —
-        // the measured source of the MTP width wall's top-2 VALUE drift.
-        // Splitting the queries at row 5 keeps both halves on the fused
-        // vector path with windows that are BYTE-IDENTICAL to two
-        // consecutive <= 5-row rounds at the same offsets: with bottom-right
-        // causal alignment, chunk A (rows 0..<5) over keys[..<kL-(qL-5)]
-        // gives row i the window a width-5 round would, and chunk B
-        // (rows 5..) over the full keys gives row 5+j the window a follow-up
-        // width-(qL-5) round would. Keys/values are re-sliced, not
-        // recomputed — the only extra cost is one more pass over the KV
-        // rows (a few MB), never over weights. Serial (qL == 1), the <= 5
-        // verify widths, and prefill (qL > 9) are untouched.
-        // The cache update above happens exactly once; both segments below
-        // are read-only views of that single committed candidate window.
+        // WIDE-DECODE EXACTNESS CHUNK (B == 1, causal,
+        // 6 <= qL <= wideDecodeExactnessMaxQueryRows): the fused sdpa vector
+        // path serves qL * gqa <= 32; above it the dispatch changes kernel
+        // family and the accumulation order of every score — the measured
+        // source of the MTP width wall's top-2 VALUE drift.
+        // Splitting the queries every 5 rows keeps every segment on the fused
+        // vector path with windows that are BYTE-IDENTICAL to consecutive
+        // <= 5-row rounds at the same offsets: with bottom-right causal
+        // alignment, the segment [start, end) taken over
+        // keys[..<kL - (qL - end)] gives absolute row i the window
+        // kL - qL + 1 + i that a serial round at that position would see, for
+        // every segmentation. Keys/values are re-sliced, not recomputed — the
+        // only extra cost is one more pass over the KV rows (a few MB), never
+        // over weights. Serial (qL == 1), the <= 5 verify widths, and prefill
+        // (qL > wideDecodeExactnessMaxQueryRows) are untouched.
+        // The cache update above happens exactly once; every segment below is
+        // a read-only view of that single committed candidate window.
+        //
+        // THE UPPER GUARD IS A DEPTH-CEILING CONSUMER, not a free constant.
+        // A verify round of depth d is qL = d + 1 rows, so a guard below the
+        // trusted ceiling + 1 would send the widest legal rounds down the
+        // unchunked path and reintroduce exactly the drift this chunk exists
+        // to remove — silently. `wideDecodeExactnessMaxQueryRows` therefore
+        // tracks the same environment override the ceiling does.
         let qL = queries.dim(2)
         let kL = cachedKeys.dim(2)
-        if queries.dim(0) == 1, qL >= 6, qL <= 9, kL >= qL,
-           case .causal = mask
+        if queries.dim(0) == 1, qL >= 6, qL <= wideDecodeExactnessMaxQueryRows,
+           kL >= qL, case .causal = mask
         {
             let split = 5
-            let kSplit = kL - (qL - split)
-            let outA = MLXFast.scaledDotProductAttention(
-                queries: queries[0..., 0..., 0 ..< split, 0...],
-                keys: cachedKeys[0..., 0..., 0 ..< kSplit, 0...],
-                values: cachedValues[0..., 0..., 0 ..< kSplit, 0...],
-                scale: scale,
-                mask: .causal
-            )
-            let outB = MLXFast.scaledDotProductAttention(
-                queries: queries[0..., 0..., split..., 0...],
-                keys: cachedKeys,
-                values: cachedValues,
-                scale: scale,
-                mask: .causal
-            )
-            return concatenated([outA, outB], axis: 2)
+            var segments: [MLXArray] = []
+            var start = 0
+            while start < qL {
+                let end = min(start + split, qL)
+                let kEnd = kL - (qL - end)
+                // The final segment spans the whole cached window; pass the
+                // arrays themselves rather than a full-range slice so the
+                // two-segment case stays the graph the shipped code built.
+                let k = kEnd == kL ? cachedKeys : cachedKeys[0..., 0..., 0 ..< kEnd, 0...]
+                let v = kEnd == kL ? cachedValues : cachedValues[0..., 0..., 0 ..< kEnd, 0...]
+                segments.append(
+                    MLXFast.scaledDotProductAttention(
+                        queries: queries[0..., 0..., start ..< end, 0...],
+                        keys: k,
+                        values: v,
+                        scale: scale,
+                        mask: .causal
+                    ))
+                start = end
+            }
+            return concatenated(segments, axis: 2)
         }
         return MLXFast.scaledDotProductAttention(
             queries: queries,

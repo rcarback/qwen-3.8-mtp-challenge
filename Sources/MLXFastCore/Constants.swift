@@ -1,3 +1,5 @@
+import Foundation
+
 public enum MLXFastConstants {
     // Qwen native-MTP track identity. The artifact is named Qwen3.8; its
     // immutable internal architecture name is `qwen3_5_text` (the raw
@@ -328,7 +330,63 @@ public enum MLXFastConstants {
     /// round ACTUALLY proposed) while the worker mirrors it as a request bound
     /// through `Qwen36MTPLimits.maxDepth`. The parent's check is the one that
     /// binds: the worker's copy sits in editable model code.
-    public static let qwenMTPMaxDraftDepth = 8
+    /// THE SHIPPED BOUND. Every published measurement of this track was taken
+    /// with the ceiling here.
+    public static let qwenMTPMaxDraftDepthDefault = 8
+
+    /// The largest value `qwenMTPMaxDraftDepthEnvName` may select.
+    ///
+    /// It is not an arbitrary round number. A round of depth `d` asks the
+    /// target for a verify block of `d + 1` rows, and the widest verify block
+    /// the runtime has a plan for is 16: `Qwen35CustomQMV` carries an
+    /// inputs-per-group entry up to width 16, and the activation-sum table its
+    /// kernel reads pads a lane slot to 16 floats. So `d <= 15`.
+    public static let qwenMTPMaxDraftDepthHardCap = 15
+
+    /// Runtime override for the trusted ceiling.
+    ///
+    /// The `MLX_` prefix is load-bearing and it is what keeps the parent and
+    /// the worker equal. `sanitizedRuntimeWorkerEnvironment`
+    /// (`QwenRuntimeWorker.swift`) forwards `MLX_*` to the spawned worker from
+    /// `ProcessInfo.processInfo.environment` -- the same dictionary the parent
+    /// read -- and drops every `MLXFAST_*` name. Both processes therefore
+    /// parse the same string with the same parser and reach the same number.
+    /// An `MLXFAST_`-spelled override would raise the parent's bound while the
+    /// worker kept the default, which is the one failure mode this constant
+    /// must not have.
+    public static let qwenMTPMaxDraftDepthEnvName = "MLX_QWEN_MTP_MAX_DRAFT_DEPTH"
+
+    /// Pure, total parser for `qwenMTPMaxDraftDepthEnvName`. Anything that is
+    /// not an integer in `1 ... qwenMTPMaxDraftDepthHardCap` returns the
+    /// shipped default, so a typo, an empty value or an out-of-range number
+    /// narrows to the shipped behaviour rather than widening the bound.
+    /// Separated from the environment read so the contract is unit-testable.
+    ///
+    /// The floor is 1, not 0: 0 is `qwenMTPSerialControlDepth`, and a ceiling
+    /// of 0 would make the serial control the only legal configuration.
+    public static func parseMaxDraftDepth(_ raw: String?) -> Int {
+        guard let raw else { return qwenMTPMaxDraftDepthDefault }
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard let value = Int(trimmed),
+              value >= 1, value <= qwenMTPMaxDraftDepthHardCap
+        else { return qwenMTPMaxDraftDepthDefault }
+        return value
+    }
+
+    /// THE ONE PLACE THE CEILING IS DECIDED. Read once at process start.
+    ///
+    /// Raising it does NOT make the parent's check advisory. The driver still
+    /// rejects any round whose ACTUAL draft count exceeds this value
+    /// (`QwenRuntimeMTPDriver.requireStructurallySound`) and the row ledger is
+    /// still closed against it (`QwenMTPRowAccounting`); only the number the
+    /// comparison uses moves.
+    ///
+    /// Divergence between the two processes cannot make the parent accept a
+    /// round it should reject. If the worker's mirror were somehow the higher
+    /// of the two, the parent rejects the wide round; if the parent's were
+    /// higher, the worker simply never drafts that wide. Both are refusals.
+    public static let qwenMTPMaxDraftDepth = parseMaxDraftDepth(
+        ProcessInfo.processInfo.environment[qwenMTPMaxDraftDepthEnvName])
 
     /// Wire/request spelling of the same bound, kept because the worker
     /// protocol and `Qwen36MTPLimits` were written against this name. It is an

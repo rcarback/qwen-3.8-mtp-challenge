@@ -1673,7 +1673,7 @@ private let qwen35E120QMVHeader = """
 private func qwen35E120QMVSource(table: Bool) -> String {
     let sums = table ? "xsums" : "qmv_null_sums"
     let flag = table ? "USE_TABLE" : "false"
-    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3)]
+    let cases = Qwen35CustomQMV.enabledInputGroupPlan
         .map { m, ipg in
             """
                     case \(m):
@@ -1705,7 +1705,8 @@ private func qwen35E120QMVSource(table: Bool) -> String {
 }
 
 private let qwen35CustomAffine4QMVKernel = MLXFast.metalKernel(
-    name: "qwen35_custom_affine4_g64_qmv_wide_v1",
+    name: "qwen35_custom_affine4_g64_qmv_wide_v1"
+        + Qwen35CustomQMV.kernelNameWidthSuffix,
     inputNames: ["w", "scales", "biases", "x"],
     outputNames: ["y"],
     source: qwen35E120QMVSource(table: false),
@@ -1714,7 +1715,8 @@ private let qwen35CustomAffine4QMVKernel = MLXFast.metalKernel(
 )
 
 private let qwen35CustomAffine4QMVTableKernel = MLXFast.metalKernel(
-    name: "qwen35_custom_affine4_g64_qmv_wide_sums_v1",
+    name: "qwen35_custom_affine4_g64_qmv_wide_sums_v1"
+        + Qwen35CustomQMV.kernelNameWidthSuffix,
     inputNames: ["w", "scales", "biases", "x", "xsums"],
     outputNames: ["y"],
     source: qwen35E120QMVSource(table: true),
@@ -1805,12 +1807,109 @@ public enum Qwen35CustomQMV {
         return Arm(rawValue: raw) ?? .sumTable
     }()
 
+    /// Shipped upper width bound. The replica has served `2 ... 9` since it
+    /// landed, and every published measurement of it was taken there.
+    static let maxWidthDefault = 9
+
+    /// Largest width `inputGroupPlan` carries an entry for. Also the largest
+    /// width the kernel's activation-sum table addresses: `qmv_stride` is
+    /// `m <= 8 ? 8 : 16` (see `qwen35E120QMVSource` and
+    /// `qwen35CustomAffine4XSumsKernel`), so a lane's row slot only exists for
+    /// `m <= 16`. Raising this bound needs a wider stride first.
+    static let maxWidthHardCap = 16
+
+    /// Runtime override for the upper width bound.
+    ///
+    /// The `MLX_` prefix is load-bearing for the same reason it is on
+    /// `MLX_E120_QMV_ARM` above: `sanitizedRuntimeWorkerEnvironment` is a
+    /// strict allowlist that drops every `MLXFAST_*` name, so an
+    /// `MLXFAST_`-spelled bound would never reach the runtime worker and a
+    /// width sweep would silently measure the shipped 9 on every leg.
+    static let maxWidthEnvName = "MLX_QWEN_QMV_MAX_WIDTH"
+
+    /// Pure, total parser for `maxWidthEnvName`. Anything that is not an
+    /// integer in `2 ... maxWidthHardCap` returns the shipped default, so a
+    /// typo cannot widen the plan or collapse `widths` into an empty range.
+    /// Separated from the environment read so the contract is unit-testable
+    /// without a device.
+    static func parseMaxWidth(_ raw: String?) -> Int {
+        guard let raw else { return maxWidthDefault }
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard let value = Int(trimmed),
+              value >= 2, value <= maxWidthHardCap
+        else { return maxWidthDefault }
+        return value
+    }
+
+    /// Read once at process start; never varies with the request, the prompt
+    /// or the benchmark phase.
+    static let maxWidth = parseMaxWidth(
+        ProcessInfo.processInfo.environment[maxWidthEnvName])
+
     /// Widths the candidate-owned dispatch may take. M=1 stays on MLX
     /// (serial and the candidate share it, so speeding it does not move the
     /// ratio). M=2 is the pair kernel the library still launches as two
     /// X-groups, one of which returns before any read. Routing it here
     /// applies the same active-group launch the M=3..9 path already uses.
-    static let widths = 2 ... 9
+    static let widths = 2 ... maxWidth
+
+    /// Inputs per threadgroup, per width. THE ONE TABLE: the Metal switch in
+    /// `qwen35E120QMVSource` and the launch witness `activeInputGroups` are
+    /// both generated from it, so a width can never be dispatchable in one and
+    /// unplanned in the other. A width absent from the switch would fall
+    /// through `default: break` and leave the output buffer unwritten, which
+    /// is why the two must not be maintained separately.
+    ///
+    /// LEGALITY. `qwen_e120_qmv_m` carries
+    /// `static_assert(M % IPG != 1)` (see the header above): the tail group
+    /// instantiates `qwen_e120_qmv_wide<TAIL >= 2 ? TAIL : 2>`, so a tail of
+    /// exactly one row would read and write a second row that does not exist.
+    /// Every entry below therefore has `m % ipg != 1`, and among the legal
+    /// choices each takes the one with the fewest groups -- one group is one
+    /// full pass over the weights -- breaking ties toward the smaller `ipg`,
+    /// which is the smaller register footprint.
+    ///
+    ///     m   ipg  m % ipg  groups   why not the alternative
+    ///      2    2     0       1
+    ///      3    3     0       1
+    ///      4    4     0       1
+    ///      5    5     0       1
+    ///      6    3     0       2      ipg 4 -> 6 % 4 = 2, also 2 groups
+    ///      7    4     3       2      ipg 5 -> 7 % 5 = 2, also 2 groups
+    ///      8    4     0       2      ipg 5 -> 8 % 5 = 3, 2 groups
+    ///      9    3     0       3      ipg 5 -> 9 % 5 = 4, 2 groups (shipped 3)
+    ///     10    5     0       2      ipg 4 -> 10 % 4 = 2 but 3 groups
+    ///     11    4     3       3      ipg 5 -> 11 % 5 = 1, ILLEGAL
+    ///     12    4     0       3      ipg 5 -> 12 % 5 = 2, also 3 groups
+    ///     13    5     3       3      ipg 4 -> 13 % 4 = 1, ILLEGAL
+    ///     14    5     4       3      ipg 4 -> 14 % 4 = 2 but 4 groups
+    ///     15    5     0       3      ipg 4 -> 15 % 4 = 3 but 4 groups
+    ///     16    4     0       4      ipg 5 -> 16 % 5 = 1, ILLEGAL
+    ///
+    /// Entries 2...9 are the shipped plan, reproduced exactly. Nothing above
+    /// 5 inputs per group is enabled: `NA` sizes `acc[4]`, `partial[4]`,
+    /// `a0..a3` and `sums`, about `13 * NA` floats per thread, so `ipg = 5`
+    /// is the ~65-float footprint the shipped `m = 5` entry has always paid.
+    /// A larger `ipg` would cut groups further at `m = 15` or `m = 16` but on
+    /// an untested register budget, so it is left out.
+    static let inputGroupPlan: [(Int, Int)] = [
+        (2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3),
+        (10, 5), (11, 4), (12, 4), (13, 5), (14, 5), (15, 5), (16, 4),
+    ]
+
+    /// The plan restricted to the widths this process actually dispatches.
+    /// At the default bound this is exactly the eight shipped entries, so the
+    /// generated Metal source is byte-identical to the shipped kernel.
+    static let enabledInputGroupPlan: [(Int, Int)] = inputGroupPlan.filter {
+        $0.0 <= maxWidth
+    }
+
+    /// Empty at the default bound, so the shipped kernel keeps its shipped
+    /// name. A non-default bound generates a different Metal source, and the
+    /// JIT library cache is keyed on the kernel name, so the name has to move
+    /// with the source.
+    static let kernelNameWidthSuffix =
+        maxWidth == maxWidthDefault ? "" : "_w\(maxWidth)"
 
     /// Lane stride of the chunk-sum table, in floats.
     public static func sumsStride(_ m: Int) -> Int { m <= 8 ? 8 : 16 }
@@ -1819,22 +1918,15 @@ public enum Qwen35CustomQMV {
     /// current shared QMV width table. The Metal body maps group `g` to
     /// `first_m = g * IPG` and returns before any read or write when
     /// `first_m >= M`; launching `M` groups therefore submitted 67--80 %
-    /// no-op groups at every routed width. Keep the table explicit so a future
-    /// width-plan edit must update this launch witness deliberately.
+    /// no-op groups at every routed width. The plan is shared with the Metal
+    /// switch (`inputGroupPlan`), so a width-plan edit moves the launch
+    /// witness and the dispatchable widths together.
     static func activeInputGroups(_ m: Int) -> Int {
-        let inputsPerGroup: Int
-        switch m {
-        case 2: inputsPerGroup = 2
-        case 3: inputsPerGroup = 3
-        case 4: inputsPerGroup = 4
-        case 5: inputsPerGroup = 5
-        case 6: inputsPerGroup = 3
-        case 7: inputsPerGroup = 4
-        case 8: inputsPerGroup = 4
-        case 9: inputsPerGroup = 3
-        default: preconditionFailure("Qwen wide QMV has no width plan for \(m)")
+        guard let entry = enabledInputGroupPlan.first(where: { $0.0 == m })
+        else {
+            preconditionFailure("Qwen wide QMV has no width plan for \(m)")
         }
-        return (m + inputsPerGroup - 1) / inputsPerGroup
+        return (m + entry.1 - 1) / entry.1
     }
 
     /// The chunk-sum table costs one fill dispatch, measured at 4 to 6 us and
