@@ -215,4 +215,22 @@ struct QwenForwardStreamTests {
         #expect(qwen35EpsScalarMisses - afterSecond == 1)
         #expect(!MLX.all(MLX.equal(first, other)).item(Bool.self))
     }
+
+    /// Receipt for Task 5: the packed prework kernel equals the eager chain
+    /// bit for bit at widths 1 through 9, and the control proves the
+    /// comparison can see the conv-state store the generalization adds.
+    @Test("packed gated-delta prework equals the eager chain")
+    func packedPreworkIsByteExact() {
+        let (trials, bad, firstBad) = qwen35VerifyPackedPrework()
+        #expect(trials == 24)
+        #expect(bad == 0, "first mismatching trial: \(firstBad)")
+
+        let control = qwen35PackedPreworkNegativeControl()
+        #expect(
+            control.sensitive,
+            "conv-state row 1 must reach the next conv state at width 1")
+        #expect(
+            control.insensitive,
+            "conv-state row 0 must fall out of the window at width 1")
+    }
 }
