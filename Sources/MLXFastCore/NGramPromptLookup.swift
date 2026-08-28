@@ -70,6 +70,93 @@ public struct NGramPromptLookupConfiguration: Equatable, Sendable {
         ladder: [3, 8, 15, 31],
         ladderThresholds: [3, 5, 8, 12])
 
+    /// Read the policy from the process environment, or nil for "off".
+    ///
+    /// `DARKBLOOM_` and not `MLXFAST_`: the runtime worker starts from an
+    /// empty environment and admits only an allowlist, in which `DARKBLOOM_`
+    /// is a permitted prefix and `MLXFAST_` is deliberately excluded. An
+    /// `MLXFAST_` name would be dropped at spawn and the knob would look
+    /// applied while doing nothing.
+    ///
+    ///     DARKBLOOM_QWEN_LOOKUP_DRAFT        "1" enables; anything else, or
+    ///                                        absent, leaves the feature off
+    ///     DARKBLOOM_QWEN_LOOKUP_LADDER       comma-separated draft counts,
+    ///                                        ascending, default "3,8,15,31"
+    ///     DARKBLOOM_QWEN_LOOKUP_THRESHOLDS   comma-separated matched-suffix
+    ///                                        thresholds, ascending, default
+    ///                                        "3,5,8,12"
+    ///
+    /// The overrides exist so a threshold sweep can hold ONE worker binary
+    /// across every sample. Rebuilding the worker to move a constant
+    /// invalidates every persisted prefill checkpoint and costs a cold
+    /// multi-minute prefill per sample.
+    ///
+    /// A malformed override FAILS CLOSED with a named reason on standard
+    /// error, rather than silently reverting to the shipped policy: a sweep
+    /// that quietly measured the default twice is worse than one that stops.
+    public static func fromEnvironment(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> NGramPromptLookupConfiguration? {
+        guard environment["DARKBLOOM_QWEN_LOOKUP_DRAFT"] == "1" else {
+            return nil
+        }
+        let ladder = parseList(
+            environment["DARKBLOOM_QWEN_LOOKUP_LADDER"],
+            default: shipped.ladder,
+            name: "DARKBLOOM_QWEN_LOOKUP_LADDER")
+        let thresholds = parseList(
+            environment["DARKBLOOM_QWEN_LOOKUP_THRESHOLDS"],
+            default: shipped.ladderThresholds,
+            name: "DARKBLOOM_QWEN_LOOKUP_THRESHOLDS")
+        guard let ladder, let thresholds else { return nil }
+        guard ladder.count == thresholds.count else {
+            refuse(
+                "DARKBLOOM_QWEN_LOOKUP_LADDER has \(ladder.count) entries and "
+                    + "DARKBLOOM_QWEN_LOOKUP_THRESHOLDS has "
+                    + "\(thresholds.count); they must agree")
+            return nil
+        }
+        guard isStrictlyAscending(ladder), isStrictlyAscending(thresholds),
+              ladder[0] >= 1, thresholds[0] >= 1,
+              ladder[ladder.count - 1]
+                  <= NGramPromptLookupIndex.maximumSupportedDrafts
+        else {
+            refuse(
+                "the lookup ladder must be strictly ascending, positive, and "
+                    + "at most "
+                    + "\(NGramPromptLookupIndex.maximumSupportedDrafts) drafts "
+                    + "wide; got \(ladder) with thresholds \(thresholds)")
+            return nil
+        }
+        return NGramPromptLookupConfiguration(
+            minimumOrder: shipped.minimumOrder,
+            maximumOrder: shipped.maximumOrder,
+            candidateSiteLimit: shipped.candidateSiteLimit,
+            ladder: ladder,
+            ladderThresholds: thresholds)
+    }
+
+    /// nil means "the variable was present and unusable"; the default is
+    /// returned only when the variable is absent entirely.
+    private static func parseList(
+        _ raw: String?, default fallback: [Int], name: String
+    ) -> [Int]? {
+        guard let raw else { return fallback }
+        let parts = raw.split(separator: ",", omittingEmptySubsequences: false)
+        let values = parts.compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        guard !values.isEmpty, values.count == parts.count else {
+            refuse("\(name)='\(raw)' is not a comma-separated integer list")
+            return nil
+        }
+        return values
+    }
+
+    private static func refuse(_ reason: String) {
+        FileHandle.standardError.write(Data(
+            ("mlxfast: prompt-lookup drafting refused: " + reason
+                + "; the feature stays off\n").utf8))
+    }
+
     static func isStrictlyAscending(_ values: [Int]) -> Bool {
         for index in 1 ..< Swift.max(values.count, 1)
         where values[index] <= values[index - 1] {
@@ -167,6 +254,58 @@ public final class NGramPromptLookupIndex {
             best = Match(continuationStart: site, matchedSuffixLength: length)
         }
         return best
+    }
+
+    public struct Proposal: Equatable {
+        /// Continuation tokens copied verbatim from the earlier site, in
+        /// order. Exactly one ladder rung long.
+        public let tokens: [Int]
+        public let matchedSuffixLength: Int
+
+        /// Spelled out rather than left to the memberwise initializer, which a
+        /// public struct declares as internal and which the tests in the
+        /// consuming module therefore cannot call.
+        public init(tokens: [Int], matchedSuffixLength: Int) {
+            self.tokens = tokens
+            self.matchedSuffixLength = matchedSuffixLength
+        }
+    }
+
+    /// The drafts this round should propose, or nil when nothing qualifies.
+    ///
+    /// The count is always a ladder rung, never the raw amount of context that
+    /// happens to be available. A width off the ladder would be a verify shape
+    /// the warm never compiled, and the first round to hit it would pay a
+    /// Metal pipeline compile inside the request.
+    public func propose() -> Proposal? {
+        guard let match = longestMatch() else { return nil }
+        guard let unlocked = rung(
+            forMatchedSuffixLength: match.matchedSuffixLength)
+        else { return nil }
+        // Bounded by where the CURRENT occurrence of the matched suffix
+        // begins, not by the end of history. Tokens at or past that point
+        // only reproduce the matched context itself rather than offering a
+        // genuinely earlier continuation to draft from.
+        let currentMatchStart = history.count - match.matchedSuffixLength
+        let available = currentMatchStart - match.continuationStart
+        let allowed = Swift.min(unlocked, available)
+        guard let count = configuration.ladder.last(where: { $0 <= allowed })
+        else { return nil }
+        let end = match.continuationStart + count
+        return Proposal(
+            tokens: Array(history[match.continuationStart ..< end]),
+            matchedSuffixLength: match.matchedSuffixLength)
+    }
+
+    /// The widest rung this agreement length unlocks, or nil below the lowest
+    /// threshold.
+    func rung(forMatchedSuffixLength length: Int) -> Int? {
+        var unlocked: Int?
+        for (index, threshold) in configuration.ladderThresholds.enumerated()
+        where length >= threshold {
+            unlocked = configuration.ladder[index]
+        }
+        return unlocked
     }
 
     /// How many tokens immediately before `site` equal the tokens immediately
