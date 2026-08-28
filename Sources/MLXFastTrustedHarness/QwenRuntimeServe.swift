@@ -458,7 +458,9 @@ extension QwenRuntime {
         var exitCause = "budget-or-loop-end"
 
         while !done, emitted.count < budget {
+            let roundStarted = Date()
             let response = try context.client.mtpDecodeRound(depth: depth)
+            stats.workerRoundSeconds += Date().timeIntervalSince(roundStarted)
             guard response.ok, let tokens = response.tokens else {
                 throw MLXFastError.invalidInput(
                     "the MTP worker failed a decode round: "
@@ -486,17 +488,26 @@ extension QwenRuntime {
             // Decode the whole prefix each round: Qwen uses byte-level BPE, so a
             // token can carry a fragment of a multi-byte character and decoding
             // tokens singly produces replacement characters at the seams.
+            let decodeStarted = Date()
             full = tokenizer.decode(tokens: emitted, skipSpecialTokens: true)
+            stats.detokenizeSeconds += Date().timeIntervalSince(decodeStarted)
 
-            if let stop = firstStopHit(in: full, stopStrings: stopStrings) {
+            let stopStarted = Date()
+            let stopHit = firstStopHit(in: full, stopStrings: stopStrings)
+            stats.stopScanSeconds += Date().timeIntervalSince(stopStarted)
+            if let stop = stopHit {
                 exitCause = "stop-string"
                 full = String(full[full.startIndex..<stop])
                 done = true
             }
 
+            let gateStarted = Date()
             let admitted = gate.admit(full)
+            stats.gateSeconds += Date().timeIntervalSince(gateStarted)
             if let onDelta, !admitted.delta.isEmpty {
+                let emitStarted = Date()
                 onDelta(admitted.delta)
+                stats.streamEmitSeconds += Date().timeIntervalSince(emitStarted)
             }
             if admitted.sawToolCall { finishReason = "tool_calls" }
             if tokens.isEmpty {

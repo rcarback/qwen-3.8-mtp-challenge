@@ -52,6 +52,31 @@ extension QwenRuntime {
         var seconds = 0.0
         var seedPrefillSeconds = 0.0
 
+        // PER-ROUND PARENT SEGMENTS. `seconds` covers the whole turn and
+        // `workerRoundSeconds` covers the part of it the worker owned, so the
+        // difference between them is the parent's own between-round work --
+        // the window in which the worker is blocked on read and the GPU is
+        // idle. The four segments below name where that window goes.
+        var workerRoundSeconds = 0.0
+        var detokenizeSeconds = 0.0
+        var stopScanSeconds = 0.0
+        var gateSeconds = 0.0
+        var streamEmitSeconds = 0.0
+
+        /// Parent work between rounds, by subtraction rather than by summing
+        /// the four segments: anything unaccounted for belongs here rather
+        /// than disappearing.
+        var hostTailSeconds: Double {
+            Swift.max(0, seconds - seedPrefillSeconds - workerRoundSeconds)
+        }
+
+        /// The host tail as a share of the decode window. This is the number
+        /// this plan moves.
+        var hostTailShare: Double? {
+            let decodeSeconds = seconds - seedPrefillSeconds
+            return decodeSeconds > 0 ? hostTailSeconds / decodeSeconds : nil
+        }
+
         var proposedDrafts: Int { acceptedDrafts + rejectedDrafts }
 
         /// Share of proposed drafts the target kept. This is THE number the
@@ -336,6 +361,14 @@ extension QwenRuntime {
             fields.append(String(format: "%.2f tok/round", perRound))
         }
         fields.append("\(stats.emittedTokens) tok in \(stats.rounds) rounds")
+        if let share = stats.hostTailShare {
+            fields.append(String(
+                format: "host tail %.2fs (%.0f%%) [detok %.2f stop %.2f "
+                    + "gate %.2f stream %.2f]",
+                stats.hostTailSeconds, share * 100,
+                stats.detokenizeSeconds, stats.stopScanSeconds,
+                stats.gateSeconds, stats.streamEmitSeconds))
+        }
         fields.append(String(
             format: "prefill %.2fs", stats.seedPrefillSeconds))
         let bar = fields.joined(separator: " │ ")
