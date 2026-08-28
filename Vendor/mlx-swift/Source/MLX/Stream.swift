@@ -51,8 +51,12 @@ public struct StreamOrDevice: Sendable, CustomStringConvertible, Equatable {
     /// - ``GPU``
     public static var gpu: StreamOrDevice { device(.gpu) }
 
+    /// Wrap an explicit ``Stream``.
+    ///
+    /// The returned value carries the given stream, so an op dispatched with
+    /// `stream: .stream(s)` runs on `s` -- and therefore on `s`'s device.
     public static func stream(_ stream: Stream) -> StreamOrDevice {
-        StreamOrDevice(Device.defaultStream())
+        StreamOrDevice(stream)
     }
 
     /// Internal context -- used with Cmlx calls.
