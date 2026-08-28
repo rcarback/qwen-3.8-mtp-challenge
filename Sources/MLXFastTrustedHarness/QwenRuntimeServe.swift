@@ -480,6 +480,48 @@ extension QwenRuntime {
         }
     }
 
+    /// Whole-prefix decode, computed from a bounded token suffix.
+    ///
+    /// The whole-prefix decode at `QwenRuntimeServe`'s round loop is quadratic
+    /// in the reply length. It cannot become a per-token decode, because Qwen
+    /// uses byte-level byte-pair encoding and a character can straddle tokens.
+    /// It CAN become a suffix decode plus a splice: a character spans at most
+    /// four bytes and therefore at most four tokens, so re-decoding the last
+    /// `window` tokens and keeping everything before the resulting overlap
+    /// point reproduces the whole-prefix decode as long as `window` exceeds
+    /// four. The default is sixteen.
+    ///
+    /// The committed prefix is only ever extended by the part of a suffix
+    /// decode that a LATER decode can no longer change, which is everything
+    /// except the last `window` tokens' worth of text. Nothing is committed
+    /// until it is out of reach of a seam repair.
+    struct IncrementalDetokenizer {
+        let window: Int
+        /// Text for `tokens[0 ..< committedTokens]`, known stable.
+        private var committedText = ""
+        private var committedTokens = 0
+
+        init(window: Int = 16) {
+            self.window = Swift.max(1, window)
+        }
+
+        mutating func text(
+            for tokens: [Int],
+            decode: (ArraySlice<Int>) -> String
+        ) -> String {
+            guard !tokens.isEmpty else { return "" }
+            // Everything from `committedTokens` on is re-decoded each call, so
+            // the committed point must never advance past `tokens.count -
+            // window`; beyond that a later token could still repair a seam.
+            let safeCommit = Swift.max(0, tokens.count - window)
+            if safeCommit > committedTokens {
+                committedText = decode(tokens[0 ..< safeCommit])
+                committedTokens = safeCommit
+            }
+            return committedText + decode(tokens[committedTokens...])
+        }
+    }
+
     /// Read the sampling knobs off the request. Absent or zero temperature is
     /// greedy, which is the session's untouched argmax path.
     private static func samplingFor(
@@ -557,6 +599,7 @@ extension QwenRuntime {
         var full = ""
         var stage = ServeRoundText(
             stopStrings: stopStrings, streaming: onDelta != nil)
+        var detokenizer = IncrementalDetokenizer()
         var finishReason = "stop"
         var done = false
         // Local diagnostic: the stats bar reports how many tokens a turn
@@ -593,7 +636,9 @@ extension QwenRuntime {
             }
 
             let text = stage.advance {
-                tokenizer.decode(tokens: emitted, skipSpecialTokens: true)
+                detokenizer.text(for: emitted) {
+                    tokenizer.decode(tokens: Array($0), skipSpecialTokens: true)
+                }
             }
             stats.detokenizeSeconds += text.decodeSeconds
             stats.stopScanSeconds += text.stopSeconds
@@ -616,7 +661,9 @@ extension QwenRuntime {
         }
 
         let finalText = stage.finish {
-            tokenizer.decode(tokens: emitted, skipSpecialTokens: true)
+            detokenizer.text(for: emitted) {
+                tokenizer.decode(tokens: Array($0), skipSpecialTokens: true)
+            }
         }
         stats.detokenizeSeconds += finalText.decodeSeconds
         stats.gateSeconds += finalText.gateSeconds
