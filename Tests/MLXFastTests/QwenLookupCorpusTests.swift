@@ -127,8 +127,7 @@ struct QwenLookupCorpusTests {
             gateMean, pooledAtFiveOrMore.count))
         #expect(
             gateMean >= 4.0,
-            "prompt-lookup drafting does not pay on this corpus: mean run "
-                + "\(gateMean) at k >= 5 is below the rung-8 break-even of 4")
+            "prompt-lookup drafting does not pay on this corpus: mean run \(gateMean) at k >= 5 is below the rung-8 break-even of 4")
     }
 
     /// How many consecutive tokens starting at `from` equal the tokens
