@@ -1683,6 +1683,62 @@ public final class Qwen36MTPBlockSession {
         Swift.min(offeredDepth, 1)
     }
 
+    // MARK: - draft source (LOCAL SERVE FORK)
+
+    /// Where this round's drafts come from.
+    ///
+    /// `.none` is a one-token serial forward, whether because the parent
+    /// offered depth 0 or because the schedule declined the offer. `.head` is
+    /// the shipped autoregressive or block drafter. `.lookup` is the local
+    /// serve fork's prompt-lookup source, which carries its own host-side
+    /// tokens and runs no proposal forward at all.
+    enum DraftSource: Equatable {
+        case none
+        case head(Int)
+        case lookup([Int])
+    }
+
+    /// Choose this round's draft source.
+    ///
+    /// A LOOKUP PROPOSAL WINS whenever one exists. The arithmetic behind that:
+    /// a head round at depth 4 costs about `V * (1 + 4 * headStepCostRatio)`
+    /// and commits about 3 tokens at the accept rates this pool shows, roughly
+    /// 45 ms per token. The lowest lookup rung costs one 4-row verify, 79.4 ms,
+    /// and pays from a single accepted draft. Confidence is controlled by the
+    /// index's matched-suffix thresholds, not by competing with the head here.
+    ///
+    /// A rejected lookup draft costs one wasted verify row -- it cannot change
+    /// an emitted token, because the target verifies every drafted row and the
+    /// accept walk takes only the correct prefix. Degraded lookup quality is
+    /// therefore a throughput regression here, never a correctness one.
+    ///
+    /// `lookupProposal` is an autoclosure so the SERIAL CONTROL never evaluates
+    /// it. Depth 0 is the denominator this track divides by; its compute stream
+    /// must stay exactly what it was.
+    static func resolveDraftSource(
+        offeredDepth: Int,
+        headDraftCount: Int,
+        lookupProposal: @autoclosure () -> NGramPromptLookupIndex.Proposal?
+    ) -> DraftSource {
+        guard offeredDepth != Qwen36MTPLimits.serialControlDepth else {
+            return .none
+        }
+        if let proposal = lookupProposal(),
+           !proposal.tokens.isEmpty,
+           proposal.tokens.count <= Qwen36MTPLimits.maxLookupDepth
+        {
+            return .lookup(proposal.tokens)
+        }
+        return headDraftCount == 0 ? .none : .head(headDraftCount)
+    }
+
+    /// Verify widths a lookup round can dispatch that the head's own warm loop
+    /// never compiles. The head loop covers `1 ... maxDepth + 1`, so only the
+    /// rungs above it need warming.
+    static func lookupWarmWidths(ladder: [Int]) -> [Int] {
+        ladder.map { $0 + 1 }.filter { $0 > Qwen36MTPLimits.maxDepth + 1 }
+    }
+
     /// Consecutive fully-accepted DRAFTING rounds. Kept as a public-ish
     /// telemetry counter; the cost-model schedule below reads the per-position
     /// EMAs, not this.
@@ -3398,4 +3454,20 @@ public enum Qwen36MTPLimits {
     /// `MLXFastConstants.qwenMTPSerialControlDepth` for why this is 0 and not 1.
     public static let serialControlDepth =
         MLXFastConstants.qwenMTPSerialControlDepth
+
+    /// The widest a LOOKUP-sourced round may draft.
+    ///
+    /// Deliberately a SEPARATE number from `maxDepth`, and deliberately not
+    /// derived from it. `maxDepth` is the trusted maximum: it is mirrored in
+    /// the contract fixture, the ranked workflow, the manifest and the box
+    /// wrapper's row accounting, and `QwenMTPDepthFreedomTests` pins all five
+    /// to 8. Raising it here would silently re-tune what the ranked ledger
+    /// accepts.
+    ///
+    /// This bound governs only the LOCAL SERVE FORK's prompt-lookup source,
+    /// which is excluded from the ranked track outright. It is 31 because 31
+    /// drafts plus the primary is a 32-row verify, the widest MEASURED point
+    /// on the cost sweep, where a row costs about 10.5 ms against a 53.3 ms
+    /// serial step.
+    public static let maxLookupDepth = 31
 }
