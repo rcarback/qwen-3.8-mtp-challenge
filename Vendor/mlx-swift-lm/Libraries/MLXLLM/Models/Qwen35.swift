@@ -5680,6 +5680,62 @@ public func qwen35PackedPreworkNegativeControl(
     )
 }
 
+/// Prices the candidate-owned width-1 QMV dispatch against MLX's own, on the
+/// widest shape a decode round reaches (the fused gate-and-up projection), and
+/// checks that the two agree bit for bit before the timing means anything.
+///
+/// Returns microseconds per call for each arm and whether the outputs matched.
+public func qwen35BenchWidth1QMV(
+    iters: Int = 200, seed: UInt64 = 1
+) -> (mlxMicroseconds: Double, replicaMicroseconds: Double, equal: Bool) {
+    MLXRandom.seed(seed)
+    let k = 5120
+    let n = 34816
+    let groupSize = 64
+    let x = MLXRandom.normal([1, 1, k]).asType(.bfloat16)
+    let w = MLXRandom.randInt(Int32(0) ..< Int32(4096), [n, k / 8])
+        .asType(.uint32)
+    let scales = MLXRandom.normal([n, k / groupSize]).asType(.bfloat16)
+    let biases = MLXRandom.normal([n, k / groupSize]).asType(.bfloat16)
+    eval(x, w, scales, biases)
+
+    let replica = Qwen35CustomQMV.matmul(
+        x, w, scales: scales, biases: biases,
+        groupSize: groupSize, bits: 4, mode: .affine)
+    let reference = quantizedMM(
+        x, w, scales: scales, biases: biases, transpose: true,
+        groupSize: groupSize, bits: 4, mode: .affine)
+    guard let replica else {
+        return (0, 0, false)
+    }
+    eval(replica, reference)
+    let equal = MLX.all(MLX.equal(replica, reference)).item(Bool.self)
+
+    func time(_ body: () -> MLXArray) -> Double {
+        var warm = body()
+        eval(warm)
+        let start = Date()
+        for _ in 0 ..< iters {
+            warm = body()
+            eval(warm)
+        }
+        return 1_000_000 * Date().timeIntervalSince(start) / Double(iters)
+    }
+
+    let mlxMicroseconds = time {
+        quantizedMM(
+            x, w, scales: scales, biases: biases, transpose: true,
+            groupSize: groupSize, bits: 4, mode: .affine)
+    }
+    let replicaMicroseconds = time {
+        Qwen35CustomQMV.matmul(
+            x, w, scales: scales, biases: biases,
+            groupSize: groupSize, bits: 4, mode: .affine)
+            ?? MLXArray.zeros([1])
+    }
+    return (mlxMicroseconds, replicaMicroseconds, equal)
+}
+
 /// A gated-delta layer at the pinned geometry and a small hidden size, with
 /// every parameter cast to BF16 as the checkpoint carries them. Fixture for
 /// the prework receipts above; never on a serve path.

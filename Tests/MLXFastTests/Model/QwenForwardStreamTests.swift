@@ -233,4 +233,28 @@ struct QwenForwardStreamTests {
             control.insensitive,
             "conv-state row 0 must fall out of the window at width 1")
     }
+
+    /// Evaluation for Task 7. Prints the two arms and asserts only the thing
+    /// that must hold whatever the timing says: the width-1 replica returns
+    /// the same bytes MLX does. The speed question is decided by reading the
+    /// printed numbers, not by an assertion.
+    @Test("width-1 quantized matmul dispatch")
+    func width1QMVDispatch() {
+        let result = qwen35BenchWidth1QMV()
+        print(String(
+            format: "\n[width-1 QMV] mlx %.1f us   replica %.1f us"
+                + "   ratio %.3f   equal %@",
+            result.mlxMicroseconds, result.replicaMicroseconds,
+            result.mlxMicroseconds > 0
+                ? result.replicaMicroseconds / result.mlxMicroseconds : 0,
+            result.equal ? "yes" : "NO"))
+        // A declined replica (widths excludes 1, both arms report 0 us) is a
+        // recorded outcome, not a mismatch: the equality invariant binds only
+        // when the replica actually ran. Measured 2026-08-28: with width 1
+        // enabled the replica ran 2.9x faster (175 vs 506 us) but was NOT
+        // bit-exact, so the exclusion stays per the plan's hard stop.
+        if result.mlxMicroseconds > 0 {
+            #expect(result.equal, "the width-1 replica does not match MLX")
+        }
+    }
 }
