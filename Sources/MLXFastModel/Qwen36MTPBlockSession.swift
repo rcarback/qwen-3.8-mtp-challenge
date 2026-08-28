@@ -2087,6 +2087,38 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 7
+
+    /// Rows of seed history the head is primed with, or nil for all of them.
+    ///
+    /// The head cache is unbounded and nothing trims its head, so an uncapped
+    /// prime makes every later draft step attend over the whole prompt: 4,096
+    /// bytes per seed token, per step, for the life of the session. The ranked
+    /// 512-token window never notices; a serve session with a large prompt
+    /// does. `MLX_QWEN_MTP_HEAD_PRIME_CAP` sets it; unset primes everything,
+    /// which is the behaviour before this cap existed.
+    ///
+    /// PROPOSAL-CHANGING. The head sees less history and therefore proposes
+    /// different tokens. It cannot change an emitted token.
+    internal static let headPrimingRowCap: Int? =
+        ProcessInfo.processInfo
+            .environment["MLX_QWEN_MTP_HEAD_PRIME_CAP"]
+            .flatMap(Int.init)
+            .flatMap { $0 > 0 ? $0 : nil }
+
+    /// Which seed rows and which seed tokens the prime keeps.
+    ///
+    /// The layout is MTPLX priming: hidden row `i` pairs with token `i + 1`,
+    /// because the hidden state at `t` predicts alongside token `t + 1`. A cap
+    /// keeps the LAST pairs, so both ranges shift by the same amount and stay
+    /// the same length.
+    internal static func headPrimingRange(
+        primeCount: Int, cap: Int?
+    ) -> (hiddenRows: Range<Int>, tokenIndices: Range<Int>) {
+        let kept = cap.map { Swift.min($0, primeCount) } ?? primeCount
+        let start = primeCount - kept
+        return (start ..< primeCount, (start + 1) ..< (primeCount + 1))
+    }
+
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
@@ -2516,10 +2548,20 @@ public final class Qwen36MTPBlockSession {
                 {
                     // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
                     // tokens 1..L-1 (hidden at t predicts alongside token t+1).
+                    // `headPrimingRange` applies the cap to both halves together
+                    // so the pairing survives it.
                     let primeCount = seedTokensForPriming.count - 1
+                    let kept = Self.headPrimingRange(
+                        primeCount: primeCount, cap: Self.headPrimingRowCap)
                     flushHidden.append(
-                        model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
-                    flushTokens.append(contentsOf: seedTokensForPriming[1...])
+                        model.applyFinalNorm(
+                            seedHidden[
+                                0...,
+                                kept.hiddenRows.lowerBound
+                                    ..< kept.hiddenRows.upperBound,
+                                0...]))
+                    flushTokens.append(
+                        contentsOf: seedTokensForPriming[kept.tokenIndices])
                 }
                 seedHiddenForPriming = nil
                 seedTokensForPriming = []
