@@ -20,25 +20,36 @@ namespace mlx::core {
 
 namespace {
 
-// --- BMPROBE: opt-in row-tile (bm) knob for the qmm_t microbenchmark. ---
+// --- Row-tile (bm) selection for qmm_t, plus the A/B knobs it was chosen with. ---
 //
-// Shipped behaviour is unchanged when MLX_QMM_BM is unset: bm stays 32 and the
-// kernel name keeps its historical spelling. The probe times a 16-row
-// accumulator tile against the shipped 32-row one, so the bm value is folded
-// into the JIT kernel name -- the library cache in jit_kernels.cpp is keyed on
-// that name alone, and without the suffix the second arm would silently reuse
-// the first arm's compiled pipeline. Only qmm() and qmm_splitk() consult this;
-// the gather_qmm family is untouched.
-// Read fresh on every dispatch, never cached: the probe flips arms inside one
-// process so that thermal drift hits both equally, and a cached value would
-// pin the whole run to whichever arm ran first.
-inline int qmm_probe_bm() {
+// The bm value is folded into the JIT kernel name: the library cache in
+// jit_kernels.cpp is keyed on that name alone, so without the suffix a 16-row
+// request would silently be served a cached 32-row pipeline (or the reverse),
+// leaving rows unwritten. Only qmm() and qmm_splitk() consult this; the
+// gather_qmm family is untouched.
+// Read fresh on every dispatch, never cached: bm now depends on M, and an A/B
+// flips arms inside one process so thermal drift hits both equally.
+inline int qmm_row_tile(int M) {
+  // Rows 1..M are useful; the kernel computes a full BM-row accumulator tile
+  // and clips at the store, so a narrow call throws away BM - M rows of MMA
+  // work. At M <= 16 a 16-row tile does half the MMA for the SAME weight
+  // traffic, because ceil(M/16) == ceil(M/32) == 1 there. Above 16 a second
+  // tile appears and weight traffic doubles, which costs more than the MMA it
+  // saves. So the guard is the whole change: measured 2026-08-28 on the real
+  // forward at depth ~2k, BM=16 is 1.30x at M=12 and 1.38x at M=16, and
+  // 0.79-0.81x at M=24 and M=32.
+  //
+  // MLX_QMM_BM overrides the rule for A/B work; MLX_QMM_BM_COLLIDE reproduces
+  // the name-cache hazard on purpose (see qmm_probe_suffix). Neither is read
+  // on the shipped path when unset.
   const char* e = std::getenv("MLX_QMM_BM");
-  if (e == nullptr) {
-    return 32;
+  if (e != nullptr) {
+    int v = std::atoi(e);
+    if (v == 16 || v == 32) {
+      return v;
+    }
   }
-  int v = std::atoi(e);
-  return (v == 16 || v == 32) ? v : 32;
+  return M <= 16 ? 16 : 32;
 }
 
 // When set, the bm suffix is omitted from the kernel name while bm still drives
@@ -789,7 +800,7 @@ void qmm(
 
   int wm = 2;
   int wn = 2;
-  int bm = qmm_probe_bm();
+  int bm = qmm_row_tile(M);
   int bn = 32;
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
@@ -875,7 +886,7 @@ void qmm_splitk(
     const Stream& s,
     const std::string& mode) {
   // Choose split_k to target ~512 threadgroups
-  int bm = qmm_probe_bm(), bn = 32;
+  int bm = qmm_row_tile(M), bn = 32;
   int n_tiles = (N + bn - 1) / bn;
   int m_tiles = (M + bm - 1) / bm;
   int current_tgs = n_tiles * m_tiles;
