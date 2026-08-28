@@ -250,7 +250,7 @@ struct QwenPhaseBreakdownTests {
             widths: [1, 2, 3, 4, 8, 9, 12, 16, 24, 32, 33, 48],
             filled: &filled)
 
-        // ---- MTP head draft chain ----
+        // ---- MTP head draft chain, decomposed ----
         if model.hasMTPHead {
             let (logits, hidden) = model.callWithHidden(
                 input: LMInput.Text(tokens: tokens(1, offset: filled)),
@@ -263,21 +263,119 @@ struct QwenPhaseBreakdownTests {
             eval(h, next)
 
             let mtpCache = model.makeMTPCache()
-            let t0 = Date()
-            var lastID: MLXArray = next
-            for _ in 0 ..< 8 {
-                let h2 = model.mtpHeadHiddenForward(
+            let cost = Qwen36MTPHeadCost.pinnedQwen38Head
+            let projectionBytes = Qwen36MTPHeadCost.projectionBytes(
+                rows: 98_336, hiddenSize: 5_120, bits: 4, groupSize: 64)
+
+            // Arm 1: the flush step the serve path takes, through the
+            // key/value-only history call, with a three-row flush.  The head
+            // cache is empty here, so this is also what a fresh round pays.
+            let flushRows = 3
+            let flushHidden = concatenated(
+                (0 ..< flushRows).map { _ in h }, axis: 1)
+            let flushTokens = concatenated(
+                (0 ..< flushRows).map { _ in next }, axis: 1)
+            let tFlush0 = Date()
+            let flushOut = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                hidden: flushHidden, nextTokenIds: flushTokens,
+                cache: mtpCache)
+            let usedKVOnlyPath = flushOut != nil
+            let flushResult = flushOut
+                ?? model.mtpHeadHiddenForward(
+                    hidden: flushHidden, nextTokenIds: flushTokens,
+                    cache: mtpCache)
+            let tFlush1 = Date()
+            eval(flushResult)
+            let tFlush2 = Date()
+            h = flushResult[0..., (flushResult.dim(1) - 1)..., 0...]
+            next = model.draftTokenID(h)
+            eval(next)
+
+            // Arm 2: seven pure one-row chain steps, each with its own build
+            // and eval boundary, head forward and draft projection separated.
+            var headBuilds: [Double] = []
+            var headEvals: [Double] = []
+            var projectionBuilds: [Double] = []
+            var projectionEvals: [Double] = []
+            for _ in 0 ..< 7 {
+                let t0 = Date()
+                let stepHidden = model.mtpHeadHiddenForward(
                     hidden: h, nextTokenIds: next, cache: mtpCache)
-                next = model.draftTokenID(h2)
-                h = h2
-                lastID = next
+                let t1 = Date()
+                eval(stepHidden)
+                let t2 = Date()
+                let id = model.draftTokenID(stepHidden)
+                let t3 = Date()
+                eval(id)
+                let t4 = Date()
+                headBuilds.append(t1.timeIntervalSince(t0))
+                headEvals.append(t2.timeIntervalSince(t1))
+                projectionBuilds.append(t3.timeIntervalSince(t2))
+                projectionEvals.append(t4.timeIntervalSince(t3))
+                h = stepHidden
+                next = id
             }
-            eval(lastID)
-            let chain = Date().timeIntervalSince(t0)
+
+            // Arm 3: the shipped shape, eight steps built lazily and evaluated
+            // once, so this decomposition stays comparable to the number the
+            // earlier revision of this instrument reported.
+            let chainCache = model.makeMTPCache()
+            var chainHidden = h
+            var chainID = next
+            let tChain0 = Date()
+            for _ in 0 ..< 8 {
+                chainHidden = model.mtpHeadHiddenForward(
+                    hidden: chainHidden, nextTokenIds: chainID,
+                    cache: chainCache)
+                chainID = model.draftTokenID(chainHidden)
+            }
+            eval(chainID)
+            let chainSeconds = Date().timeIntervalSince(tChain0)
+
+            func median(_ values: [Double]) -> Double {
+                let sorted = values.sorted()
+                return sorted[sorted.count / 2]
+            }
+            let headBuild = median(headBuilds)
+            let headEval = median(headEvals)
+            let projectionBuild = median(projectionBuilds)
+            let projectionEval = median(projectionEvals)
+            let stepSeconds =
+                headBuild + headEval + projectionBuild + projectionEval
+            let historyRows = mtpCache.first?.offset ?? 0
+            let headBytes = cost.headModuleBytes
+                + historyRows * cost.headKVBytesPerRow
+
+            func rate(_ bytes: Int, _ seconds: Double) -> Double {
+                Double(bytes) / seconds / 1_000_000_000
+            }
+
             print(String(
-                format: "\n[MTP head @ depth ~2k] 8-draft chain %.1f ms"
-                    + "  (%.2f ms/draft, lazy chain, one eval)",
-                1000 * chain, 1000 * chain / 8))
+                format: """
+
+                    [MTP head @ depth ~2k] head history %d rows, \
+                    key/value-only path %@
+                      flush step (%d rows)  build %6.2f ms   eval %6.2f ms
+                      head module          build %6.2f ms   eval %6.2f ms   \
+                    %6.1f GB/s
+                      draft projection     build %6.2f ms   eval %6.2f ms   \
+                    %6.1f GB/s
+                      one step             %6.2f ms   host share %4.1f%%   \
+                    %6.1f GB/s
+                      8-step lazy chain    %6.2f ms   (%.2f ms/draft)
+                    """,
+                historyRows, usedKVOnlyPath ? "taken" : "NOT taken",
+                flushRows,
+                1000 * tFlush1.timeIntervalSince(tFlush0),
+                1000 * tFlush2.timeIntervalSince(tFlush1),
+                1000 * headBuild, 1000 * headEval,
+                rate(headBytes, headEval),
+                1000 * projectionBuild, 1000 * projectionEval,
+                rate(projectionBytes, projectionEval),
+                1000 * stepSeconds,
+                100 * (headBuild + projectionBuild) / stepSeconds,
+                rate(headBytes + projectionBytes, stepSeconds),
+                1000 * chainSeconds, 1000 * chainSeconds / 8))
         }
 
         // ---- lm_head projection + argmax, the verify's sampling cost ----
