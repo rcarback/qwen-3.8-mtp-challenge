@@ -183,9 +183,72 @@ struct QwenPhaseBreakdownTests {
             filled += 1024
         }
 
+        // Per-layer attribution at the verify widths this plan optimizes.
+        // The seam is unfused and synced per layer (Qwen35.swift:6306), so
+        // treat the SHARES as the signal, not the totals: it runs the plain
+        // layer call rather than the boundary-fused chain the production
+        // forward uses.
+        for m in [16, 32] {
+            let fused = fusedChunk(cache: cache, width: m, offset: filled)
+            filled += m
+            if let p = profiledChunk(cache: cache, width: m, offset: filled) {
+                filled += m
+                report("verify width \(m) @ depth ~2k", p, fusedSeconds: fused)
+            }
+        }
+
+        // Mask hypothesis: `createSSMMask` returns nil without left padding or
+        // lengths (KVCache.swift:1397-1405), and the full-attention mask is
+        // symbolic `.causal` unless a subclass overrides `makeMask`
+        // (KVCache.swift:160-174). Name the concrete types so the reading is
+        // checked against the objects the serve path actually builds.
+        do {
+            let probe = MLXArray.zeros([1, 32], dtype: .int32)
+            let ssm = createSSMMask(h: probe, cache: cache[0] as? MambaCache)
+            let fa = createAttentionMask(h: probe, cache: cache[3])
+            print("\n[masks at width 32] "
+                + "ssm=\(ssm == nil ? "nil" : "array\(ssm!.shape)")  "
+                + "fa=\(fa)  "
+                + "ssm cache=\(type(of: cache[0]))  "
+                + "fa cache=\(type(of: cache[3]))")
+        }
+
+        // Tape hypothesis: one verify-shaped forward, then total the bytes the
+        // gated-delta caches retain for replay.
+        do {
+            let (logits, _) = model.callWithHidden(
+                input: LMInput.Text(tokens: tokens(32, offset: filled)),
+                cache: cache, nConfirmed: 1)
+            eval(logits)
+            filled += 32
+            var tapeBytes = 0
+            var tapedLayers = 0
+            for entry in cache {
+                guard let mamba = entry as? MambaCache,
+                      let tape = mamba.prefixReplayTape
+                else { continue }
+                tapedLayers += 1
+                for array in [
+                    tape.convInput, tape.q, tape.k, tape.v,
+                    tape.a, tape.b, tape.g, tape.beta,
+                ] {
+                    tapeBytes += array.nbytes
+                }
+                if let pre = tape.ssmPre { tapeBytes += pre.nbytes }
+            }
+            print(String(
+                format: "[replay tape at width 32] %d layers, %.1f MB retained",
+                tapedLayers, Double(tapeBytes) / 1_048_576))
+        }
+
+        print("\n[qmv arm] MLX_E120_QMV_ARM="
+            + (ProcessInfo.processInfo.environment["MLX_E120_QMV_ARM"]
+                ?? "<unset, shipped sumtable>"))
+
         widthSweep(
             "decode @ depth ~2k", cache: cache,
-            widths: [1, 2, 4, 8, 9, 16, 32], filled: &filled)
+            widths: [1, 2, 3, 4, 8, 9, 12, 16, 24, 32, 33, 48],
+            filled: &filled)
 
         // ---- MTP head draft chain ----
         if model.hasMTPHead {

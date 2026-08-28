@@ -44,4 +44,66 @@ struct GatedDeltaScanCostTests {
         }
         print("")
     }
+
+    /// The recurrence at VERIFY widths, carrying state across calls the way a
+    /// decode round does.
+    ///
+    /// The kernel body (GatedDelta.swift:60) is a serial `for t` loop and its
+    /// launch geometry (GatedDelta.swift:169) does not depend on T, so the
+    /// prediction is: cost is close to flat in M at these widths, and no step
+    /// appears at 16 or 32. If a step DOES appear here, the scan owns part of
+    /// the plateau after all and Tasks 6 through 8 are mis-aimed.
+    @Test("gated-delta recurrence cost at verify widths")
+    func scanCostAtVerifyWidths() throws {
+        guard ProcessInfo.processInfo
+            .environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else { return }
+        let Hk = 16, Hv = 48, Dk = 128, Dv = 128, B = 1
+        let aLog = MLXRandom.normal([Hv])
+        let dtBias = MLXRandom.normal([Hv])
+        var state = MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+        eval(aLog, dtBias, state)
+
+        print("\nGatedDelta recurrence at verify widths (state carried)")
+        print("      M   seconds   ms/row")
+        var measured: [Int: Double] = [:]
+        for M in [1, 2, 4, 8, 9, 12, 16, 24, 32, 33, 48, 64] {
+            let q = MLXRandom.normal([B, M, Hk, Dk]).asType(.bfloat16)
+            let k = MLXRandom.normal([B, M, Hk, Dk]).asType(.bfloat16)
+            let v = MLXRandom.normal([B, M, Hv, Dv]).asType(.bfloat16)
+            let a = MLXRandom.normal([B, M, Hv])
+            let bb = MLXRandom.normal([B, M, Hv])
+            eval(q, k, v, a, bb)
+            func once() -> (MLXArray, MLXArray) {
+                gatedDeltaUpdate(
+                    q: q, k: k, v: v, a: a, b: bb, aLog: aLog,
+                    dtBias: dtBias, state: state)
+            }
+            for _ in 0 ..< 3 {
+                let (y, s) = once()
+                eval(y, s)
+            }
+            var best = Double.greatestFiniteMagnitude
+            for _ in 0 ..< 5 {
+                let start = Date()
+                let (y, s) = once()
+                eval(y, s)
+                best = Swift.min(best, Date().timeIntervalSince(start))
+            }
+            let (_, nextState) = once()
+            eval(nextState)
+            state = nextState
+            measured[M] = best
+            print(String(
+                format: "  %5d  %8.4f  %7.4f",
+                M, best, 1000 * best / Double(M)))
+        }
+        print("")
+
+        let m1 = try #require(measured[1])
+        let m32 = try #require(measured[32])
+        // The recurrence is 48 of 64 layers. If one width-32 recurrence cost
+        // more than eight width-1 recurrences, the scan is a first-order term
+        // in the wide forward and this plan is aimed at the wrong thing.
+        #expect(m32 < 8 * m1)
+    }
 }
