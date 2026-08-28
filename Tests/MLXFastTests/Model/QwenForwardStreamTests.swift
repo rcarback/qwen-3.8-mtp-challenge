@@ -166,4 +166,17 @@ struct QwenForwardStreamTests {
         }
         print("")
     }
+
+    /// Receipt for Task 2: the compiled g/beta helper equals the eager
+    /// expression bit for bit at every width the decode path uses.
+    @Test("compiled g and beta equal the eager expression")
+    func compiledGBetaIsByteExact() {
+        let (trials, bad, firstBad) = qwen35VerifyCompiledGBeta()
+        #expect(trials == 40)
+        #expect(bad == 0, "first mismatching trial: \(firstBad)")
+
+        let control = qwen35CompiledGBetaNegativeControl()
+        #expect(control.gMoved, "the comparison cannot detect a changed g")
+        #expect(control.betaHeld, "beta must not depend on a")
+    }
 }

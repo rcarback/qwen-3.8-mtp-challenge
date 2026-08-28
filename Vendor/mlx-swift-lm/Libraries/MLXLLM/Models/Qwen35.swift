@@ -743,8 +743,12 @@ final class Qwen35GatedDeltaNet: Module {
                 q: q, k: k, v: v, a: a, b: b,
                 aLog: aLog, dtBias: dtBias, state: state, mask: mask)
         }
-        let beta = sigmoid(b).asType(.float32)
-        let g = exp(negExpALog * softplus(a + dtBias))
+        // Same two expressions, one compiled launch instead of six eager ones.
+        // This is the form the width-2 and width-3-to-9 paths already run
+        // (lines 1020-1023 and 1217-1218); width 1 was the last caller still
+        // building them node by node. `qwen35VerifyCompiledGBeta` is the
+        // byte-equality receipt.
+        let (g, beta) = qwen35CompiledGatedDeltaGBeta(a, b, negExpALog, dtBias)
         let B = q.dim(0)
         let Dk = q.dim(3)
         let Hv = v.dim(2)
@@ -5325,6 +5329,78 @@ public func qwen35BenchMTPHeadStep(
     return (
         median(headBuilds), median(headEvals),
         median(projectionBuilds), median(projectionEvals))
+}
+
+/// Byte-equality receipt for the compiled g/beta helper against the eager
+/// expression the width-1 recurrence path used to build inline.
+///
+/// The two expressions are textually the same — `exp(negExpALog *
+/// softplus(a + dtBias))` and `sigmoid(b).asType(.float32)` — so the only
+/// question this answers is whether `compile(shapeless: true)` changes any
+/// intermediate rounding. It must not: MLX fusion keeps each node's output
+/// dtype. Shapes and dtypes follow the loaded checkpoint, where `dt_bias` and
+/// `A_log` are BF16 and the activations are BF16.
+///
+/// Returns `(trials, bad, firstBad)`.
+public func qwen35VerifyCompiledGBeta(
+    widths: [Int] = [1, 2, 3, 4, 9], trials: Int = 8, seed: UInt64 = 1
+) -> (trials: Int, bad: Int, firstBad: Int) {
+    MLXRandom.seed(seed)
+    let heads = 48
+    var run = 0
+    var bad = 0
+    var firstBad = -1
+    for width in widths {
+        for _ in 0 ..< trials {
+            let a = MLXRandom.normal([1, width, heads]).asType(.bfloat16)
+            let b = MLXRandom.normal([1, width, heads]).asType(.bfloat16)
+            let aLog = MLXRandom.normal([heads]).asType(.bfloat16)
+            let dtBias = MLXRandom.normal([heads]).asType(.bfloat16)
+            let negExpALog = -exp(aLog.asType(.float32))
+            eval(a, b, negExpALog, dtBias)
+            let (g, beta) = qwen35CompiledGatedDeltaGBeta(
+                a, b, negExpALog, dtBias)
+            let gEager = exp(negExpALog * softplus(a + dtBias))
+            let betaEager = sigmoid(b).asType(.float32)
+            eval(g, beta, gEager, betaEager)
+            let same = MLX.all(MLX.equal(g, gEager)).item(Bool.self)
+                && MLX.all(MLX.equal(beta, betaEager)).item(Bool.self)
+            if !same {
+                bad += 1
+                if firstBad < 0 { firstBad = run }
+            }
+            run += 1
+        }
+    }
+    return (run, bad, firstBad)
+}
+
+/// Negative control for `qwen35VerifyCompiledGBeta`. Shifts one element of
+/// `a`, which must move `g` and must leave `beta` alone, and requires the same
+/// comparison to report both facts. A gate that cannot fail is not a gate.
+/// Returns `(gMoved, betaHeld)`.
+public func qwen35CompiledGBetaNegativeControl(
+    seed: UInt64 = 7
+) -> (gMoved: Bool, betaHeld: Bool) {
+    MLXRandom.seed(seed)
+    let heads = 48
+    let a = MLXRandom.normal([1, 1, heads]).asType(.bfloat16)
+    let b = MLXRandom.normal([1, 1, heads]).asType(.bfloat16)
+    let aLog = MLXRandom.normal([heads]).asType(.bfloat16)
+    let dtBias = MLXRandom.normal([heads]).asType(.bfloat16)
+    let negExpALog = -exp(aLog.asType(.float32))
+    eval(a, b, negExpALog, dtBias)
+    var host = a.asType(.float32).asArray(Float.self)
+    host[0] += 1
+    let damaged = MLXArray(host).reshaped([1, 1, heads]).asType(.bfloat16)
+    let (g, beta) = qwen35CompiledGatedDeltaGBeta(a, b, negExpALog, dtBias)
+    let (gDamaged, betaDamaged) = qwen35CompiledGatedDeltaGBeta(
+        damaged, b, negExpALog, dtBias)
+    eval(g, beta, gDamaged, betaDamaged)
+    return (
+        !MLX.all(MLX.equal(g, gDamaged)).item(Bool.self),
+        MLX.all(MLX.equal(beta, betaDamaged)).item(Bool.self)
+    )
 }
 
 /// One backbone forward's published outputs.
