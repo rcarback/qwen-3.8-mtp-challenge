@@ -805,6 +805,10 @@ public final class Qwen36MTPBlockSession {
             // nothing at all. Skipped on the final chunk, where the call site's
             // own batched `eval` covers it.
             if index < tokens.count {
+                // Deliberately still `state` (not `innerState()`): the
+                // prefill barriers co-evaluate a hidden read that dwarfs the
+                // slice cost, and they fire per chunk, not per round. The
+                // decode-round barriers are the ones converted.
                 eval(cache.flatMap { $0.state } + [hidden]
                     + (captured.map { [$0] } ?? []))
             }
@@ -2403,8 +2407,8 @@ public final class Qwen36MTPBlockSession {
             // one in 256 (KVCache.swift:443-454, step 256). Those slices exist
             // only to be evaluated and discarded. `innerState()` returns the
             // same roots without them, and the barrier wants the roots: the
-            // slice depends on the root, so evaluating the root forces
-            // strictly more of the graph, and no host read is taken from these
+            // root subsumes everything the barrier needs while skipping the
+            // throwaway slice ops, and no host read is taken from these
             // arrays. The 48 recurrent layers are unaffected -- `state` and
             // `innerState()` are the same expression there.
             eval(cache.flatMap { $0.innerState() } + [tailIDs, tailValues])

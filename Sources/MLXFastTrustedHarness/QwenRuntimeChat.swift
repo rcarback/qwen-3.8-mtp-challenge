@@ -73,6 +73,9 @@ extension QwenRuntime {
         /// The host tail as a share of the decode window. This is the number
         /// this plan moves.
         var hostTailShare: Double? {
+            // Without a worker-round accumulation the "tail" would be the
+            // whole decode window; omit the field rather than print that.
+            guard workerRoundSeconds > 0 else { return nil }
             let decodeSeconds = seconds - seedPrefillSeconds
             return decodeSeconds > 0 ? hostTailSeconds / decodeSeconds : nil
         }

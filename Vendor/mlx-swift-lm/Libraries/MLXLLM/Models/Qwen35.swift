@@ -773,7 +773,8 @@ final class Qwen35GatedDeltaNet: Module {
         }
         // Same two expressions, one compiled launch instead of six eager ones.
         // This is the form the width-2 and width-3-to-9 paths already run
-        // (lines 1020-1023 and 1217-1218); width 1 was the last caller still
+        // (the boundary fuser and the fused in-projection arm); width 1 was
+        // the last caller still
         // building them node by node. `qwen35VerifyCompiledGBeta` is the
         // byte-equality receipt.
         let (g, beta) = qwen35CompiledGatedDeltaGBeta(a, b, negExpALog, dtBias)
@@ -949,6 +950,7 @@ final class Qwen35GatedDeltaNet: Module {
     ) -> Bool {
         let nKeep = convKernelSize - 1
         return MLXHardwareInfo.isCompiledDecodeSupported
+            && qwen35GatedDeltaMidKernel != nil
             && mask == nil
             && qkv.dim(0) == 1 && qkv.dim(1) >= 1 && qkv.dim(1) <= 9
             && nKeep == 3
@@ -1005,12 +1007,15 @@ final class Qwen35GatedDeltaNet: Module {
     /// packed kernel's receipt compares against, so the two can never describe
     /// different arithmetic.
     fileprivate func referencePrework(
-        qkv: MLXArray, a: MLXArray, b: MLXArray, convState: MLXArray
+        qkv: MLXArray, a: MLXArray, b: MLXArray, convState: MLXArray,
+        convInput existing: MLXArray? = nil
     ) -> Prework {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
         let nKeep = convKernelSize - 1
-        let convInput = concatenated([convState, qkv], axis: 1)
+        // The stashing-prefix caller already built this concat for the tape;
+        // reuse it there so widths above 9 do not pay it twice per layer.
+        let convInput = existing ?? concatenated([convState, qkv], axis: 1)
         let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
         let convOut = silu(conv1d(convInput))
 
@@ -1116,7 +1121,9 @@ final class Qwen35GatedDeltaNet: Module {
         let prework = packedPreworkEligible(
             qkv: qkv, a: a, b: b, convState: convState, mask: mask)
             ? packedPrework(qkv: qkv, a: a, b: b, convState: convState)
-            : referencePrework(qkv: qkv, a: a, b: b, convState: convState)
+            : referencePrework(
+                qkv: qkv, a: a, b: b, convState: convState,
+                convInput: convInput)
         let qNormed = prework.q
         let kNormed = prework.k
         let v = prework.v

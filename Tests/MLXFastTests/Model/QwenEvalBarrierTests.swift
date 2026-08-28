@@ -50,10 +50,11 @@ struct QwenEvalBarrierTests {
         #expect(recurrent.innerState().count == recurrent.state.count)
     }
 
-    /// The barrier change must not move a single token, and this is where
-    /// that is checked: same seed, same depth, same session shape, tokens
-    /// compared position by position against a run recorded before the
-    /// change. Opt-in, because it loads the real backbone and head.
+    /// The barrier change must not move a single token. This run prints the
+    /// first tokens of each depth for eyeball comparison across builds; the
+    /// position-by-position machine check is the serve A/B against the frozen
+    /// trajectories, not this test. Opt-in, because it loads the real
+    /// backbone and head.
     ///
     /// It also prints the per-round wall time, which is the only measurement
     /// of this change that exists before ship point S1.

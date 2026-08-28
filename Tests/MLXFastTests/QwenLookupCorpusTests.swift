@@ -125,6 +125,13 @@ struct QwenLookupCorpusTests {
             format: "  GATE: mean run at k >= 5 is %.2f over %d positions "
                 + "(pass at 5.00, marginal 4.00, stop below)\n",
             gateMean, pooledAtFiveOrMore.count))
+        let band =
+            gateMean >= 5.0
+            ? "PROCEED"
+            : gateMean >= 4.0
+                ? "MARGINAL (raise the rung-8 threshold before shipping)"
+                : "STOP"
+        print(String(format: "  GATE BAND: %@ (mean %.2f)", band, gateMean))
         #expect(
             gateMean >= 4.0,
             "prompt-lookup drafting does not pay on this corpus: mean run \(gateMean) at k >= 5 is below the rung-8 break-even of 4")
