@@ -352,7 +352,10 @@ extension QwenRuntime {
             context.invalidate()
             // Once SSE headers are out the only honest signal left is an abrupt
             // end of stream; before that a 500 still reaches the client.
-            if streaming {
+            // Before the headers are out a real 500 still reaches the client,
+            // and the error text is the only way the fault is visible at all.
+            // Only an already-open stream has to end abruptly.
+            if streaming, responder.didSendHeaders {
                 responder.endSSE()
             } else {
                 responder.sendError(status: 500, message: "\(error)")

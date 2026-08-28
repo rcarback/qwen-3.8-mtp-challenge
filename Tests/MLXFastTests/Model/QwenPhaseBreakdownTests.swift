@@ -1,0 +1,283 @@
+import Foundation
+import MLX
+import MLXLLM
+import MLXHuggingFace
+import MLXLMCommon
+import Testing
+import Tokenizers  // required for #huggingFaceTokenizerLoader() macro expansion
+
+@testable import MLXFastCore
+@testable import MLXFastModel
+
+/// Where does prefill and decode time actually go?  One opt-in instrument,
+/// three tables:
+///
+///   1. Per-layer attribution of a 1024-token prefill chunk (depth 0 and
+///      ~8k), grouped 48 linear vs 16 full-attention blocks, via the
+///      profiling seam in the vendored model.  The seam is unfused and
+///      synced per layer, so its SHARES are the signal and the separately
+///      measured fused total is the truth they scale to.
+///   2. Decode-shaped verify-width sweep: cost of one forward of M rows,
+///      M in 1..32, with the host graph-build and GPU eval halves split so
+///      a debug-built host does not masquerade as GPU time.
+///   3. The MTP head draft chain and the lm_head projection, the two
+///      non-backbone costs a decode round pays.
+///
+///     MLXFAST_RUN_MLX_RUNTIME_TESTS=1 \
+///     MLXFAST_QWEN_PREFILL_WEIGHTS=weights \
+///     MLXFAST_QWEN_PREFILL_HEAD=<head dir> \
+///     swift test --force-resolved-versions --filter phaseBreakdown
+@Suite(.serialized)
+struct QwenPhaseBreakdownTests {
+    @Test("prefill and decode phase breakdown")
+    func phaseBreakdown() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
+            let weights = env["MLXFAST_QWEN_PREFILL_WEIGHTS"],
+            let head = env["MLXFAST_QWEN_PREFILL_HEAD"]
+        else { return }
+
+        let targetURL = URL(fileURLWithPath: weights)
+        let headURL = URL(fileURLWithPath: head)
+        let context = try Qwen36MTPHeadAttachment.withHeadAttached(
+            backboneDirectory: targetURL, headDirectory: headURL
+        ) { _ in
+            let box = UnsafeSendableBox<ModelContext>()
+            let semaphore = DispatchSemaphore(value: 0)
+            Task {
+                box.value = try? await LLMModelFactory.shared.load(
+                    from: targetURL, using: #huggingFaceTokenizerLoader())
+                semaphore.signal()
+            }
+            semaphore.wait()
+            guard let loaded = box.value else {
+                throw MLXFastError.invalidInput("failed to load backbone")
+            }
+            return loaded
+        }
+        guard let model = context.model as? any Qwen36MTPTarget else {
+            Issue.record("backbone is not an MTP target")
+            return
+        }
+
+        func tokens(_ count: Int, offset: Int) -> MLXArray {
+            MLXArray((0 ..< count).map {
+                Int32((($0 + offset) * 7919) % 100_000 + 10)
+            }).reshaped([1, count])
+        }
+
+        /// Fused production forward of one appended chunk, one eval at the
+        /// end: the truth the profiled shares scale to.
+        @discardableResult
+        func fusedChunk(
+            cache: [any KVCache], width: Int, offset: Int
+        ) -> Double {
+            let start = Date()
+            let (_, hidden) = model.callWithHidden(
+                input: LMInput.Text(tokens: tokens(width, offset: offset)),
+                cache: cache, nConfirmed: 0)
+            eval(hidden)
+            return Date().timeIntervalSince(start)
+        }
+
+        func profiledChunk(
+            cache: [any KVCache], width: Int, offset: Int
+        ) -> Qwen35LayerProfile? {
+            let input = tokens(width, offset: offset)
+            if let top = context.model as? MLXLLM.Qwen35Model {
+                return top.profiledLayerForward(input, cache: cache)
+            }
+            if let text = context.model as? Qwen35TextModel {
+                return text.profiledLayerForward(input, cache: cache)
+            }
+            return nil
+        }
+
+        func report(
+            _ label: String, _ profile: Qwen35LayerProfile,
+            fusedSeconds: Double
+        ) {
+            let linearTotal = zip(profile.layerSeconds, profile.layerIsLinear)
+                .filter { $0.1 }.map { $0.0 }.reduce(0, +)
+            let fullTotal = zip(profile.layerSeconds, profile.layerIsLinear)
+                .filter { !$0.1 }.map { $0.0 }.reduce(0, +)
+            let synced = profile.layerSeconds.reduce(0, +)
+                + profile.embedSeconds
+            print("\n[\(label)] per-layer attribution (synced, unfused)")
+            print(String(
+                format: "  embed              %8.1f ms",
+                1000 * profile.embedSeconds))
+            print(String(
+                format: "  48 linear blocks   %8.1f ms  (%4.1f%%)  mean %6.2f ms",
+                1000 * linearTotal, 100 * linearTotal / synced,
+                1000 * linearTotal / 48))
+            print(String(
+                format: "  16 full blocks     %8.1f ms  (%4.1f%%)  mean %6.2f ms",
+                1000 * fullTotal, 100 * fullTotal / synced,
+                1000 * fullTotal / 16))
+            print(String(
+                format: "  synced total       %8.1f ms   fused truth %8.1f ms"
+                    + "  (sync tax %+.1f%%)",
+                1000 * synced, 1000 * fusedSeconds,
+                100 * (synced - fusedSeconds) / fusedSeconds))
+            let ranked = profile.layerSeconds.enumerated()
+                .sorted { $0.element > $1.element }.prefix(6)
+            let rows = ranked.map { pair in
+                String(
+                    format: "L%02d/%@ %.1fms", pair.offset,
+                    profile.layerIsLinear[pair.offset] ? "lin" : "FUL",
+                    1000 * pair.element)
+            }.joined(separator: "  ")
+            print("  slowest: \(rows)")
+        }
+
+        func widthSweep(
+            _ label: String, cache: [any KVCache], widths: [Int],
+            filled: inout Int
+        ) {
+            print("\n[\(label)] verify-width sweep, 3 reps, best shown")
+            print("     M   build_ms   eval_ms   total_ms    ms/row    vs M=1")
+            var baseline = 0.0
+            for m in widths {
+                var best = (
+                    build: 0.0, eval: 0.0,
+                    total: Double.greatestFiniteMagnitude)
+                for _ in 0 ..< 3 {
+                    let t0 = Date()
+                    let (logits, _) = model.callWithHidden(
+                        input: LMInput.Text(tokens: tokens(m, offset: filled)),
+                        cache: cache, nConfirmed: 0)
+                    let t1 = Date()
+                    eval(logits)
+                    let t2 = Date()
+                    filled += m
+                    let total = t2.timeIntervalSince(t0)
+                    if total < best.total {
+                        best = (
+                            t1.timeIntervalSince(t0),
+                            t2.timeIntervalSince(t1), total)
+                    }
+                }
+                if m == widths.first { baseline = best.total }
+                print(String(
+                    format: "  %4d  %9.1f  %8.1f  %9.1f  %8.1f  %7.2fx",
+                    m, 1000 * best.build, 1000 * best.eval,
+                    1000 * best.total, 1000 * best.total / Double(m),
+                    best.total / baseline))
+            }
+        }
+
+        // ---- depth 0: fused truth, then per-layer shares, fresh caches ----
+        let fused0 = fusedChunk(
+            cache: model.newCache(parameters: nil), width: 1024, offset: 0)
+        if let p = profiledChunk(
+            cache: model.newCache(parameters: nil), width: 1024, offset: 0) {
+            report("prefill 1024 @ depth 0", p, fusedSeconds: fused0)
+        }
+
+        // ---- one shared cache from here on; depth grows as we measure ----
+        let cache = model.newCache(parameters: nil)
+        var filled = 0
+        while filled < 2048 {
+            fusedChunk(cache: cache, width: 1024, offset: filled)
+            filled += 1024
+        }
+
+        widthSweep(
+            "decode @ depth ~2k", cache: cache,
+            widths: [1, 2, 4, 8, 9, 16, 32], filled: &filled)
+
+        // ---- MTP head draft chain ----
+        if model.hasMTPHead {
+            let (logits, hidden) = model.callWithHidden(
+                input: LMInput.Text(tokens: tokens(1, offset: filled)),
+                cache: cache, nConfirmed: 0)
+            filled += 1
+            let d = logits.dim(1)
+            var next = argMax(logits[0..., (d - 1) ..< d, 0...], axis: -1)
+                .asType(.int32)
+            var h = model.applyFinalNorm(hidden)
+            eval(h, next)
+
+            let mtpCache = model.makeMTPCache()
+            let t0 = Date()
+            var lastID: MLXArray = next
+            for _ in 0 ..< 8 {
+                let h2 = model.mtpHeadHiddenForward(
+                    hidden: h, nextTokenIds: next, cache: mtpCache)
+                next = model.draftTokenID(h2)
+                h = h2
+                lastID = next
+            }
+            eval(lastID)
+            let chain = Date().timeIntervalSince(t0)
+            print(String(
+                format: "\n[MTP head @ depth ~2k] 8-draft chain %.1f ms"
+                    + "  (%.2f ms/draft, lazy chain, one eval)",
+                1000 * chain, 1000 * chain / 8))
+        }
+
+        // ---- lm_head projection + argmax, the verify's sampling cost ----
+        do {
+            let (_, hidden) = model.callWithHidden(
+                input: LMInput.Text(tokens: tokens(9, offset: filled)),
+                cache: cache, nConfirmed: 0)
+            filled += 9
+            let normed = model.applyFinalNorm(hidden)
+            eval(normed)
+            print("")
+            for rows in [1, 9] {
+                let x = normed[0..., 0 ..< rows, 0...]
+                eval(x)
+                var best = Double.greatestFiniteMagnitude
+                for _ in 0 ..< 3 {
+                    let t0 = Date()
+                    let ids = argMax(model.applyLMHead(x), axis: -1)
+                    eval(ids)
+                    best = min(best, Date().timeIntervalSince(t0))
+                }
+                print(String(
+                    format: "  lm_head+argmax %d row(s): %.1f ms",
+                    rows, 1000 * best))
+            }
+        }
+
+        // ---- deepen to ~8k and repeat the key measurements ----
+        while filled < 8192 {
+            let w = min(1024, 8192 - filled)
+            fusedChunk(cache: cache, width: w, offset: filled)
+            filled += w
+        }
+        let fused8k = fusedChunk(cache: cache, width: 1024, offset: filled)
+        filled += 1024
+        if let p = profiledChunk(cache: cache, width: 1024, offset: filled) {
+            filled += 1024
+            report("prefill 1024 @ depth ~9k", p, fusedSeconds: fused8k)
+        }
+
+        widthSweep(
+            "decode @ depth ~10k", cache: cache, widths: [1, 9, 32],
+            filled: &filled)
+
+        // ---- verify-shaped arm LAST: nConfirmed 1 engages the session's
+        // checkpoint tape machinery, and running it outside a session is the
+        // least-charted call in this instrument.  Anything it breaks can only
+        // lose this one number. ----
+        do {
+            var best = Double.greatestFiniteMagnitude
+            for _ in 0 ..< 3 {
+                let t0 = Date()
+                let (logits, _) = model.callWithHidden(
+                    input: LMInput.Text(tokens: tokens(9, offset: filled)),
+                    cache: cache, nConfirmed: 1)
+                eval(logits)
+                filled += 9
+                best = min(best, Date().timeIntervalSince(t0))
+            }
+            print(String(
+                format: "\n  M=9 verify-shaped (nConfirmed 1) @ ~10k: %.1f ms",
+                1000 * best))
+        }
+        print("")
+    }
+}

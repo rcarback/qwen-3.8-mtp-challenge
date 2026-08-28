@@ -70,6 +70,11 @@ final class HTTPResponder: @unchecked Sendable {
     private let connection: NWConnection
     private var headersSent = false
 
+    /// Whether a status line has already gone out. The streaming error path
+    /// needs this: before the headers a real 500 still reaches the client,
+    /// after them the only honest signal is an abrupt end of stream.
+    var didSendHeaders: Bool { headersSent }
+
     init(connection: NWConnection) {
         self.connection = connection
     }
@@ -84,6 +89,14 @@ final class HTTPResponder: @unchecked Sendable {
     static let sseTerminator = Data("data: [DONE]\n\n".utf8)
 
     func sendJSON(status: Int, body: Data) {
+        // A second status line written into an open SSE body is not a
+        // response, it is corruption: the client already parsed the 200 and
+        // reads these bytes as event data. End the stream instead.
+        guard !headersSent else {
+            endSSE()
+            return
+        }
+        headersSent = true
         var out = Data(headLine(status: status, extra: [
             "Content-Type": "application/json",
             "Content-Length": "\(body.count)",
@@ -113,10 +126,17 @@ final class HTTPResponder: @unchecked Sendable {
     }
 
     func sendSSE(_ payload: Data) {
+        // Idempotent, and mandatory: a frame written before the status line
+        // makes "data: {...}" the first bytes on the wire, which every HTTP
+        // client rejects as a malformed response rather than as a server
+        // error. That masked a real worker fault as "invalid HTTP version
+        // parsed" and sent the client into a retry loop.
+        beginSSE()
         send(Self.sseFrame(payload), closing: false)
     }
 
     func endSSE() {
+        beginSSE()
         send(Self.sseTerminator, closing: true)
     }
 

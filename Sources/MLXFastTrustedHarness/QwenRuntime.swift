@@ -284,7 +284,26 @@ public struct LocalIterateOptions: Equatable {
 
 public struct RuntimeWorkerOptions: Equatable {
     public static let defaultHelloTimeoutSeconds = 15 * 60.0
-    public static let defaultRequestTimeoutSeconds = 15 * 60.0
+    /// The watchdog that reaps a hung worker. It also bounds a LEGITIMATE
+    /// long operation, and one operation can exceed 15 minutes on purpose: a
+    /// cold prefill of a very large context. At the measured 11-24 ms/token a
+    /// 66k-token cold prefill runs 12-26 minutes, so the watchdog kills a
+    /// worker that is doing exactly what it was asked to do.
+    ///
+    /// That is reachable in normal use because the prefill checkpoint cache is
+    /// fingerprinted on the worker binary: rebuilding the worker discards every
+    /// checkpoint, and the next large request is therefore cold.
+    ///
+    /// `DARKBLOOM_WORKER_REQUEST_TIMEOUT_SECONDS` raises the bound for serving
+    /// large contexts. Anything absent, unparseable or non-positive keeps the
+    /// 15-minute default rather than trapping.
+    public static let defaultRequestTimeoutSeconds: Double = {
+        let raw = ProcessInfo.processInfo
+            .environment["DARKBLOOM_WORKER_REQUEST_TIMEOUT_SECONDS"]
+        guard let raw, let value = Double(raw), value.isFinite, value > 0
+        else { return 15 * 60.0 }
+        return value
+    }()
     public static let defaultShutdownTimeoutSeconds = 2.0
     public static let defaultTerminationGraceSeconds = 1.0
 

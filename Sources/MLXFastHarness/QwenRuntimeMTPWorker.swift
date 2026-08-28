@@ -903,8 +903,23 @@ extension QwenRuntime {
                       result.perRowTop2Tokens.count == result.declaredRows,
                       result.perRowTop2Logits.count == result.declaredRows
                 else {
+                    // Name the numbers. This fires on a session that has been
+                    // restored from a checkpoint and then extended, which is
+                    // not reproducible on demand, so a bare message costs a
+                    // whole reproduction cycle to learn nothing.
                     throw MLXFastError.invalidInput(
-                        "MTP round ledger or target cache offset diverged")
+                        "MTP round ledger or target cache offset diverged: "
+                            + "targetCacheOffset=\(result.targetCacheOffset) "
+                            + "expectedOffset=\(expectedOffset) "
+                            + "(seed=\(state.seedTokenCount) "
+                            + "decoded=\(state.decodedTokenCount) "
+                            + "+\(result.tokens.count)) "
+                            + "declaredRows=\(result.declaredRows) "
+                            + "accepted=\(result.acceptedDraftCount) "
+                            + "rejected=\(result.rejectedDraftCount) "
+                            + "depth=\(round.depth) "
+                            + "top2Tokens=\(result.perRowTop2Tokens.count) "
+                            + "top2Logits=\(result.perRowTop2Logits.count)")
                 }
                 state.decodedTokenCount = nextCount
                 return RuntimeWorkerResponse(

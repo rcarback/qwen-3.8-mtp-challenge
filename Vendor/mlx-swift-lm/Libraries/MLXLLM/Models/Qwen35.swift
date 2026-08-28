@@ -6285,3 +6285,69 @@ extension Qwen35Model: MTPCapable {
         languageModel.makeMTPCache()
     }
 }
+
+// MARK: - Per-layer profiling seam
+
+/// Per-layer wall-clock attribution of one backbone forward.
+///
+/// PROFILING INSTRUMENT, not a production path. The loop below runs the
+/// UNFUSED layer chain and synchronizes after every layer, so its total runs
+/// slower than the fused production forward: use the per-layer SHARES, scaled
+/// to a separately measured un-synced fused total. It lives in this file
+/// because `Qwen35TextModelInner.layers` is fileprivate, and widening that
+/// access for a measurement would be a larger change than the seam itself.
+public struct Qwen35LayerProfile {
+    public let layerSeconds: [Double]
+    public let layerIsLinear: [Bool]
+    public let embedSeconds: Double
+}
+
+extension Qwen35TextModelInner {
+    func profiledLayerForward(
+        _ inputs: MLXArray, cache: [any KVCache]
+    ) -> Qwen35LayerProfile {
+        var t0 = Date()
+        var hiddenStates = embedTokens(inputs)
+        eval(hiddenStates)
+        let embedSeconds = Date().timeIntervalSince(t0)
+
+        let faMask = createAttentionMask(h: hiddenStates, cache: cache[faIdx])
+        let ssmMask = createSSMMask(
+            h: hiddenStates, cache: cache[ssmIdx] as? MambaCache)
+
+        var seconds: [Double] = []
+        var linear: [Bool] = []
+        for (i, layer) in layers.enumerated() {
+            let mask = layer.isLinear ? ssmMask : nil
+            let attnMask =
+                layer.isLinear
+                ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+            t0 = Date()
+            hiddenStates = layer(
+                hiddenStates, attentionMask: attnMask, ssmMask: mask,
+                cache: cache[i], nConfirmed: 0)
+            eval(hiddenStates)
+            seconds.append(Date().timeIntervalSince(t0))
+            linear.append(layer.isLinear)
+        }
+        return Qwen35LayerProfile(
+            layerSeconds: seconds, layerIsLinear: linear,
+            embedSeconds: embedSeconds)
+    }
+}
+
+extension Qwen35TextModel {
+    public func profiledLayerForward(
+        _ inputs: MLXArray, cache: [any KVCache]
+    ) -> Qwen35LayerProfile {
+        model.profiledLayerForward(inputs, cache: cache)
+    }
+}
+
+extension Qwen35Model {
+    public func profiledLayerForward(
+        _ inputs: MLXArray, cache: [any KVCache]
+    ) -> Qwen35LayerProfile {
+        languageModel.profiledLayerForward(inputs, cache: cache)
+    }
+}
