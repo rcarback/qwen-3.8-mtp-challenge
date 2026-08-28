@@ -241,9 +241,12 @@ struct QwenPhaseBreakdownTests {
                 tapedLayers, Double(tapeBytes) / 1_048_576))
         }
 
+        let ladderBand = ProcessInfo.processInfo
+            .environment["MLX_QWEN_MTP_LADDER_MAXWIDTH"] ?? "<unset, 9>"
         print("\n[qmv arm] MLX_E120_QMV_ARM="
             + (ProcessInfo.processInfo.environment["MLX_E120_QMV_ARM"]
-                ?? "<unset, shipped sumtable>"))
+                ?? "<unset, shipped sumtable>")
+            + "  [ladder band] MLX_QWEN_MTP_LADDER_MAXWIDTH=\(ladderBand)")
 
         widthSweep(
             "decode @ depth ~2k", cache: cache,
@@ -423,21 +426,37 @@ struct QwenPhaseBreakdownTests {
         // ---- verify-shaped arm LAST: nConfirmed 1 engages the session's
         // checkpoint tape machinery, and running it outside a session is the
         // least-charted call in this instrument.  Anything it breaks can only
-        // lose this one number. ----
+        // lose this one number.  Widths beyond 9 pay tape, rollback and
+        // repair costs the nConfirmed:0 sweep above never touches, so this is
+        // the arm rejection economics for wide rounds must be sized on. ----
         do {
-            var best = Double.greatestFiniteMagnitude
-            for _ in 0 ..< 3 {
-                let t0 = Date()
-                let (logits, _) = model.callWithHidden(
-                    input: LMInput.Text(tokens: tokens(9, offset: filled)),
-                    cache: cache, nConfirmed: 1)
-                eval(logits)
-                filled += 9
-                best = min(best, Date().timeIntervalSince(t0))
+            print("\n[verify-shaped (nConfirmed 1) @ ~10k] 3 reps, best shown")
+            print("     M   build_ms   eval_ms   total_ms    ms/row")
+            for m in [9, 12, 16, 32] {
+                var best = (
+                    build: 0.0, eval: 0.0,
+                    total: Double.greatestFiniteMagnitude)
+                for _ in 0 ..< 3 {
+                    let t0 = Date()
+                    let (logits, _) = model.callWithHidden(
+                        input: LMInput.Text(tokens: tokens(m, offset: filled)),
+                        cache: cache, nConfirmed: 1)
+                    let t1 = Date()
+                    eval(logits)
+                    let t2 = Date()
+                    filled += m
+                    let total = t2.timeIntervalSince(t0)
+                    if total < best.total {
+                        best = (
+                            t1.timeIntervalSince(t0),
+                            t2.timeIntervalSince(t1), total)
+                    }
+                }
+                print(String(
+                    format: "  %4d  %9.1f  %8.1f  %9.1f  %8.1f",
+                    m, 1000 * best.build, 1000 * best.eval,
+                    1000 * best.total, 1000 * best.total / Double(m)))
             }
-            print(String(
-                format: "\n  M=9 verify-shaped (nConfirmed 1) @ ~10k: %.1f ms",
-                1000 * best))
         }
         print("")
     }
