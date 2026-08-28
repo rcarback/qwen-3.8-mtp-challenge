@@ -33,7 +33,7 @@ struct QwenForwardStreamTests {
         #expect(!CompiledDecode.eligible(qwenShaped))
 
         // The specific layer that blocks it, isolated from its neighbour.
-        let recurrent = MambaCache()
+        let recurrent: any KVCache = MambaCache()
         #expect(!(recurrent is KVCacheSimple))
         #expect(!(recurrent is RotatingKVCache))
         #expect(!CompiledDecode.eligible([recurrent]))
@@ -241,13 +241,18 @@ struct QwenForwardStreamTests {
     @Test("width-1 quantized matmul dispatch")
     func width1QMVDispatch() {
         let result = qwen35BenchWidth1QMV()
-        print(String(
-            format: "\n[width-1 QMV] mlx %.1f us   replica %.1f us"
-                + "   ratio %.3f   equal %@",
-            result.mlxMicroseconds, result.replicaMicroseconds,
-            result.mlxMicroseconds > 0
-                ? result.replicaMicroseconds / result.mlxMicroseconds : 0,
-            result.equal ? "yes" : "NO"))
+        if result.mlxMicroseconds > 0 {
+            print(String(
+                format: "\n[width-1 QMV] mlx %.1f us   replica %.1f us"
+                    + "   ratio %.3f   equal %@",
+                result.mlxMicroseconds, result.replicaMicroseconds,
+                result.replicaMicroseconds / result.mlxMicroseconds,
+                result.equal ? "yes" : "NO"))
+        } else {
+            print("\n[width-1 QMV] declined (widths excludes 1); "
+                + "measured 2026-08-28 with width 1 enabled: replica 2.9x "
+                + "faster but not bit-exact, exclusion kept")
+        }
         // A declined replica (widths excludes 1, both arms report 0 us) is a
         // recorded outcome, not a mismatch: the equality invariant binds only
         // when the replica actually ran. Measured 2026-08-28: with width 1

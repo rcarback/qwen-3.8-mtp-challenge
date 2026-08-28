@@ -252,7 +252,7 @@ private let qwen35CompiledSigmoidMultiply:
 }()
 
 
-// MARK: - packed GDN prework mixer (verify widths 3...9)
+// MARK: - packed GDN prework mixer (decode and verify widths 1...9)
 //
 // ONE launch replacing the wide verify's GDN prework chain — conv1d + SiLU +
 // split + Q/K rmsNorm-and-scale + the g/beta producer — for S in 3...9 on
@@ -268,9 +268,10 @@ private let qwen35CompiledSigmoidMultiply:
 // zero mismatches)
 // on the vendored MLX version, with a +1-row conv-window negative control
 // failing exactly the three outputs that read the window. Widths 1 and 2 need a state
-// row from the OLD conv state. The copy loop reads it: logical rows below
-// NKeep are written by row 0 from `conv_state`, and the qkv-sourced stores
-// are untouched, so widths 3 and above are byte-for-byte what they were. The fused in-proj
+// row from the OLD conv state. The copy loop reads it: logical rows
+// below NKeep are written by row 0 from `conv_state`, and the
+// qkv-sourced stores are untouched, so widths 3 and above are
+// byte-for-byte what the receipt above covers. The fused in-proj
 // carrier's live row stride (16480, not 10240) is consumed via the provided
 // stride arrays — ensureRowContiguous stays FALSE; forcing contiguity here
 // would silently insert a full-carrier copy and give back the launch saving.
