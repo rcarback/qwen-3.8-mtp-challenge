@@ -87,9 +87,28 @@ struct QwenLookupDraftDecisionTests {
 
     @Test("only widths the head loop never compiles need a lookup warm")
     func onlyWidthsTheHeadLoopNeverCompilesNeedAWarm() {
-        #expect(Session.lookupWarmWidths(ladder: [3, 8, 15, 31]) == [16, 32])
-        #expect(Session.lookupWarmWidths(ladder: [3, 8]) == [])
-        #expect(Session.lookupWarmWidths(ladder: [10, 20]) == [11, 21])
+        #expect(
+            Session.lookupWarmWidths(
+                ladder: [3, 8, 15, 31], sweptMaxDepth: Qwen36MTPLimits.maxDepth)
+                == [16, 32])
+        #expect(
+            Session.lookupWarmWidths(
+                ladder: [3, 8], sweptMaxDepth: Qwen36MTPLimits.maxDepth) == [])
+        #expect(
+            Session.lookupWarmWidths(
+                ladder: [10, 20], sweptMaxDepth: Qwen36MTPLimits.maxDepth)
+                == [11, 21])
+    }
+
+    @Test("a headless or block-drafter sweep, which stops at width 1, still warms every rung")
+    func aNarrowerSweepStillWarmsEveryRung() {
+        // `warmAllDepths` calls `warmAllDepthShapes(maxDepth: 0)` for a
+        // headless or block-drafter session, so the head loop only ever
+        // compiles width 1. Filtering against that swept depth instead of the
+        // trusted constant must widen, not narrow, what gets warmed.
+        #expect(
+            Session.lookupWarmWidths(ladder: [3, 8, 15, 31], sweptMaxDepth: 0)
+                == [4, 9, 16, 32])
     }
 }
 

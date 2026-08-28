@@ -258,8 +258,13 @@ public final class Qwen36MTPBlockSession {
     // Nil unless something installs an index, and nothing in this file ever
     // does: enablement lives in `Sources/MLXFastHarness/QwenRuntimeMTPWorker`,
     // which is outside `benchmark.json` `editablePaths` and therefore outside
-    // what a submission packages. A packaged tree carries the branch below and
-    // can never reach it.
+    // what a submission packages. The truth is stronger than "unreachable":
+    // `NGramPromptLookupIndex` lives in `Sources/MLXFastCore`, which is also
+    // outside `editablePaths`, so a packaged tree does not merely fail to
+    // reach the branch below -- it cannot COMPILE this file at all without
+    // that type in scope. This is a known local-fork-only defect (this branch
+    // is not meant to be submitted); see the report for what moving the type
+    // into `MLXFastModel` or a compile-time guard would take.
     //
     // The index only PROPOSES. Like the head, nothing routed through it can
     // move an emitted token: the target verify decides every one. That is also
@@ -1340,7 +1345,8 @@ public final class Qwen36MTPBlockSession {
         // without one pays nothing at all.
         if let lookupIndex {
             for width in Self.lookupWarmWidths(
-                ladder: lookupIndex.configuration.ladder)
+                ladder: lookupIndex.configuration.ladder,
+                sweptMaxDepth: maxDepth)
             {
                 let block = Array(repeating: 0, count: width)
                 let (wideLogits, _, wideNormed) =
@@ -1796,10 +1802,19 @@ public final class Qwen36MTPBlockSession {
     }
 
     /// Verify widths a lookup round can dispatch that the head's own warm loop
-    /// never compiles. The head loop covers `1 ... maxDepth + 1`, so only the
-    /// rungs above it need warming.
-    static func lookupWarmWidths(ladder: [Int]) -> [Int] {
-        ladder.map { $0 + 1 }.filter { $0 > Qwen36MTPLimits.maxDepth + 1 }
+    /// never compiles.
+    ///
+    /// Filtered against the width the head loop ACTUALLY SWEPT, not against
+    /// the trusted constant `Qwen36MTPLimits.maxDepth`. `warmAllDepths`
+    /// dispatches three ways: a headless session warms `maxDepth: 0`, a
+    /// block-drafter session also warms `maxDepth: 0` (plus its own block
+    /// shapes), and only a native-head session sweeps the full range. Filtering
+    /// against the constant would leave the low rungs cold on the first two --
+    /// `for width in 1 ... 1` compiles width 1 only -- and the first lookup
+    /// proposal on those sessions would pay a Metal pipeline compile inside a
+    /// live request.
+    static func lookupWarmWidths(ladder: [Int], sweptMaxDepth: Int) -> [Int] {
+        ladder.map { $0 + 1 }.filter { $0 > sweptMaxDepth + 1 }
     }
 
     /// Consecutive fully-accepted DRAFTING rounds. Kept as a public-ish
