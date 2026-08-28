@@ -485,11 +485,24 @@ extension QwenRuntime {
     /// The whole-prefix decode at `QwenRuntimeServe`'s round loop is quadratic
     /// in the reply length. It cannot become a per-token decode, because Qwen
     /// uses byte-level byte-pair encoding and a character can straddle tokens.
-    /// It CAN become a suffix decode plus a splice: a character spans at most
-    /// four bytes and therefore at most four tokens, so re-decoding the last
-    /// `window` tokens and keeping everything before the resulting overlap
-    /// point reproduces the whole-prefix decode as long as `window` exceeds
-    /// four. The default is sixteen.
+    /// It CAN become a suffix decode plus a splice: re-decode the last
+    /// `window` tokens each round and freeze everything before that as
+    /// `committedText`, so only a bounded tail is ever re-decoded. The
+    /// default `window` is sixteen.
+    ///
+    /// `window` alone is a MARGIN, not a proof: a character spans at most
+    /// four bytes, so a large-enough window makes it likely that
+    /// `tokens.count - window` lands after any in-progress character, but
+    /// "likely" is not exact -- a boundary can still fall inside a
+    /// multi-byte sequence for any window size, including the default.
+    /// CORRECTNESS instead comes from checking the candidate commit itself:
+    /// decoding a slice that ends mid-character renders a trailing
+    /// replacement character (U+FFFD), so a commit is only ever frozen when
+    /// its decode does not end in one (see `text(for:decode:)`). A rejected
+    /// candidate is not an error -- the pending decode below still spans the
+    /// whole reply, so the round costs a larger-than-ideal re-decode rather
+    /// than a wrong answer, and the next call (a longer `tokens`) tries
+    /// again at a larger boundary.
     ///
     /// The committed prefix is only ever extended by the part of a suffix
     /// decode that a LATER decode can no longer change, which is everything
@@ -515,8 +528,25 @@ extension QwenRuntime {
             // window`; beyond that a later token could still repair a seam.
             let safeCommit = Swift.max(0, tokens.count - window)
             if safeCommit > committedTokens {
-                committedText = decode(tokens[0 ..< safeCommit])
-                committedTokens = safeCommit
+                let candidate = decode(tokens[0 ..< safeCommit])
+                // A token-count margin alone does not guarantee `safeCommit`
+                // lands on a character boundary: it only bounds how far a
+                // FUTURE token can still repair a seam, not whether THIS
+                // slice, decoded alone, already ends mid-character. Decoding
+                // an incomplete trailing byte sequence renders one or more
+                // trailing replacement characters (the same signal
+                // `QwenRuntimeServe.generate`'s round loop comment already
+                // relies on above), so a trailing replacement character
+                // means this candidate is not yet safe to freeze. Skip the
+                // commit and retry at the next call's larger boundary rather
+                // than caching a wrong interpretation permanently -- the
+                // pending decode below still covers the full reply either
+                // way, so this only costs extra re-decoding, never a wrong
+                // answer.
+                if !candidate.hasSuffix("\u{FFFD}") {
+                    committedText = candidate
+                    committedTokens = safeCommit
+                }
             }
             return committedText + decode(tokens[committedTokens...])
         }
