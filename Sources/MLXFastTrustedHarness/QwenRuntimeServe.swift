@@ -81,7 +81,12 @@ extension QwenRuntime {
         // the next begins. Two interleaved `mtp_decode_round` streams on one
         // session would corrupt both.
         let generationQueue = DispatchQueue(label: "mlxfast.serve.generate")
-        let context = ServeContext(client: client, tokenizer: tokenizer)
+        let context = ServeContext(
+            client: client,
+            tokenizer: tokenizer,
+            stopTokens: Self.serveStopTokens(
+                directory: URL(fileURLWithPath: options.targetWeightsPath),
+                tokenizer: tokenizer))
 
         let server = try MinimalHTTPServer(port: options.port)
         try server.start { request, responder in
@@ -125,6 +130,12 @@ extension QwenRuntime {
     final class ServeContext: @unchecked Sendable {
         let client: RuntimeWorkerClient
         let tokenizer: any Tokenizer
+        /// EVERY id that terminates a turn, not just `tokenizer.eosTokenId`.
+        /// `generation_config.json` lists two for this model (248046
+        /// <|im_end|> and 248044 <|endoftext|>) and the worker's accept walk
+        /// already stops on the full set, so a parent that recognised one was
+        /// letting a committed 248044 run the turn on to its token budget.
+        let stopTokens: Set<Int>
 
         /// The seed the worker's live session holds plus everything it emitted.
         /// A new request is compared against this to decide whether it can
@@ -134,9 +145,14 @@ extension QwenRuntime {
         private let lock = NSLock()
         private var history: [Int] = []
 
-        init(client: RuntimeWorkerClient, tokenizer: any Tokenizer) {
+        init(
+            client: RuntimeWorkerClient,
+            tokenizer: any Tokenizer,
+            stopTokens: Set<Int>
+        ) {
             self.client = client
             self.tokenizer = tokenizer
+            self.stopTokens = stopTokens
         }
 
         func decide(for incoming: [Int]) -> ServePrefixDecision {
@@ -325,7 +341,13 @@ extension QwenRuntime {
             // Best-effort by design: a failed snapshot costs a slower resume,
             // never a wrong answer, so it must not fail the request that just
             // succeeded.
+            // The session consumed the stop token too, so the resume point
+            // has to describe it. This is also what makes the array matchable:
+            // the chat template writes the same terminator into the next
+            // turn's prompt, so seed + emitted + [terminator] is a genuine
+            // prefix of what arrives next.
             let history = seedTokens + outcome.emittedTokens
+                + (outcome.terminalToken.map { [$0] } ?? [])
             // Three outcomes, three distinct log lines, because they mean
             // different things and the old form collapsed all of them into
             // silence. `ok == false` is the worker REFUSING to file a
@@ -345,11 +367,19 @@ extension QwenRuntime {
             // witnesses, 0 forwarded "mlxfast-worker: " lines, 0 redacted
             // "token-validation-failed" lines. So the branches ran 51 times
             // and forwarded nothing.
+            // Keyed on the FILED COUNT, not on `ok`. An earlier version
+            // branched on `snapshot.ok` and its refusal arm was DEAD CODE:
+            // `send()` throws on !ok, so an ok:false refusal never returned as
+            // a value and the parent logged it as a call failure. The worker
+            // now reports a refusal as ok:true having filed zero tokens --
+            // a refusal is a normal outcome, not a protocol failure -- so the
+            // three cases are distinguishable and the failure label means
+            // only what it says.
             if let snapshot = try? context.client.snapshotMTPDecode(
                 conversationId: Self.conversationKey(for: seedTokens),
                 tokens: history)
             {
-                if snapshot.ok {
+                if (snapshot.resumedTokens ?? 0) > 0 {
                     serveNote("recorded resume point at \(history.count) tokens")
                 } else {
                     serveNote(
@@ -401,6 +431,15 @@ extension QwenRuntime {
         /// Needed by `ServeContext` so the next request can tell whether it
         /// extends this one.
         var emittedTokens: [Int]
+        /// The stop token the session COMMITTED and the client never saw.
+        ///
+        /// The emit loop stops at a stop token without emitting it, so the
+        /// session's state runs one token ahead of `emittedTokens`. A resume
+        /// point has to describe the state, so the filed array needs this
+        /// token appended -- and appending it also makes the array MORE
+        /// matchable, because the chat template writes the same terminator
+        /// into the next turn's prompt.
+        var terminalToken: Int?
     }
 
     /// The serve round loop's text stage: decode the reply so far, test it
@@ -665,6 +704,9 @@ extension QwenRuntime {
         // emitted but not why it stopped, and EOS, a stop string and an empty
         // round are indistinguishable from the outside. Name the branch.
         var exitCause = "budget-or-loop-end"
+        // Set only when the loop stops ON a stop token. The session committed
+        // it; the client never sees it; the resume point must carry it.
+        var terminalToken: Int?
 
         while !done, emitted.count < budget {
             let roundStarted = Date()
@@ -680,8 +722,9 @@ extension QwenRuntime {
             stats.rejectedDrafts += response.rejectedDraftCount ?? 0
 
             for token in tokens {
-                if let eos = tokenizer.eosTokenId, token == eos {
+                if context.stopTokens.contains(token) {
                     exitCause = "eos"
+                    terminalToken = token
                     done = true
                     break
                 }
@@ -759,7 +802,48 @@ extension QwenRuntime {
             toolCalls: calls,
             finishReason: finishReason,
             stats: stats,
-            emittedTokens: emitted)
+            emittedTokens: emitted,
+            terminalToken: terminalToken)
+    }
+
+    /// Every id that terminates a turn: the union of `eos_token_id` and
+    /// `pad_token_id` across `config.json` and `generation_config.json` (each
+    /// accepting a scalar or a list), plus the tokenizer's own EOS id.
+    ///
+    /// DUPLICATED ON PURPOSE. The worker resolves the same set with
+    /// `resolveQwenMTPStopTokens`, but that whole file sits inside
+    /// `#if !MLXFAST_TRUSTED_HARNESS` and so compiles to nothing in this
+    /// binary -- the trusted harness excludes participant-facing worker code
+    /// by construction. Sharing it would mean moving it across that boundary,
+    /// which is a bigger change than restating twenty lines. The two must
+    /// agree: the worker stops ACCEPTING drafts on this set, and if the parent
+    /// recognised a smaller one it would keep decoding past a token the
+    /// session already treated as terminal.
+    static func serveStopTokens(
+        directory: URL, tokenizer: any Tokenizer
+    ) -> Set<Int> {
+        var ids = Set<Int>()
+        for name in ["config.json", "generation_config.json"] {
+            guard let data = try? Data(
+                contentsOf: directory.appendingPathComponent(name)),
+                let root = (try? JSONSerialization.jsonObject(with: data))
+                    as? [String: Any]
+            else { continue }
+            for key in ["eos_token_id", "pad_token_id"] {
+                switch root[key] {
+                case let value as Int:
+                    ids.insert(value)
+                case let values as [Any]:
+                    ids.formUnion(values.compactMap { $0 as? Int })
+                default:
+                    continue
+                }
+            }
+        }
+        if let eos = tokenizer.eosTokenId {
+            ids.insert(eos)
+        }
+        return ids
     }
 
     static func firstStopHit(

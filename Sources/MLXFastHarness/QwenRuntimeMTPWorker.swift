@@ -633,8 +633,14 @@ extension QwenRuntime {
                         + "\(snapshot.seedTokenCount + snapshot.committedTokenCount) "
                         + "tokens but the filed array has \(tokens.count) "
                         + "(the parent cut a decode round short)\n").utf8))
+                // ok:TRUE having filed ZERO tokens. A refusal is a normal
+                // outcome, not a protocol failure, and `send()` throws on
+                // !ok -- so reporting it as a failure made the parent unable
+                // to tell a refusal from a dead worker. The filed count is
+                // the natural encoding and it already exists: the success
+                // path returns `resumedTokens: tokens.count`.
                 return RuntimeWorkerResponse(
-                    id: request.id, nonce: sessionNonce, ok: false,
+                    id: request.id, nonce: sessionNonce, ok: true,
                     resumedTokens: 0)
             }
 
