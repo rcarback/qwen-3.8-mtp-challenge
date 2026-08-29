@@ -757,6 +757,30 @@ extension QwenRuntime {
                         ("qwen-mtp: resumed \(hit.round.tokenCount) cached "
                             + "tokens from the shared prefix store, prefilling "
                             + "\(hit.tail.count)\n").utf8))
+                } else if let hit = qwenMTPResumeStore.deepestPrefixMatch(
+                    incoming: seedTokens),
+                    (try? session.restoreState(hit.round.state)) != nil
+                {
+                    // The key probe above only looks at offsets THIS request
+                    // derived, so a retained checkpoint at any other depth is
+                    // invisible to it even when it is a valid prefix. That is
+                    // the common case once several agents share one server:
+                    // their turn boundaries land in different places, so they
+                    // derive different keys for the same shared prefix.
+                    //
+                    // Tried after the keyed probe, never instead of it: the
+                    // keyed path is an O(keys) dictionary lookup while this
+                    // scans retained rounds, and when the keyed path hits it
+                    // has already found the deepest match this request can
+                    // name. Resumes only where a snapshot was actually taken.
+                    seedToken = try prefillCheckpointed(
+                        from: hit.round.tokenCount,
+                        baseKvBytes: hit.round.state.kvBytes)
+                    resumedTokens = hit.round.tokenCount
+                    FileHandle.standardError.write(Data(
+                        ("qwen-mtp: resumed \(hit.round.tokenCount) cached "
+                            + "tokens by prefix scan, prefilling "
+                            + "\(hit.tail.count)\n").utf8))
                 } else if let hit = qwenMTPResumeStore.diskChunkMatch(
                     keys: chunkKeys, incoming: seedTokens) {
                     // Disk checkpoint. Tried only after the in-memory

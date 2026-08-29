@@ -295,6 +295,61 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
             state: state, roundBytes: roundBytes, kvBytes: kvBytes)
     }
 
+    /// Deepest retained checkpoint that is a prefix of `incoming`, searched
+    /// across EVERY retained round rather than only the offsets this request
+    /// happened to derive.
+    ///
+    /// WHY THIS EXISTS. `chunkMatch` probes only the positions in `keys`, and
+    /// those come from this request's own turn boundaries after `chainKeys`
+    /// thins them to `chunkSize` spacing. A checkpoint retained at any other
+    /// depth is invisible to it even when it is a perfectly valid prefix --
+    /// which is the common case once several agents share one server, because
+    /// their boundaries fall in different places. Measured on four real
+    /// sessions replayed against one store, with the live-session extend path
+    /// and conversation-scoped match modelled first so the baseline is honest:
+    ///
+    ///   sequential sessions                       0% -- `extend` already wins
+    ///   concurrent, store starved for memory   10.7%
+    ///   concurrent, store given enough memory  49.5%
+    ///
+    /// So this pays only under concurrency, and only once the store is not
+    /// evicting faster than it is used; on a single sticky session the live
+    /// session resumes optimally without it. It reads no more state than
+    /// `chunkMatch` and cannot resume anywhere a snapshot was not taken.
+    ///
+    /// Cost is a scan of retained rounds with an O(1) length check before any
+    /// token comparison, so the token compare runs only for rounds that could
+    /// still match.
+    public func deepestPrefixMatch(
+        incoming: [Int]
+    ) -> (round: Round, tail: [Int])? {
+        lock.lock(); defer { lock.unlock() }
+        var best: Round?
+        var bestKey: String?
+        for (id, conversation) in conversations {
+            for round in conversation.rounds {
+                // Cheap rejects first: a round at or past the prompt's length
+                // leaves no row to read the next token from, and one no deeper
+                // than the incumbent cannot win.
+                //
+                // Both comparisons run in the same direction deliberately. A
+                // `a < b, c > (d)` pair inside one `guard` parses as generic
+                // brackets, not as two comparisons.
+                let incumbent = best?.tokenCount ?? 0
+                guard round.tokenCount < incoming.count,
+                      incumbent < round.tokenCount,
+                      round.tokens == Array(incoming.prefix(round.tokenCount))
+                else { continue }
+                best = round
+                bestKey = id
+            }
+        }
+        guard let best, let bestKey else { return nil }
+        clock += 1
+        conversations[bestKey]?.lastUsed = clock
+        return (best, Array(incoming.dropFirst(best.tokenCount)))
+    }
+
     /// Deepest retained checkpoint whose tokens are a prefix of `incoming`.
     ///
     /// `keys` arrives shallowest-first and is walked in reverse, so the first

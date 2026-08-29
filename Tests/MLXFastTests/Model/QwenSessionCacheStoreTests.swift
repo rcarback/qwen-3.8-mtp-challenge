@@ -53,6 +53,31 @@ struct QwenSessionCacheStoreTests {
         #expect(hit == nil, "no retained round is a prefix of the incoming prompt")
     }
 
+    /// The P1 lookup: a checkpoint retained under a key this request never
+    /// derives is still found, provided it is genuinely a prefix.
+    @Test("a prefix scan finds a checkpoint no derived key names")
+    func prefixScanFindsUnkeyedCheckpoint() {
+        let store = QwenSessionCacheStore<Payload>(budgetBytes: 1 * GiB)
+        // Recorded by some OTHER agent, under its own boundaries.
+        store.recordChunk(key: "other-agents-key", tokens: [1, 2, 3, 4, 5],
+                          state: state(7), roundBytes: MiB, kvBytes: MiB)
+
+        // This request derives a different key set entirely, so the keyed
+        // probe cannot see it.
+        #expect(store.chunkMatch(
+            keys: [(key: "my-own-key", tokenCount: 5)],
+            incoming: [1, 2, 3, 4, 5, 6]) == nil)
+
+        // The scan finds it, and returns the correct tail.
+        let hit = store.deepestPrefixMatch(incoming: [1, 2, 3, 4, 5, 6])
+        #expect(hit?.round.tokenCount == 5)
+        #expect(hit?.tail == [6])
+
+        // It must still refuse a non-prefix and an equal-length prompt.
+        #expect(store.deepestPrefixMatch(incoming: [1, 2, 9, 9, 9, 9]) == nil)
+        #expect(store.deepestPrefixMatch(incoming: [1, 2, 3, 4, 5]) == nil)
+    }
+
     @Test("deepest usable round wins; an equal-length prompt falls back")
     func matching() {
         let store = QwenSessionCacheStore<Payload>(budgetBytes: 1 * GiB)
