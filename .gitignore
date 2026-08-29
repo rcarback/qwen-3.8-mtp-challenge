@@ -65,3 +65,4 @@ local-docs/
 # `git add` has swallowed them before.
 .local/
 score.baseline-*.json
+.build-instr/
