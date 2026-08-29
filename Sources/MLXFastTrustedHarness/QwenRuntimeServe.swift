@@ -326,11 +326,40 @@ extension QwenRuntime {
             // never a wrong answer, so it must not fail the request that just
             // succeeded.
             let history = seedTokens + outcome.emittedTokens
+            // Three outcomes, three distinct log lines, because they mean
+            // different things and the old form collapsed all of them into
+            // silence. `ok == false` is the worker REFUSING to file a
+            // checkpoint whose snapshot does not describe the array handed
+            // with it; a nil result is the snapshot call itself failing.
+            // Distinguishing them matters: a guard that refused everything
+            // and a guard that never fired both produce zero errors, and
+            // only the log tells them apart.
+            //
+            // Logged parent-side because worker stderr forwarding is BROKEN.
+            // Proven, not inferred: each parent-side "resumed N tokens from
+            // the session store" line is a witness that a worker stderr write
+            // executed, because every `resumedTokens` assignment in
+            // mtp_decode_begin (:801/:817/:841/:897) is immediately followed
+            // by that write with no branch between, and that local is the
+            // only feed for the field at :951. Across the serve logs: 51
+            // witnesses, 0 forwarded "mlxfast-worker: " lines, 0 redacted
+            // "token-validation-failed" lines. So the branches ran 51 times
+            // and forwarded nothing.
             if let snapshot = try? context.client.snapshotMTPDecode(
                 conversationId: Self.conversationKey(for: seedTokens),
-                tokens: history), snapshot.ok
+                tokens: history)
             {
-                serveNote("recorded resume point at \(history.count) tokens")
+                if snapshot.ok {
+                    serveNote("recorded resume point at \(history.count) tokens")
+                } else {
+                    serveNote(
+                        "skipped resume point at \(history.count) tokens "
+                        + "(worker refused: snapshot does not describe this array)")
+                }
+            } else {
+                serveNote(
+                    "skipped resume point at \(history.count) tokens "
+                    + "(snapshot call failed)")
             }
             FileHandle.standardError.write(Data(
                 (renderStatsBar(outcome.stats, depth: options.depth) + "\n").utf8))
