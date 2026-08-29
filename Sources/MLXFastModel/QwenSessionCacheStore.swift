@@ -81,10 +81,11 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
 
     /// Default budget. 64 GiB holds roughly 27 concurrent conversations at 20k
     /// context with 8 rounds each, or 3 at the 262144 ceiling (7 under
-    /// `DARKBLOOM_KV_QUANT_BITS=8`). It is CLAMPED to a quarter of physical RAM
+    /// `DARKBLOOM_KV_QUANT_BITS=8`). It is CLAMPED to half of physical RAM
     /// so the default does not break a smaller machine: on a 128 GiB box the
-    /// full 64 GiB stands (78.1 GiB with the 14.1 GiB model, ~50 GiB spare),
-    /// while a 64 GiB box gets 16 GiB.
+    /// full 64 GiB stands (79 GiB with the ~15 GB model, ~49 GiB spare), while
+    /// a 64 GiB box gets 32 GiB. `DARKBLOOM_SESSION_CACHE_BUDGET_GIB` lowers
+    /// it on a machine that needs the headroom elsewhere.
     private let budgetBytes: Int
     private var conversations: [String: Conversation] = [:]
     private var clock: UInt64 = 0
@@ -507,13 +508,36 @@ public enum QwenSessionCacheBudget {
     /// `DARKBLOOM_KV_QUANT_BITS=8`).
     public static let defaultBytes = 64 * 1024 * 1024 * 1024
 
-    /// Clamped to a quarter of physical RAM so the default does not break a
-    /// smaller machine: a 128 GiB box keeps the full 64 GiB (78.1 GiB with the
-    /// 14.1 GiB model, ~50 GiB spare); a 64 GiB box gets 16 GiB.
+    /// Clamped to HALF of physical RAM, and overridable in GiB with
+    /// `DARKBLOOM_SESSION_CACHE_BUDGET_GIB`.
+    ///
+    /// The clamp was a quarter until 2026-08-29, which contradicted the comment
+    /// above it and the one on `defaultBytes`: both promised "a 128 GiB box
+    /// keeps the full 64 GiB", while `min(64 GiB, 128 GiB / 4)` delivered 32.
+    /// The tests encoded the 32, so the prose was the thing that was wrong --
+    /// but the halving mattered, because a starved store evicts checkpoints
+    /// faster than they are used. Replaying four real sessions interleaved,
+    /// concurrency cost 12.8x at 32 GiB (708,722 -> 9,066,516 prefill tokens)
+    /// and 1.98x at 64 GiB, so the budget was the binding constraint rather
+    /// than the lookup.
+    ///
+    /// At half, a 128 GiB box gets the full 64 GiB (79 GiB with the ~15 GB
+    /// model resident, ~49 GiB spare) and a 64 GiB box gets 32 GiB. The
+    /// override exists because that second number is the tighter one: set
+    /// `DARKBLOOM_SESSION_CACHE_BUDGET_GIB` lower on a machine that needs the
+    /// headroom for something else. It is clamped the same way, so the override
+    /// can lower the budget but never past what the machine can hold.
     public static func clampedDefault(
         physicalMemory: Int = Int(ProcessInfo.processInfo.physicalMemory)
     ) -> Int {
-        Swift.min(defaultBytes, physicalMemory / 4)
+        let ceiling = physicalMemory / 2
+        if let raw = ProcessInfo.processInfo
+            .environment["DARKBLOOM_SESSION_CACHE_BUDGET_GIB"],
+            let gib = Int(raw), gib > 0
+        {
+            return Swift.min(gib * 1024 * 1024 * 1024, ceiling)
+        }
+        return Swift.min(defaultBytes, ceiling)
     }
 }
 
