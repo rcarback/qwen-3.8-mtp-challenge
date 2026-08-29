@@ -71,6 +71,21 @@ struct ChatMessage: Decodable {
         self.toolCallId = toolCallId
     }
 
+    /// The assistant turn that requested one or more tool calls. Synthesised
+    /// server-side when compaction retrieval answers an `expand` call, so the
+    /// model sees a well-formed call/result pair rather than a bare result.
+    static func assistantToolCall(_ calls: [ToolCallPayload]) -> ChatMessage {
+        ChatMessage(
+            role: "assistant", content: nil, toolCalls: calls, toolCallId: nil)
+    }
+
+    /// The matching tool result. `tool_call_id` must echo the call's id or the
+    /// pair is invalid on the wire.
+    static func toolResult(id: String, text: String) -> ChatMessage {
+        ChatMessage(
+            role: "tool", content: .text(text), toolCalls: nil, toolCallId: id)
+    }
+
     /// Same message with different text. Used by tool-result compaction, which
     /// must preserve `tool_call_id` -- an orphaned tool message is invalid on
     /// the wire, and dropping the id would strand the assistant `tool_calls`

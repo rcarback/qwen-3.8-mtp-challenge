@@ -260,15 +260,64 @@ extension QwenRuntime {
         // `JSONDecoder` cannot promise, so they are re-parsed from the raw body.
         let tools = parseToolsFromRawBody(request.body)
 
-        var prompt: String
-        var turnEnds: [Int]
-        do {
-            (prompt, turnEnds) = try OpenAIPromptRendering
+        // Render, compact, tokenise. A function because an expand() round
+        // trip appends messages and has to repeat every step of it.
+        var toolsForModel: [OrderedJSON]? = tools
+        func renderTurn(
+            _ extra: [ChatMessage]
+        ) throws -> (prompt: String, turnEnds: [Int], seed: [Int]) {
+            let base = try OpenAIPromptRendering.renderPromptWithTurnBoundaries(
+                messages: decoded.messages + extra, tools: toolsForModel)
+            let seed = context.tokenizer.encode(
+                text: base.0, addSpecialTokens: false)
+
+            // COMPACTION. Above a token threshold, replace SETTLED tool
+            // results with a content-derived stub and re-render. Cold prefill
+            // is linear in token count, so this is the only lever that changes
+            // the input rather than the cost per token: on a real session the
+            // largest prompt fell 59,407 -> 9,866 tokens, 475 s -> 79 s.
+            //
+            // The threshold tests the ACTUAL token count rather than a
+            // character estimate, because tool output and prose differ in
+            // token density. One extra tokenisation costs milliseconds against
+            // a prefill measured in minutes.
+            guard seed.count > Self.compactionThresholdTokens else {
+                return (base.0, base.1, seed)
+            }
+            let compacted = Self.compactSettledToolResults(
+                decoded.messages + extra,
+                minimumCharacters: Self.compactionMinimumChars)
+            guard compacted.stubbed > 0 else {
+                return (base.0, base.1, seed)
+            }
+            // Retrieval is advertised only on a turn that actually stubbed
+            // something; otherwise the model is told about a tool it has no
+            // valid handle for.
+            if let expand = Self.expandToolSchema(),
+               !(toolsForModel ?? []).contains(where: { Self.isExpandTool($0) })
+            {
+                toolsForModel = (toolsForModel ?? []) + [expand]
+            }
+            guard let after = try? OpenAIPromptRendering
                 .renderPromptWithTurnBoundaries(
-                    messages: decoded.messages, tools: tools)
-        } catch {
-            responder.sendError(status: 400, message: "\(error)")
-            return
+                    messages: compacted.messages, tools: toolsForModel)
+            else { return (base.0, base.1, seed) }
+            let afterSeed = context.tokenizer.encode(
+                text: after.0, addSpecialTokens: false)
+            // Only adopt it if it actually helped. A stub carries a hash, a
+            // size and head/tail lines, so on content long in characters but
+            // short in tokens the swap can be a wash or worse.
+            guard afterSeed.count < seed.count else {
+                serveNote(
+                    "compaction declined: \(seed.count) -> "
+                        + "\(afterSeed.count) tokens, no gain")
+                return (base.0, base.1, seed)
+            }
+            let saved = Self.estimatedSeconds(seed.count - afterSeed.count)
+            serveNote(
+                "compacted \(compacted.stubbed) tool results: \(seed.count) "
+                    + "-> \(afterSeed.count) tokens (saved ~\(saved) of prefill)")
+            return (after.0, after.1, afterSeed)
         }
 
         var budget = decoded.maxTokens ?? options.maxNewTokens
@@ -278,53 +327,17 @@ extension QwenRuntime {
         }
         budget = max(1, budget)
 
-        var seedTokens = context.tokenizer.encode(
-            text: prompt, addSpecialTokens: false)
-
-        // COMPACTION. Above a token threshold, replace SETTLED tool results
-        // with a content-derived stub and re-render. Cold prefill is linear in
-        // token count, so this is the only lever that changes the input rather
-        // than the cost per token: on a real session the largest prompt fell
-        // 59,407 -> 9,866 tokens, which at ~8 ms/token is 475 s -> 79 s.
-        //
-        // Measure first, then decide: the threshold is checked against the
-        // ACTUAL token count rather than a character estimate, because a
-        // character heuristic would misfire on tool output whose token density
-        // differs from prose. One extra tokenisation of a long prompt costs
-        // milliseconds against a prefill measured in minutes.
-        if seedTokens.count > Self.compactionThresholdTokens {
-            let compacted = Self.compactSettledToolResults(
-                decoded.messages, minimumCharacters: Self.compactionMinimumChars)
-            if compacted.stubbed > 0,
-               let rerendered = try? OpenAIPromptRendering
-                   .renderPromptWithTurnBoundaries(
-                       messages: compacted.messages, tools: tools)
-            {
-                let after = context.tokenizer.encode(
-                    text: rerendered.0, addSpecialTokens: false)
-                // Only adopt it if it actually helped. A stub is not free --
-                // it carries a hash, a size and head/tail lines -- so on
-                // content that is large in characters but short in tokens the
-                // replacement can be a wash or worse.
-                if after.count < seedTokens.count {
-                    let saved = Self.estimatedSeconds(
-                        seedTokens.count - after.count)
-                    serveNote(
-                        "compacted \(compacted.stubbed) tool results: "
-                            + "\(seedTokens.count) -> \(after.count) tokens "
-                            + "(saved ~\(saved) of prefill)")
-                    prompt = rerendered.0
-                    turnEnds = rerendered.1
-                    seedTokens = after
-                } else {
-                    serveNote(
-                        "compaction declined: \(seedTokens.count) -> "
-                            + "\(after.count) tokens, no gain")
-                }
-            }
+        var extraMessages: [ChatMessage] = []
+        var prompt: String
+        var turnEnds: [Int]
+        var seedTokens: [Int]
+        do {
+            (prompt, turnEnds, seedTokens) = try renderTurn(extraMessages)
+        } catch {
+            responder.sendError(status: 400, message: "\(error)")
+            return
         }
-
-        let turnBoundaries = Self.tokenBoundaries(
+        var turnBoundaries = Self.tokenBoundaries(
             forCharacterOffsets: turnEnds, in: prompt,
             tokenizer: context.tokenizer, totalTokens: seedTokens.count)
         let streaming = decoded.stream ?? false
@@ -339,42 +352,78 @@ extension QwenRuntime {
             // tail turns a full re-prefill into a short one. Anything that is
             // not a strict extension restarts, because the session's recurrent
             // layers cannot rewind (see `ServePrefixDecision`).
-            let decision = context.decide(for: seedTokens)
-            switch decision {
-            case .extend(let tail):
-                serveNote(
-                    "reusing \(seedTokens.count - tail.count) cached tokens, "
-                        + "prefilling \(tail.count)")
-            case .restart:
-                context.invalidate()
-                let reset = try context.client.resetMTPDecode()
-                guard reset.ok else {
-                    throw MLXFastError.invalidInput(
-                        "the MTP worker refused the session reset: "
-                            + (reset.error ?? "no reason reported"))
-                }
-            }
-
-            let outcome = try generate(
-                context: context,
-                seedTokens: seedTokens,
-                turnBoundaries: turnBoundaries,
-                decision: decision,
-                sampling: samplingFor(decoded),
-                budget: budget,
-                stopStrings: decoded.stop?.values ?? [],
-                depth: options.depth,
-                tools: tools,
-                onDelta: streaming
-                    ? { delta in
-                        emitChunk(
-                            responder: responder, id: String(completionID),
-                            created: created, model: options.modelName,
-                            delta: .init(role: nil, content: delta, toolCalls: nil),
-                            finishReason: nil, openStream: true)
+            // RETRIEVAL LOOP. Compaction removes bytes from the prompt, not
+            // from the conversation, so the model must be able to reach the
+            // original text. It asks by calling `expand_tool_result`, and this
+            // answers it HERE rather than returning the call to the client:
+            // the client has never heard of the tool, because the stub the
+            // model is reading is ours.
+            //
+            // Each pass appends a well-formed call/result pair and re-renders.
+            // The re-prefill is short -- the new prompt strictly extends the
+            // last one, so `ServePrefixDecision` sees `.extend` and only the
+            // appended tail is prefilled.
+            var outcome: ServeOutcome
+            var expansions = 0
+            while true {
+                let decision = context.decide(for: seedTokens)
+                switch decision {
+                case .extend(let tail):
+                    serveNote(
+                        "reusing \(seedTokens.count - tail.count) cached tokens, "
+                            + "prefilling \(tail.count)")
+                case .restart:
+                    context.invalidate()
+                    let reset = try context.client.resetMTPDecode()
+                    guard reset.ok else {
+                        throw MLXFastError.invalidInput(
+                            "the MTP worker refused the session reset: "
+                                + (reset.error ?? "no reason reported"))
                     }
-                    : nil
-            )
+                }
+
+                    outcome = try generate(
+                    context: context,
+                    seedTokens: seedTokens,
+                    turnBoundaries: turnBoundaries,
+                    decision: decision,
+                    sampling: samplingFor(decoded),
+                    budget: budget,
+                    stopStrings: decoded.stop?.values ?? [],
+                    depth: options.depth,
+                    tools: tools,
+                    onDelta: streaming
+                        ? { delta in
+                            emitChunk(
+                                responder: responder, id: String(completionID),
+                                created: created, model: options.modelName,
+                                delta: .init(role: nil, content: delta, toolCalls: nil),
+                                finishReason: nil, openStream: true)
+                        }
+                        : nil
+                )
+                let expandCalls = outcome.toolCalls.filter {
+                    $0.function.name == Self.expandToolName
+                }
+                guard !expandCalls.isEmpty,
+                      expansions + expandCalls.count <= Self.maxExpansionsPerTurn
+                else { break }
+
+                extraMessages.append(.assistantToolCall(expandCalls))
+                for call in expandCalls {
+                    let handle = Self.handleArgument(call.function.arguments)
+                    extraMessages.append(.toolResult(
+                        id: call.id,
+                        text: Self.resolveExpansion(handle: handle)))
+                    serveNote("expanded compacted result \(handle)")
+                }
+                expansions += expandCalls.count
+                (prompt, turnEnds, seedTokens) = try renderTurn(extraMessages)
+                turnBoundaries = Self.tokenBoundaries(
+                    forCharacterOffsets: turnEnds, in: prompt,
+                    tokenizer: context.tokenizer,
+                    totalTokens: seedTokens.count)
+            }
 
             context.record(prompt: seedTokens, emitted: outcome.emittedTokens)
             // Refresh this conversation's resume point to the END of the turn.
@@ -850,6 +899,75 @@ extension QwenRuntime {
             terminalToken: terminalToken)
     }
 
+    // MARK: - compaction retrieval
+
+    static let expandToolName = "expand_tool_result"
+
+    /// Bound on server-side expansions per turn. A model that keeps asking for
+    /// more text would otherwise re-prefill the turn indefinitely; four is
+    /// enough to answer a question about a handful of results and small enough
+    /// that a loop cannot run away.
+    static let maxExpansionsPerTurn = 4
+
+    static func isExpandTool(_ tool: OrderedJSON) -> Bool {
+        guard case .object(let pairs) = tool else { return false }
+        for pair in pairs where pair.key == "function" {
+            guard case .object(let fn) = pair.value else { continue }
+            for entry in fn where entry.key == "name" {
+                if case .string(let name) = entry.value {
+                    return name == expandToolName
+                }
+            }
+        }
+        return false
+    }
+
+    /// Advertised to the model ONLY when this turn actually stubbed something.
+    /// Declaring it unconditionally would invite calls with no valid handle
+    /// and spend tokens describing a capability the turn cannot use.
+    ///
+    /// Resolved SERVER-SIDE. The OpenAI protocol has the client execute tools,
+    /// but the client has never heard of this one -- it is our stub the model
+    /// is reading, so it is our job to answer. The turn continues internally
+    /// and the client sees only the final reply.
+    static func expandToolSchema() -> OrderedJSON? {
+        try? OrderedJSON.parse("""
+        {"type":"function","function":{
+          "name":"\(expandToolName)",
+          "description":"Retrieve the full original text of a tool result that was replaced by a [compacted tool result] stub. Pass the sha handle shown in the stub.",
+          "parameters":{"type":"object",
+            "properties":{"handle":{"type":"string",
+              "description":"The 16-hex sha handle from the stub line."}},
+            "required":["handle"]}}}
+        """)
+    }
+
+    /// Pull `handle` out of the call's JSON-encoded arguments.
+    ///
+    /// Tolerant on purpose: the model writes this string, and a malformed
+    /// argument should produce a "no such handle" answer it can read and
+    /// recover from, not a 500 that kills a turn which is otherwise fine.
+    static func handleArgument(_ arguments: String) -> String {
+        guard let data = arguments.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data)
+                  as? [String: Any],
+              let handle = root["handle"] as? String
+        else { return "" }
+        return handle
+    }
+
+    /// Answer one expansion. A miss is reported to the MODEL as text rather
+    /// than raised: the handle may have been evicted or the server restarted,
+    /// and a failed retrieval should cost answer quality, never the request.
+    static func resolveExpansion(handle: String) -> String {
+        guard let text = CompactionStore.shared.get(handle: handle) else {
+            return "No retained text for handle \(handle). It may have been "
+                + "evicted, or produced before this server started. Re-run the "
+                + "original tool call to obtain it."
+        }
+        return text
+    }
+
     // MARK: - tool-result compaction
 
     /// Prompt-token count above which settled tool results are stubbed.
@@ -910,6 +1028,8 @@ extension QwenRuntime {
             // Settled: some later message is an assistant turn.
             guard messages[(index + 1)...].contains(where: { $0.role == "assistant" })
             else { continue }
+            let handle = Self.handle(for: text)
+            CompactionStore.shared.put(handle: handle, text: text)
             out[index] = messages[index].replacingContent(
                 Self.renderStub(for: text))
             stubbed += 1
@@ -936,7 +1056,10 @@ extension QwenRuntime {
         if let tail = nonEmpty.last, nonEmpty.count > 1 {
             parts.append("tail: " + String(tail.prefix(200)))
         }
-        parts.append("The full text is not retained; re-run the original call.")
+        parts.append(
+            "The full text is retained. To read it, call "
+                + "\(Self.expandToolName)(handle=\"\(Self.handle(for: content))\"). "
+                + "Re-running the original call also works.")
         return parts.joined(separator: "\n")
     }
 
