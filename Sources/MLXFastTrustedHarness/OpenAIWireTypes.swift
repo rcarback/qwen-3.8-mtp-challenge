@@ -60,6 +60,26 @@ struct ChatMessage: Decodable {
         case toolCalls = "tool_calls"
         case toolCallId = "tool_call_id"
     }
+
+    private init(
+        role: String, content: MessageContent?,
+        toolCalls: [ToolCallPayload]?, toolCallId: String?
+    ) {
+        self.role = role
+        self.content = content
+        self.toolCalls = toolCalls
+        self.toolCallId = toolCallId
+    }
+
+    /// Same message with different text. Used by tool-result compaction, which
+    /// must preserve `tool_call_id` -- an orphaned tool message is invalid on
+    /// the wire, and dropping the id would strand the assistant `tool_calls`
+    /// entry that refers to it.
+    func replacingContent(_ text: String) -> ChatMessage {
+        ChatMessage(
+            role: role, content: .text(text),
+            toolCalls: toolCalls, toolCallId: toolCallId)
+    }
 }
 
 /// Content arrives either as a bare string or as an array of typed parts.

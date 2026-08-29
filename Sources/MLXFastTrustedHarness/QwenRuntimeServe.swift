@@ -260,8 +260,8 @@ extension QwenRuntime {
         // `JSONDecoder` cannot promise, so they are re-parsed from the raw body.
         let tools = parseToolsFromRawBody(request.body)
 
-        let prompt: String
-        let turnEnds: [Int]
+        var prompt: String
+        var turnEnds: [Int]
         do {
             (prompt, turnEnds) = try OpenAIPromptRendering
                 .renderPromptWithTurnBoundaries(
@@ -278,8 +278,52 @@ extension QwenRuntime {
         }
         budget = max(1, budget)
 
-        let seedTokens = context.tokenizer.encode(
+        var seedTokens = context.tokenizer.encode(
             text: prompt, addSpecialTokens: false)
+
+        // COMPACTION. Above a token threshold, replace SETTLED tool results
+        // with a content-derived stub and re-render. Cold prefill is linear in
+        // token count, so this is the only lever that changes the input rather
+        // than the cost per token: on a real session the largest prompt fell
+        // 59,407 -> 9,866 tokens, which at ~8 ms/token is 475 s -> 79 s.
+        //
+        // Measure first, then decide: the threshold is checked against the
+        // ACTUAL token count rather than a character estimate, because a
+        // character heuristic would misfire on tool output whose token density
+        // differs from prose. One extra tokenisation of a long prompt costs
+        // milliseconds against a prefill measured in minutes.
+        if seedTokens.count > Self.compactionThresholdTokens {
+            let compacted = Self.compactSettledToolResults(
+                decoded.messages, minimumCharacters: Self.compactionMinimumChars)
+            if compacted.stubbed > 0,
+               let rerendered = try? OpenAIPromptRendering
+                   .renderPromptWithTurnBoundaries(
+                       messages: compacted.messages, tools: tools)
+            {
+                let after = context.tokenizer.encode(
+                    text: rerendered.0, addSpecialTokens: false)
+                // Only adopt it if it actually helped. A stub is not free --
+                // it carries a hash, a size and head/tail lines -- so on
+                // content that is large in characters but short in tokens the
+                // replacement can be a wash or worse.
+                if after.count < seedTokens.count {
+                    let saved = Self.estimatedSeconds(
+                        seedTokens.count - after.count)
+                    serveNote(
+                        "compacted \(compacted.stubbed) tool results: "
+                            + "\(seedTokens.count) -> \(after.count) tokens "
+                            + "(saved ~\(saved) of prefill)")
+                    prompt = rerendered.0
+                    turnEnds = rerendered.1
+                    seedTokens = after
+                } else {
+                    serveNote(
+                        "compaction declined: \(seedTokens.count) -> "
+                            + "\(after.count) tokens, no gain")
+                }
+            }
+        }
+
         let turnBoundaries = Self.tokenBoundaries(
             forCharacterOffsets: turnEnds, in: prompt,
             tokenizer: context.tokenizer, totalTokens: seedTokens.count)
@@ -804,6 +848,107 @@ extension QwenRuntime {
             stats: stats,
             emittedTokens: emitted,
             terminalToken: terminalToken)
+    }
+
+    // MARK: - tool-result compaction
+
+    /// Prompt-token count above which settled tool results are stubbed.
+    /// Tunable; deliberately not tuned yet.
+    static var compactionThresholdTokens: Int {
+        envInt("DARKBLOOM_COMPACT_THRESHOLD_TOKENS", default: 8192)
+    }
+
+    /// Minimum tool-result size, in characters, worth replacing. 2048 is the
+    /// sized default: on real sessions 512 and 1024 land within 0.3% of it,
+    /// so almost nothing falls in that band, while 8192 loses about half the
+    /// win. Characters, not tokens, so the test is cheap and needs no encode.
+    static var compactionMinimumChars: Int {
+        envInt("DARKBLOOM_COMPACT_MIN_CHARS", default: 2048)
+    }
+
+    static func envInt(_ name: String, default fallback: Int) -> Int {
+        guard let raw = ProcessInfo.processInfo.environment[name],
+              let value = Int(raw), value > 0
+        else { return fallback }
+        return value
+    }
+
+    /// Reporting only: prefill runs about 8 ms/token on this box.
+    static func estimatedSeconds(_ tokens: Int) -> String {
+        String(format: "%.1fs", Double(tokens) * 0.008)
+    }
+
+    /// Replace SETTLED tool results with a content-derived stub.
+    ///
+    /// Settled means at least one assistant message follows it. A fresh result
+    /// is the one the model must act on THIS turn, so it is never stubbed --
+    /// that is the difference between compaction and simply deleting context.
+    /// Message arrays are append-only, so "settled" flips false to true exactly
+    /// once and never back.
+    ///
+    /// Whole results only. A truncated tool result is malformed input that the
+    /// recurrent layers fold in irreversibly, and there is no way to signal
+    /// partiality that the model reliably respects.
+    ///
+    /// The stub is derived only from the content, so it is byte-identical
+    /// across turns. Under a warm cache that preserves the prefix; the value
+    /// here is simply that it is deterministic.
+    ///
+    /// LIMITATION, stated because it is a real behaviour change: there is no
+    /// expand() tool on this path, so the full text is NOT retrievable from
+    /// inside the turn. The stub says to re-run the original call. The Python
+    /// sidecar in tools/serve-compactor offers retrieval; this does not.
+    static func compactSettledToolResults(
+        _ messages: [ChatMessage], minimumCharacters: Int
+    ) -> (messages: [ChatMessage], stubbed: Int) {
+        var out = messages
+        var stubbed = 0
+        for index in messages.indices {
+            guard messages[index].role == "tool" else { continue }
+            let text = messages[index].content?.text ?? ""
+            guard text.count >= minimumCharacters else { continue }
+            // Settled: some later message is an assistant turn.
+            guard messages[(index + 1)...].contains(where: { $0.role == "assistant" })
+            else { continue }
+            out[index] = messages[index].replacingContent(
+                Self.renderStub(for: text))
+            stubbed += 1
+        }
+        return (out, stubbed)
+    }
+
+    /// The replacement text. Carries enough to reason about what was elided --
+    /// a stable handle, the size, and the first and last non-empty lines --
+    /// without carrying the body.
+    static func renderStub(for content: String) -> String {
+        let lines = content.split(
+            separator: "\n", omittingEmptySubsequences: false)
+        let nonEmpty = lines.filter {
+            !$0.trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        var parts = [
+            "[compacted tool result | sha=\(Self.handle(for: content)) "
+                + "| \(content.count) chars | \(lines.count) lines]"
+        ]
+        if let head = nonEmpty.first {
+            parts.append("head: " + String(head.prefix(200)))
+        }
+        if let tail = nonEmpty.last, nonEmpty.count > 1 {
+            parts.append("tail: " + String(tail.prefix(200)))
+        }
+        parts.append("The full text is not retained; re-run the original call.")
+        return parts.joined(separator: "\n")
+    }
+
+    /// FNV-1a over the content. Not cryptographic -- it only has to be stable
+    /// and collision-resistant enough to name one blob inside one prompt.
+    static func handle(for content: String) -> String {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in content.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        return String(format: "%016llx", hash)
     }
 
     /// Every id that terminates a turn: the union of `eos_token_id` and
