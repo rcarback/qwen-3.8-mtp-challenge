@@ -119,6 +119,28 @@ func qwenKVPolicyIdentity() -> String {
         + "s\(policy.seed)"
 }
 
+/// Whether a captured snapshot describes exactly the token array filed with it.
+///
+/// A resume point is a pair: an array of tokens, and the session state reached
+/// by consuming them. The pair is only usable if both halves agree, and they
+/// can disagree in one specific way. A decode round at depth 2 commits one to
+/// three tokens at once, and the serve loop stops walking that round at EOS or
+/// its `max_tokens` budget, discarding the rest. The parent then files
+/// `seed + emitted` while the session has already folded the whole round in, so
+/// the state runs ahead of the array by however many tokens were dropped.
+///
+/// The session's own position is `seedTokenCount + committedTokenCount`, the
+/// same quantity the round ledger compares against, so the check is an equality
+/// between that and the filed array's length.
+///
+/// Pure arithmetic so it can be tested without a model.
+func qwenMTPSnapshotDescribes(
+    tokenCount: Int, seedTokenCount: Int, committedTokenCount: Int
+) -> Bool {
+    tokenCount == seedTokenCount + committedTokenCount
+}
+
+
 /// Flatten a snapshot's heterogeneous per-layer caches into named arrays.
 ///
 /// The layer stack mixes `ArraysCache` for the 48 gated-delta layers with
@@ -576,6 +598,46 @@ extension QwenRuntime {
             // Capturing state cannot fail: it copies caches the session
             // already holds, so there is no error path to poison the session on.
             let snapshot = session.snapshotState()
+
+            // REFUSE a snapshot the token array does not describe.
+            //
+            // A decode round at depth 2 commits one to three tokens at once,
+            // and the serve loop stops walking that round the moment it hits
+            // EOS or its max_tokens budget, dropping the rest
+            // (QwenRuntimeServe.swift:655-668). The parent then files
+            // `seed + emitted`, which is SHORTER than what the session
+            // actually folded in, while this snapshot carries the session's
+            // own committed count. Restoring that pair sets the session
+            // counters from the snapshot and the ledger seed from the shorter
+            // array, so the two disagree permanently and the first decode
+            // round after the resume throws at the ledger check below.
+            // Measured on a live server: every resume that fired returned
+            // HTTP 500, three out of three, with the offset ahead by exactly
+            // the number of tokens the parent discarded.
+            //
+            // Reconciling the counters is NOT available: the discarded tokens
+            // are already folded into all 48 gated-delta layers' recurrent
+            // state, and that fold cannot be undone. Recording the longer
+            // array instead would be accurate but useless -- the client never
+            // saw those tokens, so no later prompt can match the checkpoint.
+            // So the honest move is to skip the checkpoint. Snapshotting is
+            // best-effort by contract (QwenRuntimeServe.swift:325-330): a
+            // missing resume point costs a slower turn, never a wrong answer.
+            guard qwenMTPSnapshotDescribes(
+                tokenCount: tokens.count,
+                seedTokenCount: snapshot.seedTokenCount,
+                committedTokenCount: snapshot.committedTokenCount)
+            else {
+                FileHandle.standardError.write(Data(
+                    ("qwen-mtp: skipping resume point, snapshot describes "
+                        + "\(snapshot.seedTokenCount + snapshot.committedTokenCount) "
+                        + "tokens but the filed array has \(tokens.count) "
+                        + "(the parent cut a decode round short)\n").utf8))
+                return RuntimeWorkerResponse(
+                    id: request.id, nonce: sessionNonce, ok: false,
+                    resumedTokens: 0)
+            }
+
             qwenMTPResumeStore.record(
                 conversation: conversationId,
                 tokens: tokens,
