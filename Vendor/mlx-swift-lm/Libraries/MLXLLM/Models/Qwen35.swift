@@ -1843,7 +1843,14 @@ public enum Qwen35CustomQMV {
 
     /// Read once at process start; never varies with the request, the prompt
     /// or the benchmark phase.
-    static let maxWidth = parseMaxWidth(
+    ///
+    /// PUBLIC BECAUSE THE VERIFY-WIDTH CAP CONSUMES IT. A verify round of
+    /// depth `d` projects `d + 1` rows, and rows above this bound leave the
+    /// replica for MLX's own dispatch, which switches from qmv to qmm at
+    /// `M >= get_qmv_batch_limit(K, N)` and stops being per-row exact. The
+    /// MTP session therefore clamps its depth cap to `maxWidth - 1`; see
+    /// `Qwen36MTPBlockSession.provenExactDepthCeiling`.
+    public static let maxWidth = parseMaxWidth(
         ProcessInfo.processInfo.environment[maxWidthEnvName])
 
     /// Widths the candidate-owned dispatch may take. M=1 stays on MLX
