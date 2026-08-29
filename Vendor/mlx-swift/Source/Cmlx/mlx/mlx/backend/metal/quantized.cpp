@@ -66,7 +66,30 @@ inline int qmm_row_tile(int M) {
       return v;
     }
   }
-  return M <= 16 ? 16 : 32;
+  // Above 32 the choice is decided by PADDED ROWS, not by M alone. The kernel
+  // computes ceil(M/BM) full BM-row tiles, so a 64-row tile is worth its
+  // halved weight-dequant traffic only when it does not pad more rows than a
+  // 32-row tile would. Measured 2026-08-29 at the three real projection
+  // shapes, BM=64 against BM=32 (mean of gate_up / gdn in_proj / mlp down):
+  //
+  //   M      24    32    48    64    96   128   256   512  1024
+  //   x    0.54  0.59  0.95  1.08  0.78  1.06  1.06  1.07  1.08
+  //
+  // M=96 is the tell: a 32-row tile computes exactly 96 rows while a 64-row
+  // tile computes 128, and a third of the MMA thrown away costs far more than
+  // the dequant saving returns. The `M >= 64` floor drops M=48, where both
+  // tiles pad to 64 but the smaller one still measured better.
+  //
+  // The ladder stops here. BM=128 measured 1.00-1.03x at M=1024, worse than
+  // 64 on all three shapes, and BM=256 does not compile at all: loader.h
+  // derives TCOLS = BCOLS / n_reads, and at BK=32 with 128 threads BM=256
+  // drives n_reads past BCOLS so TCOLS truncates to zero.
+  if (M <= 16) {
+    return 16;
+  }
+  const int padded32 = ((M + 31) / 32) * 32;
+  const int padded64 = ((M + 63) / 64) * 64;
+  return (M >= 64 && padded64 <= padded32) ? 64 : 32;
 }
 
 // When set, the bm suffix is omitted from the kernel name while bm still drives
