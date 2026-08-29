@@ -1248,7 +1248,19 @@ final class Qwen35GatedDeltaNet: Module {
         let z: MLXArray
         let b: MLXArray
         let a: MLXArray
-        if S <= 9, let fused = fusedInProjections(inputs) {
+        // WIDTH WALL, and the literal 9 that used to stand here was one.
+        // The fused form is one matmul over the concatenated [qkv | z | b | a]
+        // weight; the fallback is four separate ones. Those are different
+        // dispatches and therefore different bits, and a serial round is
+        // S = 1 and ALWAYS takes the fused path -- so every verify width that
+        // falls back diverges from the serial trajectory at every row.
+        //
+        // The bound belongs to the QMV replica, not to this call site: the
+        // fused matmul is per-row exact exactly where `qwen35RoutedQuantizedMM`
+        // routes it to the replica, which is `2 ... Qwen35CustomQMV.maxWidth`.
+        // Tying the two together is what makes one knob move both. The
+        // replica's default is 9, so this is behaviour-preserving by default.
+        if S <= Qwen35CustomQMV.maxWidth, let fused = fusedInProjections(inputs) {
             qkv = fused.0
             z = fused.1.reshaped(B, S, numVHeads, headVDim)
             b = fused.2
