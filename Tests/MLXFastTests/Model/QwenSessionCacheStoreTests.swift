@@ -17,12 +17,16 @@ struct QwenSessionCacheStoreTests {
 
     @Test("default budget is clamped to a quarter of physical memory")
     func budgetClamp() {
+        // Half of physical, capped by the 64 GiB default. A 128 GiB box now
+        // gets the full 64 GiB the comments always claimed it did.
         #expect(QwenSessionCacheBudget.clampedDefault(
-            physicalMemory: 128 * GiB) == 32 * GiB)
+            physicalMemory: 128 * GiB) == 64 * GiB)
         #expect(QwenSessionCacheBudget.clampedDefault(
             physicalMemory: 512 * GiB) == 64 * GiB)   // capped by the default
         #expect(QwenSessionCacheBudget.clampedDefault(
-            physicalMemory: 64 * GiB) == 16 * GiB)
+            physicalMemory: 64 * GiB) == 32 * GiB)
+        #expect(QwenSessionCacheBudget.clampedDefault(
+            physicalMemory: 16 * GiB) == 8 * GiB)
     }
 
     /// REGRESSION. `bestMatch` must verify against the tokens the ROUND was
