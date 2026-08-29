@@ -45,9 +45,22 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
     /// One retained round: everything needed to resume decoding at exactly
     /// this many committed tokens.
     public struct Round {
-        /// Committed token count this round ends at. The KV slices are already
-        /// cut to it; this is carried for the prefix match and for accounting.
-        public let tokenCount: Int
+        /// The exact token prefix this snapshot was built from.
+        ///
+        /// CARRIED PER ROUND, NOT PER CONVERSATION, and that is the whole point.
+        /// `record` overwrites `Conversation.tokens` on every call, and
+        /// `conversationKey` buckets on a hash of only the first 128 tokens
+        /// (`QwenRuntimeServe.swift:194-198`), so agent sessions sharing a
+        /// system prompt land in one bucket. Verifying a round against the
+        /// conversation's LATEST array therefore checks the wrong stream: a
+        /// snapshot captured on one branch could be handed to a request from
+        /// another, resuming 48 gated-delta layers from state conditioned on
+        /// text the caller never sent, with nothing to report it. At ~8 B per
+        /// token against a 144 MiB round this costs about 0.1%.
+        public let tokens: [Int]
+        /// Committed token count this round ends at. DERIVED from `tokens` so
+        /// the count and the stream it describes cannot disagree.
+        public var tokenCount: Int { tokens.count }
         /// The retained resume point. Full-attention KV rides along as
         /// copy-on-write slices (free); the gated-delta recurrent arrays are
         /// the real cost.
@@ -134,9 +147,7 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
             // read the next token from, the same reason `ServePrefixDecision`
             // treats an equal-length prompt as a restart.
             guard round.tokenCount < incoming.count,
-                  round.tokenCount <= conversation.tokens.count,
-                  Array(conversation.tokens.prefix(round.tokenCount))
-                      == Array(incoming.prefix(round.tokenCount))
+                  round.tokens == Array(incoming.prefix(round.tokenCount))
             else { continue }
             if best == nil || round.tokenCount > best!.0.tokenCount {
                 best = (round, Array(incoming.dropFirst(round.tokenCount)))
@@ -164,7 +175,7 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
         conversation.tokens = tokens
         conversation.kvBytes = Swift.max(conversation.kvBytes, kvBytes)
         conversation.rounds.append(
-            Round(tokenCount: tokens.count, state: state, roundBytes: roundBytes))
+            Round(tokens: tokens, state: state, roundBytes: roundBytes))
         conversation.lastUsed = clock
         conversations[id] = conversation
         evictToBudget(protecting: id)
@@ -302,9 +313,7 @@ public final class QwenSessionCacheStore<Payload>: @unchecked Sendable {
                   // row to read the next token from, the same reason
                   // `bestMatch` treats an equal-length prompt as a restart.
                   round.tokenCount < incoming.count,
-                  conversation.tokens.count >= round.tokenCount,
-                  Array(conversation.tokens.prefix(round.tokenCount))
-                      == Array(incoming.prefix(round.tokenCount))
+                  round.tokens == Array(incoming.prefix(round.tokenCount))
             else { continue }
             clock += 1
             conversation.lastUsed = clock

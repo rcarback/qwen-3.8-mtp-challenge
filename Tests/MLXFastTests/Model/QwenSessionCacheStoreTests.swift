@@ -25,6 +25,34 @@ struct QwenSessionCacheStoreTests {
             physicalMemory: 64 * GiB) == 16 * GiB)
     }
 
+    /// REGRESSION. `bestMatch` must verify against the tokens the ROUND was
+    /// built from, never against the conversation's latest token array.
+    ///
+    /// `conversationKey` hashes only the first 128 tokens
+    /// (`QwenRuntimeServe.swift:194-198`), so every agent session that shares a
+    /// system prompt lands in ONE bucket. `record` then overwrites
+    /// `conversation.tokens` wholesale. If verification reads that shared,
+    /// mutable array, a snapshot captured on one branch can be handed to a
+    /// request from another: the 48 gated-delta layers resume from state that
+    /// was conditioned on text the caller never sent, and nothing reports it.
+    ///
+    /// Here round 4 was built from [1,2,3,4]. The incoming prompt is
+    /// [1,2,9,9,7], which diverges from it at index 2, so NO round is a valid
+    /// prefix and the honest answer is nil. Round 5 is excluded because a round
+    /// ending at the prompt's own length leaves no row to read the next token
+    /// from, which is what makes the stale round 4 the deepest candidate.
+    @Test("a round is verified against its own tokens, not the latest stream")
+    func roundVerifiesAgainstItsOwnTokens() {
+        let store = QwenSessionCacheStore<Payload>(budgetBytes: 1 * GiB)
+        store.record(conversation: "c", tokens: [1, 2, 3, 4],
+                     state: state(111), roundBytes: MiB, kvBytes: MiB)
+        store.record(conversation: "c", tokens: [1, 2, 9, 9, 9],
+                     state: state(222), roundBytes: MiB, kvBytes: MiB)
+
+        let hit = store.bestMatch(conversation: "c", incoming: [1, 2, 9, 9, 7])
+        #expect(hit == nil, "no retained round is a prefix of the incoming prompt")
+    }
+
     @Test("deepest usable round wins; an equal-length prompt falls back")
     func matching() {
         let store = QwenSessionCacheStore<Payload>(budgetBytes: 1 * GiB)
