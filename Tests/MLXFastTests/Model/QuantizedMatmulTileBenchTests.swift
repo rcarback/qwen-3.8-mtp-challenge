@@ -33,8 +33,21 @@ struct QuantizedMatmulTileBenchTests {
         Shape(label: "mlp down", k: 17_408, n: 5_120),
     ]
 
-    private static let widths = [10, 12, 16, 24, 32]
-    private static let arms = [32, 16]
+    /// Defaults cover the narrow decode band the 16-vs-32 rule was written for.
+    /// `MLX_QMM_BM_WIDTHS` and `MLX_QMM_BM_ARMS` (comma-separated) retarget the
+    /// sweep without a second harness -- the large-M / BM=64 question needs
+    /// M=1024 and arms 32,64, which is the same measurement on other points.
+    private static func intList(_ name: String, default fallback: [Int]) -> [Int] {
+        guard let raw = ProcessInfo.processInfo.environment[name] else {
+            return fallback
+        }
+        let parsed = raw.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        return parsed.isEmpty ? fallback : parsed
+    }
+
+    private static var widths: [Int] { intList("MLX_QMM_BM_WIDTHS", default: [10, 12, 16, 24, 32]) }
+    private static var arms: [Int] { intList("MLX_QMM_BM_ARMS", default: [32, 16]) }
+
 
     private static let groupSize = 64
     private static let bits = 4
@@ -44,7 +57,9 @@ struct QuantizedMatmulTileBenchTests {
     private static let xVariants = 8
     /// Dispatches folded into one `eval`, to keep host graph-build cost small
     /// against the measured device time.
-    private static let itersPerSample = 16
+    /// Lowered for large M via `MLX_QMM_BM_ITERS` so one folded eval does not
+    /// allocate gigabytes of output: at M=1024 each gate_up result is 71 MB.
+    private static var itersPerSample: Int { intList("MLX_QMM_BM_ITERS", default: [16])[0] }
     /// Timed samples per cell per arm. Arms alternate sample by sample.
     private static let samples = 15
 
@@ -150,7 +165,10 @@ struct QuantizedMatmulTileBenchTests {
                     }
                 }
 
-                var timings: [Int: [Double]] = [32: [], 16: []]
+                // Keyed from `arms`, never a hardcoded pair: an override
+                // that names any other tile would otherwise force-unwrap nil.
+                var timings: [Int: [Double]] = Dictionary(
+                    uniqueKeysWithValues: Self.arms.map { ($0, [Double]()) })
                 // ABAB: arms alternate sample by sample so thermal drift over
                 // the cell lands on both equally.
                 for _ in 0 ..< Self.samples {
@@ -195,15 +213,24 @@ struct QuantizedMatmulTileBenchTests {
                                 weightBytes / med / 1e9))
                     #expect(med > 0)
                 }
-                let ratio = median(timings[32]!) / median(timings[16]!)
+                // Every arm is reported against arms[0], so the sweep takes
+                // any number of tiles. A hardcoded key would force-unwrap nil
+                // the moment the override names a tile the literal missed.
+                let base = Self.arms[0]
                 let label = shape.label.padding(
                     toLength: 12, withPad: " ", startingAt: 0)
-                let tail = String(
-                    format: "bm16 speedup %.3fx  (relerr 32:%.4f 16:%.4f)",
-                    ratio, errors[32]!, errors[16]!)
+                let speedups = Self.arms.dropFirst().map { arm in
+                    String(
+                        format: "bm%d %.3fx", arm,
+                        median(timings[base]!) / median(timings[arm]!))
+                }.joined(separator: " ")
+                let relerrs = Self.arms.map {
+                    String(format: "%d:%.4f", $0, errors[$0]!)
+                }.joined(separator: " ")
                 lines.append(
-                    "  \(label) M=\(m)\t\(cells[0])  |  \(cells[1])  |  "
-                        + tail)
+                    "  \(label) M=\(m)\t" + cells.joined(separator: "  |  ")
+                        + "  |  vs bm\(base): " + speedups
+                        + "  (relerr " + relerrs + ")")
             }
         }
 

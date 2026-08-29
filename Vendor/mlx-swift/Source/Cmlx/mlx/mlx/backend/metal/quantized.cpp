@@ -39,13 +39,30 @@ inline int qmm_row_tile(int M) {
   // forward at depth ~2k, BM=16 is 1.30x at M=12 and 1.38x at M=16, and
   // 0.79-0.81x at M=24 and M=32.
   //
-  // MLX_QMM_BM overrides the rule for A/B work; MLX_QMM_BM_COLLIDE reproduces
-  // the name-cache hazard on purpose (see qmm_probe_suffix). Neither is read
-  // on the shipped path when unset.
+  // At LARGE M the amortisation runs the other way. The kernel launches
+  // ceil(M/BM) row tiles and each one re-reads the whole weight matrix, so at
+  // M=1024 a BM=32 tile dequantises the entire 17408x5120 weight 32 times.
+  // That costs twice over: the scalar dequant loader issues about 2
+  // instructions per MMA issue, and on pre-M5 parts simdgroup MMA shares the
+  // FP32 ALU pipes, so those issues displace MMA one for one; and the repeated
+  // read is served from DRAM once the weight exceeds cache (a 50 MB gate_up
+  // set does, a 5.9 MB set does not, which is why the two shapes measure
+  // 5.0 and 10.2 TFLOPS). BM=64 halves the pass count and so attacks both.
+  //
+  // Higher tiles keep halving the pass count but grow the accumulator: the
+  // C tile is BM/(8*WM) x BN/(8*WN) fragments, so per lane it is 16 floats at
+  // BM=32, 32 at 64, 64 at 128 and 128 at 256. Threadgroup memory stays legal
+  // throughout (Xs+Ws is 5.1/7.7/12.8/23.0 KiB against a 32 KiB limit), so the
+  // binding resource is registers, not shared memory, and the cliff is where
+  // the accumulator spills.
+  //
+  // MLX_QMM_BM overrides the rule for A/B work and accepts 16/32/64/128/256;
+  // MLX_QMM_BM_COLLIDE reproduces the name-cache hazard on purpose (see
+  // qmm_probe_suffix). Neither is read on the shipped path when unset.
   const char* e = std::getenv("MLX_QMM_BM");
   if (e != nullptr) {
     int v = std::atoi(e);
-    if (v == 16 || v == 32) {
+    if (v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
       return v;
     }
   }
