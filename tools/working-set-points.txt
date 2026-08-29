@@ -1,0 +1,22 @@
+# shape arm width -- the decisive subset, 21 points.
+# Read the three arms at each width against each other, not across shapes.
+gate_up  reuse     1
+gate_up  stream    1
+gate_up  stream    2
+gate_up  stream    4
+gate_up  stream    8
+gate_up  stream   16
+gate_up  pressure  2
+gate_up  pressure  4
+gate_up  pressure  8
+gate_up  pressure 16
+small    reuse     1
+small    stream    1
+small    stream    4
+small    stream    8
+small    stream   16
+small    stream   64
+small    pressure  4
+small    pressure  8
+small    pressure 16
+small    pressure 64
