@@ -944,6 +944,40 @@ final class Qwen35GatedDeltaNet: Module {
     ///
     /// Prefill sits outside the gate on purpose: above width 9 the eager
     /// chain keeps the pinned reduction order.
+    /// Widest verify block the packed GDN prework kernel serves.
+    ///
+    /// THIS IS THE THIRD WIDTH WALL, and until 2026-08-28 it was an
+    /// unremarked literal `9` in the predicate below. Above it the layer
+    /// falls back to `referencePrework`, which computes the same math by a
+    /// different route and therefore in different bits. A serial round is
+    /// S = 1 and always takes the packed path, so any verify block that
+    /// falls back diverges from the serial trajectory at every row.
+    ///
+    /// Measured end to end on the hexfloat row gate (546-token prose seed,
+    /// 256 decoded tokens, depth pinned): verify widths 6...9 are bit-exact
+    /// per position, and widths 10...16 all drift with an IDENTICAL
+    /// signature — same first mismatch, same count — because they all take
+    /// the same fallback. That is this bound and nothing else.
+    ///
+    /// Left at 9 by default. `MLX_QWEN_GDN_PACKED_MAX_ROWS` raises it for
+    /// measurement; the `MLX_` prefix is what lets the runtime worker see
+    /// the same value the parent read.
+    fileprivate static let packedPreworkMaxRowsDefault = 9
+
+    /// Pure, total parser, separated from the environment read so the
+    /// contract is testable without a device.
+    static func parsePackedPreworkMaxRows(_ raw: String?) -> Int {
+        guard let raw else { return packedPreworkMaxRowsDefault }
+        guard let value = Int(raw.trimmingCharacters(in: .whitespaces)),
+              value >= 1, value <= Qwen35CustomQMV.maxWidthHardCap
+        else { return packedPreworkMaxRowsDefault }
+        return value
+    }
+
+    /// Read once at process start; never varies with the request.
+    fileprivate static let packedPreworkMaxRows = parsePackedPreworkMaxRows(
+        ProcessInfo.processInfo.environment["MLX_QWEN_GDN_PACKED_MAX_ROWS"])
+
     fileprivate func packedPreworkEligible(
         qkv: MLXArray, a: MLXArray, b: MLXArray, convState: MLXArray,
         mask: MLXArray?
@@ -952,7 +986,8 @@ final class Qwen35GatedDeltaNet: Module {
         return MLXHardwareInfo.isCompiledDecodeSupported
             && qwen35GatedDeltaMidKernel != nil
             && mask == nil
-            && qkv.dim(0) == 1 && qkv.dim(1) >= 1 && qkv.dim(1) <= 9
+            && qkv.dim(0) == 1 && qkv.dim(1) >= 1
+            && qkv.dim(1) <= Self.packedPreworkMaxRows
             && nKeep == 3
             && numKHeads == 16 && numVHeads == 48
             && headKDim == 128 && headVDim == 128
