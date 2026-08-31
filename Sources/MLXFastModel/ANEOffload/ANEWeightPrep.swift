@@ -19,4 +19,17 @@ public enum ANEWeightPrep {
         let full = dequantized(wq, scales: scales, biases: biases, groupSize: 64, bits: 4)
         return full[channelStart ..< channelEnd, 0...].asType(.float16)
     }
+
+    /// Dequantize MLX 4-bit (wq,scales,biases,groupSize:64,bits:4) to fp16 [out,in],
+    /// restricted to an INPUT-channel (column) range [columnStart..<columnEnd].
+    /// Unlike the packed 4-bit operand, `dequantized(...)` returns the full
+    /// logical `[out, in]` array, so this is a plain column slice -- no
+    /// packed-axis arithmetic needed.
+    public static func dequantizeFP16Columns(
+        wq: MLXArray, scales: MLXArray, biases: MLXArray,
+        columnStart: Int, columnEnd: Int
+    ) -> MLXArray {
+        let full = dequantized(wq, scales: scales, biases: biases, groupSize: 64, bits: 4)
+        return full[0..., columnStart ..< columnEnd].asType(.float16)
+    }
 }
