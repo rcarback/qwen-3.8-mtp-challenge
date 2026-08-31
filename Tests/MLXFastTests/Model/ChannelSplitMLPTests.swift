@@ -75,17 +75,26 @@ struct ChannelSplitMLPTests {
     }
 
     /// Tolerance on the final `[S,hidden]` max-abs error against the
-    /// all-GPU reference. `CoarseOffloadMLPTests` (which offloads the
-    /// *entire* `up` projection to fp16 ANE) measured maxAbsDiff=0.015625
-    /// with the same `1/sqrt(inn)` weight scaling and set tolerance=0.1
-    /// (~6x margin). Here at aneFraction=0.4 only 40% of the output
-    /// channels of EACH of gate/up/down run through fp16 -- a smaller
-    /// fraction of a smaller fraction of the compute than the coarse case,
-    /// so the coarse bound is not tighter than what this split can produce;
-    /// reusing it keeps the same interpretable margin (still far below the
-    /// unscaled-weights failure mode of maxAbsDiff in the thousands, which
+    /// all-GPU reference, measured directly against THIS implementation --
+    /// not borrowed from `CoarseOffloadMLPTests`. Reasoning by "offloads
+    /// less" is wrong here: gate/up/down are equal-FLOP projections,
+    /// `aneFraction=0.4` puts 40% of the output channels of ALL THREE
+    /// through fp16 ANE, and fp16 error on `gate`/`up` leaks through the
+    /// elementwise `silu(gate)*up` into `down`'s contraction. A live run at
+    /// the ranked shape (`aneFraction=0.4`, S=512 and S=500, same
+    /// `1/sqrt(inn)` weight scaling as `CoarseOffloadMLPTests`) measured
+    /// maxAbsDiff=0.015625 on both S. This bound is ~6x that: 0.015625*6 =
+    /// 0.09375 -- generous margin while still well below the
+    /// unscaled-weights failure mode of maxAbsDiff in the thousands (which
     /// would flag a real layout/axis/dtype bug).
-    private static let tolerance: Float = 0.1
+    private static let tolerance: Float = 0.09375
+
+    /// Bound on the mean-abs error, alongside the max-abs bound above. A
+    /// max-only gate would pass a hypothetical bug that adds a small
+    /// *uniform* bias to every element (well under the max bound, but a real
+    /// correctness bug); mean-abs catches that. The same live run measured
+    /// meanAbsDiff~0.00084-0.00085 at S=512/S=500; ~12x margin.
+    private static let meanTolerance: Float = 0.01
 
     private func assertMatchesReference(S: Int, aneFraction: Double, seed: UInt64, tol: Float = tolerance) throws {
         let env = ProcessInfo.processInfo.environment
@@ -113,8 +122,12 @@ struct ChannelSplitMLPTests {
         eval(got)
 
         #expect(got.shape == want.shape, "shape mismatch: got \(String(describing: got.shape)), want \(String(describing: want.shape))")
-        let maxAbsDiff = (abs(got.asType(.float32) - want.asType(.float32)).max()).item(Float.self)
+        let absDiff = abs(got.asType(.float32) - want.asType(.float32))
+        let maxAbsDiff = absDiff.max().item(Float.self)
+        let meanAbsDiff = absDiff.mean().item(Float.self)
+        print("ChannelSplitMLPTests S=\(S) aneFraction=\(aneFraction) seed=\(seed): maxAbsDiff=\(maxAbsDiff) meanAbsDiff=\(meanAbsDiff)")
         #expect(maxAbsDiff < tol, "ChannelSplitMLP diverged from all-GPU reference: maxAbsErr=\(maxAbsDiff), aneFraction=\(aneFraction)")
+        #expect(meanAbsDiff < Self.meanTolerance, "ChannelSplitMLP diverged from all-GPU reference: meanAbsErr=\(meanAbsDiff), aneFraction=\(aneFraction)")
     }
 
     @Test("ChannelSplitMLP(aneFraction=0.4) matches all-GPU reference at the ranked prefill shape (S=512)")
@@ -128,9 +141,13 @@ struct ChannelSplitMLPTests {
     }
 
     /// aneFraction=0.0 must take the pure-GPU path on every projection (F=0
-    /// everywhere), so the result should be identical (bit-for-bit modulo
-    /// the harmless bf16 round-trip cast `projSplit` applies uniformly) to
-    /// the all-GPU reference -- no ANE involvement at all.
+    /// everywhere, no ANE involvement at all), so the result must be
+    /// bit-identical to the all-GPU reference -- both compute the identical
+    /// `quantizedMM` calls on the identical weights. A live run measured
+    /// maxAbsDiff=0.0, confirming the exact-equality expectation, so this
+    /// asserts `== 0` rather than an arbitrary small tolerance. NEVER weaken
+    /// this back to a nonzero tolerance -- a nonzero residual here would mean
+    /// the ANE path is silently touched at aneFraction=0.0.
     @Test("ChannelSplitMLP(aneFraction=0.0) is identical to all-GPU reference")
     func zeroFractionMatchesReferenceExactly() throws {
         let env = ProcessInfo.processInfo.environment
@@ -158,7 +175,8 @@ struct ChannelSplitMLPTests {
         eval(got)
 
         let maxAbsDiff = (abs(got.asType(.float32) - want.asType(.float32)).max()).item(Float.self)
-        #expect(maxAbsDiff < 1e-3, "aneFraction=0.0 should be pure-GPU and match the reference near-exactly: maxAbsErr=\(maxAbsDiff)")
+        print("ChannelSplitMLPTests aneFraction=0.0: maxAbsDiff=\(maxAbsDiff)")
+        #expect(maxAbsDiff == 0, "aneFraction=0.0 must be pure-GPU and bit-identical to the reference: maxAbsErr=\(maxAbsDiff)")
     }
 
     /// aneFraction outside [0,1] must clamp rather than crash or produce
@@ -171,5 +189,56 @@ struct ChannelSplitMLPTests {
 
         try assertMatchesReference(S: 512, aneFraction: -0.5, seed: 40, tol: 1e-3)
         try assertMatchesReference(S: 512, aneFraction: 1.5, seed: 50, tol: Self.tolerance)
+    }
+
+    /// Mixed-edge combination: at `aneFraction=0.996`, `down` (out=5120,
+    /// F=round(0.996*5120/64)*64=5120) hits its F==out pure-ANE edge while
+    /// gate/up (out=17408, F=round(0.996*17408/64)*64=17344) still have a
+    /// nonzero GPU suffix (17408-17344=64 channels). The three projections
+    /// are NOT all on the same edge/interior case at once anywhere else this
+    /// suite exercises, so this specifically covers `callAsFunction` combining
+    /// a pure-ANE `down` result with interior-split `gate`/`up` results.
+    @Test("ChannelSplitMLP(aneFraction=0.996) exercises down==pure-ANE while gate/up retain a GPU suffix")
+    func mixedEdgeDownPureANEGateUpInterior() throws {
+        try assertMatchesReference(S: 512, aneFraction: 0.996, seed: 60, tol: Self.tolerance)
+    }
+
+    /// Locks the frozen 4-bit envelope property `ChannelSplitMLP` depends on:
+    /// row-slicing a shipped 4-bit affine group-64 operand along the output
+    /// (row) axis and running `quantizedMM` on the slice must be bit-identical
+    /// to running `quantizedMM` on the full operand and then slicing the
+    /// output columns. This is what makes `ChannelSplitMLP`'s GPU suffix (a
+    /// row slice of `wq`/`scales`/`biases`, never dequantized-then-requantized)
+    /// safe -- `ChannelSplitMLPTests`'s MLP-level tolerance tests cannot
+    /// isolate this property from other sources of fp16/4-bit noise, since
+    /// they always compare against a full-precision-per-projection reference.
+    @Test("row-slicing a 4-bit quantized operand is bit-identical to slicing quantizedMM's output")
+    func rowSliceOfQuantizedOperandIsLosslessEnvelope() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else { return }
+
+        let out = 256, inn = 128, S = 8, f = 128
+        let (wq, scales, biases) = Self.quantizedWeight(out: out, inn: inn, seed: 70)
+
+        MLXRandom.seed(71)
+        let x = MLXRandom.normal([S, inn]).asType(.bfloat16)
+        eval(x)
+
+        let fullOut = quantizedMM(x, wq, scales: scales, biases: biases,
+                                   transpose: true, groupSize: 64, bits: 4)
+        eval(fullOut)
+        let wantSuffix = fullOut[0..., f...]
+
+        let sliceWq = wq[f ..< out, 0...]
+        let sliceScales = scales[f ..< out, 0...]
+        let sliceBiases = biases[f ..< out, 0...]
+        eval(sliceWq, sliceScales, sliceBiases)
+        let gotSuffix = quantizedMM(x, sliceWq, scales: sliceScales, biases: sliceBiases,
+                                     transpose: true, groupSize: 64, bits: 4)
+        eval(gotSuffix)
+
+        let maxAbsDiff = (abs(gotSuffix.asType(.float32) - wantSuffix.asType(.float32)).max()).item(Float.self)
+        print("rowSliceOfQuantizedOperandIsLosslessEnvelope: maxAbsDiff=\(maxAbsDiff)")
+        #expect(maxAbsDiff == 0, "row-sliced quantizedMM must be bit-identical to slicing the full output: maxAbsErr=\(maxAbsDiff)")
     }
 }

@@ -2,7 +2,6 @@
 // the WHOLE `up` projection on the ANE concurrent with the WHOLE `gate`
 // projection on the GPU, then `down` on the GPU. See
 // `.superpowers/sdd/2026-08-30-ane-gpu-concurrent-offload/task-5-brief.md`.
-import CoreML
 import Foundation
 import MLX
 import MLXNN
@@ -55,8 +54,9 @@ public final class CoarseOffloadMLP {
     ///
     /// `makeInput`/`readOutput` run on this (the calling) thread -- both do
     /// MLX `eval` internally -- and only `aneUp.predict` (Core ML, no MLX)
-    /// runs on `ConcurrentEngines.run`'s background queue, so the `gpu`
-    /// closure's `eval` is the only MLX `eval` ever invoked off this thread.
+    /// runs on `ConcurrentEngines.run`'s background queue; `gpu` runs ON the
+    /// calling thread (see `ConcurrentEngines.run`), so there is zero MLX
+    /// `eval` off the caller.
     public func callAsFunction(_ x: MLXArray) throws -> MLXArray {
         let upInput = try aneUp.makeInput(x)
         let (upOut, gateArr) = try ConcurrentEngines.run(

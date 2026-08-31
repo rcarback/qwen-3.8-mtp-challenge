@@ -75,6 +75,13 @@ struct CoarseOffloadMLPTests {
     /// unscaled-weights run of this same test did: maxAbsDiff=16384.0).
     private static let tolerance: Float = 0.1
 
+    /// Bound on the mean-abs error, alongside the max-abs bound above. A
+    /// max-only gate would pass a hypothetical bug that adds a small
+    /// *uniform* bias to every element (well under 0.1 max, but a real
+    /// correctness bug); mean-abs catches that. Measured meanAbsDiff at
+    /// S=512/S=500 was ~0.00135 (see `tolerance`'s comment); ~6x margin.
+    private static let meanTolerance: Float = 0.01
+
     /// Shared body: `CoarseOffloadMLP(x)` must match `referenceForward` (the
     /// all-GPU MLP with the same weights) within fp16-vs-4bit noise on the
     /// `up` projection. See `tolerance` above for how the bound was set.
@@ -106,8 +113,12 @@ struct CoarseOffloadMLPTests {
         eval(got)
 
         #expect(got.shape == want.shape, "shape mismatch: got \(String(describing: got.shape)), want \(String(describing: want.shape))")
-        let maxAbsDiff = (abs(got.asType(.float32) - want.asType(.float32)).max()).item(Float.self)
+        let absDiff = abs(got.asType(.float32) - want.asType(.float32))
+        let maxAbsDiff = absDiff.max().item(Float.self)
+        let meanAbsDiff = absDiff.mean().item(Float.self)
+        print("CoarseOffloadMLPTests S=\(S) seed=\(seed): maxAbsDiff=\(maxAbsDiff) meanAbsDiff=\(meanAbsDiff)")
         #expect(maxAbsDiff < Self.tolerance, "CoarseOffloadMLP diverged from all-GPU reference: maxAbsErr=\(maxAbsDiff)")
+        #expect(meanAbsDiff < Self.meanTolerance, "CoarseOffloadMLP diverged from all-GPU reference: meanAbsErr=\(meanAbsDiff)")
     }
 
     @Test("CoarseOffloadMLP matches all-GPU reference at the ranked prefill shape (S=512)")

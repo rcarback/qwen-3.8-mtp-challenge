@@ -5,7 +5,6 @@
 // `.superpowers/sdd/2026-08-30-ane-gpu-concurrent-offload/task-6-brief.md`.
 // Task 5's `CoarseOffloadMLP` is "Approach A / coarse" (one whole
 // projection per engine); Task 7 times the two against each other.
-import CoreML
 import Foundation
 import MLX
 import MLXNN
@@ -15,8 +14,9 @@ import MLXNN
 /// (fp16, via a warm `ANEGemm` built at init) concurrently with the
 /// remaining `out-F` channels on the GPU (4-bit affine group-64
 /// `quantizedMM`, exactly as shipped), then the two parts are concatenated.
-/// `F` is `round(aneFraction * out / 64) * 64`, 64-aligned so the GPU
-/// suffix's row slice stays on a group-64 boundary.
+/// `F` is `round(aneFraction * out / 64) * 64`. 64-alignment is a schedule
+/// choice, not a packing constraint -- groups pack along the `in` axis, so
+/// any integer `F` is a valid row slice of the shipped 4-bit operand.
 public final class ChannelSplitMLP {
     private static let groupSize = 64
     private static let bits = 4
@@ -117,10 +117,11 @@ public final class ChannelSplitMLP {
     /// Runs one projection's channel split on input `a`. `makeInput` and
     /// `readOutput` run on this (the calling) thread -- both do MLX `eval`
     /// internally -- and only `aneGemm.predict` (Core ML, no MLX) runs on
-    /// `ConcurrentEngines.run`'s background queue, so the `gpu` closure's
-    /// `eval` is the only MLX `eval` ever invoked off this thread. Result is
-    /// normalized to bf16 on every path so gate/up/down outputs combine
-    /// consistently regardless of which edge case each projection took.
+    /// `ConcurrentEngines.run`'s background queue; `gpu` runs ON the calling
+    /// thread (see `ConcurrentEngines.run`), so there is zero MLX `eval` off
+    /// the caller. Result is normalized to bf16 on every path so gate/up/down
+    /// outputs combine consistently regardless of which edge case each
+    /// projection took.
     private func projSplit(_ a: MLXArray, _ split: ProjSplit) throws -> MLXArray {
         if split.f == 0 {
             guard let suffixWq = split.suffixWq, let suffixScales = split.suffixScales,
