@@ -42,6 +42,59 @@ struct ANEGemmTests {
         #expect(meanErr < 0.01)
     }
 
+    @Test("ANEGemm matches MLX dense matmul at S=1, not a multiple of the ANE's 32-wide padding")
+    func aneGemmArbitrarySequenceLength1() throws {
+        try assertArbitrarySequenceLength(S: 1, seed: 100)
+    }
+
+    @Test("ANEGemm matches MLX dense matmul at S=500, not a multiple of the ANE's 32-wide padding")
+    func aneGemmArbitrarySequenceLength500() throws {
+        try assertArbitrarySequenceLength(S: 500, seed: 101)
+    }
+
+    /// Shared body for the arbitrary-S regression tests: prior to the
+    /// stride-correct `multiArray_1C1S_toMLX` fix, any `S` not already a
+    /// multiple of 32 hit an `MLXArray.init` precondition crash (the ANE
+    /// output is 64-byte/32-element padded on its trailing sequence axis).
+    private func assertArbitrarySequenceLength(S: Int, seed: UInt64) throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else { return }
+        MLXRandom.seed(seed)
+        let K = 5120, out = 2048
+        let w = MLXRandom.normal([out, K]).asType(.float16)
+        let x = MLXRandom.normal([S, K]).asType(.float16)
+        eval(w, x)
+        let g = try ANEGemm(weight: w, sequenceLength: S)
+        let got = try g(x)
+        let want = matmul(x, w.transposed(1, 0))
+        eval(want)
+        // Same fp16 tolerance as `aneGemmCorrect` above.
+        #expect((abs(got - want).max()).item(Float.self) < 0.3)
+        let meanErr = (abs(got - want)).mean().item(Float.self)
+        #expect(meanErr < 0.01)
+    }
+
+    @Test("split path (makeInput -> predict -> readOutput) matches the callAsFunction convenience bit-identically")
+    func splitPathMatchesConvenience() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else { return }
+        MLXRandom.seed(2)
+        let S = 512, K = 5120, out = 2048
+        let w = MLXRandom.normal([out, K]).asType(.float16)
+        let x = MLXRandom.normal([S, K]).asType(.float16)
+        eval(w, x)
+        let g = try ANEGemm(weight: w, sequenceLength: S)
+
+        let viaConvenience = try g(x)
+        let input = try g.makeInput(x)
+        let output = try g.predict(input)
+        let viaSplit = g.readOutput(output)
+        eval(viaConvenience, viaSplit)
+
+        let maxDiff = (abs(viaConvenience - viaSplit).max()).item(Float.self)
+        #expect(maxDiff == 0, "split path diverged from callAsFunction by \(maxDiff)")
+    }
+
     @Test("ANEGemm per-call latency is stable across repeated calls (no recompile per call)")
     func aneGemmWarmupStable() throws {
         let env = ProcessInfo.processInfo.environment

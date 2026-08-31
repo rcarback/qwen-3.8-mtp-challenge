@@ -95,18 +95,49 @@ public final class ANEGemm {
 
     /// x: [S, in] fp16 -> [S, out] fp16, computed on the ANE. `S` must equal
     /// the `sequenceLength` this instance was compiled for.
+    ///
+    /// Convenience that chains `makeInput` -> `predict` -> `readOutput` on
+    /// the calling thread. For concurrent ANE+GPU use, call the three parts
+    /// separately instead (see below) -- bundling the MLX conversion with
+    /// the Core ML prediction here is correct only because all three run on
+    /// one thread; `ConcurrentEngines.run` must never see MLX `eval` from
+    /// its background closure.
     public func callAsFunction(_ x: MLXArray) throws -> MLXArray {
+        try autoreleasepool {
+            let input = try makeInput(x)
+            let output = try predict(input)
+            return readOutput(output)
+        }
+    }
+
+    /// CALLER THREAD ONLY. Converts `x[S,in]` fp16 (MLX, evals) into the ANE
+    /// input `MLMultiArray`. Call this and `readOutput` from the thread that
+    /// owns MLX `eval`; only `predict` is safe to run in the background.
+    public func makeInput(_ x: MLXArray) throws -> MLMultiArray {
         precondition(x.ndim == 2 && x.shape[0] == sequenceLength && x.shape[1] == inn,
                      "ANEGemm expected input shape [\(sequenceLength), \(inn)], got \(x.shape)")
-        return try autoreleasepool {
-            let xa = try mlxToMultiArray_1C1S(x)
-            let input = try MLDictionaryFeatureProvider(dictionary: ["a": MLFeatureValue(multiArray: xa)])
-            let out = try model.prediction(from: input)
+        return try mlxToMultiArray_1C1S(x)
+    }
+
+    /// BACKGROUND-SAFE. Core ML prediction only -- touches no MLX state, so
+    /// this is the one piece of `ANEGemm` that may run on
+    /// `ConcurrentEngines.run`'s background `ane` closure while the GPU
+    /// closure calls MLX `eval` on the calling thread.
+    public func predict(_ input: MLMultiArray) throws -> MLMultiArray {
+        try autoreleasepool {
+            let provider = try MLDictionaryFeatureProvider(dictionary: ["a": MLFeatureValue(multiArray: input)])
+            let out = try model.prediction(from: provider)
             guard let ya = out.featureValue(for: "y")?.multiArrayValue else {
                 throw NSError(domain: "ANEGemm", code: 2,
                                userInfo: [NSLocalizedDescriptionKey: "no ANE output 'y'"])
             }
-            return multiArray_1C1S_toMLX(ya)
+            return ya
         }
+    }
+
+    /// CALLER THREAD ONLY. Converts the ANE output `MLMultiArray` back to an
+    /// MLXArray `[S,out]` fp16.
+    public func readOutput(_ output: MLMultiArray) -> MLXArray {
+        multiArray_1C1S_toMLX(output)
     }
 }

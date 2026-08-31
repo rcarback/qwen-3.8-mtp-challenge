@@ -193,25 +193,89 @@ public func f16Bytes(_ w: MLXArray) -> Data {
 
 /// [S,K] fp16 MLXArray -> `MLMultiArray` shaped `[1,K,1,S]` (the ANE
 /// activation layout: batch, channels, 1, sequence).
+///
+/// Stride-aware: a freshly allocated `MLMultiArray(shape:dataType:)` is not
+/// guaranteed to be tightly packed -- the ANE pads the trailing sequence
+/// axis to a multiple of 32 elements in fp16, so `arr`'s `S` stride on the
+/// `K` axis can exceed `S` for any `S` not already a multiple of 32 (S=1
+/// decode, arbitrary prefill lengths, ...). Writing via `memcpy` at the
+/// packed byte count either falls short of the padded rows (silently
+/// leaving garbage/uninitialized padding, which is harmless since the conv
+/// op never reads it) or -- for non-contiguous strides -- corrupts the
+/// wrong elements entirely. Reading `arr.strides` and scattering
+/// element-by-element is correct for any padding the runtime chooses.
 public func mlxToMultiArray_1C1S(_ x: MLXArray) throws -> MLMultiArray {
     let S = x.shape[0], K = x.shape[1]
-    let xT = x.transposed(1, 0).asType(.float16)
+    let xT = x.transposed(1, 0).asType(.float16) // [K,S]
     eval(xT)
     let arr = try MLMultiArray(shape: [1, K, 1, S].map { NSNumber(value: $0) }, dataType: .float16)
     let bytes = xT.asData().data
-    arr.withUnsafeMutableBytes { raw, _ in
-        _ = bytes.withUnsafeBytes { src in
-            memcpy(raw.baseAddress!, src.baseAddress!, Swift.min(raw.count, bytes.count))
+    precondition(bytes.count == K * S * MemoryLayout<Float16>.stride,
+                 "mlxToMultiArray_1C1S: source is \(bytes.count) bytes, expected packed K*S*2 = \(K * S * MemoryLayout<Float16>.stride)")
+
+    let strides = arr.strides.map(\.intValue) // element strides for [1,K,1,S]
+    let strideK = strides[1], strideS = strides[3]
+    if strideK == S, strideS == 1 {
+        // Already tightly packed -- bulk copy is both correct and faster.
+        arr.withUnsafeMutableBytes { raw, _ in
+            bytes.withUnsafeBytes { src in
+                precondition(raw.count >= bytes.count,
+                             "mlxToMultiArray_1C1S: destination \(raw.count) bytes smaller than packed source \(bytes.count)")
+                memcpy(raw.baseAddress!, src.baseAddress!, bytes.count)
+            }
+        }
+    } else {
+        arr.withUnsafeMutableBytes { raw, _ in
+            let dst = raw.baseAddress!.assumingMemoryBound(to: Float16.self)
+            bytes.withUnsafeBytes { srcRaw in
+                let src = srcRaw.bindMemory(to: Float16.self)
+                for k in 0 ..< K {
+                    let rowBase = k * strideK
+                    for s in 0 ..< S {
+                        dst[rowBase + s * strideS] = src[k * S + s]
+                    }
+                }
+            }
         }
     }
     return arr
 }
 
 /// `MLMultiArray` shaped `[1,F,1,S]` -> `[S,F]` MLXArray.
+///
+/// Stride-aware for the same reason as `mlxToMultiArray_1C1S`'s write side:
+/// Core ML's ANE `prediction` output pads the trailing sequence axis (`S`)
+/// to a multiple of 32 elements in fp16, so `a`'s byte count is
+/// `F * paddedS * 2`, not `F * S * 2`. Passing `raw.count` straight into
+/// `MLXArray.init` (the prior implementation) preconditions on
+/// `byteCount == F*S*2` and crashes for any `S` that is not already a
+/// multiple of 32 (confirmed at S=8; guaranteed at decode's S=1). Reading
+/// `a.strides` and gathering into a packed `[F,S]` buffer first is correct
+/// for any padding.
 public func multiArray_1C1S_toMLX(_ a: MLMultiArray) -> MLXArray {
+    precondition(a.dataType == .float16, "multiArray_1C1S_toMLX expects a float16 MLMultiArray, got \(a.dataType)")
     let shape = a.shape.map(\.intValue) // [1,F,1,S]
+    precondition(shape.count == 4 && shape[0] == 1 && shape[2] == 1,
+                 "multiArray_1C1S_toMLX expects shape [1,F,1,S], got \(shape)")
     let F = shape[1], S = shape[3]
-    let bytes = a.withUnsafeBytes { raw in Data(bytes: raw.baseAddress!, count: raw.count) }
+    let strides = a.strides.map(\.intValue) // element strides, matching `shape`
+    let strideF = strides[1], strideS = strides[3]
+
+    var packed = [Float16](repeating: 0, count: F * S)
+    a.withUnsafeBytes { raw in
+        let base = raw.baseAddress!.assumingMemoryBound(to: Float16.self)
+        packed.withUnsafeMutableBufferPointer { dst in
+            for f in 0 ..< F {
+                let rowBase = f * strideF
+                for s in 0 ..< S {
+                    dst[f * S + s] = base[rowBase + s * strideS]
+                }
+            }
+        }
+    }
+    let bytes = packed.withUnsafeBufferPointer { Data(buffer: $0) }
+    precondition(bytes.count == F * S * MemoryLayout<Float16>.stride,
+                 "multiArray_1C1S_toMLX: packed buffer is \(bytes.count) bytes, expected F*S*2 = \(F * S * MemoryLayout<Float16>.stride)")
     let arr = MLXArray(bytes, [F, S], type: Float16.self)
     return arr.transposed(1, 0) // [S,F]
 }

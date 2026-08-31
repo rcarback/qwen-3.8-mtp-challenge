@@ -9,6 +9,17 @@ import Testing
 /// join a real ANE closure (`ANEGemm`) and a real GPU closure (`quantizedMM`)
 /// without cross-thread corruption. See
 /// `.superpowers/sdd/2026-08-30-ane-gpu-concurrent-offload/task-3-brief.md`.
+/// Cross-thread box for the `MLMultiArray` handed into `ANEGemm.predict` on
+/// the background `ane` closure. `MLMultiArray` is not `Sendable`; the box
+/// itself is `@unchecked Sendable` for the same reason as `ANEGemm.swift`'s
+/// `LoadInputs` -- the value is written once (by `makeInput`, on the caller
+/// thread, before `ConcurrentEngines.run` is invoked) and only read
+/// thereafter, so the single handoff is safe without a lock.
+private final class MLMultiArrayBox: @unchecked Sendable {
+    let value: MLMultiArray
+    init(_ value: MLMultiArray) { self.value = value }
+}
+
 @Suite(.serialized)
 struct ConcurrentEnginesTests {
     // Matches the proven ANEGemmTests shape (S=512, K=5120) so this test
@@ -17,8 +28,6 @@ struct ConcurrentEnginesTests {
     static let S = 512, K = 5120, N = 2048
     static let F = 1024 // ANE prefix channel count; N-F is the GPU suffix
 
-    // NOTE: overlap here is limited pending the ANEGemm predict-only split
-    // (see plan Task 4b); do not copy this closure shape into the MLP tasks.
     @Test("concurrent ANE-prefix + GPU-suffix matches sequential run and full dense reference")
     func concurrentMatchesSequential() throws {
         let env = ProcessInfo.processInfo.environment
@@ -63,9 +72,24 @@ struct ConcurrentEnginesTests {
         eval(seqCombined)
 
         // Several concurrent cycles -- corruption from a race is not
-        // guaranteed to show up on the first call.
+        // guaranteed to show up on the first call. Each cycle uses the real
+        // predict-only split (Task 4b): `makeInput` and `readOutput` run on
+        // the calling thread (this test method), and the background `ane`
+        // closure handed to `ConcurrentEngines.run` calls ONLY
+        // `aneGemm.predict` -- no MLX, no `eval` -- so the GPU closure's
+        // `eval` genuinely overlaps with real Core ML compute on the ANE
+        // thread instead of the two serializing behind a background `eval`.
         for cycle in 0 ..< 5 {
-            let (concAne, concGpu) = try ConcurrentEngines.run(ane: aneOp, gpu: gpuSuffixOp)
+            let inputBox = try autoreleasepool { MLMultiArrayBox(try aneGemm.makeInput(x)) }
+            let (aneOutBox, concGpu) = try ConcurrentEngines.run(
+                ane: { MLMultiArrayBox(try aneGemm.predict(inputBox.value)) },
+                gpu: {
+                    let r = gpuSuffixOp()
+                    eval(r) // force real GPU kernel execution during the join
+                    return r
+                }
+            )
+            let concAne = autoreleasepool { aneGemm.readOutput(aneOutBox.value) }
             eval(concAne, concGpu)
             let concCombined = concatenated([concAne, concGpu], axis: 1)
             eval(concCombined)
