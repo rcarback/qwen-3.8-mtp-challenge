@@ -210,7 +210,14 @@ public func f16Bytes(_ w: MLXArray) -> Data {
 /// that would otherwise run F*S times on every ANE projection call.
 public func mlxToMultiArray_1C1S(_ x: MLXArray) throws -> MLMultiArray {
     let S = x.shape[0], K = x.shape[1]
-    let xT = x.transposed(1, 0).asType(.float16) // [K,S]
+    // `transposed` is a lazy metadata op: the result [K,S] has strides [1,K],
+    // which match no contiguous layout. `asData()` on such an array degrades to
+    // a per-element (2-byte) scalar copy over K*S elements -- measured at ~2.4s
+    // for K=5120,S=512 (and ~8.5s at K=17408). `contiguous(...)` forces a single
+    // GPU kernel that writes a row-contiguous [K,S] buffer, after which
+    // `asData()` takes the whole-buffer memcpy fast path (~0.2ms). Same bytes,
+    // ~3500x faster makeInput.
+    let xT = contiguous(x.transposed(1, 0).asType(.float16)) // [K,S], row-contiguous
     eval(xT)
     let arr = try MLMultiArray(shape: [1, K, 1, S].map { NSNumber(value: $0) }, dataType: .float16)
     let bytes = xT.asData().data
