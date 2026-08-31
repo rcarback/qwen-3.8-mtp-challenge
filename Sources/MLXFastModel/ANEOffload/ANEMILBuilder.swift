@@ -210,6 +210,76 @@ public func buildConvMILProgram(K: Int, F: Int, S: Int, weight: Data) -> Data {
     return buildProgram(inputs: io.ins, outputs: io.outs, ops: ops)
 }
 
+// MARK: - MIL text (oMLX `fp16_linear_mil` format)
+
+/// Same single-op 1x1 conv `buildConvMILProgram` builds as a binary MIL
+/// protobuf, but emitted as MIL TEXT instead -- the format
+/// `_ANEInMemoryModelDescriptor`'s `initWithNetworkText:weights:optionsPlist:isMILModel:`
+/// actually expects. Task 2's binary-protobuf program failed compile with
+/// `InvalidCompilationParam`; the open-source oMLX project's
+/// `fp16_linear_mil` (`omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm`)
+/// proves this text format compiles unentitled. Verbatim shape, with `w`'s
+/// weight bytes referenced via `BLOBFILE` at `weights/weight_data.bin`
+/// offset 64 (see `buildConvWeightBlob`).
+public func buildConvMILText(inputDim: Int, outputDim: Int, sequenceLength: Int) -> String {
+    """
+    program(1.3)
+    [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+    {
+      func main<ios18>(tensor<fp16, [1, \(inputDim), 1, \(sequenceLength)]> x) {
+        tensor<fp16, [\(outputDim), \(inputDim), 1, 1]> w = const()[name=string("w"), val=tensor<fp16, [\(outputDim), \(inputDim), 1, 1]>(BLOBFILE(path=string("@model_path/weights/weight_data.bin"), offset=uint64(64)))];
+        string pt = const()[name=string("pt"), val=string("valid")];
+        tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+        tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+        tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+        int32 gr = const()[name=string("gr"), val=int32(1)];
+        tensor<fp16, [1, \(outputDim), 1, \(sequenceLength)]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=w, x=x)[name=string("conv")];
+      } -> (y);
+    }
+    """
+}
+
+/// The on-disk weight blob `buildConvMILText`'s `BLOBFILE(offset=uint64(64))`
+/// reference reads. `BLOBFILE` does not read a raw tensor payload directly
+/// at that offset -- it reads oMLX's `make_blob` chunk-descriptor structure,
+/// which the compiler parses to locate the actual payload. A 64-zero-byte
+/// header (this function's first cut, matching the task brief's simplified
+/// description) mmaps and reads without error but the compiler then rejects
+/// the program with `InvalidMILProgram` ("Could not convert input MIL
+/// program", confirmed via the ANECompilerService `log stream` trace) --
+/// the chunk descriptor's magic/offset fields are load-bearing, not padding.
+/// Layout (`make_blob` in oMLX's `qwen35_ane.mm`), matched byte-for-byte:
+/// bytes `[0]=0x01`, `[4]=0x02` (blob-level header, unvalidated by a
+/// single-chunk read but written for parity); at offset 64 (where the MIL
+/// text's `BLOBFILE` offset points), a chunk header --
+/// `[0..3]` = `EF BE AD DE` (magic, little-endian `0xDEADBEEF`), `[4]=0x01`
+/// (chunk type), `[8..11]` = byte count of the payload (little-endian
+/// `UInt32`), `[16..19]` = `128` (little-endian `UInt32`, the payload's
+/// absolute byte offset in the file) -- followed by the payload itself
+/// starting at absolute offset 128: the fp16 weight bytes, row-major
+/// `[F,K,1,1]` (`outputDim` rows of `inputDim` fp16 values each).
+public func buildConvWeightBlob(_ fp16Weight: Data) -> Data {
+    let byteCount = fp16Weight.count
+    var blob = [UInt8](repeating: 0, count: 128 + byteCount)
+    blob[0] = 0x01
+    blob[4] = 0x02
+    blob[64] = 0xEF
+    blob[65] = 0xBE
+    blob[66] = 0xAD
+    blob[67] = 0xDE
+    blob[68] = 0x01
+    withUnsafeBytes(of: UInt32(byteCount).littleEndian) { raw in
+        for i in 0 ..< 4 { blob[64 + 8 + i] = raw[i] }
+    }
+    withUnsafeBytes(of: UInt32(128).littleEndian) { raw in
+        for i in 0 ..< 4 { blob[64 + 16 + i] = raw[i] }
+    }
+    fp16Weight.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
+        for i in 0 ..< byteCount { blob[128 + i] = src[i] }
+    }
+    return Data(blob)
+}
+
 // MARK: - MLX <-> MLMultiArray bridges
 
 /// Materializes an [F,K] MLXArray as row-major fp16 bytes (the payload

@@ -30,17 +30,6 @@ final class ANEInMemoryModel {
     /// the last argument here is a `BOOL`, not an object.
     private typealias Init4 = @convention(c) (AnyObject?, Selector, AnyObject?, AnyObject?, AnyObject?, ObjCBool) -> Unmanaged<AnyObject>?
 
-    /// `objc_msgSend` cast for a void 1-object-arg setter, e.g. `setModelURL:`.
-    /// `ANERuntime.send` always casts the raw call through a
-    /// `Unmanaged<AnyObject>?`-returning shim and then takes that "result" --
-    /// harmless for methods that really return an object, but for a
-    /// void-returning method the x0 register on return holds whatever the
-    /// callee last left there (not guaranteed to be anything meaningful),
-    /// and `send` would still retain/release it as if it were a real return
-    /// value. Calling through a `Void`-returning shim instead reads no
-    /// bogus return value at all.
-    private typealias SetterFn = @convention(c) (AnyObject?, Selector, AnyObject?) -> Void
-
     /// `objc_msgSend` cast for a `BOOL(id,SEL,NSInteger,id,NSError**)` call
     /// with a correctly-bridged `NSError**` out-param -- covers
     /// `compileWithQoS:options:error:` and `loadWithQoS:options:error:`.
@@ -109,13 +98,22 @@ final class ANEInMemoryModel {
         return (ok, errU?.takeUnretainedValue().localizedDescription)
     }
 
-    /// milProgram: bare MIL program bytes (the `program` submessage
-    /// `buildConvMILProgram` returns), not a full CoreML `Model` proto.
-    /// weights are baked as consts in the program, so the descriptor's
-    /// `weights` argument is an empty dictionary.
-    init(milProgram: Data) throws {
+    /// `milText`: a MIL TEXT program (see `ANEMILBuilder.buildConvMILText`),
+    /// not the binary MIL protobuf `buildConvMILProgram` emits -- Task 2's
+    /// binary-proto program failed `compileWithQoS:` with
+    /// `InvalidCompilationParam`; the open-source oMLX project's
+    /// `fp16_linear_mil`/`load_or_compile_ane_model`
+    /// (`omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm`) prove the
+    /// private ANE compiler accepts MIL text, unentitled, when the
+    /// descriptor's referenced weight file is staged on disk first.
+    /// `weightBlob`: the full on-disk blob the MIL text's `BLOBFILE`
+    /// reference reads (see `ANEMILBuilder.buildConvWeightBlob` -- a 64-byte
+    /// header followed by the fp16 weight bytes).
+    init(milText: String, weightBlob: Data) throws {
         guard ANERuntime.available() else { throw ANEError.unavailable }
         guard let Desc = ANERuntime.cls("_ANEInMemoryModelDescriptor") else { throw ANEError.descriptor }
+
+        let milData = Data(milText.utf8)
 
         // alloc/init dance, kept manually balanced: `alloc` hands back a
         // single owned (+1) reference that `init...` consumes and returns
@@ -136,9 +134,19 @@ final class ANEInMemoryModel {
         let allocFn = unsafeBitCast(msgSend, to: AllocFn.self)
         guard let allocU = allocFn(Desc, NSSelectorFromString("alloc")) else { throw ANEError.descriptor }
 
+        // `optionsPlist` must be a real serialized property list, even an
+        // empty one -- passing `NSData()` (zero bytes) here is what produced
+        // `InvalidCompilationParam` even with correctly staged MIL text and
+        // weight files: the framework writes this argument verbatim to
+        // `compiler_options.plist` in the staging directory, and the ANE
+        // compiler rejects a zero-byte file as an invalid plist before it
+        // ever reaches MIL parsing. An empty dictionary serialized as an XML
+        // plist clears that gate; the actual content is otherwise unused for
+        // this program (no per-model compiler options needed here).
+        let emptyOptionsPlist = try PropertyListSerialization.data(fromPropertyList: [String: Any](), format: .xml, options: 0)
         let initSel = Selector(("initWithNetworkText:weights:optionsPlist:isMILModel:"))
         let initFn = unsafeBitCast(msgSend, to: Init4.self)
-        guard let descU = initFn(allocU.takeUnretainedValue(), initSel, milProgram as NSData, NSDictionary(), NSData(), true) else {
+        guard let descU = initFn(allocU.takeUnretainedValue(), initSel, milData as NSData, NSDictionary(), emptyOptionsPlist as NSData, true) else {
             throw ANEError.descriptor
         }
         let desc = descU.takeRetainedValue()
@@ -148,24 +156,29 @@ final class ANEInMemoryModel {
             throw ANEError.model
         }
 
-        // `inMemoryModelWithDescriptor:` leaves `modelURL` nil -- `_ANEInMemoryModel`
-        // is "in-memory" only from the caller's perspective; `saveModelFiles`
-        // (called from inside `compileWithQoS:options:error:`) still writes the
-        // descriptor's MIL/weights out to a scratch directory on disk for the
-        // out-of-process ANE compiler service to read, and dereferences `modelURL`
-        // unconditionally to find it. Confirmed live: leaving it nil segfaults
-        // inside `-[_ANEInMemoryModel saveModelFiles]` (EXC_BAD_ACCESS, objc_retain
-        // on a garbage ivar) before any NSError is ever produced -- this is Apple's
-        // framework code assuming a caller (normally Core ML's own model-loading
-        // path) already set a working directory, not a validation gate we can
-        // observe by inspecting the descriptor alone. One scratch directory per
-        // instance avoids collisions across concurrent `ANEInMemoryModel`s.
-        let scratch = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("ane-in-memory-model-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
-        let setModelURL = unsafeBitCast(msgSend, to: SetterFn.self)
-        setModelURL(model, Selector(("setModelURL:")), scratch as NSURL)
-        scratchURL = scratch
+        // `hexStringIdentifier` is the descriptor-content hash
+        // `_ANEInMemoryModel` uses to derive its own on-disk staging
+        // location under `NSTemporaryDirectory()`. Per oMLX (which never
+        // calls `setModelURL:` on this path -- overriding the derived URL
+        // breaks per-file bundle-hash verification on newer macOS), staging
+        // `model.mil` and `weights/weight_data.bin` at that SAME derived
+        // path is what lets `compileWithQoS:options:error:` find them
+        // without us pointing `modelURL` anywhere ourselves. Task 2's nil-
+        // modelURL segfault inside `saveModelFiles` was reproduced with NO
+        // staged files present at all (a binary-proto program, no on-disk
+        // inputs); staging the files this way clears that crash on this
+        // macOS 26.5.2 build without needing the `setModelURL:` fallback.
+        guard let identifierObj = ANERuntime.send(model, Selector(("hexStringIdentifier"))),
+              let identifier = identifierObj as? String else {
+            throw ANEError.model
+        }
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(identifier)
+        let weightsDir = dir.appendingPathComponent("weights")
+        try FileManager.default.createDirectory(at: weightsDir, withIntermediateDirectories: true)
+        try milData.write(to: dir.appendingPathComponent("model.mil"))
+        try weightBlob.write(to: weightsDir.appendingPathComponent("weight_data.bin"))
+
+        scratchURL = dir
         raw = model
     }
 

@@ -22,7 +22,16 @@ enum ANERuntime {
     typealias Send1 = @convention(c) (AnyObject?, Selector, AnyObject?) -> Unmanaged<AnyObject>?
     typealias Send3 = @convention(c) (AnyObject?, Selector, AnyObject?, AnyObject?, AnyObject?) -> Unmanaged<AnyObject>?
     typealias SendU64 = @convention(c) (AnyObject?, Selector) -> UInt64
-    typealias SendBoolQoS = @convention(c) (AnyObject?, Selector, Int, AnyObject?, UnsafeMutablePointer<NSError?>?) -> ObjCBool
+    /// `NSError**` out-param bridged with the correct Swift type for an
+    /// ObjC `__autoreleasing` out-param -- see `ANEInMemoryModel`'s
+    /// `SendBoolQoSErr` doc comment for the ARC-corruption bug this avoids:
+    /// a plain `UnsafeMutablePointer<NSError?>` writes the callee's +0
+    /// autoreleased `NSError*` without the retain Swift's bridging would
+    /// normally insert, so the later implicit release of the Swift `NSError?`
+    /// variable is unbalanced and corrupts the allocator. Swift bridges an
+    /// `inout NSError?` argument to `AutoreleasingUnsafeMutablePointer`
+    /// automatically at the call site, which performs that retain.
+    typealias SendBoolQoS = @convention(c) (AnyObject?, Selector, Int, AnyObject?, AutoreleasingUnsafeMutablePointer<NSError?>?) -> ObjCBool
 
     static func send(_ r: AnyObject?, _ s: Selector, retained: Bool = false) -> AnyObject? {
         let f = unsafeBitCast(raw, to: Send0.self)
@@ -43,11 +52,11 @@ enum ANERuntime {
         unsafeBitCast(raw, to: SendU64.self)(r, s)
     }
     static func sendBoolQoS(_ r: AnyObject?, _ s: Selector, qos: Int, options: AnyObject?, error: inout NSError?) -> Bool {
-        var e: NSError? = nil
-        let ok = withUnsafeMutablePointer(to: &e) { p in
-            unsafeBitCast(raw, to: SendBoolQoS.self)(r, s, qos, options, p).boolValue
-        }
-        error = e
-        return ok
+        // `&error` bridges the `inout NSError?` to the
+        // `AutoreleasingUnsafeMutablePointer<NSError?>` `SendBoolQoS` now
+        // declares, which is what performs the correct retain on the
+        // callee's autoreleased out-param write -- see `SendBoolQoS`'s doc
+        // comment.
+        unsafeBitCast(raw, to: SendBoolQoS.self)(r, s, qos, options, &error).boolValue
     }
 }
