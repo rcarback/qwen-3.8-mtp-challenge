@@ -73,7 +73,7 @@ struct ANEChannelSplitPoCTests {
 
     /// Cross-thread result handoff via `DispatchGroup` join (happens-before/
     /// -after via the group), so no lock is needed for this narrow use.
-    private final class ResultBox: @unchecked Sendable { var value = 0 }
+    private final class ResultBox: @unchecked Sendable { var value = 0; var failed = false }
 
     @Test("channel-split gate beats GPU-alone on M4 (paired)")
     func splitBeatsGPU() async throws {
@@ -153,7 +153,7 @@ struct ANEChannelSplitPoCTests {
         // pattern `ANEMetalPartitionTests.timeSplit` uses from a plain
         // (non-async) static helper. Route the loop through one here so the
         // `wait()` call sits outside the enclosing `async` function.
-        func runOneCycle() -> (solo: Double, gpuConc: Double, aneConc: Double) {
+        func runOneCycle() -> (solo: Double, gpuConc: Double, aneConc: Double, aneFailed: Bool) {
             // Phase A: GPU alone, all N channels.
             let solo = Double(gpuIters(gpuAllOp, until: Date().addingTimeInterval(window)))
                 * gpuAllFlop / window / 1e12
@@ -165,8 +165,21 @@ struct ANEChannelSplitPoCTests {
             g.enter()
             let boxRef = box
             DispatchQueue.global(qos: .userInitiated).async {
+                // Only count predictions that actually succeeded -- `try?`
+                // swallowing a thrown prediction while still incrementing `n`
+                // would silently inflate the ANE-side TF (and the ratio) on a
+                // failure. A real failure aborts the loop and is reported
+                // loudly by the caller instead.
                 var n = 0
-                while Date() < dl { autoreleasepool { _ = try? boxRef.model.prediction(from: boxRef.input) }; n += 1 }
+                loop: while Date() < dl {
+                    do {
+                        try autoreleasepool { _ = try boxRef.model.prediction(from: boxRef.input) }
+                        n += 1
+                    } catch {
+                        aneRes.failed = true
+                        break loop
+                    }
+                }
                 aneRes.value = n
                 g.leave()
             }
@@ -174,22 +187,44 @@ struct ANEChannelSplitPoCTests {
             g.wait()
             let gpuConc = Double(gpuN) * gpuSuffixFlop / window / 1e12
             let aneConc = Double(aneRes.value) * aneFlop / window / 1e12
-            return (solo, gpuConc, aneConc)
+            return (solo, gpuConc, aneConc, aneRes.failed)
         }
+
+        // One untimed throwaway cycle absorbs the cold-start bump (the R1
+        // review flagged cycle 0 of the original run as the lowest solo TF /
+        // highest ratio outlier); its numbers are discarded.
+        _ = runOneCycle()
+        report += "(one untimed warmup cycle ran and was discarded before the table below)\n\n"
+
         var ratios: [Double] = []
+        var soloTFs: [Double] = []
         for c in 0 ..< 6 {
-            let (solo, gpuConc, aneConc) = runOneCycle()
+            let (solo, gpuConc, aneConc, aneFailed) = runOneCycle()
+            if aneFailed {
+                report += "\nANE prediction threw during the timed window at cycle \(c); aborting measurement.\n"
+                Issue.record("ANE prediction threw during timed window (cycle \(c))")
+                return
+            }
             let combined = gpuConc + aneConc
             let ratio = solo > 0 ? combined / solo : 0
             ratios.append(ratio)
+            soloTFs.append(solo)
             report += String(format: "| %d | %.2f | %.2f | %.2f | %.2f | %.3f |\n",
                               c, solo, gpuConc, aneConc, combined, ratio)
             flush()
         }
         let mean = ratios.reduce(0, +) / Double(ratios.count)
         let sorted = ratios.sorted()
+        let meanSolo = soloTFs.reduce(0, +) / Double(soloTFs.count)
         report += String(format: "\n- [MEASURED] mean split/GPU-alone ratio = %.3f (min %.3f, max %.3f) over %d cycles\n",
                           mean, sorted.first ?? 0, sorted.last ?? 0, ratios.count)
+        report += String(format: "- [MEASURED] mean solo GPU TF (visibility only, not a gate) = %.2f\n", meanSolo)
+        // Soft visibility note only -- host background load is legitimate and
+        // pass/fail stays defined on the ratio, never on this absolute number.
+        if meanSolo < 3.0 {
+            report += "  NOTE: mean solo GPU TF is implausibly low for this shape; likely heavy host " +
+                "contention during this run -- interpret the ratio with that in mind.\n"
+        }
         report += "\nPass criterion: mean ratio > 1.05. Read: ratio > 1 => the channel split delivers more " +
             "total useful throughput than the GPU computing every channel alone; ratio <= 1 => GPU-alone " +
             "wins and the offload is not worth it on this hardware.\n"
