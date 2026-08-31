@@ -194,45 +194,66 @@ public func f16Bytes(_ w: MLXArray) -> Data {
 /// [S,K] fp16 MLXArray -> `MLMultiArray` shaped `[1,K,1,S]` (the ANE
 /// activation layout: batch, channels, 1, sequence).
 ///
-/// Stride-aware: a freshly allocated `MLMultiArray(shape:dataType:)` is not
-/// guaranteed to be tightly packed -- the ANE pads the trailing sequence
-/// axis to a multiple of 32 elements in fp16, so `arr`'s `S` stride on the
-/// `K` axis can exceed `S` for any `S` not already a multiple of 32 (S=1
-/// decode, arbitrary prefill lengths, ...). Writing via `memcpy` at the
-/// packed byte count either falls short of the padded rows (silently
-/// leaving garbage/uninitialized padding, which is harmless since the conv
-/// op never reads it) or -- for non-contiguous strides -- corrupts the
-/// wrong elements entirely. Reading `arr.strides` and scattering
-/// element-by-element is correct for any padding the runtime chooses.
+/// Stride-aware: a freshly allocated `MLMultiArray(shape:dataType:)` is a
+/// plain CPU allocation and is NOT guaranteed to be tightly packed -- Core
+/// ML is free to pad the trailing sequence axis for its own layout reasons
+/// (the same kind of padding `multiArray_1C1S_toMLX` below observes,
+/// confirmed, on the ANE's *prediction output*), so `arr`'s `K`-axis stride
+/// can exceed `S` for any `S` (S=1 decode, arbitrary prefill lengths, ...).
+/// Writing via `memcpy` at the packed byte count either falls short of the
+/// padded rows (silently leaving garbage/uninitialized padding, which is
+/// harmless since the conv op never reads it) or -- for non-contiguous
+/// strides -- corrupts the wrong elements entirely. Reading `arr.strides`
+/// first and copying accordingly is correct for any padding Core ML
+/// chooses; bulk `memcpy` (whole-buffer, or row-by-row when only the
+/// between-row gap is padded) keeps this off the per-element scalar path
+/// that would otherwise run F*S times on every ANE projection call.
 public func mlxToMultiArray_1C1S(_ x: MLXArray) throws -> MLMultiArray {
     let S = x.shape[0], K = x.shape[1]
     let xT = x.transposed(1, 0).asType(.float16) // [K,S]
     eval(xT)
     let arr = try MLMultiArray(shape: [1, K, 1, S].map { NSNumber(value: $0) }, dataType: .float16)
     let bytes = xT.asData().data
-    precondition(bytes.count == K * S * MemoryLayout<Float16>.stride,
-                 "mlxToMultiArray_1C1S: source is \(bytes.count) bytes, expected packed K*S*2 = \(K * S * MemoryLayout<Float16>.stride)")
+    let elementSize = MemoryLayout<Float16>.stride
+    precondition(bytes.count == K * S * elementSize,
+                 "mlxToMultiArray_1C1S: source is \(bytes.count) bytes, expected packed K*S*2 = \(K * S * elementSize)")
 
     let strides = arr.strides.map(\.intValue) // element strides for [1,K,1,S]
     let strideK = strides[1], strideS = strides[3]
-    if strideK == S, strideS == 1 {
-        // Already tightly packed -- bulk copy is both correct and faster.
-        arr.withUnsafeMutableBytes { raw, _ in
-            bytes.withUnsafeBytes { src in
-                precondition(raw.count >= bytes.count,
-                             "mlxToMultiArray_1C1S: destination \(raw.count) bytes smaller than packed source \(bytes.count)")
-                memcpy(raw.baseAddress!, src.baseAddress!, bytes.count)
-            }
-        }
-    } else {
-        arr.withUnsafeMutableBytes { raw, _ in
-            let dst = raw.baseAddress!.assumingMemoryBound(to: Float16.self)
-            bytes.withUnsafeBytes { srcRaw in
-                let src = srcRaw.bindMemory(to: Float16.self)
+
+    arr.withUnsafeMutableBytes { raw, _ in
+        // Real bound: the strides above only describe the layout, not
+        // whether the backing store is actually large enough for the
+        // farthest element this scatter touches -- verify that directly
+        // rather than trusting the nominal `raw.count`.
+        precondition(((K - 1) * strideK + (S - 1) * strideS + 1) * elementSize <= raw.count,
+                     "mlxToMultiArray_1C1S: destination MLMultiArray (\(raw.count) bytes) too small for a [K,S] scatter at strides (\(strideK), \(strideS))")
+        bytes.withUnsafeBytes { src in
+            // All offsets below are computed on the RAW (byte) pointers, so
+            // every stride/index gets an explicit `* elementSize` -- MLX
+            // and MLMultiArray strides are in elements, memcpy lengths and
+            // pointer arithmetic on `UnsafeRawPointer` are in bytes.
+            let dstBase = raw.baseAddress!
+            let srcBase = src.baseAddress!
+            if strideK == S, strideS == 1 {
+                // Fully packed -- one bulk copy for the whole buffer.
+                memcpy(dstBase, srcBase, bytes.count)
+            } else if strideS == 1 {
+                // Rows are packed but padded between each other -- one
+                // memcpy per row instead of a per-element scalar loop.
+                let rowBytes = S * elementSize
+                for k in 0 ..< K {
+                    memcpy(dstBase + k * strideK * elementSize, srcBase + k * rowBytes, rowBytes)
+                }
+            } else {
+                // Non-unit last-axis stride -- no contiguous run to copy,
+                // fall back to a scalar scatter.
+                let dst = dstBase.assumingMemoryBound(to: Float16.self)
+                let srcTyped = srcBase.assumingMemoryBound(to: Float16.self)
                 for k in 0 ..< K {
                     let rowBase = k * strideK
                     for s in 0 ..< S {
-                        dst[rowBase + s * strideS] = src[k * S + s]
+                        dst[rowBase + s * strideS] = srcTyped[k * S + s]
                     }
                 }
             }
@@ -251,7 +272,9 @@ public func mlxToMultiArray_1C1S(_ x: MLXArray) throws -> MLMultiArray {
 /// `byteCount == F*S*2` and crashes for any `S` that is not already a
 /// multiple of 32 (confirmed at S=8; guaranteed at decode's S=1). Reading
 /// `a.strides` and gathering into a packed `[F,S]` buffer first is correct
-/// for any padding.
+/// for any padding; the gather uses bulk `memcpy` (whole-buffer, or
+/// row-by-row when only the between-row gap is padded) rather than a
+/// per-element scalar loop, since this runs on every ANE projection call.
 public func multiArray_1C1S_toMLX(_ a: MLMultiArray) -> MLXArray {
     precondition(a.dataType == .float16, "multiArray_1C1S_toMLX expects a float16 MLMultiArray, got \(a.dataType)")
     let shape = a.shape.map(\.intValue) // [1,F,1,S]
@@ -260,22 +283,45 @@ public func multiArray_1C1S_toMLX(_ a: MLMultiArray) -> MLXArray {
     let F = shape[1], S = shape[3]
     let strides = a.strides.map(\.intValue) // element strides, matching `shape`
     let strideF = strides[1], strideS = strides[3]
+    let elementSize = MemoryLayout<Float16>.stride
 
     var packed = [Float16](repeating: 0, count: F * S)
     a.withUnsafeBytes { raw in
-        let base = raw.baseAddress!.assumingMemoryBound(to: Float16.self)
-        packed.withUnsafeMutableBufferPointer { dst in
-            for f in 0 ..< F {
-                let rowBase = f * strideF
-                for s in 0 ..< S {
-                    dst[f * S + s] = base[rowBase + s * strideS]
+        // Real bound, not the tautological "packed buffer is F*S by
+        // construction" check: verify the SOURCE backing store actually
+        // covers the farthest element this gather reads.
+        precondition(((F - 1) * strideF + (S - 1) * strideS + 1) * elementSize <= raw.count,
+                     "multiArray_1C1S_toMLX: source MLMultiArray (\(raw.count) bytes) too small for a [F,S] gather at strides (\(strideF), \(strideS))")
+        let srcBase = raw.baseAddress!
+        packed.withUnsafeMutableBytes { dstRaw in
+            let dstBase = dstRaw.baseAddress!
+            if strideS == 1, strideF == S {
+                // Fully packed -- one bulk copy for the whole buffer.
+                memcpy(dstBase, srcBase, F * S * elementSize)
+            } else if strideS == 1 {
+                // Rows are packed but padded between each other -- one
+                // memcpy per row instead of a per-element scalar loop.
+                let rowBytes = S * elementSize
+                for f in 0 ..< F {
+                    memcpy(dstBase + f * rowBytes, srcBase + f * strideF * elementSize, rowBytes)
+                }
+            } else {
+                // Non-unit last-axis stride -- no contiguous run to copy,
+                // fall back to a scalar gather.
+                let dst = dstBase.assumingMemoryBound(to: Float16.self)
+                let src = srcBase.assumingMemoryBound(to: Float16.self)
+                for f in 0 ..< F {
+                    let rowBase = f * strideF
+                    for s in 0 ..< S {
+                        dst[f * S + s] = src[rowBase + s * strideS]
+                    }
                 }
             }
         }
     }
     let bytes = packed.withUnsafeBufferPointer { Data(buffer: $0) }
-    precondition(bytes.count == F * S * MemoryLayout<Float16>.stride,
-                 "multiArray_1C1S_toMLX: packed buffer is \(bytes.count) bytes, expected F*S*2 = \(F * S * MemoryLayout<Float16>.stride)")
+    precondition(bytes.count == F * S * elementSize,
+                 "multiArray_1C1S_toMLX: packed buffer is \(bytes.count) bytes, expected F*S*2 = \(F * S * elementSize)")
     let arr = MLXArray(bytes, [F, S], type: Float16.self)
     return arr.transposed(1, 0) // [S,F]
 }
