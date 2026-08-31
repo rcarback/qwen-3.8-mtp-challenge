@@ -280,6 +280,94 @@ public func buildConvWeightBlob(_ fp16Weight: Data) -> Data {
     return Data(blob)
 }
 
+// MARK: - MIL text (oMLX `fp16_swiglu_down_mil` format, fused SwiGLU-down)
+
+/// The fused SwiGLU-down MLP as ONE MIL program: gate-conv, up-conv, silu,
+/// mul, down-conv, no per-projection barrier -- oMLX's key optimization
+/// (`fp16_swiglu_down_mil` in `qwen35_ane.mm`), matched verbatim. `inputDim`
+/// is the model's hidden size (both the gate/up projections' input and the
+/// down projection's output); `hiddenDim` is the ANE-fraction intermediate
+/// width `F` (gate/up's output, down's input); `outputDim` is kept as its
+/// own parameter, matching the reference signature, even though this MLP's
+/// down-projection output is always `inputDim` again (down splits along the
+/// *inter* dimension across ANE/GPU, not along hidden). Weight `BLOBFILE`
+/// references point at `weights/weight.bin`, at the chunk-header offsets
+/// `buildMultiWeightBlob` returns for the gate/up/down chunks in that order.
+public func buildSwiGLUDownMILText(
+    inputDim: Int, hiddenDim: Int, outputDim: Int, sequenceLength: Int,
+    gateOffset: UInt64, upOffset: UInt64, downOffset: UInt64
+) -> String {
+    """
+    program(1.3)
+    [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+    {
+      func main<ios18>(tensor<fp16, [1, \(inputDim), 1, \(sequenceLength)]> x) {
+        tensor<fp16, [\(hiddenDim), \(inputDim), 1, 1]> gw = const()[name=string("gw"), val=tensor<fp16, [\(hiddenDim), \(inputDim), 1, 1]>(BLOBFILE(path=string("@model_path/weights/weight.bin"), offset=uint64(\(gateOffset))))];
+        tensor<fp16, [\(hiddenDim), \(inputDim), 1, 1]> uw = const()[name=string("uw"), val=tensor<fp16, [\(hiddenDim), \(inputDim), 1, 1]>(BLOBFILE(path=string("@model_path/weights/weight.bin"), offset=uint64(\(upOffset))))];
+        tensor<fp16, [\(outputDim), \(hiddenDim), 1, 1]> dw = const()[name=string("dw"), val=tensor<fp16, [\(outputDim), \(hiddenDim), 1, 1]>(BLOBFILE(path=string("@model_path/weights/weight.bin"), offset=uint64(\(downOffset))))];
+        string pt = const()[name=string("pt"), val=string("valid")];
+        tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+        tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+        tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+        int32 gr = const()[name=string("gr"), val=int32(1)];
+        tensor<fp16, [1, \(hiddenDim), 1, \(sequenceLength)]> gate = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=gw, x=x)[name=string("gate")];
+        tensor<fp16, [1, \(hiddenDim), 1, \(sequenceLength)]> up = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=uw, x=x)[name=string("up")];
+        tensor<fp16, [1, \(hiddenDim), 1, \(sequenceLength)]> silu_out = silu(x=gate)[name=string("silu")];
+        tensor<fp16, [1, \(hiddenDim), 1, \(sequenceLength)]> act = mul(x=silu_out, y=up)[name=string("swiglu")];
+        tensor<fp16, [1, \(outputDim), 1, \(sequenceLength)]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=dw, x=act)[name=string("down")];
+      } -> (y);
+    }
+    """
+}
+
+/// Multi-chunk weight blob for a fused program (oMLX `append_blob_chunk` +
+/// the swiglu constructor's blob assembly). A 64-byte zero prefix, then one
+/// 64-byte-aligned chunk per entry in `chunks` -- each chunk is a 64-byte
+/// header (`[0..3]` = `EF BE AD DE` magic, `uint32` type=1 at `+4`,
+/// `uint64` byte count at `+8`, `uint64` absolute payload offset
+/// (`chunkOffset+64`) at `+16`) followed immediately by the payload bytes.
+/// After every chunk is appended, the prefix's first 8 bytes are set to
+/// `uint32[0]=chunks.count` (chunk count), `uint32[1]=2` (version). Returns
+/// each chunk's HEADER offset (not its payload offset) -- what a MIL text's
+/// `BLOBFILE(offset=...)` reference expects, matching
+/// `buildConvWeightBlob`'s single-chunk convention (offset 64 = the header,
+/// not the payload at 128).
+public func buildMultiWeightBlob(chunks: [Data]) -> (blob: Data, offsets: [UInt64]) {
+    var blob = Data(count: 64)
+    var offsets: [UInt64] = []
+    for chunk in chunks {
+        let aligned = ((blob.count + 63) / 64) * 64
+        if aligned > blob.count {
+            blob.append(Data(count: aligned - blob.count))
+        }
+        let chunkOffset = UInt64(blob.count)
+        var header = [UInt8](repeating: 0, count: 64)
+        header[0] = 0xEF
+        header[1] = 0xBE
+        header[2] = 0xAD
+        header[3] = 0xDE
+        withUnsafeBytes(of: UInt32(1).littleEndian) { raw in
+            for i in 0 ..< 4 { header[4 + i] = raw[i] }
+        }
+        withUnsafeBytes(of: UInt64(chunk.count).littleEndian) { raw in
+            for i in 0 ..< 8 { header[8 + i] = raw[i] }
+        }
+        withUnsafeBytes(of: (chunkOffset + 64).littleEndian) { raw in
+            for i in 0 ..< 8 { header[16 + i] = raw[i] }
+        }
+        blob.append(Data(header))
+        blob.append(chunk)
+        offsets.append(chunkOffset)
+    }
+    withUnsafeBytes(of: UInt32(chunks.count).littleEndian) { raw in
+        for i in 0 ..< 4 { blob[i] = raw[i] }
+    }
+    withUnsafeBytes(of: UInt32(2).littleEndian) { raw in
+        for i in 0 ..< 4 { blob[4 + i] = raw[i] }
+    }
+    return (blob, offsets)
+}
+
 // MARK: - MLX <-> MLMultiArray bridges
 
 /// Materializes an [F,K] MLXArray as row-major fp16 bytes (the payload

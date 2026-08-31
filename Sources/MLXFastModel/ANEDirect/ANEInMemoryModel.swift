@@ -114,7 +114,12 @@ final class ANEInMemoryModel {
     /// `make_blob` chunk-descriptor header the MIL text's `offset=uint64(64)`
     /// points into, with the fp16 weight payload itself starting at
     /// absolute offset 128).
-    init(milText: String, weightBlob: Data) throws {
+    /// `weightFileName`: the file the MIL text's `BLOBFILE` references are
+    /// staged under (`weights/<weightFileName>`). Defaults to
+    /// `weight_data.bin`, matching `buildConvMILText`'s single-weight
+    /// `BLOBFILE` path; a fused multi-weight program (see `ANEFusedMLP`)
+    /// passes `weight.bin` to match `buildSwiGLUDownMILText`'s path instead.
+    init(milText: String, weightBlob: Data, weightFileName: String = "weight_data.bin") throws {
         guard ANERuntime.available() else { throw ANEError.unavailable }
         guard let Desc = ANERuntime.cls("_ANEInMemoryModelDescriptor") else { throw ANEError.descriptor }
 
@@ -181,7 +186,7 @@ final class ANEInMemoryModel {
         let weightsDir = dir.appendingPathComponent("weights")
         try FileManager.default.createDirectory(at: weightsDir, withIntermediateDirectories: true)
         try milData.write(to: dir.appendingPathComponent("model.mil"))
-        try weightBlob.write(to: weightsDir.appendingPathComponent("weight_data.bin"))
+        try weightBlob.write(to: weightsDir.appendingPathComponent(weightFileName))
 
         scratchURL = dir
         raw = model
