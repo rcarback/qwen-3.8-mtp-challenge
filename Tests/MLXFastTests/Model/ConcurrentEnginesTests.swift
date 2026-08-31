@@ -17,6 +17,8 @@ struct ConcurrentEnginesTests {
     static let S = 512, K = 5120, N = 2048
     static let F = 1024 // ANE prefix channel count; N-F is the GPU suffix
 
+    // NOTE: overlap here is limited pending the ANEGemm predict-only split
+    // (see plan Task 4b); do not copy this closure shape into the MLP tasks.
     @Test("concurrent ANE-prefix + GPU-suffix matches sequential run and full dense reference")
     func concurrentMatchesSequential() throws {
         let env = ProcessInfo.processInfo.environment
@@ -79,5 +81,60 @@ struct ConcurrentEnginesTests {
             let vsFull = abs(concCombined.asType(.float32) - full.asType(.float32)).max().item(Float.self)
             #expect(vsFull < 40.0, "cycle \(cycle): concurrent combined diverged from full dense reference by \(vsFull)")
         }
+    }
+}
+
+/// Fast, model-free tests for the join/error-propagation logic itself --
+/// `ConcurrentEngines.run` is pure concurrency plumbing (no MLX, no Core ML),
+/// so these use trivial closures and run in every `swift test`, without the
+/// `MLXFAST_RUN_MLX_RUNTIME_TESTS` gate. Their load-bearing property is that
+/// `run` never hangs: `group.leave()` runs from a `defer`, so even a throwing
+/// `ane` closure still releases the `DispatchGroup` and `group.wait()`
+/// returns.
+struct ConcurrentEnginesThrowTests {
+    private struct ANEError: Error { let id: Int }
+    private struct GPUError: Error { let id: Int }
+
+    @Test("ane throws, gpu succeeds -> run() throws the ANE error, does not hang")
+    func aneThrowsGpuSucceeds() {
+        do {
+            _ = try ConcurrentEngines.run(ane: { throw ANEError(id: 1) }, gpu: { 42 })
+            Issue.record("expected run() to throw")
+        } catch let error as ANEError {
+            #expect(error.id == 1)
+        } catch {
+            Issue.record("expected ANEError, got \(error)")
+        }
+    }
+
+    @Test("ane succeeds, gpu throws -> run() throws the GPU error, does not hang")
+    func aneSucceedsGpuThrows() {
+        do {
+            _ = try ConcurrentEngines.run(ane: { "ok" }, gpu: { throw GPUError(id: 2) })
+            Issue.record("expected run() to throw")
+        } catch let error as GPUError {
+            #expect(error.id == 2)
+        } catch {
+            Issue.record("expected GPUError, got \(error)")
+        }
+    }
+
+    @Test("both throw -> run() throws the ANE error (documented priority: ANE wins)")
+    func bothThrowANEWins() {
+        do {
+            _ = try ConcurrentEngines.run(ane: { throw ANEError(id: 3) }, gpu: { throw GPUError(id: 4) })
+            Issue.record("expected run() to throw")
+        } catch let error as ANEError {
+            #expect(error.id == 3)
+        } catch {
+            Issue.record("expected ANEError (ANE-wins priority), got \(error)")
+        }
+    }
+
+    @Test("both succeed -> returns (aneResult, gpuResult) correctly")
+    func bothSucceed() throws {
+        let (a, g) = try ConcurrentEngines.run(ane: { 7 }, gpu: { "gpu-value" })
+        #expect(a == 7)
+        #expect(g == "gpu-value")
     }
 }

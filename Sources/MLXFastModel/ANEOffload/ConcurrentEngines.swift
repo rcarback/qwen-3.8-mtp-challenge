@@ -13,6 +13,16 @@ private final class ANEResultBox<A>: @unchecked Sendable {
     var error: Error?
 }
 
+/// Carries the `ane` closure itself across the thread boundary. The closure
+/// type `() throws -> A` is not `Sendable` (generic closures aren't inferred
+/// `@Sendable`), but `ane` is only ever invoked once, from inside the single
+/// background task this box is handed to -- the same one-shot cross-boundary
+/// handoff pattern as `ANEGemm.init`'s `LoadInputs`.
+private final class ClosureBox<T>: @unchecked Sendable {
+    let body: () throws -> T
+    init(_ body: @escaping () throws -> T) { self.body = body }
+}
+
 public enum ConcurrentEngines {
     /// Runs `ane` on a background QoS-userInitiated queue and `gpu` on the
     /// calling thread, joins, returns both. MLX `eval` is only ever called
@@ -26,15 +36,19 @@ public enum ConcurrentEngines {
     /// does not change any call site.
     public static func run<A, G>(ane: @escaping () throws -> A, gpu: () throws -> G) throws -> (A, G) {
         let aneBox = ANEResultBox<A>()
+        let aneClosure = ClosureBox(ane)
         let group = DispatchGroup()
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async {
+            // `defer` (not a trailing statement) so a future early return
+            // added inside the do-block cannot skip `group.leave()` and
+            // deadlock the `group.wait()` below.
+            defer { group.leave() }
             do {
-                aneBox.value = try ane()
+                aneBox.value = try aneClosure.body()
             } catch {
                 aneBox.error = error
             }
-            group.leave()
         }
 
         var gpuValue: G?
