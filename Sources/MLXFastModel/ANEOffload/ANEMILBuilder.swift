@@ -141,14 +141,24 @@ func fd(_ n: String, _ shape: [Int]) -> Data {
     return strF(1, n) + lenF(3, lenF(5, arr))
 }
 
-func buildSpec(inputs: [(String, [Int])], outputs: [(String, [Int])], ops: Data) -> Data {
+/// Builds just the `program` submessage (`Program{version=1, functions=2(map)}`)
+/// for the given ops -- the same function block `buildSpec` wraps inside a
+/// full CoreML `Model` proto. Shared by `buildSpec` (Model-envelope path,
+/// used by `ANEGemm` via `MLModelAsset(specification:)`) and
+/// `buildConvMILProgram` (bare-program path, used by `ANEInMemoryModel` via
+/// `initWithNetworkText:weights:optionsPlist:isMILModel:`).
+func buildProgram(inputs: [(String, [Int])], outputs: [(String, [Int])], ops: Data) -> Data {
     var block = Data()
     for o in outputs { block += strF(2, o.0) }
     block += ops
     var fnInputs = Data()
     for i in inputs { fnInputs += lenF(1, namedValue(i.0, .fp16, i.1)) }
     let fn = fnInputs + strF(2, "CoreML8") + mapEntry(3, key: "CoreML8", value: block)
-    let program = varF(1, 1) + mapEntry(2, key: "main", value: fn)
+    return varF(1, 1) + mapEntry(2, key: "main", value: fn)
+}
+
+func buildSpec(inputs: [(String, [Int])], outputs: [(String, [Int])], ops: Data) -> Data {
+    let program = buildProgram(inputs: inputs, outputs: outputs, ops: ops)
     var desc = Data()
     for i in inputs { desc += lenF(1, fd(i.0, i.1)) }
     for o in outputs { desc += lenF(10, fd(o.0, o.1)) }
@@ -163,7 +173,7 @@ func buildSpec(inputs: [(String, [Int])], outputs: [(String, [Int])], ops: Data)
 /// exactly `x @ w.T` evaluated per sequence position -- see
 /// `tools/ane-gated-delta/layer2.swift`'s `convW` for the same op shape used
 /// in the gated-delta layer's real projections.
-public func buildConvMatmul(K: Int, F: Int, S: Int, weight: Data) -> Data {
+private func convOps(K: Int, F: Int, S: Int, weight: Data) -> Data {
     var ops = Data()
     ops += lenF(3, constIntsOp(name: "st", values: [1, 1]))
     ops += lenF(3, constIntsOp(name: "dl", values: [1, 1]))
@@ -176,9 +186,28 @@ public func buildConvMatmul(K: Int, F: Int, S: Int, weight: Data) -> Data {
                                 ("pad_type", "pt"), ("pad", "pd"), ("dilations", "dl"),
                                 ("groups", "gp")],
                        outName: "y", outType: .fp16, outShape: [1, F, 1, S]))
-    let ins: [(String, [Int])] = [("a", [1, K, 1, S])]
-    let outs: [(String, [Int])] = [("y", [1, F, 1, S])]
-    return buildSpec(inputs: ins, outputs: outs, ops: ops)
+    return ops
+}
+
+private func convIO(K: Int, F: Int, S: Int) -> (ins: [(String, [Int])], outs: [(String, [Int])]) {
+    ([("a", [1, K, 1, S])], [("y", [1, F, 1, S])])
+}
+
+public func buildConvMatmul(K: Int, F: Int, S: Int, weight: Data) -> Data {
+    let ops = convOps(K: K, F: F, S: S, weight: weight)
+    let io = convIO(K: K, F: F, S: S)
+    return buildSpec(inputs: io.ins, outputs: io.outs, ops: ops)
+}
+
+/// Same single-op conv program `buildConvMatmul` builds, but returns just the
+/// `program` submessage bytes -- what `_ANEInMemoryModelDescriptor`'s
+/// `initWithNetworkText:weights:optionsPlist:isMILModel:` wants for an
+/// in-memory MIL model, rather than the full CoreML `Model` proto envelope
+/// `buildConvMatmul` wraps it in for `MLModelAsset(specification:)`.
+public func buildConvMILProgram(K: Int, F: Int, S: Int, weight: Data) -> Data {
+    let ops = convOps(K: K, F: F, S: S, weight: weight)
+    let io = convIO(K: K, F: F, S: S)
+    return buildProgram(inputs: io.ins, outputs: io.outs, ops: ops)
 }
 
 // MARK: - MLX <-> MLMultiArray bridges
