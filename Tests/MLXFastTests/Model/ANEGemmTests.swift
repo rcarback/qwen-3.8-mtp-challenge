@@ -32,6 +32,14 @@ struct ANEGemmTests {
         // computation, matching the "near-tie" fp16 behavior documented
         // elsewhere in this repo's correctness contracts.
         #expect((abs(got - want).max()).item(Float.self) < 0.3)
+        // Mean-error lock alongside the max check: a uniform bias (e.g. a
+        // wrong weight/activation layout or a scale error) could stay under
+        // the 0.3 max bound yet be wrong on every element, which the max-only
+        // check would miss. Measured ~2.7e-4 on this seed/shape -- ~40x
+        // margin below this bound -- so this catches a systematic error the
+        // max check alone would not.
+        let meanErr = (abs(got - want)).mean().item(Float.self)
+        #expect(meanErr < 0.01)
     }
 
     @Test("ANEGemm per-call latency is stable across repeated calls (no recompile per call)")
