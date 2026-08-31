@@ -34,29 +34,32 @@ final class ANEInMemoryModel {
     /// with a correctly-bridged `NSError**` out-param -- covers
     /// `compileWithQoS:options:error:` and `loadWithQoS:options:error:`.
     ///
-    /// Deliberately NOT `ANERuntime.sendBoolQoS`, despite that shim covering
-    /// the same selector shape: its `error` parameter is a plain
-    /// `UnsafeMutablePointer<NSError?>`, and writing an ObjC
-    /// `__autoreleasing`-convention out-param through that type from a raw
-    /// `@convention(c)` call bypasses the retain Swift's ARC-aware bridging
-    /// would normally insert on that write. The callee hands back an
-    /// autoreleased (+0) `NSError*`; reading it into a plain
-    /// `UnsafeMutablePointer<NSError?>.pointee` gives Swift's `err` variable
-    /// the bit pattern without ever performing that retain, so Swift
-    /// believes it owns a reference it never actually retained. The later
-    /// release Swift inserts for that variable -- at explicit reassignment
-    /// or at scope exit, the latter coinciding with an enclosing
-    /// `autoreleasepool`'s own pop -- is then unbalanced and corrupts the
-    /// allocator. Confirmed live and root-caused by bisection (reproduced
-    /// standalone, outside Swift Testing, in single-threaded scripts):
-    /// passing a null error pointer never crashes; passing this same
-    /// `UnsafeMutablePointer<NSError?>` shim always crashes at the next
-    /// release of `err`, deterministically, regardless of how long the
-    /// scope is kept open first. `UnsafeMutablePointer<Unmanaged<NSError>?>`
-    /// receives the same raw write but performs NO implicit ARC on its own;
-    /// calling `.takeUnretainedValue()` on the result explicitly performs
-    /// exactly the one retain the callee's +0 convention requires, which
-    /// balances correctly against Swift's later release.
+    /// Deliberately NOT `ANERuntime.sendBoolQoS`, even though that shim now
+    /// covers the same selector shape via a correctly-bridged
+    /// `AutoreleasingUnsafeMutablePointer<NSError?>` (see `SendBoolQoS`'s
+    /// doc comment in `ANERuntimeBridge.swift`): this call site was
+    /// authored before that fix, against a plain `UnsafeMutablePointer<NSError?>`
+    /// shim, and writing an ObjC `__autoreleasing`-convention out-param
+    /// through that type from a raw `@convention(c)` call bypasses the
+    /// retain Swift's ARC-aware bridging would normally insert on that
+    /// write. The callee hands back an autoreleased (+0) `NSError*`;
+    /// reading it into a plain `UnsafeMutablePointer<NSError?>.pointee`
+    /// gives Swift's `err` variable the bit pattern without ever
+    /// performing that retain, so Swift believes it owns a reference it
+    /// never actually retained. The later release Swift inserts for that
+    /// variable -- at explicit reassignment or at scope exit, the latter
+    /// coinciding with an enclosing `autoreleasepool`'s own pop -- is then
+    /// unbalanced and corrupts the allocator. Confirmed live and
+    /// root-caused by bisection (reproduced standalone, outside Swift
+    /// Testing, in single-threaded scripts): passing a null error pointer
+    /// never crashes; passing that plain-pointer shim always crashes at
+    /// the next release of `err`, deterministically, regardless of how
+    /// long the scope is kept open first. `UnsafeMutablePointer<Unmanaged<NSError>?>`
+    /// (what `SendBoolQoSErr` below uses) receives the same raw write but
+    /// performs NO implicit ARC on its own; calling `.takeUnretainedValue()`
+    /// on the result explicitly performs exactly the one retain the
+    /// callee's +0 convention requires, which balances correctly against
+    /// Swift's later release.
     private typealias SendBoolQoSErr = @convention(c) (AnyObject?, Selector, Int, AnyObject?, UnsafeMutablePointer<Unmanaged<NSError>?>?) -> ObjCBool
 
     /// `objc_msgSend` cast for `unloadWithQoS:error:` -> `(NSInteger,NSError**)`,
@@ -107,8 +110,10 @@ final class ANEInMemoryModel {
     /// private ANE compiler accepts MIL text, unentitled, when the
     /// descriptor's referenced weight file is staged on disk first.
     /// `weightBlob`: the full on-disk blob the MIL text's `BLOBFILE`
-    /// reference reads (see `ANEMILBuilder.buildConvWeightBlob` -- a 64-byte
-    /// header followed by the fp16 weight bytes).
+    /// reference reads (see `ANEMILBuilder.buildConvWeightBlob` -- the
+    /// `make_blob` chunk-descriptor header the MIL text's `offset=uint64(64)`
+    /// points into, with the fp16 weight payload itself starting at
+    /// absolute offset 128).
     init(milText: String, weightBlob: Data) throws {
         guard ANERuntime.available() else { throw ANEError.unavailable }
         guard let Desc = ANERuntime.cls("_ANEInMemoryModelDescriptor") else { throw ANEError.descriptor }
@@ -186,13 +191,13 @@ final class ANEInMemoryModel {
         try? FileManager.default.removeItem(at: scratchURL)
     }
 
-    func compile(qos: Int = 0x21) throws {
+    func compile(qos: Int = 0x15) throws {
         let msgSend = dlsym(dlopen(nil, RTLD_LAZY), "objc_msgSend")!
         let (ok, message) = ANEInMemoryModel.callBoolQoSErr(msgSend, raw, Selector(("compileWithQoS:options:error:")), qos: qos, options: NSDictionary())
         if !ok { throw ANEError.compile(message ?? "unknown compile failure") }
     }
 
-    func load(qos: Int = 0x21) throws {
+    func load(qos: Int = 0x15) throws {
         let msgSend = dlsym(dlopen(nil, RTLD_LAZY), "objc_msgSend")!
         let (ok, message) = ANEInMemoryModel.callBoolQoSErr(msgSend, raw, Selector(("loadWithQoS:options:error:")), qos: qos, options: NSDictionary())
         if !ok { throw ANEError.load(message ?? "unknown load failure") }
