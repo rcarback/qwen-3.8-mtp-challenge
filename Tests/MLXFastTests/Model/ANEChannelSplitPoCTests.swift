@@ -1,6 +1,7 @@
 import CoreML
 import Foundation
 import MLX
+import MLXFastModel
 import MLXRandom
 import Testing
 

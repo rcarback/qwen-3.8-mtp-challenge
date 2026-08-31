@@ -1,13 +1,13 @@
-// MIL protobuf builder for the ANE channel-split PoC (ANEChannelSplitPoCTests).
+// MIL protobuf builder for ANE offload (moved from the Task 1 PoC test
+// target -- see `ANEGemm.swift`, which is the reusable warm primitive built
+// on top of this builder).
 //
 // The free functions below (through `constIntsVecOp`) are copied verbatim
 // from `tools/ane-gated-delta/proto.swift` (a hand-authored, self-contained,
 // MLX-free MIL protobuf writer) plus `buildSpec` from
 // `tools/ane-gated-delta/harness.swift`. Both are reference/investigation
-// files outside `editablePaths` and are not modified; this file exists so
-// the test target does not have to add either to `Package.swift`. See
-// `docs/qwen-mtp-editable-surface.md` -- Tests/ is not part of the
-// submission surface, so this MIL builder never ships.
+// files outside `editablePaths` and are not modified; this file is the
+// editable-surface copy those reference files informed.
 import CoreML
 import Foundation
 import MLX
@@ -155,7 +155,7 @@ func buildSpec(inputs: [(String, [Int])], outputs: [(String, [Int])], ops: Data)
     return varF(1, 9) + lenF(2, desc) + lenF(502, program)
 }
 
-// MARK: - Channel-split PoC specific: one 1x1 conv == x @ w.T
+// MARK: - One 1x1 conv == x @ w.T
 
 /// Builds a single-op MIL program: input `a<fp16,[1,K,1,S]>`, a baked-in
 /// fp16 weight const `[F,K,1,1]`, one `conv` (1x1, stride 1, valid pad,
@@ -163,7 +163,7 @@ func buildSpec(inputs: [(String, [Int])], outputs: [(String, [Int])], ops: Data)
 /// exactly `x @ w.T` evaluated per sequence position -- see
 /// `tools/ane-gated-delta/layer2.swift`'s `convW` for the same op shape used
 /// in the gated-delta layer's real projections.
-func buildConvMatmul(K: Int, F: Int, S: Int, weight: Data) -> Data {
+public func buildConvMatmul(K: Int, F: Int, S: Int, weight: Data) -> Data {
     var ops = Data()
     ops += lenF(3, constIntsOp(name: "st", values: [1, 1]))
     ops += lenF(3, constIntsOp(name: "dl", values: [1, 1]))
@@ -185,7 +185,7 @@ func buildConvMatmul(K: Int, F: Int, S: Int, weight: Data) -> Data {
 
 /// Materializes an [F,K] MLXArray as row-major fp16 bytes (the payload
 /// layout the `const` op's TensorValue expects for a `[F,K,1,1]` weight).
-func f16Bytes(_ w: MLXArray) -> Data {
+public func f16Bytes(_ w: MLXArray) -> Data {
     let w16 = w.asType(.float16)
     eval(w16)
     return w16.asData().data
@@ -193,7 +193,7 @@ func f16Bytes(_ w: MLXArray) -> Data {
 
 /// [S,K] fp16 MLXArray -> `MLMultiArray` shaped `[1,K,1,S]` (the ANE
 /// activation layout: batch, channels, 1, sequence).
-func mlxToMultiArray_1C1S(_ x: MLXArray) throws -> MLMultiArray {
+public func mlxToMultiArray_1C1S(_ x: MLXArray) throws -> MLMultiArray {
     let S = x.shape[0], K = x.shape[1]
     let xT = x.transposed(1, 0).asType(.float16)
     eval(xT)
@@ -208,7 +208,7 @@ func mlxToMultiArray_1C1S(_ x: MLXArray) throws -> MLMultiArray {
 }
 
 /// `MLMultiArray` shaped `[1,F,1,S]` -> `[S,F]` MLXArray.
-func multiArray_1C1S_toMLX(_ a: MLMultiArray) -> MLXArray {
+public func multiArray_1C1S_toMLX(_ a: MLMultiArray) -> MLXArray {
     let shape = a.shape.map(\.intValue) // [1,F,1,S]
     let F = shape[1], S = shape[3]
     let bytes = a.withUnsafeBytes { raw in Data(bytes: raw.baseAddress!, count: raw.count) }
