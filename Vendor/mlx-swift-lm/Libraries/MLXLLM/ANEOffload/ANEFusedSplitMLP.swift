@@ -26,6 +26,13 @@ public final class ANEFusedSplitMLP {
     private let inter: Int
     private let f: Int
     private let aneMLP: ANEFusedMLP?
+    // GPU-fp16 ablation (MLX_ANE_FP16_GPU=1): the dequantized fp16 prefix
+    // weights, kept so the prefix partial can run as a pure-GPU fp16 matmul
+    // instead of on the ANE. Isolates fp16-vs-4bit from ANE-specific error.
+    private let ablate: Bool
+    private let gatePrefixFP16: MLXArray?
+    private let upPrefixFP16: MLXArray?
+    private let downPrefixFP16: MLXArray?
 
     private let gateSuffixWq: MLXArray?
     private let gateSuffixScales: MLXArray?
@@ -58,6 +65,7 @@ public final class ANEFusedSplitMLP {
         self.inter = inter
         self.f = f
 
+        self.ablate = ANESplitConfig.fp16GpuAblate
         if f > 0 {
             let gatePrefix = ANEWeightPrep.dequantizeFP16(
                 wq: gateW, scales: gateScales, biases: gateBiases, channelStart: 0, channelEnd: f)
@@ -66,11 +74,26 @@ public final class ANEFusedSplitMLP {
             let downPrefix = ANEWeightPrep.dequantizeFP16Columns(
                 wq: downW, scales: downScales, biases: downBiases, columnStart: 0, columnEnd: f)
             eval(gatePrefix, upPrefix, downPrefix)
-            aneMLP = try ANEFusedMLP(
-                hidden: hidden, innerFraction: f, sequenceLength: sequenceLength,
-                gate: gatePrefix, up: upPrefix, down: downPrefix)
+            if ablate {
+                // GPU-fp16 ablation: keep the fp16 prefix for a GPU matmul,
+                // skip the ANE program build entirely (no ANE, no sandbox).
+                gatePrefixFP16 = gatePrefix
+                upPrefixFP16 = upPrefix
+                downPrefixFP16 = downPrefix
+                aneMLP = nil
+            } else {
+                gatePrefixFP16 = nil
+                upPrefixFP16 = nil
+                downPrefixFP16 = nil
+                aneMLP = try ANEFusedMLP(
+                    hidden: hidden, innerFraction: f, sequenceLength: sequenceLength,
+                    gate: gatePrefix, up: upPrefix, down: downPrefix)
+            }
         } else {
             aneMLP = nil
+            gatePrefixFP16 = nil
+            upPrefixFP16 = nil
+            downPrefixFP16 = nil
         }
 
         if f < inter {
@@ -146,6 +169,21 @@ public final class ANEFusedSplitMLP {
             eval(y)
             return y
         }
+        if ablate {
+            // GPU-fp16 ablation: the SAME fp16 prefix function the ANE would
+            // compute, but on the GPU, plus the identical 4-bit suffix. If
+            // this still flips token-0 vs the 4-bit golden, the divergence is
+            // fp16-vs-4bit representation, not ANE-specific.
+            let anePartial = gpuFp16Prefix(x)
+            if f == inter {
+                eval(anePartial)
+                return anePartial
+            }
+            let gpu = try gpuPartial(x)
+            let y = anePartial.asType(gpu.dtype) + gpu
+            eval(y)
+            return y
+        }
         guard let aneMLP else {
             preconditionFailure("ANEFusedSplitMLP: F=\(f)>0 but no ANEFusedMLP was built")
         }
@@ -186,6 +224,20 @@ public final class ANEFusedSplitMLP {
         let y = anePartial.asType(gpu.dtype) + gpu
         eval(y)
         return y
+    }
+
+    /// GPU-fp16 ablation: the `[0..<F]` prefix SwiGLU-down computed as a pure
+    /// GPU fp16 dequant-matmul (same fp16 weights the ANE would use). `[S,hidden]`.
+    private func gpuFp16Prefix(_ x: MLXArray) -> MLXArray {
+        guard let gatePrefixFP16, let upPrefixFP16, let downPrefixFP16 else {
+            preconditionFailure("ANEFusedSplitMLP: ablation prefix weights missing")
+        }
+        let x16 = x.asType(.float16)
+        let g = matmul(x16, gatePrefixFP16.transposed(1, 0))          // [S,F]
+        let u = matmul(x16, upPrefixFP16.transposed(1, 0))            // [S,F]
+        let act = (silu(g) * u)                                        // [S,F] fp16
+        let y = matmul(act, downPrefixFP16.transposed(1, 0))          // [S,hidden]
+        return y.asType(.bfloat16)
     }
 
     /// Runs the `[F..<inter]` suffix chain through native 4-bit

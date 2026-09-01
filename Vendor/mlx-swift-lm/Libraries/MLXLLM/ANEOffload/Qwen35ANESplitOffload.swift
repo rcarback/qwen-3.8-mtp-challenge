@@ -37,6 +37,15 @@ public enum ANESplitConfig {
         guard let cString = getenv("MLX_ANE_MIN_SEQ") else { return 128 }
         return Int(String(cString: cString)) ?? 128
     }()
+    /// Diagnostic (MLX_ANE_FP16_GPU=1): compute the ANE fraction as a pure-GPU
+    /// fp16 dequant-matmul instead of on the ANE. Isolates whether the
+    /// correctness divergence is the fp16-vs-4bit REPRESENTATION (present here,
+    /// no ANE) or ANE-specific (silu table / radix-4 / padding). No ANE, so it
+    /// runs in the normal sandboxed worker without MLXFAST_NO_SANDBOX.
+    public static let fp16GpuAblate: Bool = {
+        guard let cString = getenv("MLX_ANE_FP16_GPU") else { return false }
+        return String(cString: cString) == "1"
+    }()
 }
 
 /// Diagnostic sink for the ANE offload. Writes to the file named by
