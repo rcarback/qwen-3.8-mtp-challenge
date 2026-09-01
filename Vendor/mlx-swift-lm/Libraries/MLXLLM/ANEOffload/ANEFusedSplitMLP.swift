@@ -44,6 +44,14 @@ public final class ANEFusedSplitMLP {
     private let downSuffixScales: MLXArray?
     private let downSuffixBiases: MLXArray?
 
+    /// `F = round(aneFraction*inter/64)*64`, clamped to `[0, inter]`: the
+    /// number of intermediate channels the ANE side owns.
+    public static func prefixChannels(inter: Int, aneFraction: Double) -> Int {
+        let clampedFraction = min(max(aneFraction, 0.0), 1.0)
+        let rawF = Int((clampedFraction * Double(inter) / 64.0).rounded()) * 64
+        return min(max(rawF, 0), inter)
+    }
+
     /// `gate`/`up`: 4-bit affine group-64 triples, logical shape
     /// `[inter, hidden]`. `down`: 4-bit affine group-64 triple, logical
     /// shape `[hidden, inter]`. `aneFraction` (clamped to `[0,1]`) selects
@@ -51,28 +59,42 @@ public final class ANEFusedSplitMLP {
     /// through a single fused ANE program (fp16); the remaining
     /// `inter-F` channels run through native 4-bit `quantizedMM` on the
     /// GPU. `F==0` is pure GPU (the all-GPU reference, bit-identical);
-    /// `F==inter` is pure ANE.
+    /// `F==inter` is pure ANE. `prefixFP16`, when given, supplies the ANE
+    /// side's fp16 `[F,hidden]`/`[F,hidden]`/`[hidden,F]` weights directly
+    /// (the bf16 base slices, see `ANEBF16WeightSource`) instead of
+    /// dequantizing the 4-bit prefix; the GPU suffix is unaffected.
     public init(
         gateW: MLXArray, gateScales: MLXArray, gateBiases: MLXArray,
         upW: MLXArray, upScales: MLXArray, upBiases: MLXArray,
         downW: MLXArray, downScales: MLXArray, downBiases: MLXArray,
-        hidden: Int, inter: Int, sequenceLength: Int, aneFraction: Double
+        hidden: Int, inter: Int, sequenceLength: Int, aneFraction: Double,
+        prefixFP16: ANEPrefixWeights? = nil
     ) throws {
-        let clampedFraction = min(max(aneFraction, 0.0), 1.0)
-        let rawF = Int((clampedFraction * Double(inter) / 64.0).rounded()) * 64
-        let f = min(max(rawF, 0), inter)
+        let f = Self.prefixChannels(inter: inter, aneFraction: aneFraction)
         self.hidden = hidden
         self.inter = inter
         self.f = f
 
         self.ablate = ANESplitConfig.fp16GpuAblate
         if f > 0 {
-            let gatePrefix = ANEWeightPrep.dequantizeFP16(
-                wq: gateW, scales: gateScales, biases: gateBiases, channelStart: 0, channelEnd: f)
-            let upPrefix = ANEWeightPrep.dequantizeFP16(
-                wq: upW, scales: upScales, biases: upBiases, channelStart: 0, channelEnd: f)
-            let downPrefix = ANEWeightPrep.dequantizeFP16Columns(
-                wq: downW, scales: downScales, biases: downBiases, columnStart: 0, columnEnd: f)
+            let gatePrefix: MLXArray
+            let upPrefix: MLXArray
+            let downPrefix: MLXArray
+            if let prefixFP16 {
+                precondition(prefixFP16.gate.shape == [f, hidden] && prefixFP16.up.shape == [f, hidden]
+                             && prefixFP16.down.shape == [hidden, f],
+                             "ANEFusedSplitMLP: prefixFP16 shapes \(prefixFP16.gate.shape)/\(prefixFP16.up.shape)/\(prefixFP16.down.shape) do not match F=\(f) hidden=\(hidden)")
+                gatePrefix = prefixFP16.gate.asType(.float16)
+                upPrefix = prefixFP16.up.asType(.float16)
+                downPrefix = prefixFP16.down.asType(.float16)
+            } else {
+                gatePrefix = ANEWeightPrep.dequantizeFP16(
+                    wq: gateW, scales: gateScales, biases: gateBiases, channelStart: 0, channelEnd: f)
+                upPrefix = ANEWeightPrep.dequantizeFP16(
+                    wq: upW, scales: upScales, biases: upBiases, channelStart: 0, channelEnd: f)
+                downPrefix = ANEWeightPrep.dequantizeFP16Columns(
+                    wq: downW, scales: downScales, biases: downBiases, columnStart: 0, columnEnd: f)
+            }
             eval(gatePrefix, upPrefix, downPrefix)
             if ablate {
                 // GPU-fp16 ablation: keep the fp16 prefix for a GPU matmul,

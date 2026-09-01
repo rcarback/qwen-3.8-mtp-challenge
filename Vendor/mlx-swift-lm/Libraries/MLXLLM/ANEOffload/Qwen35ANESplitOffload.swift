@@ -61,6 +61,15 @@ public enum ANESplitConfig {
         return Int(String(cString: cString)) ?? 0
     }()
 
+    /// `MLX_ANE_BF16_WEIGHTS=<snapshot dir>`: source the ANE fp16 slices from
+    /// the original bf16 base checkpoint (see `ANEBF16WeightSource`) instead
+    /// of dequantizing the 4-bit weights. Unset = dequantize (default).
+    public static let bf16WeightsPath: String? = {
+        guard let cString = getenv("MLX_ANE_BF16_WEIGHTS") else { return nil }
+        let path = String(cString: cString)
+        return path.isEmpty ? nil : path
+    }()
+
     /// True when a dense layer at `index` of `total` should offload, honoring
     /// the selective-layer sandwich. `index < 0` (unknown) offloads (back-compat).
     public static func layerOffloads(index: Int, total: Int) -> Bool {
@@ -105,8 +114,11 @@ public final class ANESplitMLPCache: @unchecked Sendable {
     /// or a prior/again build failure). `gate`/`up` are 4-bit affine
     /// group-64 triples with logical shape `[inter, hidden]`; `down` is a
     /// 4-bit affine group-64 triple with logical shape `[hidden, inter]`.
+    /// `layerIndex` selects the layer's bf16 slices when
+    /// `MLX_ANE_BF16_WEIGHTS` is set; `-1` (unknown) always dequantizes.
     public func program(
         forSequenceLength s: Int,
+        layerIndex: Int = -1,
         gateW: MLXArray, gateScales: MLXArray, gateBiases: MLXArray,
         gateBits: Int, gateGroupSize: Int,
         upW: MLXArray, upScales: MLXArray, upBiases: MLXArray,
@@ -128,14 +140,32 @@ public final class ANESplitMLPCache: @unchecked Sendable {
         if failed.contains(s) { return nil }
 
         do {
+            // bf16 base slices for this layer, when configured. A missing or
+            // malformed shard throws into the shared failure path below (GPU
+            // fallback + log) rather than silently dequantizing instead: a
+            // set flag that quietly changed meaning would poison every
+            // fidelity comparison made against it.
+            var prefix: ANEPrefixWeights? = nil
+            if layerIndex >= 0, let source = ANEBF16WeightSource.shared {
+                let f = ANEFusedSplitMLP.prefixChannels(inter: inter, aneFraction: ANESplitConfig.fraction)
+                let p = try source.mlpPrefix(layer: layerIndex, hidden: hidden, inter: inter, f: f)
+                // Sanity check against the dequantized 4-bit slice: a wrong
+                // checkpoint (or a mis-indexed layer) shows up as a large
+                // number here instead of as silently wrong logits.
+                let dq = ANEWeightPrep.dequantizeFP16(
+                    wq: gateW, scales: gateScales, biases: gateBiases, channelStart: 0, channelEnd: f)
+                let drift = MLX.abs(p.gate.asType(.float32) - dq.asType(.float32)).max().item(Float.self)
+                aneLog("layer \(layerIndex): bf16 gate prefix vs dequant4 maxAbs=\(drift)")
+                prefix = p
+            }
             let split = try ANEFusedSplitMLP(
                 gateW: gateW, gateScales: gateScales, gateBiases: gateBiases,
                 upW: upW, upScales: upScales, upBiases: upBiases,
                 downW: downW, downScales: downScales, downBiases: downBiases,
                 hidden: hidden, inter: inter, sequenceLength: s,
-                aneFraction: ANESplitConfig.fraction)
+                aneFraction: ANESplitConfig.fraction, prefixFP16: prefix)
             programs[s] = split
-            aneLog("built split program S=\(s) fraction=\(ANESplitConfig.fraction) hidden=\(hidden) inter=\(inter)")
+            aneLog("built split program S=\(s) fraction=\(ANESplitConfig.fraction) hidden=\(hidden) inter=\(inter) source=\(prefix == nil ? "dequant4" : "bf16")")
             return split
         } catch {
             failed.insert(s)

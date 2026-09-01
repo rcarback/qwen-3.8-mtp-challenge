@@ -2466,7 +2466,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
             let hidden = x.dim(-1)
             let tokens = x.size / hidden
             if let split = aneCache.program(
-                forSequenceLength: tokens,
+                forSequenceLength: tokens, layerIndex: aneLayerIndex,
                 gateW: g.weight, gateScales: gs, gateBiases: gb,
                 gateBits: g.bits, gateGroupSize: g.groupSize,
                 upW: u.weight, upScales: us, upBiases: ub,
@@ -2499,7 +2499,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // scales is [out, in/groupSize]; recover hidden without an input tensor.
         let hidden = g.scales.dim(1) * g.groupSize
         _ = aneCache.program(
-            forSequenceLength: sequenceLength,
+            forSequenceLength: sequenceLength, layerIndex: aneLayerIndex,
             gateW: g.weight, gateScales: g.scales, gateBiases: gb,
             gateBits: g.bits, gateGroupSize: g.groupSize,
             upW: u.weight, upScales: u.scales, upBiases: ub,
