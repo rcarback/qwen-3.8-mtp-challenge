@@ -15,7 +15,7 @@ import IOSurface
 import MLX
 import ObjectiveC
 
-enum ANEDirectDispatch {
+public enum ANEDirectDispatch {
     enum ANEDispatchError: Error, CustomStringConvertible {
         case surfaceAllocationFailed
         case wrapFailed
@@ -78,7 +78,7 @@ enum ANEDirectDispatch {
     /// `ConcurrentEngines.run`'s background queue, then by `read` back on
     /// the caller thread -- so there is no concurrent mutation, the same
     /// one-shot handoff pattern as `ANEGemm`'s `LoadInputs`/`LoadResult`.
-    final class Prepared: @unchecked Sendable {
+    public final class Prepared: @unchecked Sendable {
         let model: ANEInMemoryModel
         let request: AnyObject
         // The input surface is held even though `read` never touches it: the
@@ -108,7 +108,7 @@ enum ANEDirectDispatch {
     /// transpose + eval + `asData`), wraps both surfaces, and builds the
     /// `_ANERequest`. Returns a `Prepared` that `evaluate` and `read`
     /// consume -- only `evaluate` may run off this thread.
-    static func prepare(model: ANEInMemoryModel, x: MLXArray, inputDim: Int, outputDim: Int, sequenceLength: Int) throws -> Prepared {
+    public static func prepare(model: ANEInMemoryModel, x: MLXArray, inputDim: Int, outputDim: Int, sequenceLength: Int) throws -> Prepared {
         precondition(x.ndim == 2 && x.shape[0] == sequenceLength && x.shape[1] == inputDim,
                      "ANEDirectDispatch.prepare expected x shape [\(sequenceLength), \(inputDim)], got \(x.shape)")
 
@@ -203,7 +203,7 @@ enum ANEDirectDispatch {
     /// used. Touches only the private ANE ObjC API -- no MLX -- so this is
     /// the one phase safe to run on `ConcurrentEngines.run`'s background
     /// queue while the caller thread does MLX `eval` elsewhere.
-    static func evaluate(_ prepared: Prepared) throws {
+    public static func evaluate(_ prepared: Prepared) throws {
         let msgSend = dlsym(dlopen(nil, RTLD_LAZY), "objc_msgSend")!
         let evaluateFn = unsafeBitCast(msgSend, to: EvaluateFn.self)
         let evaluateSel = Selector(("evaluateWithQoS:options:request:error:"))
@@ -221,7 +221,7 @@ enum ANEDirectDispatch {
     /// `[OUT,paddedS]` row-padded output surface and returns `[S,OUT]` fp16
     /// (MLX). Must run only after `evaluate` has completed for this
     /// `Prepared`.
-    static func read(_ prepared: Prepared) -> MLXArray {
+    public static func read(_ prepared: Prepared) -> MLXArray {
         let outputDim = prepared.outputDim
         let sequenceLength = prepared.sequenceLength
         let rowStride = prepared.rowStride
@@ -261,7 +261,7 @@ enum ANEDirectDispatch {
     /// visible before MLX reads the bytes (bit-identity vs the locked gather
     /// path confirms it). mlx-swift's own `MLXArray(rawPointer:)` IOSurface
     /// example is likewise unlocked. Must run only after `evaluate` completed.
-    static func readZeroCopy(_ prepared: Prepared) -> MLXArray {
+    public static func readZeroCopy(_ prepared: Prepared) -> MLXArray {
         let outputDim = prepared.outputDim
         let sequenceLength = prepared.sequenceLength
         let rowStride = prepared.rowStride
@@ -280,7 +280,7 @@ enum ANEDirectDispatch {
     /// (MLX). For concurrent ANE+GPU use, call the three phases separately
     /// instead (only `evaluate` is background-safe -- see `Prepared`'s doc
     /// comment).
-    static func runConv(model: ANEInMemoryModel, x: MLXArray, inputDim: Int, outputDim: Int, sequenceLength: Int) throws -> MLXArray {
+    public static func runConv(model: ANEInMemoryModel, x: MLXArray, inputDim: Int, outputDim: Int, sequenceLength: Int) throws -> MLXArray {
         let prepared = try prepare(model: model, x: x, inputDim: inputDim, outputDim: outputDim, sequenceLength: sequenceLength)
         try evaluate(prepared)
         return readZeroCopy(prepared)

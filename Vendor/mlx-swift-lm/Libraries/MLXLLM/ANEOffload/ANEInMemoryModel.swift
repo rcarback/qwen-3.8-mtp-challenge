@@ -11,12 +11,12 @@
 import Foundation
 import ObjectiveC
 
-final class ANEInMemoryModel {
-    enum ANEError: Error, Equatable { case unavailable, descriptor, model, compile(String), load(String) }
+public final class ANEInMemoryModel {
+    public enum ANEError: Error, Equatable { case unavailable, descriptor, model, compile(String), load(String) }
 
     /// The `_ANEInMemoryModel` instance (for Task 4).
     let raw: AnyObject
-    private(set) var programHandle: UInt64 = 0
+    public private(set) var programHandle: UInt64 = 0
     private let scratchURL: URL
 
     /// `objc_msgSend` cast for a plain 0-arg call returning `Unmanaged` --
@@ -119,7 +119,7 @@ final class ANEInMemoryModel {
     /// `weight_data.bin`, matching `buildConvMILText`'s single-weight
     /// `BLOBFILE` path; a fused multi-weight program (see `ANEFusedMLP`)
     /// passes `weight.bin` to match `buildSwiGLUDownMILText`'s path instead.
-    init(milText: String, weightBlob: Data, weightFileName: String = "weight_data.bin") throws {
+    public init(milText: String, weightBlob: Data, weightFileName: String = "weight_data.bin") throws {
         guard ANERuntime.available() else { throw ANEError.unavailable }
         guard let Desc = ANERuntime.cls("_ANEInMemoryModelDescriptor") else { throw ANEError.descriptor }
 
@@ -196,20 +196,20 @@ final class ANEInMemoryModel {
         try? FileManager.default.removeItem(at: scratchURL)
     }
 
-    func compile(qos: Int = 0x15) throws {
+    public func compile(qos: Int = 0x15) throws {
         let msgSend = dlsym(dlopen(nil, RTLD_LAZY), "objc_msgSend")!
         let (ok, message) = ANEInMemoryModel.callBoolQoSErr(msgSend, raw, Selector(("compileWithQoS:options:error:")), qos: qos, options: NSDictionary())
         if !ok { throw ANEError.compile(message ?? "unknown compile failure") }
     }
 
-    func load(qos: Int = 0x15) throws {
+    public func load(qos: Int = 0x15) throws {
         let msgSend = dlsym(dlopen(nil, RTLD_LAZY), "objc_msgSend")!
         let (ok, message) = ANEInMemoryModel.callBoolQoSErr(msgSend, raw, Selector(("loadWithQoS:options:error:")), qos: qos, options: NSDictionary())
         if !ok { throw ANEError.load(message ?? "unknown load failure") }
         programHandle = ANERuntime.sendUInt64(raw, Selector(("programHandle")))
     }
 
-    func unload() {
+    public func unload() {
         let msgSend = dlsym(dlopen(nil, RTLD_LAZY), "objc_msgSend")!
         _ = ANEInMemoryModel.callBoolQoSErrNoOptions(msgSend, raw, Selector(("unloadWithQoS:error:")), qos: 0)
         programHandle = 0

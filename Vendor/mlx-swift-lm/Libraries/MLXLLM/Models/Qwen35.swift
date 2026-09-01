@@ -2084,6 +2084,184 @@ public enum Qwen35CustomQMV {
     }
 }
 
+// MARK: - Prefill CPU/GPU column-split quantized projection
+
+/// Environment variable that sets the fraction of output columns computed on
+/// the CPU during prefill quantized projections. Unset or empty is 0: GPU
+/// only, today's behaviour. A present but unparsable or out-of-range value
+/// is a refusal, never a silent fall-back to GPU-only.
+let qwen35PrefillCPUColumnFractionEnv = "MLXFAST_PREFILL_CPU_COLUMN_FRACTION"
+
+enum Qwen35CPUAssistError: Error, Equatable, CustomStringConvertible {
+    case invalidFraction(String)
+    case fractionOutOfRange(Double)
+    case silentGPUFallback(fraction: Double, columns: Int)
+    case unsupportedQuantization(mode: String, bits: Int, groupSize: Int)
+
+    var description: String {
+        switch self {
+        case .invalidFraction(let raw):
+            return
+                "\(qwen35PrefillCPUColumnFractionEnv) must be a finite number in [0, 1], got \(raw)"
+        case .fractionOutOfRange(let value):
+            return
+                "\(qwen35PrefillCPUColumnFractionEnv) must be in [0, 1], got \(value)"
+        case .silentGPUFallback(let fraction, let columns):
+            return
+                "\(qwen35PrefillCPUColumnFractionEnv)=\(fraction) assigned 0 of \(columns) output columns; refusing a silent GPU-only run"
+        case .unsupportedQuantization(let mode, let bits, let groupSize):
+            return
+                "CPU column-split assist requires affine 4-bit group-64, got mode=\(mode) bits=\(bits) groupSize=\(groupSize)"
+        }
+    }
+}
+
+func qwen35ParsePrefillCPUColumnFraction(_ raw: String?) throws -> Double {
+    guard let raw, !raw.isEmpty else { return 0 }
+    guard let value = Double(raw), value.isFinite else {
+        throw Qwen35CPUAssistError.invalidFraction(raw)
+    }
+    guard value >= 0 else {
+        throw Qwen35CPUAssistError.fractionOutOfRange(value)
+    }
+    guard value <= 1 else {
+        throw Qwen35CPUAssistError.fractionOutOfRange(value)
+    }
+    return value
+}
+
+func qwen35PrefillCPUColumnFraction() throws -> Double {
+    guard let cString = getenv(qwen35PrefillCPUColumnFractionEnv) else {
+        return 0
+    }
+    return try qwen35ParsePrefillCPUColumnFraction(String(cString: cString))
+}
+
+func qwen35CPUColumnCount(outputColumns n: Int, fraction: Double) throws -> Int {
+    guard fraction.isFinite else {
+        throw Qwen35CPUAssistError.invalidFraction(String(fraction))
+    }
+    guard fraction >= 0 else {
+        throw Qwen35CPUAssistError.fractionOutOfRange(fraction)
+    }
+    guard fraction <= 1 else {
+        throw Qwen35CPUAssistError.fractionOutOfRange(fraction)
+    }
+    if fraction == 0 { return 0 }
+    if fraction == 1 { return n }
+    let count = Int((Double(n) * fraction).rounded(.down))
+    if n > 0, count == 0 {
+        throw Qwen35CPUAssistError.silentGPUFallback(fraction: fraction, columns: n)
+    }
+    if count > n { return n }
+    return count
+}
+
+/// Result of a column-split quantized projection. Tests read the column
+/// counts and the streams so placement is observable, not assumed.
+struct Qwen35ColumnSplitQuantizedMM {
+    let output: MLXArray
+    let cpuColumns: Int
+    let gpuColumns: Int
+    let cpuStream: MLX.Stream
+    let gpuStream: MLX.Stream
+}
+
+func qwen35QuantizedMMOnStream(
+    _ x: MLXArray,
+    _ w: MLXArray,
+    scales: MLXArray,
+    biases: MLXArray,
+    groupSize: Int,
+    bits: Int,
+    mode: QuantizationMode,
+    stream: MLX.Stream
+) -> MLXArray {
+    quantizedMM(
+        x, w, scales: scales, biases: biases, transpose: true,
+        groupSize: groupSize, bits: bits, mode: mode,
+        stream: .stream(stream))
+}
+
+/// Split a transposed affine quantized projection (`y = x @ W.T`) across a
+/// CPU stream and a GPU stream by output column. Columns `0 ..< cpuN` of `y`
+/// depend only on rows `0 ..< cpuN` of `W` (and of the matching scales and
+/// biases); those rows are dispatched on `cpuStream`. The remaining columns
+/// are dispatched on `gpuStream`. The halves are concatenated.
+///
+/// Fraction 0 is GPU-only with the default stream, matching today's
+/// `quantizedMM` call. Fraction 1 is CPU-only. A positive fraction that
+/// would assign zero CPU columns is a refusal, not a quiet GPU-only run.
+/// Failures on the CPU stream propagate; they are never caught and retried
+/// on the GPU.
+func qwen35ColumnSplitQuantizedMM(
+    _ x: MLXArray,
+    _ w: MLXArray,
+    scales: MLXArray,
+    biases: MLXArray,
+    groupSize: Int,
+    bits: Int,
+    mode: QuantizationMode,
+    cpuColumnFraction: Double,
+    cpuStream: MLX.Stream = .cpu,
+    gpuStream: MLX.Stream = .gpu
+) throws -> Qwen35ColumnSplitQuantizedMM {
+    let cpuN = try qwen35CPUColumnCount(
+        outputColumns: w.dim(0), fraction: cpuColumnFraction)
+    let n = w.dim(0)
+    let gpuN = n - cpuN
+
+    if cpuColumnFraction > 0 {
+        let modeName = String(describing: mode)
+        guard mode == .affine, bits == 4, groupSize == 64 else {
+            throw Qwen35CPUAssistError.unsupportedQuantization(
+                mode: modeName, bits: bits, groupSize: groupSize)
+        }
+    }
+
+    if cpuN == 0 {
+        let y = quantizedMM(
+            x, w, scales: scales, biases: biases, transpose: true,
+            groupSize: groupSize, bits: bits, mode: mode)
+        return Qwen35ColumnSplitQuantizedMM(
+            output: y, cpuColumns: 0, gpuColumns: n,
+            cpuStream: cpuStream, gpuStream: gpuStream)
+    }
+
+    if gpuN == 0 {
+        let y = qwen35QuantizedMMOnStream(
+            x, w, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits, mode: mode,
+            stream: cpuStream)
+        return Qwen35ColumnSplitQuantizedMM(
+            output: y, cpuColumns: n, gpuColumns: 0,
+            cpuStream: cpuStream, gpuStream: gpuStream)
+    }
+
+    let cpuWrapped = StreamOrDevice.stream(cpuStream)
+    let gpuWrapped = StreamOrDevice.stream(gpuStream)
+    let wCPU = w[0..<cpuN].contiguous(stream: cpuWrapped)
+    let sCPU = scales[0..<cpuN].contiguous(stream: cpuWrapped)
+    let zCPU = biases[0..<cpuN].contiguous(stream: cpuWrapped)
+    let wGPU = w[cpuN...].contiguous(stream: gpuWrapped)
+    let sGPU = scales[cpuN...].contiguous(stream: gpuWrapped)
+    let zGPU = biases[cpuN...].contiguous(stream: gpuWrapped)
+
+    let cpuY = qwen35QuantizedMMOnStream(
+        x, wCPU, scales: sCPU, biases: zCPU,
+        groupSize: groupSize, bits: bits, mode: mode,
+        stream: cpuStream)
+    let gpuY = qwen35QuantizedMMOnStream(
+        x, wGPU, scales: sGPU, biases: zGPU,
+        groupSize: groupSize, bits: bits, mode: mode,
+        stream: gpuStream)
+    eval(cpuY, gpuY)
+    let y = concatenated([cpuY, gpuY], axis: -1)
+    return Qwen35ColumnSplitQuantizedMM(
+        output: y, cpuColumns: cpuN, gpuColumns: gpuN,
+        cpuStream: cpuStream, gpuStream: gpuStream)
+}
+
 /// `quantizedMM` with the candidate-owned wide QMV dispatch in front of it.
 /// `Qwen35CustomQMV.matmul` returns nil for every arm, shape, width, group
 /// size, bit width and mode it does not own, so this is a drop-in replacement
@@ -2103,9 +2281,26 @@ func qwen35RoutedQuantizedMM(
     {
         return y
     }
-    return quantizedMM(
-        x, w, scales: scales, biases: biases, transpose: true,
-        groupSize: groupSize, bits: bits, mode: mode)
+    let fraction: Double
+    do {
+        fraction = try qwen35PrefillCPUColumnFraction()
+    } catch {
+        fatalError(String(describing: error))
+    }
+    if fraction == 0 {
+        return quantizedMM(
+            x, w, scales: scales, biases: biases, transpose: true,
+            groupSize: groupSize, bits: bits, mode: mode)
+    }
+    do {
+        return try qwen35ColumnSplitQuantizedMM(
+            x, w, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits, mode: mode,
+            cpuColumnFraction: fraction
+        ).output
+    } catch {
+        fatalError(String(describing: error))
+    }
 }
 
 /// A projection layer with the candidate-owned wide QMV dispatch in front of
@@ -2132,6 +2327,10 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     private var _fqMode = QuantizationMode.affine
     private var _fbfW: MLXArray?
     private var _gateOut = 0
+
+    /// Opt-in ANE∥GPU prefill offload cache (LOCAL FORK). Inert unless
+    /// `MLXFAST_ANE_DIRECT=1`; see `ANEOffload/Qwen35ANESplitOffload.swift`.
+    private let aneCache = ANESplitMLPCache()
 
     /// Proposal-only derived quantization, in bits. Set before the first
     /// forward on a head-side perceptron and left nil everywhere else. The
@@ -2223,6 +2422,58 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
             return downProjection(qwen35CompiledFusedSwiGLU(y))
+        }
+        // Prefill (M > 16) stays on the two-projection expression unless CPU
+        // column-split assist is enabled. Enabling it routes the fused
+        // gate/up through qwen35RoutedQuantizedMM so the split helper can
+        // place a fraction of output columns on the CPU stream. Fraction 0
+        // keeps this branch off, so the default is today's GPU-only path.
+        let fraction: Double
+        do {
+            fraction = try qwen35PrefillCPUColumnFraction()
+        } catch {
+            fatalError(String(describing: error))
+        }
+        if fraction > 0, x.dim(-2) > 16, let y = fusedGateUp(x),
+            _gateOut * 2 == y.dim(-1)
+        {
+            return downProjection(qwen35CompiledFusedSwiGLU(y))
+        }
+        if fraction > 0 {
+            return downProjection(
+                silu(qwen35RoutedLinear(gateProj, x))
+                    * qwen35RoutedLinear(upProj, x))
+        }
+        // Opt-in ANE∥GPU prefill offload (LOCAL FORK, MLXFAST_ANE_DIRECT=1).
+        // Any failure -- flag off, unsupported quantization, build/dispatch
+        // error -- falls through to the unchanged all-GPU expression below,
+        // so model output never depends on the ANE.
+        if ANESplitConfig.enabled, x.dim(-2) > 16,
+            let g = gateProj as? QuantizedLinear,
+            let u = upProj as? QuantizedLinear,
+            let d = downProj as? QuantizedLinear,
+            let gb = g.biases, let ub = u.biases, let db = d.biases
+        {
+            let gs = g.scales
+            let us = u.scales
+            let ds = d.scales
+            let hidden = x.dim(-1)
+            let tokens = x.size / hidden
+            if let split = aneCache.program(
+                forSequenceLength: tokens,
+                gateW: g.weight, gateScales: gs, gateBiases: gb,
+                gateBits: g.bits, gateGroupSize: g.groupSize,
+                upW: u.weight, upScales: us, upBiases: ub,
+                upBits: u.bits, upGroupSize: u.groupSize,
+                downW: d.weight, downScales: ds, downBiases: db,
+                downBits: d.bits, downGroupSize: d.groupSize,
+                hidden: hidden, inter: g.weight.dim(0))
+            {
+                let x2 = x.reshaped([tokens, hidden])
+                if let y2 = try? split(x2) {
+                    return y2.reshaped(x.shape)
+                }
+            }
         }
         return downProjection(silu(gateProj(x)) * upProj(x))
     }

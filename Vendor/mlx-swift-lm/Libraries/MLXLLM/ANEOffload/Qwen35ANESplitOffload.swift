@@ -1,10 +1,11 @@
+// LOCAL M4 FORK ONLY. Private Apple frameworks; breaks on macOS updates.
+// Never wired into the ranked forward; gated by MLXFAST_ANE_DIRECT=1 at call sites.
 import Foundation
 import MLX
-import MLXFastCore
 
 /// Opt-in ANE∥GPU MLP offload for the Qwen35 prefill path (LOCAL FORK ONLY).
 ///
-/// Off by default: unless `MLXFAST_ANE_DIRECT=1` is set, `Qwen35MLP.forward`
+/// Off by default: unless `MLXFAST_ANE_DIRECT=1` is set, `Qwen35FusedMLP`
 /// runs the unchanged all-GPU SwiGLU and this type is never touched. When
 /// enabled, the first prefill forward at a given sequence length `S` lazily
 /// builds an `ANEFusedSplitMLP` (fused ANE fraction + GPU 4-bit complement,
@@ -19,20 +20,31 @@ import MLXFastCore
 /// environment flag.
 public enum ANESplitConfig {
     /// Read from the environment on first access, then fixed for the process
-    /// lifetime (a lazy `static let`).
-    public static let enabled: Bool = ProcessInfo.processInfo.environment["MLXFAST_ANE_DIRECT"] == "1"
-    public static let fraction: Double = Double(ProcessInfo.processInfo.environment["MLXFAST_ANE_FRACTION"] ?? "0.3125") ?? 0.3125
+    /// lifetime (a lazy `static let`), matching the sibling
+    /// `qwen35PrefillCPUColumnFraction` style in `Qwen35.swift` (`getenv`,
+    /// not `ProcessInfo`).
+    public static let enabled: Bool = {
+        guard let cString = getenv("MLXFAST_ANE_DIRECT") else { return false }
+        return String(cString: cString) == "1"
+    }()
+    public static let fraction: Double = {
+        guard let cString = getenv("MLXFAST_ANE_FRACTION") else { return 0.3125 }
+        return Double(String(cString: cString)) ?? 0.3125
+    }()
     /// Below this token count the fixed-shape ANE program + marshaling is not
     /// worth it; decode (S=1) and short prefills stay on the GPU.
-    public static let minSequenceLength: Int = Int(ProcessInfo.processInfo.environment["MLXFAST_ANE_MIN_SEQ"] ?? "128") ?? 128
+    public static let minSequenceLength: Int = {
+        guard let cString = getenv("MLXFAST_ANE_MIN_SEQ") else { return 128 }
+        return Int(String(cString: cString)) ?? 128
+    }()
 }
 
 /// Per-layer cache of fixed-shape ANE split programs, keyed by sequence
-/// length. A reference type so it can live inside the value-type
-/// `Qwen35MLPWeights` and be shared across its copies. Not thread-safe
-/// against concurrent forwards of the SAME layer; the Qwen35 prefill path
-/// runs layers sequentially on one caller thread, and the internal lock only
-/// guards the dictionary against incidental races.
+/// length. A reference type so it can live as a stored property on
+/// `Qwen35FusedMLP` and be shared across forwards of that layer. Not
+/// thread-safe against concurrent forwards of the SAME layer; the Qwen35
+/// prefill path runs layers sequentially on one caller thread, and the
+/// internal lock only guards the dictionary against incidental races.
 public final class ANESplitMLPCache: @unchecked Sendable {
     private let lock = NSLock()
     private var programs: [Int: ANEFusedSplitMLP] = [:]
@@ -44,21 +56,24 @@ public final class ANESplitMLPCache: @unchecked Sendable {
 
     /// Returns a cached/newly-built split program for this `S`, or nil to
     /// signal "use the GPU path" (disabled, too short, unsupported weights,
-    /// or a prior/again build failure).
-    func program(
+    /// or a prior/again build failure). `gate`/`up` are 4-bit affine
+    /// group-64 triples with logical shape `[inter, hidden]`; `down` is a
+    /// 4-bit affine group-64 triple with logical shape `[hidden, inter]`.
+    public func program(
         forSequenceLength s: Int,
-        gate: Qwen35LinearWeight,
-        up: Qwen35LinearWeight,
-        down: Qwen35LinearWeight
+        gateW: MLXArray, gateScales: MLXArray, gateBiases: MLXArray,
+        gateBits: Int, gateGroupSize: Int,
+        upW: MLXArray, upScales: MLXArray, upBiases: MLXArray,
+        upBits: Int, upGroupSize: Int,
+        downW: MLXArray, downScales: MLXArray, downBiases: MLXArray,
+        downBits: Int, downGroupSize: Int,
+        hidden: Int, inter: Int
     ) -> ANEFusedSplitMLP? {
         guard ANESplitConfig.enabled,
               s >= ANESplitConfig.minSequenceLength,
-              gate.bits == 4, gate.groupSize == 64,
-              up.bits == 4, up.groupSize == 64,
-              down.bits == 4, down.groupSize == 64,
-              let gs = gate.scales, let gb = gate.biases,
-              let us = up.scales, let ub = up.biases,
-              let ds = down.scales, let db = down.biases
+              gateBits == 4, gateGroupSize == 64,
+              upBits == 4, upGroupSize == 64,
+              downBits == 4, downGroupSize == 64
         else { return nil }
 
         lock.lock()
@@ -66,13 +81,11 @@ public final class ANESplitMLPCache: @unchecked Sendable {
         if let cached = programs[s] { return cached }
         if failed.contains(s) { return nil }
 
-        let hidden = gate.logicalShape[1]
-        let inter = gate.logicalShape[0]
         do {
             let split = try ANEFusedSplitMLP(
-                gateW: gate.weight, gateScales: gs, gateBiases: gb,
-                upW: up.weight, upScales: us, upBiases: ub,
-                downW: down.weight, downScales: ds, downBiases: db,
+                gateW: gateW, gateScales: gateScales, gateBiases: gateBiases,
+                upW: upW, upScales: upScales, upBiases: upBiases,
+                downW: downW, downScales: downScales, downBiases: downBiases,
                 hidden: hidden, inter: inter, sequenceLength: s,
                 aneFraction: ANESplitConfig.fraction)
             programs[s] = split

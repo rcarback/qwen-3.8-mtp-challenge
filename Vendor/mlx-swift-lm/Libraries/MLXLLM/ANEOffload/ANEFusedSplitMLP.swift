@@ -171,11 +171,12 @@ public final class ANEFusedSplitMLP {
         return y
     }
 
-    /// TEST-ONLY (visible via `@testable import`): identical math to
-    /// `callAsFunction`'s mixed `0<F<inter` path, but runs the ANE and GPU
-    /// partials sequentially with no `ConcurrentEngines`. Used to prove the
-    /// concurrent refactor introduces no numeric change or corruption.
-    func sequentialCallAsFunctionForTesting(_ x: MLXArray) throws -> MLXArray {
+    /// TEST-ONLY (public so `@testable import MLXFastModel`'s re-export of
+    /// `MLXLLM` can reach it): identical math to `callAsFunction`'s mixed
+    /// `0<F<inter` path, but runs the ANE and GPU partials sequentially with
+    /// no `ConcurrentEngines`. Used to prove the concurrent refactor
+    /// introduces no numeric change or corruption.
+    public func sequentialCallAsFunctionForTesting(_ x: MLXArray) throws -> MLXArray {
         precondition(f > 0 && f < inter, "sequentialCallAsFunctionForTesting only exercises the mixed ANE+GPU path")
         guard let aneMLP else {
             preconditionFailure("ANEFusedSplitMLP: F=\(f)>0 but no ANEFusedMLP was built")

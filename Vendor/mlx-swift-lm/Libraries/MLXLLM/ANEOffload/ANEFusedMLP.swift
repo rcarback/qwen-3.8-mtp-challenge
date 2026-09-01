@@ -14,7 +14,7 @@
 import Foundation
 import MLX
 
-final class ANEFusedMLP {
+public final class ANEFusedMLP {
     let hidden: Int
     let innerFraction: Int
     let sequenceLength: Int
@@ -23,7 +23,7 @@ final class ANEFusedMLP {
     /// `gate`/`up`: `[innerFraction, hidden]`. `down`: `[hidden, innerFraction]`.
     /// Computes the ANE fraction's full contribution through the down
     /// projection: `down @ (silu(gate @ xT) * (up @ xT))` for `x=[S,hidden]`.
-    init(hidden: Int, innerFraction: Int, sequenceLength: Int, gate: MLXArray, up: MLXArray, down: MLXArray) throws {
+    public init(hidden: Int, innerFraction: Int, sequenceLength: Int, gate: MLXArray, up: MLXArray, down: MLXArray) throws {
         precondition(gate.shape == [innerFraction, hidden],
                      "ANEFusedMLP: gate expected [\(innerFraction), \(hidden)], got \(gate.shape)")
         precondition(up.shape == [innerFraction, hidden],
@@ -53,7 +53,7 @@ final class ANEFusedMLP {
     /// chains `makeInput` -> `predict` -> `readOutput` on the calling
     /// thread. For concurrent ANE+GPU use (Task D1), call the three parts
     /// separately instead -- see their doc comments below.
-    func callAsFunction(_ x: MLXArray) throws -> MLXArray {
+    public func callAsFunction(_ x: MLXArray) throws -> MLXArray {
         try ANEDirectDispatch.runConv(model: model, x: x, inputDim: hidden, outputDim: hidden, sequenceLength: sequenceLength)
     }
 
