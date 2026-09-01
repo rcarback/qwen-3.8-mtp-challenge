@@ -18,7 +18,8 @@ import MLXFastCore
 /// submission; it is a local serve-performance experiment gated behind an
 /// environment flag.
 public enum ANESplitConfig {
-    /// Read once at process start.
+    /// Read from the environment on first access, then fixed for the process
+    /// lifetime (a lazy `static let`).
     public static let enabled: Bool = ProcessInfo.processInfo.environment["MLXFAST_ANE_DIRECT"] == "1"
     public static let fraction: Double = Double(ProcessInfo.processInfo.environment["MLXFAST_ANE_FRACTION"] ?? "0.3125") ?? 0.3125
     /// Below this token count the fixed-shape ANE program + marshaling is not
@@ -54,6 +55,8 @@ public final class ANESplitMLPCache: @unchecked Sendable {
               s >= ANESplitConfig.minSequenceLength,
               s % 32 == 0,
               gate.bits == 4, gate.groupSize == 64,
+              up.bits == 4, up.groupSize == 64,
+              down.bits == 4, down.groupSize == 64,
               let gs = gate.scales, let gb = gate.biases,
               let us = up.scales, let ub = up.biases,
               let ds = down.scales, let db = down.biases
