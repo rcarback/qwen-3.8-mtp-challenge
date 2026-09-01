@@ -81,14 +81,21 @@ enum ANEDirectDispatch {
     final class Prepared: @unchecked Sendable {
         let model: ANEInMemoryModel
         let request: AnyObject
+        // The input surface is held even though `read` never touches it: the
+        // background `evaluate` reads its bytes, so the handle keeps its own
+        // strong reference to every surface it needs across the thread
+        // boundary rather than depending on the implicit `request` ->
+        // `_ANEIOSurfaceObject` retain chain to keep the input alive.
+        let inputSurface: IOSurface
         let outputSurface: IOSurface
         let outputDim: Int
         let sequenceLength: Int
         let rowStride: Int
 
-        init(model: ANEInMemoryModel, request: AnyObject, outputSurface: IOSurface, outputDim: Int, sequenceLength: Int, rowStride: Int) {
+        init(model: ANEInMemoryModel, request: AnyObject, inputSurface: IOSurface, outputSurface: IOSurface, outputDim: Int, sequenceLength: Int, rowStride: Int) {
             self.model = model
             self.request = request
+            self.inputSurface = inputSurface
             self.outputSurface = outputSurface
             self.outputDim = outputDim
             self.sequenceLength = sequenceLength
@@ -187,7 +194,7 @@ enum ANEDirectDispatch {
         // down the call.
         let request = requestU.takeUnretainedValue()
 
-        return Prepared(model: model, request: request, outputSurface: outputSurface,
+        return Prepared(model: model, request: request, inputSurface: inputSurface, outputSurface: outputSurface,
                          outputDim: outputDim, sequenceLength: sequenceLength, rowStride: rowStride)
     }
 
