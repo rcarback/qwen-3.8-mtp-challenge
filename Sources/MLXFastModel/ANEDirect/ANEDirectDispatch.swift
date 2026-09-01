@@ -247,12 +247,20 @@ enum ANEDirectDispatch {
 
     /// CALLER THREAD ONLY (MLX). Zero-copy variant of `read`: wraps the
     /// output IOSurface's bytes directly as an MLXArray (no CPU gather),
-    /// then returns the real `[S,OUT]` region as a lazy strided MLX view.
+    /// slices the real `[OUT,S]` region, and returns `[S,OUT]` fp16 (a
+    /// `contiguous` copy of the transposed view, so the surface bytes are
+    /// materialized into an MLX-owned buffer before the wrapper is dropped).
     /// The surface is `[OUT, paddedS]` fp16; we wrap that full padded shape
     /// and slice `[0..<OUT, 0..<S]` so the padding lanes are never read.
-    /// The finalizer keeps the surface alive for the array's lifetime.
-    /// D2 spike -- proves whether MLX accepts an IOSurface-backed pointer as
-    /// array backing. Must run only after `evaluate` completed.
+    /// The finalizer keeps the surface alive for the wrapper's lifetime.
+    ///
+    /// No `lock(.readOnly)` (unlike `read`): `evaluate` is a blocking ANE
+    /// call that returns only after the ANE finished writing this surface,
+    /// and the D1 concurrent path joins (`ConcurrentEngines.run`'s
+    /// `group.wait()`) before calling here -- so the write is complete and
+    /// visible before MLX reads the bytes (bit-identity vs the locked gather
+    /// path confirms it). mlx-swift's own `MLXArray(rawPointer:)` IOSurface
+    /// example is likewise unlocked. Must run only after `evaluate` completed.
     static func readZeroCopy(_ prepared: Prepared) -> MLXArray {
         let outputDim = prepared.outputDim
         let sequenceLength = prepared.sequenceLength
@@ -267,8 +275,8 @@ enum ANEDirectDispatch {
         return contiguous(real.transposed(1, 0)) // [S,OUT]
     }
 
-    /// Convenience that chains `prepare` -> `evaluate` -> `read` on the
-    /// calling thread. `x` is `[S, IN]` fp16 (MLX). Returns `[S, OUT]` fp16
+    /// Convenience that chains `prepare` -> `evaluate` -> `readZeroCopy` on
+    /// the calling thread. `x` is `[S, IN]` fp16 (MLX). Returns `[S, OUT]` fp16
     /// (MLX). For concurrent ANE+GPU use, call the three phases separately
     /// instead (only `evaluate` is background-safe -- see `Prepared`'s doc
     /// comment).

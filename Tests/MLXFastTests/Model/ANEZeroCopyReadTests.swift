@@ -50,10 +50,9 @@ struct ANEZeroCopyReadTests {
         let maxAbs = diff.max().item(Float.self)
         print("ZEROCOPY-READ maxAbsDiff(gather,zerocopy)=\(maxAbs)")
         #expect(maxAbs == 0.0, "zero-copy read must be bit-identical to the gather read; maxAbs=\(maxAbs)")
-
-        // Also correct vs the matmul reference.
-        let w0 = gather // gather already validated elsewhere; anchor zero-copy to matmul too
-        _ = w0
+        // The gather path is itself validated against matmul in
+        // ANEDirectDispatchTests (via runConv), so bit-identity here
+        // transitively anchors readZeroCopy to the matmul reference.
     }
 
     @Test("readZeroCopy vs read timing at S=512")
