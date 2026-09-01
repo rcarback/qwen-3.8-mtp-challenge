@@ -6,9 +6,9 @@ import Testing
 @testable import MLXLLM
 
 /// Task MOVE wiring: the vendored `Qwen35FusedMLP.callAsFunction` prefill
-/// path with the ANE∥GPU offload enabled (`MLXFAST_ANE_DIRECT=1`) must equal
+/// path with the ANE∥GPU offload enabled (`MLX_ANE_DIRECT=1`) must equal
 /// the all-GPU SwiGLU within the ANE fraction's fp16-vs-4bit tolerance, at
-/// the real prefill shape. Gated on MLXFAST_ANE_DIRECT=1 AND
+/// the real prefill shape. Gated on MLX_ANE_DIRECT=1 AND
 /// MLXFAST_RUN_MLX_RUNTIME_TESTS=1 because `ANESplitConfig.enabled` is read
 /// once from the environment at process start.
 @Suite(.serialized)
@@ -39,9 +39,9 @@ struct Qwen35ANESplitOffloadTests {
     func forwardMatchesGPU() throws {
         let env = ProcessInfo.processInfo.environment
         guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
-              env["MLXFAST_ANE_DIRECT"] == "1" else { return }
+              env["MLX_ANE_DIRECT"] == "1" else { return }
         try #require(ANERuntime.available())
-        try #require(ANESplitConfig.enabled, "ANESplitConfig.enabled must be true under MLXFAST_ANE_DIRECT=1")
+        try #require(ANESplitConfig.enabled, "ANESplitConfig.enabled must be true under MLX_ANE_DIRECT=1")
 
         let hidden = 5_120, inter = 17_408, S = 512
         let m = Self.mlp(hidden: hidden, inter: inter)
@@ -68,7 +68,7 @@ struct Qwen35ANESplitOffloadTests {
     /// Flag-independent contract lock: whenever the ANE path is NOT taken --
     /// which includes the default flag-off serve path -- `callAsFunction`
     /// must equal the GPU SwiGLU bit-for-bit. Uses S=100 (not 32-aligned),
-    /// so the cache returns nil regardless of MLXFAST_ANE_DIRECT, exercising
+    /// so the cache returns nil regardless of MLX_ANE_DIRECT, exercising
     /// the exact fallback branch that runs in production when the flag is
     /// unset.
     @Test("Qwen35FusedMLP.callAsFunction equals the GPU SwiGLU exactly when the ANE path is skipped")
@@ -91,7 +91,7 @@ struct Qwen35ANESplitOffloadTests {
     func decodeStaysGPU() throws {
         let env = ProcessInfo.processInfo.environment
         guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
-              env["MLXFAST_ANE_DIRECT"] == "1" else { return }
+              env["MLX_ANE_DIRECT"] == "1" else { return }
         let hidden = 5_120, inter = 17_408
         let m = Self.mlp(hidden: hidden, inter: inter)
         let x = MLXRandom.normal([1, 1, hidden]).asType(.bfloat16)
@@ -142,10 +142,10 @@ struct Qwen35ANESplitOffloadTests {
             downW: d.weight, downScales: d.scales, downBiases: db,
             downBits: d.bits, downGroupSize: d.groupSize,
             hidden: hidden, inter: inter)
-        if env["MLXFAST_ANE_DIRECT"] == "1" {
+        if env["MLX_ANE_DIRECT"] == "1" {
             #expect(longResult != nil, "S=512 with 4-bit/group-64 weights must build under the flag")
         } else {
-            #expect(longResult == nil, "the cache must refuse when MLXFAST_ANE_DIRECT is unset")
+            #expect(longResult == nil, "the cache must refuse when MLX_ANE_DIRECT is unset")
         }
     }
 }
