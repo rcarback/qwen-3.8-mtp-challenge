@@ -46,6 +46,29 @@ public enum ANESplitConfig {
         guard let cString = getenv("MLX_ANE_FP16_GPU") else { return false }
         return String(cString: cString) == "1"
     }()
+
+    /// (A) Selective / sandwich offload. The first `skipFirst` and last
+    /// `skipLast` decoder layers stay on the GPU (the layers nearest the
+    /// residual seed and the logits, where fp16-vs-4bit divergence flips
+    /// tokens soonest); the middle band offloads to the ANE. Grok's top
+    /// exact-match lever -- binary-search these on the failing prompt.
+    public static let skipFirstLayers: Int = {
+        guard let cString = getenv("MLX_ANE_SKIP_FIRST") else { return 0 }
+        return Int(String(cString: cString)) ?? 0
+    }()
+    public static let skipLastLayers: Int = {
+        guard let cString = getenv("MLX_ANE_SKIP_LAST") else { return 0 }
+        return Int(String(cString: cString)) ?? 0
+    }()
+
+    /// True when a dense layer at `index` of `total` should offload, honoring
+    /// the selective-layer sandwich. `index < 0` (unknown) offloads (back-compat).
+    public static func layerOffloads(index: Int, total: Int) -> Bool {
+        guard index >= 0, total > 0 else { return true }
+        if index < skipFirstLayers { return false }
+        if index >= total - skipLastLayers { return false }
+        return true
+    }
 }
 
 /// Diagnostic sink for the ANE offload. Writes to the file named by

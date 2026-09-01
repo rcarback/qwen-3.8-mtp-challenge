@@ -2331,6 +2331,11 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     /// Opt-in ANE∥GPU prefill offload cache (LOCAL FORK). Inert unless
     /// `MLXFAST_ANE_DIRECT=1`; see `ANEOffload/Qwen35ANESplitOffload.swift`.
     private let aneCache = ANESplitMLPCache()
+    // Decoder layer index / total, set at model build so the ANE offload can
+    // honor the selective-layer sandwich (MLX_ANE_SKIP_FIRST/LAST). -1 = unset
+    // (offloads, back-compat for non-decoder uses like the MTP head).
+    var aneLayerIndex: Int = -1
+    var aneTotalLayers: Int = 0
 
     /// Proposal-only derived quantization, in bits. Set before the first
     /// forward on a head-side perceptron and left nil everywhere else. The
@@ -2449,6 +2454,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // error -- falls through to the unchanged all-GPU expression below,
         // so model output never depends on the ANE.
         if ANESplitConfig.enabled, x.dim(-2) > 16,
+            ANESplitConfig.layerOffloads(index: aneLayerIndex, total: aneTotalLayers),
             let g = gateProj as? QuantizedLinear,
             let u = upProj as? QuantizedLinear,
             let d = downProj as? QuantizedLinear,
@@ -2484,6 +2490,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     /// is enabled and the projections are the supported 4-bit/group-64 form.
     func prewarmANE(sequenceLength: Int) {
         guard ANESplitConfig.enabled,
+              ANESplitConfig.layerOffloads(index: aneLayerIndex, total: aneTotalLayers),
               let g = gateProj as? QuantizedLinear,
               let u = upProj as? QuantizedLinear,
               let d = downProj as? QuantizedLinear,
@@ -4047,10 +4054,15 @@ final class Qwen35DecoderLayer: Module {
         if args.numExperts > 0 {
             _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
         } else {
-            _mlp.wrappedValue = Qwen35FusedMLP(
+            let fused = Qwen35FusedMLP(
                 dimensions: args.hiddenSize,
                 hiddenDimensions: args.intermediateSize
             )
+            // Tag the layer so the ANE offload can honor the selective-layer
+            // sandwich (MLX_ANE_SKIP_FIRST/LAST).
+            fused.aneLayerIndex = layerIdx
+            fused.aneTotalLayers = args.hiddenLayers
+            _mlp.wrappedValue = fused
         }
 
         _inputLayerNorm.wrappedValue = RMSNorm(
