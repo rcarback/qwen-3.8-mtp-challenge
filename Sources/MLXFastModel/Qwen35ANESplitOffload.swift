@@ -53,7 +53,6 @@ public final class ANESplitMLPCache: @unchecked Sendable {
     ) -> ANEFusedSplitMLP? {
         guard ANESplitConfig.enabled,
               s >= ANESplitConfig.minSequenceLength,
-              s % 32 == 0,
               gate.bits == 4, gate.groupSize == 64,
               up.bits == 4, up.groupSize == 64,
               down.bits == 4, down.groupSize == 64,
@@ -77,6 +76,8 @@ public final class ANESplitMLPCache: @unchecked Sendable {
                 hidden: hidden, inter: inter, sequenceLength: s,
                 aneFraction: ANESplitConfig.fraction)
             programs[s] = split
+            FileHandle.standardError.write(Data(
+                "[ANE-DIRECT] built split program S=\(s) fraction=\(ANESplitConfig.fraction) hidden=\(hidden) inter=\(inter)\n".utf8))
             return split
         } catch {
             failed.insert(s)

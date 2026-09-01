@@ -127,6 +127,36 @@ struct ANEFusedSplitMLPTests {
     private static let tolerance: Float = 0.09375
     private static let meanTolerance: Float = 0.02
 
+    /// De-risks the padded fused path: S=96 is NOT a multiple of 32... it is
+    /// (96=3*32); use S=100 which pads to rowStride=128, so the fused SwiGLU
+    /// program runs with real padding on both input and output surfaces at a
+    /// non-32-aligned length -- the case an arbitrary prefill hits.
+    @Test("ANEFusedSplitMLP(aneFraction=0.125) matches all-GPU reference at non-aligned S=100")
+    func splitMatchesReferenceS100() throws {
+        try #require(ANERuntime.available())
+        let hidden = Self.hidden, inter = Self.inter, S = 100
+        let w = Self.makeWeights(hidden: hidden, inter: inter, seed: 7)
+        let x = MLXRandom.normal([S, hidden]).asType(.bfloat16)
+        eval(x)
+        let split = try ANEFusedSplitMLP(
+            gateW: w.gateWq, gateScales: w.gateScales, gateBiases: w.gateBiases,
+            upW: w.upWq, upScales: w.upScales, upBiases: w.upBiases,
+            downW: w.downWq, downScales: w.downScales, downBiases: w.downBiases,
+            hidden: hidden, inter: inter, sequenceLength: S, aneFraction: 0.125)
+        let y = try split(x)
+        let ref = Self.referenceForward(
+            x, gateWq: w.gateWq, gateScales: w.gateScales, gateBiases: w.gateBiases,
+            upWq: w.upWq, upScales: w.upScales, upBiases: w.upBiases,
+            downWq: w.downWq, downScales: w.downScales, downBiases: w.downBiases)
+        eval(y, ref)
+        #expect(y.shape == [S, hidden])
+        let diff = MLX.abs(y.asType(.float32) - ref.asType(.float32))
+        eval(diff)
+        let maxAbs = diff.max().item(Float.self)
+        print("ANEFusedSplitMLPTests S=100 (padded): maxAbsDiff=\(maxAbs)")
+        #expect(maxAbs < Self.tolerance, "maxAbs=\(maxAbs)")
+    }
+
     @Test("ANEFusedSplitMLP(aneFraction=0.125) matches all-GPU reference at real Qwen size (S=512)")
     func splitMatchesReferenceAtEighthFraction() throws {
         let env = ProcessInfo.processInfo.environment
