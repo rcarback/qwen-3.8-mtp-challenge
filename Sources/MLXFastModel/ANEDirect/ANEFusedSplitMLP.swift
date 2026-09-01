@@ -132,7 +132,14 @@ public final class ANEFusedSplitMLP {
         }
     }
 
-    /// `x: [S, hidden] -> [S, hidden]`.
+    /// `x: [S, hidden] -> [S, hidden]`. When `0<F<inter` the ANE and GPU
+    /// partials run concurrently (Task D1): `makeInput` prepares the ANE
+    /// request on this thread (MLX `eval` inside), `ConcurrentEngines.run`
+    /// dispatches the MLX-free `predict` to a background queue while the
+    /// GPU partial's `quantizedMM` chain runs (and evals) here, then
+    /// `readOutput` converts the ANE result back to MLX on this thread
+    /// before the two partials add. MLX `eval` therefore only ever happens
+    /// on the calling thread.
     public func callAsFunction(_ x: MLXArray) throws -> MLXArray {
         if f == 0 {
             let y = try gpuPartial(x)
@@ -148,6 +155,31 @@ public final class ANEFusedSplitMLP {
             return y
         }
 
+        // CALLER thread: prepares the ANE input (MLX eval inside makeInput).
+        let prepared = try aneMLP.makeInput(x.asType(.float16))
+        let (_, gpu) = try ConcurrentEngines.run(
+            ane: { try aneMLP.predict(prepared) }, // background: ObjC evaluate ONLY, no MLX
+            gpu: {
+                let g = try self.gpuPartial(x)
+                eval(g)
+                return g
+            })
+        // CALLER thread: reads the ANE output back into MLX.
+        let anePartial = aneMLP.readOutput(prepared)
+        let y = anePartial.asType(gpu.dtype) + gpu
+        eval(y)
+        return y
+    }
+
+    /// TEST-ONLY (visible via `@testable import`): identical math to
+    /// `callAsFunction`'s mixed `0<F<inter` path, but runs the ANE and GPU
+    /// partials sequentially with no `ConcurrentEngines`. Used to prove the
+    /// concurrent refactor introduces no numeric change or corruption.
+    func sequentialCallAsFunctionForTesting(_ x: MLXArray) throws -> MLXArray {
+        precondition(f > 0 && f < inter, "sequentialCallAsFunctionForTesting only exercises the mixed ANE+GPU path")
+        guard let aneMLP else {
+            preconditionFailure("ANEFusedSplitMLP: F=\(f)>0 but no ANEFusedMLP was built")
+        }
         let anePartial = try aneMLP(x.asType(.float16))
         let gpu = try gpuPartial(x)
         let y = anePartial.asType(gpu.dtype) + gpu

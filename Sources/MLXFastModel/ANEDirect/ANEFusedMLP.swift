@@ -49,8 +49,33 @@ final class ANEFusedMLP {
         model.unload()
     }
 
-    /// `x`: `[S, hidden]` fp16. Returns `[S, hidden]` fp16.
+    /// `x`: `[S, hidden]` fp16. Returns `[S, hidden]` fp16. Convenience that
+    /// chains `makeInput` -> `predict` -> `readOutput` on the calling
+    /// thread. For concurrent ANE+GPU use (Task D1), call the three parts
+    /// separately instead -- see their doc comments below.
     func callAsFunction(_ x: MLXArray) throws -> MLXArray {
         try ANEDirectDispatch.runConv(model: model, x: x, inputDim: hidden, outputDim: hidden, sequenceLength: sequenceLength)
+    }
+
+    /// CALLER THREAD ONLY (MLX). Prepares the ANE input/output IOSurfaces
+    /// and the `_ANERequest` for `x[S,hidden]` fp16. Only `predict` on the
+    /// returned handle may run off this thread.
+    func makeInput(_ x: MLXArray) throws -> ANEDirectDispatch.Prepared {
+        try ANEDirectDispatch.prepare(model: model, x: x, inputDim: hidden, outputDim: hidden, sequenceLength: sequenceLength)
+    }
+
+    /// BACKGROUND-SAFE. Runs the fused ANE program via the blocking ObjC
+    /// evaluate -- no MLX. Safe to run on `ConcurrentEngines.run`'s
+    /// background queue concurrently with GPU MLX work on the caller
+    /// thread.
+    func predict(_ prepared: ANEDirectDispatch.Prepared) throws {
+        try ANEDirectDispatch.evaluate(prepared)
+    }
+
+    /// CALLER THREAD ONLY (MLX). Reads the ANE output surface into an
+    /// `[S, hidden]` fp16 `MLXArray`. Call only after `predict` has
+    /// completed for this handle.
+    func readOutput(_ prepared: ANEDirectDispatch.Prepared) -> MLXArray {
+        ANEDirectDispatch.read(prepared)
     }
 }

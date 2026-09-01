@@ -197,4 +197,45 @@ struct ANEFusedSplitMLPTests {
         print("ANEFusedSplitMLPTests aneFraction=0.0: maxAbsDiff=\(maxAbsDiff)")
         #expect(maxAbsDiff == 0, "aneFraction=0.0 must be pure-GPU and bit-identical to the reference: maxAbsErr=\(maxAbsDiff)")
     }
+
+    // MARK: - Task D1: concurrent forward == sequential forward
+
+    /// `callAsFunction`'s `0<F<inter` path now overlaps the ANE `predict`
+    /// (background thread, MLX-free) with the GPU partial (caller thread)
+    /// via `ConcurrentEngines.run`. This proves the overlap introduces no
+    /// numeric change vs. running the identical two partials sequentially
+    /// (`sequentialCallAsFunctionForTesting`, same math, no
+    /// `ConcurrentEngines`) -- same math, just overlapped, so the tolerance
+    /// is tight (1e-4), unlike the ANE-vs-GPU-reference tolerance above.
+    @Test("ANEFusedSplitMLP concurrent forward matches the sequential forward at real Qwen size (S=512)")
+    func concurrentForwardMatchesSequentialForward() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else { return }
+        try #require(ANERuntime.available())
+
+        let hidden = Self.hidden, inter = Self.inter, s = 512
+        let weights = Self.makeWeights(hidden: hidden, inter: inter, seed: 300)
+
+        MLXRandom.seed(303)
+        let x = MLXRandom.normal([s, hidden]).asType(.bfloat16)
+        eval(x)
+
+        let mlp = try ANEFusedSplitMLP(
+            gateW: weights.gateWq, gateScales: weights.gateScales, gateBiases: weights.gateBiases,
+            upW: weights.upWq, upScales: weights.upScales, upBiases: weights.upBiases,
+            downW: weights.downWq, downScales: weights.downScales, downBiases: weights.downBiases,
+            hidden: hidden, inter: inter, sequenceLength: s, aneFraction: 0.125)
+
+        let concurrent = try mlp(x)
+        eval(concurrent)
+        let sequential = try mlp.sequentialCallAsFunctionForTesting(x)
+        eval(sequential)
+
+        #expect(concurrent.shape == sequential.shape)
+        let diff = abs(concurrent.asType(.float32) - sequential.asType(.float32))
+        eval(diff)
+        let maxAbsDiff = diff.max().item(Float.self)
+        print("ANEFusedSplitMLPTests concurrent-vs-sequential: maxAbsDiff=\(maxAbsDiff)")
+        #expect(maxAbsDiff < 1e-4, "concurrent forward diverged from sequential forward: maxAbsErr=\(maxAbsDiff)")
+    }
 }

@@ -70,15 +70,40 @@ enum ANEDirectDispatch {
         return IOSurfaceCreate(props as CFDictionary)
     }
 
-    /// Runs the loaded conv program once. `x` is `[S, IN]` fp16 (MLX).
-    /// Returns `[S, OUT]` fp16 (MLX). CPU-side IOSurface I/O (no
-    /// Metal/MLX zero-copy yet). Blocking: `evaluateWithQoS:options:
-    /// request:error:` returns only once the ANE has finished and the
-    /// output surface holds real data -- no completion-handler/semaphore
-    /// wait was needed (see task report).
-    static func runConv(model: ANEInMemoryModel, x: MLXArray, inputDim: Int, outputDim: Int, sequenceLength: Int) throws -> MLXArray {
+    /// Cross-thread carrier for the state `prepare` builds on the caller
+    /// thread and that `evaluate` (background-safe) and `read` (caller
+    /// thread) consume. `@unchecked Sendable` because `AnyObject`/
+    /// `IOSurface` aren't `Sendable`, but the fields are written once in
+    /// `prepare` and thereafter only read -- first by `evaluate` on
+    /// `ConcurrentEngines.run`'s background queue, then by `read` back on
+    /// the caller thread -- so there is no concurrent mutation, the same
+    /// one-shot handoff pattern as `ANEGemm`'s `LoadInputs`/`LoadResult`.
+    final class Prepared: @unchecked Sendable {
+        let model: ANEInMemoryModel
+        let request: AnyObject
+        let outputSurface: IOSurface
+        let outputDim: Int
+        let sequenceLength: Int
+        let rowStride: Int
+
+        init(model: ANEInMemoryModel, request: AnyObject, outputSurface: IOSurface, outputDim: Int, sequenceLength: Int, rowStride: Int) {
+            self.model = model
+            self.request = request
+            self.outputSurface = outputSurface
+            self.outputDim = outputDim
+            self.sequenceLength = sequenceLength
+            self.rowStride = rowStride
+        }
+    }
+
+    /// CALLER THREAD ONLY (MLX). `x` is `[S, IN]` fp16 (MLX). Allocates the
+    /// input/output IOSurfaces, writes `x` into the input surface (MLX
+    /// transpose + eval + `asData`), wraps both surfaces, and builds the
+    /// `_ANERequest`. Returns a `Prepared` that `evaluate` and `read`
+    /// consume -- only `evaluate` may run off this thread.
+    static func prepare(model: ANEInMemoryModel, x: MLXArray, inputDim: Int, outputDim: Int, sequenceLength: Int) throws -> Prepared {
         precondition(x.ndim == 2 && x.shape[0] == sequenceLength && x.shape[1] == inputDim,
-                     "ANEDirectDispatch.runConv expected x shape [\(sequenceLength), \(inputDim)], got \(x.shape)")
+                     "ANEDirectDispatch.prepare expected x shape [\(sequenceLength), \(inputDim)], got \(x.shape)")
 
         // The ANE pads the conv's trailing spatial (sequence) axis to a
         // 32-element tile internally -- confirmed empirically: at S=32
@@ -99,7 +124,6 @@ enum ANEDirectDispatch {
         let rowStride = ((sequenceLength + 31) / 32) * 32
         let inputByteCount = inputDim * sequenceLength * 2
         let inputSurfaceByteCount = inputDim * rowStride * 2
-        let outputByteCount = outputDim * sequenceLength * 2
         let outputSurfaceByteCount = outputDim * rowStride * 2
         guard let inputSurface = makeSurface(byteCount: inputSurfaceByteCount),
               let outputSurface = makeSurface(byteCount: outputSurfaceByteCount) else {
@@ -112,7 +136,7 @@ enum ANEDirectDispatch {
         eval(xT)
         let srcData = xT.asData().data
         precondition(srcData.count == inputByteCount,
-                     "ANEDirectDispatch.runConv: transposed input is \(srcData.count) bytes, expected \(inputByteCount)")
+                     "ANEDirectDispatch.prepare: transposed input is \(srcData.count) bytes, expected \(inputByteCount)")
 
         // Scatter [IN,S] into the ANE's [IN,paddedS] row-padded input --
         // one memcpy per channel row (degenerates to one bulk copy when
@@ -163,37 +187,65 @@ enum ANEDirectDispatch {
         // down the call.
         let request = requestU.takeUnretainedValue()
 
-        // Blocking evaluate at qos 21 (0x15, matching oMLX) against the same
-        // empty execution-options dictionary compile/load used.
+        return Prepared(model: model, request: request, outputSurface: outputSurface,
+                         outputDim: outputDim, sequenceLength: sequenceLength, rowStride: rowStride)
+    }
+
+    /// BACKGROUND-SAFE. Blocking evaluate at qos 21 (0x15, matching oMLX)
+    /// against the same empty execution-options dictionary compile/load
+    /// used. Touches only the private ANE ObjC API -- no MLX -- so this is
+    /// the one phase safe to run on `ConcurrentEngines.run`'s background
+    /// queue while the caller thread does MLX `eval` elsewhere.
+    static func evaluate(_ prepared: Prepared) throws {
+        let msgSend = dlsym(dlopen(nil, RTLD_LAZY), "objc_msgSend")!
         let evaluateFn = unsafeBitCast(msgSend, to: EvaluateFn.self)
         let evaluateSel = Selector(("evaluateWithQoS:options:request:error:"))
         var errU: Unmanaged<NSError>?
         let ok = withUnsafeMutablePointer(to: &errU) { p in
-            evaluateFn(model.raw, evaluateSel, 21, NSDictionary(), request, p).boolValue
+            evaluateFn(prepared.model.raw, evaluateSel, 21, NSDictionary(), prepared.request, p).boolValue
         }
         if !ok {
             let message = errU?.takeUnretainedValue().localizedDescription ?? "unknown evaluate failure"
             throw ANEDispatchError.evaluateFailed(message)
         }
+    }
 
-        // Gather [OUT,S] out of the ANE's [OUT,paddedS] row-padded output --
-        // one memcpy per row (degenerates to one bulk copy when
-        // `sequenceLength == rowStride`, e.g. S=32).
+    /// CALLER THREAD ONLY (MLX). Gathers `[OUT,S]` out of the ANE's
+    /// `[OUT,paddedS]` row-padded output surface and returns `[S,OUT]` fp16
+    /// (MLX). Must run only after `evaluate` has completed for this
+    /// `Prepared`.
+    static func read(_ prepared: Prepared) -> MLXArray {
+        let outputDim = prepared.outputDim
+        let sequenceLength = prepared.sequenceLength
+        let rowStride = prepared.rowStride
+        let outputByteCount = outputDim * sequenceLength * 2
         let outputRowStrideBytes = rowStride * 2
         let outputRowBytes = sequenceLength * 2
-        outputSurface.lock(options: .readOnly, seed: nil)
+
+        prepared.outputSurface.lock(options: .readOnly, seed: nil)
         var packed = Data(count: outputByteCount)
-        let baseAddress = outputSurface.baseAddress
+        let baseAddress = prepared.outputSurface.baseAddress
         packed.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> Void in
             let dst = raw.baseAddress!
             for f in 0 ..< outputDim {
                 _ = memcpy(dst + f * outputRowBytes, baseAddress + f * outputRowStrideBytes, outputRowBytes)
             }
         }
-        outputSurface.unlock(options: .readOnly, seed: nil)
+        prepared.outputSurface.unlock(options: .readOnly, seed: nil)
 
         // Output is [OUT,S] row-major after the gather above.
         let yT = MLXArray(packed, [outputDim, sequenceLength], type: Float16.self)
         return contiguous(yT.transposed(1, 0)) // [S,OUT]
+    }
+
+    /// Convenience that chains `prepare` -> `evaluate` -> `read` on the
+    /// calling thread. `x` is `[S, IN]` fp16 (MLX). Returns `[S, OUT]` fp16
+    /// (MLX). For concurrent ANE+GPU use, call the three phases separately
+    /// instead (only `evaluate` is background-safe -- see `Prepared`'s doc
+    /// comment).
+    static func runConv(model: ANEInMemoryModel, x: MLXArray, inputDim: Int, outputDim: Int, sequenceLength: Int) throws -> MLXArray {
+        let prepared = try prepare(model: model, x: x, inputDim: inputDim, outputDim: outputDim, sequenceLength: sequenceLength)
+        try evaluate(prepared)
+        return read(prepared)
     }
 }
