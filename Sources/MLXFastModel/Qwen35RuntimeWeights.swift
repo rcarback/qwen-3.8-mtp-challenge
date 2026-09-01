@@ -109,6 +109,11 @@ public final class Qwen35RuntimeWeightCache {
         )
         eval(model(prefillTokens, cache: caches))
         eval(model(MLXArray([bosToken], [1, 1]), cache: caches))
+        // Local-fork ANE offload: eagerly compile the per-layer ANE programs
+        // for the 512-prefill tile here (untimed load) so the one-time build
+        // does not land on the first scored/served prefill. No-op when the
+        // MLX_ANE_DIRECT offload is disabled.
+        model.prewarmANE(sequenceLength: 512)
         // The trusted phase-start request handler clears free buffers.
     }
 

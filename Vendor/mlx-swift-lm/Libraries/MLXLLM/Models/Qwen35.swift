@@ -2478,6 +2478,30 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         return downProjection(silu(gateProj(x)) * upProj(x))
     }
 
+    /// Eagerly build (and cache) the ANE split program for `sequenceLength`
+    /// so its ~0.2s compile lands at model load, not on the first (timed)
+    /// prefill. Input-independent (weights + S only). No-op unless the offload
+    /// is enabled and the projections are the supported 4-bit/group-64 form.
+    func prewarmANE(sequenceLength: Int) {
+        guard ANESplitConfig.enabled,
+              let g = gateProj as? QuantizedLinear,
+              let u = upProj as? QuantizedLinear,
+              let d = downProj as? QuantizedLinear,
+              let gb = g.biases, let ub = u.biases, let db = d.biases
+        else { return }
+        // scales is [out, in/groupSize]; recover hidden without an input tensor.
+        let hidden = g.scales.dim(1) * g.groupSize
+        _ = aneCache.program(
+            forSequenceLength: sequenceLength,
+            gateW: g.weight, gateScales: g.scales, gateBiases: gb,
+            gateBits: g.bits, gateGroupSize: g.groupSize,
+            upW: u.weight, upScales: u.scales, upBiases: ub,
+            upBits: u.bits, upGroupSize: u.groupSize,
+            downW: d.weight, downScales: d.scales, downBiases: db,
+            downBits: d.bits, downGroupSize: d.groupSize,
+            hidden: hidden, inter: g.weight.dim(0))
+    }
+
 }
 
 // MARK: - Full-attention Q/K preparation
@@ -6322,6 +6346,17 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 return MambaCache()
             }
             return KVCacheSimple()
+        }
+    }
+
+    /// Eagerly build every dense layer's ANE split program for the given
+    /// prefill length, so the one-time compile happens at load instead of on
+    /// the first (timed/latency-critical) prefill. No-op unless the offload is
+    /// enabled. Local-fork only.
+    public func prewarmANE(sequenceLength: Int) {
+        guard ANESplitConfig.enabled else { return }
+        for layer in model.layers {
+            (layer.mlp as? Qwen35FusedMLP)?.prewarmANE(sequenceLength: sequenceLength)
         }
     }
 
