@@ -76,6 +76,6 @@ final class ANEFusedMLP {
     /// `[S, hidden]` fp16 `MLXArray`. Call only after `predict` has
     /// completed for this handle.
     func readOutput(_ prepared: ANEDirectDispatch.Prepared) -> MLXArray {
-        ANEDirectDispatch.read(prepared)
+        ANEDirectDispatch.readZeroCopy(prepared)
     }
 }

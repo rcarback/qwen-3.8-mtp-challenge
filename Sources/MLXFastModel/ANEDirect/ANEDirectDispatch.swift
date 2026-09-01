@@ -245,6 +245,28 @@ enum ANEDirectDispatch {
         return contiguous(yT.transposed(1, 0)) // [S,OUT]
     }
 
+    /// CALLER THREAD ONLY (MLX). Zero-copy variant of `read`: wraps the
+    /// output IOSurface's bytes directly as an MLXArray (no CPU gather),
+    /// then returns the real `[S,OUT]` region as a lazy strided MLX view.
+    /// The surface is `[OUT, paddedS]` fp16; we wrap that full padded shape
+    /// and slice `[0..<OUT, 0..<S]` so the padding lanes are never read.
+    /// The finalizer keeps the surface alive for the array's lifetime.
+    /// D2 spike -- proves whether MLX accepts an IOSurface-backed pointer as
+    /// array backing. Must run only after `evaluate` completed.
+    static func readZeroCopy(_ prepared: Prepared) -> MLXArray {
+        let outputDim = prepared.outputDim
+        let sequenceLength = prepared.sequenceLength
+        let rowStride = prepared.rowStride
+        let surface = prepared.outputSurface
+        // Hold a strong ref for the wrapper's lifetime; released in finalizer.
+        let wrapped = MLXArray(
+            rawPointer: surface.baseAddress,
+            [outputDim, rowStride], dtype: .float16,
+            finalizer: { [surface] in _ = surface })
+        let real = wrapped[0 ..< outputDim, 0 ..< sequenceLength] // [OUT,S] view
+        return contiguous(real.transposed(1, 0)) // [S,OUT]
+    }
+
     /// Convenience that chains `prepare` -> `evaluate` -> `read` on the
     /// calling thread. `x` is `[S, IN]` fp16 (MLX). Returns `[S, OUT]` fp16
     /// (MLX). For concurrent ANE+GPU use, call the three phases separately
@@ -253,6 +275,6 @@ enum ANEDirectDispatch {
     static func runConv(model: ANEInMemoryModel, x: MLXArray, inputDim: Int, outputDim: Int, sequenceLength: Int) throws -> MLXArray {
         let prepared = try prepare(model: model, x: x, inputDim: inputDim, outputDim: outputDim, sequenceLength: sequenceLength)
         try evaluate(prepared)
-        return read(prepared)
+        return readZeroCopy(prepared)
     }
 }
