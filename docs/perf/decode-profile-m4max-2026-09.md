@@ -82,3 +82,24 @@ boundary, not real per-layer compute across 64 layers.
 
 This 47.6% share is the `host and sync` bucket of the scope's decision
 rule, measured at the serve boundary instead of inside the forward.
+
+## Ruling
+
+Rule applied: 1. Selected lever: scope section C, host synchronization at
+the serve boundary. Bucket share: 47.6% (`host and sync`, 38.7 ms of the
+81.3 ms parent-counted round). Rule 1 fires at any share over 20%.
+Expected gain if the bucket reaches 70% of peak bandwidth: not applicable to
+a host bucket. Bound instead: up to 38.7 ms per token if the outside-forward
+time were zero; a realistic target is the parent-counted step within 10% of
+forward + lm_head (about 47 ms), i.e. ~34 ms per token, 1.7x on serial
+decode.
+MTP schedule finding carried forward: pending the accept matrix; the
+single-prompt observation (bf16 hybrid accept 0.60 vs dequant 0.12 vs all-GPU
+0.53 at depth 8) stands as n=1.
+
+Follow-on plan: `.plans/2026-09-02-decode-host-sync-plan.md` (local, not
+committed). Its first task splits the 38.7 ms into measured buckets. The
+static reading of the depth-0 round (`Qwen36MTPBlockSession.swift:2569-2644`)
+shows one target forward, one GPU top-2, one `eval`, and two host reads. The
+protocol path is one JSON line each way. Neither explains 38.7 ms on its own,
+so the bucket table decides which lever the later tasks take.
