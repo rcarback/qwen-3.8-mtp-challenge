@@ -1961,8 +1961,9 @@ public final class Qwen36MTPBlockSession {
     /// constant the marginal rule needs. Derivation from the campaign's
     /// measured budgets: the verify forward is weight-stream bound on the
     /// ~14.1 GiB 4-bit backbone and near-flat in width; a head step streams
-    /// the head layer plus the full lm_head readout (~0.65 GiB 4-bit) and
-    /// carries the chained-launch overhead of the committed-history path.
+    /// the head layer plus its compact draft projection (283,207,680 bytes,
+    /// not the full lm_head readout the first fits assumed) and carries
+    /// the chained-launch overhead of the committed-history path.
     /// h HISTORY, because it was mispriced twice. 0.12 (arm 1) and 0.09
     /// (arm 2) both divided total window time by rounds WITHOUT subtracting
     /// the ~0.9 s seed prologue charged inside the local window — a prologue
@@ -1989,6 +1990,20 @@ public final class Qwen36MTPBlockSession {
     /// 0.32 -> 2.84585). The wasted-work term a reject does keep (the
     /// drafted head steps past the break) is already inside the marginal
     /// the rule prices.
+    ///
+    /// FIFTH FIT, 2026-09-02, local M4 Max, no head lever in force (quant and
+    /// priming cap off). Component side: one head step measures 2.95 ms at
+    /// 2,048 history rows (`Qwen36MTPHeadStepBenchTests`, release); the
+    /// verify forward reference is the 95.4 ms width-3 row of the phase sweep
+    /// at depth ~2k (`docs/perf/raw-phase-sumTable.txt`), giving ~0.03, which
+    /// is not the quantity the rule prices. End to end, forced depths 1..4 on
+    /// the README prompt (8,690-token seed, 512 decoded tokens, agreement
+    /// harness) fit `wall = P + rounds * (V + d * H)` with P = 54.2 s (the
+    /// seed prologue), V = 113.4 ms, H = 23.0 ms: h = 0.203 +/- 0.037 (one
+    /// sigma, one degree of freedom). The live schedule landed within 1% of
+    /// the best forced arm and all five emitted streams were byte-identical.
+    /// The shipped 0.18 sits inside that band, so the constant stays; the
+    /// record is `docs/perf/bead-close-out-2026-09-02.md`.
     private static let headStepCostRatio = 0.18
 
     /// E68: the depth price as a per-position vector.
