@@ -28,16 +28,27 @@ swift_bin="${MLXFAST_SWIFT_BIN:-.build-worker/release/mlxfast-swift}"
 stamp="$(date +%Y%m%d-%H%M%S)"
 csv="${out_dir}/mtp-accept-${stamp}.csv"
 
+# Validate up front: config_env() below runs inside a process substitution,
+# so an `exit` there only ends that subshell -- the parent's `set -e` never
+# sees it, and a bf16 leg with no MLX_ANE_BF16_WEIGHTS would silently run as
+# a plain-GPU config instead of failing. Fail closed here instead.
+for cfg in $configs; do
+  case "$cfg" in
+    gpu | dequant) ;;
+    bf16) [[ -n "${MLX_ANE_BF16_WEIGHTS:-}" ]] || { echo "bf16 needs MLX_ANE_BF16_WEIGHTS" >&2; exit 2; } ;;
+    *) echo "unknown config: $cfg" >&2; exit 2 ;;
+  esac
+done
+
 config_env() {
-  # Prints the env assignments for a config, one per line.
+  # Prints the env assignments for a config, one per line. Assumes $1 was
+  # already validated above.
   case "$1" in
     gpu) ;;
     dequant) echo "MLXFAST_NO_SANDBOX=1"; echo "MLX_ANE_DIRECT=1" ;;
     bf16)
-      [[ -n "${MLX_ANE_BF16_WEIGHTS:-}" ]] || { echo "bf16 needs MLX_ANE_BF16_WEIGHTS" >&2; exit 2; }
       echo "MLXFAST_NO_SANDBOX=1"; echo "MLX_ANE_DIRECT=1"
       echo "MLX_ANE_BF16_WEIGHTS=${MLX_ANE_BF16_WEIGHTS}" ;;
-    *) echo "unknown config: $1" >&2; exit 2 ;;
   esac
 }
 
