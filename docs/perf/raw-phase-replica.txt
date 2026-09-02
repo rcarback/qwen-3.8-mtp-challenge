@@ -1,0 +1,103 @@
+[0/3] Write swift-version--58304C5D6DBC2206.txt
+[0/1] Planning build
+[1/1] Compiling plugin CudaBuild
+[2/2] Compiling plugin GenerateManual
+[3/3] Compiling plugin GenerateDoccReference
+Building for debugging...
+[3/9] Write swift-version--58304C5D6DBC2206.txt
+Build complete! (13.78s)
+Test Suite 'Selected tests' started at 2026-09-01 21:25:25.271.
+Test Suite 'mlxfast-challenge-devPackageTests.xctest' started at 2026-09-01 21:25:25.272.
+Test Suite 'mlxfast-challenge-devPackageTests.xctest' passed at 2026-09-01 21:25:25.272.
+	 Executed 0 tests, with 0 failures (0 unexpected) in 0.000 (0.000) seconds
+Test Suite 'Selected tests' passed at 2026-09-01 21:25:25.272.
+	 Executed 0 tests, with 0 failures (0 unexpected) in 0.000 (0.001) seconds
+◇ Test run started.
+↳ Testing Library Version: 1902
+↳ Target Platform: arm64e-apple-macos14.0
+◇ Suite QwenPhaseBreakdownTests started.
+◇ Test "prefill and decode phase breakdown" started.
+
+[prefill 1024 @ depth 0] per-layer attribution (synced, unfused)
+  embed                   6.4 ms
+  48 linear blocks     5505.0 ms  (75.7%)  mean 114.69 ms
+  16 full blocks       1763.6 ms  (24.2%)  mean 110.23 ms
+  synced total         7275.0 ms   fused truth   6870.8 ms  (sync tax +5.9%)
+  slowest: L02/lin 119.5ms  L01/lin 118.8ms  L26/lin 118.5ms  L53/lin 116.1ms  L54/lin 116.0ms  L28/lin 115.8ms
+
+[decode width 1 @ depth 512] fused step best-of-5 = 50.049 ms (20.0 tok/s)
+
+[decode width 1 @ depth 512] per-layer attribution (synced, unfused)
+  embed                   0.8 ms
+  48 linear blocks      149.5 ms  (78.3%)  mean   3.11 ms
+  16 full blocks         40.6 ms  (21.3%)  mean   2.54 ms
+  synced total          190.9 ms   fused truth     50.0 ms  (sync tax +281.5%)
+  slowest: L33/lin 9.7ms  L24/lin 5.1ms  L10/lin 5.0ms  L32/lin 4.7ms  L30/lin 4.6ms  L25/lin 4.6ms
+
+[verify width 16 @ depth ~2k] per-layer attribution (synced, unfused)
+  embed                   0.3 ms
+  48 linear blocks      196.6 ms  (71.1%)  mean   4.10 ms
+  16 full blocks         79.7 ms  (28.8%)  mean   4.98 ms
+  synced total          276.6 ms   fused truth    187.2 ms  (sync tax +47.8%)
+  slowest: L51/FUL 5.9ms  L63/FUL 5.8ms  L27/FUL 5.3ms  L47/FUL 5.3ms  L43/FUL 5.3ms  L55/FUL 5.3ms
+
+[verify width 32 @ depth ~2k] per-layer attribution (synced, unfused)
+  embed                   1.0 ms
+  48 linear blocks      255.3 ms  (74.6%)  mean   5.32 ms
+  16 full blocks         85.9 ms  (25.1%)  mean   5.37 ms
+  synced total          342.2 ms   fused truth    350.1 ms  (sync tax -2.3%)
+  slowest: L00/lin 8.7ms  L05/lin 8.3ms  L11/FUL 7.9ms  L12/lin 7.7ms  L07/FUL 7.6ms  L06/lin 7.5ms
+
+[masks at width 32] ssm=nil  fa=causal  ssm cache=MambaCache  fa cache=KVCacheSimple
+[replay tape at width 32] 48 layers, 207.7 MB retained
+
+[qmv arm] MLX_E120_QMV_ARM=replica  [ladder band] MLX_QWEN_MTP_LADDER_MAXWIDTH=<unset, 9>
+
+[decode @ depth ~2k] verify-width sweep, 3 reps, best shown
+     M   build_ms   eval_ms   total_ms    ms/row    vs M=1
+     1       43.3      11.2       54.4      54.4     1.00x
+     2       68.7      19.1       87.8      43.9     1.61x
+     3       73.9      24.3       98.2      32.7     1.80x
+     4       87.2      30.5      117.7      29.4     2.16x
+     8      124.6      46.8      171.4      21.4     3.15x
+     9      145.6      55.4      201.0      22.3     3.69x
+    12       22.6     208.6      231.2      19.3     4.25x
+    16       30.3     205.3      235.7      14.7     4.33x
+    24       28.9     297.8      326.8      13.6     6.00x
+    32       30.1     303.9      334.1      10.4     6.14x
+    33       32.6     532.7      565.3      17.1    10.38x
+    48       28.8     546.6      575.4      12.0    10.57x
+
+[MTP head @ depth ~2k] head history 10 rows, key/value-only path taken
+  flush step (3 rows)  build   0.86 ms   eval  22.13 ms
+  head module          build   0.31 ms   eval   2.05 ms    415.2 GB/s
+  draft projection     build   0.09 ms   eval   0.79 ms    357.6 GB/s
+  one step               3.24 ms   host share 12.5%    349.1 GB/s
+  8-step lazy chain     23.38 ms   (2.92 ms/draft)
+
+  lm_head+argmax 1 row(s): 2.9 ms
+  lm_head+argmax 9 row(s): 14.8 ms
+
+[prefill 1024 @ depth ~9k] per-layer attribution (synced, unfused)
+  embed                  14.8 ms
+  48 linear blocks     5515.1 ms  (68.4%)  mean 114.90 ms
+  16 full blocks       2532.7 ms  (31.4%)  mean 158.29 ms
+  synced total         8062.6 ms   fused truth   7940.1 ms  (sync tax +1.5%)
+  slowest: L43/FUL 166.4ms  L03/FUL 159.9ms  L27/FUL 159.5ms  L39/FUL 158.9ms  L55/FUL 158.3ms  L35/FUL 158.1ms
+
+[decode @ depth ~10k] verify-width sweep, 3 reps, best shown
+     M   build_ms   eval_ms   total_ms    ms/row    vs M=1
+     1       39.8       5.7       45.5      45.5     1.00x
+     9      148.1      52.2      200.3      22.3     4.41x
+    32       29.2     343.9      373.1      11.7     8.21x
+
+[verify-shaped (nConfirmed 1) @ ~10k] 3 reps, best shown
+     M   build_ms   eval_ms   total_ms    ms/row
+     9      169.2      55.6      224.9      25.0
+    12       30.0     231.7      261.8      21.8
+    16       31.1     239.3      270.4      16.9
+    32       31.4     343.3      374.7      11.7
+
+✔ Test "prefill and decode phase breakdown" passed after 110.852 seconds.
+✔ Suite QwenPhaseBreakdownTests passed after 110.853 seconds.
+✔ Test run with 1 test in 1 suite passed after 110.853 seconds.

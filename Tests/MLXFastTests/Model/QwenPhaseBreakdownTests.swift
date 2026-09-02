@@ -175,6 +175,25 @@ struct QwenPhaseBreakdownTests {
             report("prefill 1024 @ depth 0", p, fusedSeconds: fused0)
         }
 
+        // ---- decode width 1 after a 512-token seed: the serve step ----
+        // Seed a fresh cache with 512 tokens (fused, untimed), take ONE
+        // fused width-1 step as the truth, then attribute the NEXT width-1
+        // step per layer through the seam. Offsets advance with the cache.
+        let decodeCache = model.newCache(parameters: nil)
+        fusedChunk(cache: decodeCache, width: 512, offset: 0)
+        var fusedStep = Double.infinity
+        for k in 0 ..< 5 {
+            fusedStep = Swift.min(
+                fusedStep,
+                fusedChunk(cache: decodeCache, width: 1, offset: 512 + k))
+        }
+        print(String(
+            format: "\n[decode width 1 @ depth 512] fused step best-of-5 = %.3f ms (%.1f tok/s)",
+            1000 * fusedStep, 1 / fusedStep))
+        if let p = profiledChunk(cache: decodeCache, width: 1, offset: 517) {
+            report("decode width 1 @ depth 512", p, fusedSeconds: fusedStep)
+        }
+
         // ---- one shared cache from here on; depth grows as we measure ----
         let cache = model.newCache(parameters: nil)
         var filled = 0
