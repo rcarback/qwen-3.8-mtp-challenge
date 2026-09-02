@@ -65,3 +65,8 @@ local-docs/
 # `git add` has swallowed them before.
 .local/
 score.baseline-*.json
+
+# MTP accept-rate sweep scratch: goldens, per-run scores, wrapper work dirs.
+# Only the reduced CSV is meant to be committed.
+docs/perf/accept-runs/*.json
+docs/perf/accept-runs/work-*
