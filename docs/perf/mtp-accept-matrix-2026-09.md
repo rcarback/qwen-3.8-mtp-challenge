@@ -1,71 +1,95 @@
 # MTP accept-rate matrix across weight configurations
 
 This document reports a multi-prompt sweep of the MTP draft accept rate under
-three ANE weight-source configurations. The sweep ran behind the 40C thermal
-gate. Each leg decoded 128 tokens at draft depth 8 or draft depth 2. It used
-four prompt files: `README.md`, `docs/qwen-prefill-research-plan.md`,
-`docs/qwen-mtp-go-live-runbook.md`, and `docs/private-benchmark-security.md`.
-The `gpu` config set no ANE flags. The `dequant` config set
-`MLXFAST_NO_SANDBOX=1` and `MLX_ANE_DIRECT=1`, and sourced ANE fp16 weights by
-dequantizing the 4-bit weights. The `bf16` config added
-`MLX_ANE_BF16_WEIGHTS` pointing at the original bf16 checkpoint, so the ANE
-weights came from the bf16 source instead of a dequantized 4-bit source.
+three ANE weight-source configurations. Only the all-GPU rows are valid. The
+dequant and bf16 hybrid rows are invalid: see "Hybrid rows" below.
 
-## Median summary by config and depth
+## Run conditions
 
-| config | depth | n | accept rate | mean draft len | serial s/tok | mtp s/tok | speedup | matched |
-|---|---|---|---|---|---|---|---|---|
-| bf16 | 2 | 4 | 0.960 | 1.99 | 0.1042 | 0.0607 | 1.720 | True |
-| bf16 | 8 | 4 | 0.943 | 5.47 | 0.1044 | 0.0510 | 2.051 | True |
-| dequant | 2 | 4 | 0.960 | 1.99 | 0.1045 | 0.0607 | 1.708 | True |
-| dequant | 8 | 4 | 0.943 | 5.47 | 0.1046 | 0.0511 | 2.052 | True |
-| gpu | 2 | 4 | 0.584 | 1.97 | 0.1081 | 0.0780 | 1.369 | True |
-| gpu | 8 | 4 | 0.515 | 2.66 | 0.1076 | 0.0783 | 1.364 | True |
+The sweep ran behind the 40C thermal gate. Each leg decoded 128 tokens at
+draft depth 8 or draft depth 2. It used four prompts: `README.md`,
+`docs/qwen-prefill-research-plan.md`, `docs/qwen-mtp-go-live-runbook.md`, and
+`docs/private-benchmark-security.md`. The `gpu` config set no flags. The
+`dequant` config set `MLXFAST_NO_SANDBOX=1` and `MLX_ANE_DIRECT=1`. The
+`bf16` config set the same two flags plus `MLX_ANE_BF16_WEIGHTS`. The full
+sweep CSV is `docs/perf/accept-runs/mtp-accept-20260901-225614.csv`.
 
-Every row has n equal to 4, one measurement per prompt file, and matched
-equal to True. All 24 legs passed token fidelity.
+## All-GPU result (valid)
 
-## Per-leg detail
+Median rows, from
+`python3 tools/mtp-accept-summary.py docs/perf/accept-runs/mtp-accept-20260901-225614.csv`:
+
+| config | depth | n | accept rate | mean draft len | speedup | matched |
+|---|---|---|---|---|---|---|
+| gpu | 8 | 4 | 0.515 | 2.66 | 1.364 | True |
+| gpu | 2 | 4 | 0.584 | 1.97 | 1.369 | True |
+
+Per-leg rows, one per prompt:
 
 | config | prompt | depth | accept rate | mean draft len | speedup | matched |
 |---|---|---|---|---|---|---|
 | gpu | README | 8 | 0.540 | 2.49 | 1.363 | True |
 | gpu | README | 2 | 0.619 | 1.95 | 1.385 | True |
-| dequant | README | 8 | 0.947 | 5.38 | 2.066 | True |
-| dequant | README | 2 | 0.966 | 1.98 | 1.708 | True |
-| bf16 | README | 8 | 0.947 | 5.38 | 2.069 | True |
-| bf16 | README | 2 | 0.966 | 1.98 | 1.744 | True |
 | gpu | qwen-prefill-research-plan | 8 | 0.490 | 2.83 | 1.365 | True |
 | gpu | qwen-prefill-research-plan | 2 | 0.549 | 1.97 | 1.353 | True |
-| dequant | qwen-prefill-research-plan | 8 | 0.939 | 5.75 | 2.047 | True |
-| dequant | qwen-prefill-research-plan | 2 | 0.955 | 2.00 | 1.709 | True |
-| bf16 | qwen-prefill-research-plan | 8 | 0.939 | 5.75 | 2.041 | True |
-| bf16 | qwen-prefill-research-plan | 2 | 0.955 | 2.00 | 1.704 | True |
 | gpu | qwen-mtp-go-live-runbook | 8 | 0.662 | 3.10 | 1.559 | True |
 | gpu | qwen-mtp-go-live-runbook | 2 | 0.762 | 1.98 | 1.533 | True |
-| dequant | qwen-mtp-go-live-runbook | 8 | 0.973 | 5.55 | 2.056 | True |
-| dequant | qwen-mtp-go-live-runbook | 2 | 0.988 | 2.00 | 1.732 | True |
-| bf16 | qwen-mtp-go-live-runbook | 8 | 0.973 | 5.55 | 2.060 | True |
-| bf16 | qwen-mtp-go-live-runbook | 2 | 0.988 | 2.00 | 1.736 | True |
 | gpu | private-benchmark-security | 8 | 0.455 | 2.34 | 1.295 | True |
 | gpu | private-benchmark-security | 2 | 0.541 | 1.97 | 1.345 | True |
-| dequant | private-benchmark-security | 8 | 0.881 | 4.92 | 1.935 | True |
-| dequant | private-benchmark-security | 2 | 0.912 | 1.98 | 1.668 | True |
-| bf16 | private-benchmark-security | 8 | 0.881 | 4.92 | 1.944 | True |
-| bf16 | private-benchmark-security | 2 | 0.912 | 1.98 | 1.661 | True |
 
-## Findings
+**Question 3 (which depth has the higher median speedup):** the two depths
+are close. Depth 2 gives a median speedup of about 1.369, and depth 8 gives
+about 1.364. The two values are within about 0.005 of each other, so neither
+depth shows a clear speedup advantage for the all-GPU config.
 
-1. The bf16 hybrid's accept rate does not exceed the dequant hybrid's on the
-   median prompt. Both configs report the same median accept rate, about
-   0.96 at depth 2 and about 0.94 at depth 8.
-2. Both hybrid configs differ from the all-GPU config by more than the
-   spread across prompts within a config. The hybrid-to-GPU gap in median
-   accept rate is about 0.38 at depth 2 and about 0.43 at depth 8. The
-   largest within-config spread across the four prompts is about 0.22 for
-   the all-GPU config and about 0.09 for either hybrid config. Prompt-to-
-   prompt noise does not explain the gap between hybrid and all-GPU.
-3. Depth 8 gives the higher median `mtp_decode_speedup` for both hybrid
-   configs, about 2.05 compared with about 1.71 to 1.72 at depth 2. Depth 2
-   gives a slightly higher median speedup for the all-GPU config, about
-   1.369 compared with about 1.364 at depth 8.
+## Hybrid rows (invalid, generation collapse)
+
+The dequant and bf16 rows are identical to three decimals on every prompt,
+and both sit near an accept rate of about 0.95. That similarity is not a
+finding about the bf16 weight source. The goldens the wrapper generated for
+these two configs are degenerate. On all four prompts, the model repeats one
+token starting from an early step. The measured accept rate reflects the MTP
+head predicting a stuck token, not speculation on real text. Do not read the
+hybrid median rows as results.
+
+The table below gives the distinct-token ratio for each prompt's golden
+(unique tokens divided by total tokens). A healthy golden, like the all-GPU
+ones above, has a high ratio. Both hybrid configs produced the same ratio per
+prompt.
+
+| prompt | gpu ratio | hybrid ratio (dequant and bf16) |
+|---|---|---|
+| README | 0.41 | 0.01 |
+| qwen-prefill-research-plan | 0.48 | 0.01 |
+| qwen-mtp-go-live-runbook | 0.56 | 0.01 |
+| private-benchmark-security | 0.55 | 0.05 |
+
+**Question 1 (does bf16 exceed dequant on the median prompt):** this
+question cannot be answered from this run. The bf16 and dequant goldens are
+both degenerate, so their accept rate measures a stuck token stream rather
+than draft speculation.
+
+**Question 2 (does either hybrid differ from all-GPU by more than the spread
+across prompts):** this question also cannot be answered from this run.
+No healthy hybrid measurement exists in this data set to compare against the
+all-GPU spread.
+
+## Diagnosis (controller, 2026-09-02)
+
+Follow-up 64-step goldens on the `README` prompt, using the same CLI and
+flags as the sweep, narrowed the cause. These diagnostic goldens are scratch
+runs and are not committed.
+
+| configuration | distinct ratio | note |
+|---|---|---|
+| all-GPU, 4-bit | 0.41 | normal |
+| GPU-fp16 ablation (`MLX_ANE_FP16_GPU=1`, same fp16 weights, no ANE) | 0.70 | normal |
+| ANE, dequant fraction 0.3125 | 0.02 | token 96597 repeated from step 0 |
+| ANE, bf16 source | 0.03 | token 91914 repeated from step 1 |
+| ANE, dequant fraction 0.0625 | 0.16 | degraded |
+
+The fp16 numeric representation is not the cause, because the GPU-fp16
+ablation uses the same fp16 weights without ANE offload and stays healthy.
+The ANE-specific error on real activations compounds across 64 layers into a
+collapse that single-layer synthetic tests at 1 ULP and self-consistent
+goldens cannot detect.
