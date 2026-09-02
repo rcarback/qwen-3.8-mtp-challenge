@@ -176,9 +176,10 @@ struct QwenPhaseBreakdownTests {
         }
 
         // ---- decode width 1 after a 512-token seed: the serve step ----
-        // Seed a fresh cache with 512 tokens (fused, untimed), take ONE
-        // fused width-1 step as the truth, then attribute the NEXT width-1
-        // step per layer through the seam. Offsets advance with the cache.
+        // Seed a fresh cache with 512 tokens (fused, untimed), take the
+        // best of five fused width-1 steps as the truth, then attribute the
+        // NEXT width-1 step per layer through the seam. Offsets advance
+        // with the cache.
         let decodeCache = model.newCache(parameters: nil)
         fusedChunk(cache: decodeCache, width: 512, offset: 0)
         var fusedStep = Double.infinity
