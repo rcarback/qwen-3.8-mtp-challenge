@@ -2223,14 +2223,96 @@ public final class Qwen36MTPBlockSession {
     /// serial trajectory. Segmenting the whole FORWARD instead (two model
     /// calls, 5+k) was measured bit-exact too but pays a second full weight
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
-    private static let sdpaWidthWallDepthCap = 5
+    ///
+    /// MEASURED 2026-08-28, and the mechanism above is confirmed but
+    /// INCOMPLETE. `gqa = 24 / 4 = 6`, so `qL * gqa <= 32` does stop at
+    /// exactly `qL = 5`, and the sdpa chunk removes that wall completely:
+    /// op-level, against both a true serial (one row at a time) reference
+    /// and consecutive width-5 rounds, widths 1...16 are bit-exact per row
+    /// at context 64 and 600 — including the >= 3-segment path, which had
+    /// never executed on a GPU. With the chunk bound left at its shipped 9,
+    /// widths 10...16 drift by 1 to 7 bfloat16 ulp (max gap 4.9e-4), which
+    /// is the control that proves the chunk is what does the work.
+    ///
+    /// BUT THE SDPA IS NOT THE ONLY WALL. The quantized projections have
+    /// their own, one width further out: MLX switches from qmv to qmm at
+    /// `M >= get_qmv_batch_limit(K, N)` and stops being per-row exact, and
+    /// the `Qwen35CustomQMV` replica that holds exactness only covers
+    /// `2 ... Qwen35CustomQMV.maxWidth`, which ships as 9. Measured on the
+    /// model's own five affine 4-bit shapes (qkv, o_proj, gate_up, down,
+    /// lm_head): rows are bit-exact against `M = 1` for M 2...9 and DRIFT
+    /// for M 10...16 at the shipped bound, and bit-exact for all of 2...16
+    /// with `MLX_QWEN_QMV_MAX_WIDTH=16`. So a depth cap above 8 is only
+    /// exact when the QMV bound is raised with it. That coupling is not a
+    /// comment: `provenExactDepthCeiling` enforces it.
+    private static let sdpaWidthWallDepthCap = depthCap(
+        environmentName: "MLX_QWEN_MTP_SDPA_WIDTH_WALL_DEPTH_CAP",
+        fallback: 5)
 
     /// Depth cap for streak-qualified deep rounds. 8 is the trusted
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 7
+    ///
+    /// Runtime-settable since 2026-08-28, DEFAULT UNCHANGED at 7. Raising it
+    /// is only sound up to `provenExactDepthCeiling`, and the parser clamps
+    /// there rather than trusting the caller.
+    private static let segmentedVerifyDepthCap = depthCap(
+        environmentName: "MLX_QWEN_MTP_SEGMENTED_VERIFY_DEPTH_CAP",
+        fallback: 7)
+
+    /// The deepest round this process can run and still be bit-exact per row
+    /// against the serial trajectory. Three independent bounds, all binding:
+    ///
+    ///   - `Qwen36MTPLimits.maxDepth`, the trusted ceiling the row ledger is
+    ///     closed against. A cap above it is not a numerics question at all;
+    ///     the round would be rejected as structurally unsound.
+    ///   - `Qwen35CustomQMV.maxWidth - 1`, because a depth-`d` round projects
+    ///     `d + 1` rows and rows past that bound leave the per-row-exact
+    ///     replica for MLX's qmm. This is the bound that binds at the shipped
+    ///     settings: QMV width 9 means depth 8, whatever the sdpa can do.
+    ///   - `wideDecodeExactnessMaxQueryRows - 1`, the sdpa chunk's own cover.
+    ///     Self-consistent by construction (both derive from
+    ///     `MLX_QWEN_MTP_MAX_DRAFT_DEPTH`), and restated so it cannot drift.
+    ///
+    /// Deliberately a CLAMP and not a precondition. These caps are read at
+    /// process start from three independent environment variables, so a
+    /// mismatched pair is a configuration error, not a code error, and the
+    /// safe response is the narrower cap rather than a dead worker.
+    internal static let provenExactDepthCeiling = Swift.max(
+        0,
+        Swift.min(
+            Qwen36MTPLimits.maxDepth,
+            Swift.min(
+                Qwen35CustomQMV.maxWidth - 1,
+                wideDecodeExactnessMaxQueryRows - 1)))
+
+    /// Pure, total parser for a verify-depth cap, separated from the
+    /// environment read so the contract is unit-testable without a device.
+    /// Anything that is not an integer in `0 ... provenExactDepthCeiling`
+    /// returns `fallback`, so a typo can neither widen the cap past what is
+    /// measured nor collapse drafting to zero by accident.
+    ///
+    /// THE `MLX_` PREFIX IS LOAD-BEARING, for the same reason it is on
+    /// `MLX_QWEN_MTP_TRACE`: `sanitizedRuntimeWorkerEnvironment` is a strict
+    /// allowlist that drops every `MLXFAST_*` name, so an `MLXFAST_`-spelled
+    /// cap would never reach the runtime worker and a depth sweep would
+    /// silently measure the shipped default on every leg.
+    internal static func parseDepthCap(_ raw: String?, fallback: Int) -> Int {
+        guard let raw else { return fallback }
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard let value = Int(trimmed), value >= 0,
+              value <= provenExactDepthCeiling
+        else { return fallback }
+        return value
+    }
+
+    private static func depthCap(environmentName: String, fallback: Int) -> Int {
+        parseDepthCap(
+            ProcessInfo.processInfo.environment[environmentName],
+            fallback: Swift.min(fallback, provenExactDepthCeiling))
+    }
 
     /// Rows of seed history the head is primed with, or nil for all of them.
     ///
