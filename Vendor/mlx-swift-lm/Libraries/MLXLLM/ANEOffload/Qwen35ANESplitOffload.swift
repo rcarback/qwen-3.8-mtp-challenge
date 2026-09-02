@@ -61,6 +61,27 @@ public enum ANESplitConfig {
         return Int(String(cString: cString)) ?? 0
     }()
 
+    /// `MLX_ANE_ACTIVATION=silu|sigmoidMul|expDiv|tanhForm`: how the fused ANE
+    /// program spells SwiGLU's activation. Default `expDiv`
+    /// (`x / (1 + exp(-x))`): the ANE lowers the MIL `silu`/`sigmoid` ops
+    /// through a coarse lookup table whose error on real Qwen activations is
+    /// 10-30x the fp16 floor and compounds into generation collapse over 64
+    /// layers (probe: ANERealActivationProbeTests, 2026-09-02). `exp` and
+    /// `tanh` are accurate on the ANE, so the exp spelling lands at the
+    /// conv-only rounding floor. `silu` is kept for A/B measurement only.
+    public static let activation: ANEActivation = {
+        guard let cString = getenv("MLX_ANE_ACTIVATION") else { return .expDiv }
+        return ANEActivation(rawValue: String(cString: cString)) ?? .expDiv
+    }()
+
+    /// `MLX_ANE_VERIFY=1` (diagnostic): at every offloaded call, also compute
+    /// the all-GPU MLP and log the per-layer max error of the substituted
+    /// result. Doubles MLP cost; never for timing.
+    public static let verify: Bool = {
+        guard let cString = getenv("MLX_ANE_VERIFY") else { return false }
+        return String(cString: cString) == "1"
+    }()
+
     /// `MLX_ANE_BF16_WEIGHTS=<snapshot dir>`: source the ANE fp16 slices from
     /// the original bf16 base checkpoint (see `ANEBF16WeightSource`) instead
     /// of dequantizing the 4-bit weights. Unset = dequantize (default).

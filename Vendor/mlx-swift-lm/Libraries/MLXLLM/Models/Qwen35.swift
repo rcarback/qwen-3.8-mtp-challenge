@@ -2449,6 +2449,20 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
                 silu(qwen35RoutedLinear(gateProj, x))
                     * qwen35RoutedLinear(upProj, x))
         }
+        // LOCAL FORK diagnostic (MLX_ANE_CAPTURE_DIR): save this layer's real
+        // MLP input and 4-bit weights once, so ANE numerics can be checked
+        // offline on real activations. Never changes the returned value.
+        if ANEActivationCapture.shouldCapture(layer: aneLayerIndex, tokens: x.dim(-2)),
+            let g = gateProj as? QuantizedLinear,
+            let u = upProj as? QuantizedLinear,
+            let d = downProj as? QuantizedLinear,
+            let gb = g.biases, let ub = u.biases, let db = d.biases
+        {
+            ANEActivationCapture.write(
+                layer: aneLayerIndex, x: x.reshaped([-1, x.dim(-1)]),
+                gate: (g.weight, g.scales, gb), up: (u.weight, u.scales, ub),
+                down: (d.weight, d.scales, db))
+        }
         // Opt-in ANE∥GPU prefill offload (LOCAL FORK, MLXFAST_ANE_DIRECT=1).
         // Any failure -- flag off, unsupported quantization, build/dispatch
         // error -- falls through to the unchanged all-GPU expression below,
@@ -2477,6 +2491,18 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
             {
                 let x2 = x.reshaped([tokens, hidden])
                 if let y2 = try? split(x2) {
+                    if ANESplitConfig.verify {
+                        let ref = downProjection(silu(gateProj(x)) * upProj(x))
+                            .reshaped([tokens, hidden]).asType(.float32)
+                        let d = MLX.abs(y2.asType(.float32) - ref)
+                        let rowMax = d.max(axis: 1)
+                        let worst = argMax(rowMax)
+                        eval(d, rowMax, worst)
+                        aneLog(String(
+                            format: "verify layer %d S=%d: maxAbs=%.4f max|ref|=%.2f worstRow=%d",
+                            aneLayerIndex, tokens, d.max().item(Float.self),
+                            MLX.abs(ref).max().item(Float.self), worst.item(Int32.self)))
+                    }
                     return y2.reshaped(x.shape)
                 }
             }

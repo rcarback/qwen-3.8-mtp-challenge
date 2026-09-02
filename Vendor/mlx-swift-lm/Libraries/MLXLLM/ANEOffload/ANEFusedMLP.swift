@@ -23,7 +23,11 @@ public final class ANEFusedMLP {
     /// `gate`/`up`: `[innerFraction, hidden]`. `down`: `[hidden, innerFraction]`.
     /// Computes the ANE fraction's full contribution through the down
     /// projection: `down @ (silu(gate @ xT) * (up @ xT))` for `x=[S,hidden]`.
-    public init(hidden: Int, innerFraction: Int, sequenceLength: Int, gate: MLXArray, up: MLXArray, down: MLXArray) throws {
+    public init(
+        hidden: Int, innerFraction: Int, sequenceLength: Int,
+        gate: MLXArray, up: MLXArray, down: MLXArray,
+        activation: ANEActivation = ANESplitConfig.activation
+    ) throws {
         precondition(gate.shape == [innerFraction, hidden],
                      "ANEFusedMLP: gate expected [\(innerFraction), \(hidden)], got \(gate.shape)")
         precondition(up.shape == [innerFraction, hidden],
@@ -37,7 +41,8 @@ public final class ANEFusedMLP {
         let (blob, offsets) = buildMultiWeightBlob(chunks: [f16Bytes(gate), f16Bytes(up), f16Bytes(down)])
         let milText = buildSwiGLUDownMILText(
             inputDim: hidden, hiddenDim: innerFraction, outputDim: hidden, sequenceLength: sequenceLength,
-            gateOffset: offsets[0], upOffset: offsets[1], downOffset: offsets[2]
+            gateOffset: offsets[0], upOffset: offsets[1], downOffset: offsets[2],
+            activation: activation
         )
         let m = try ANEInMemoryModel(milText: milText, weightBlob: blob, weightFileName: "weight.bin")
         try m.compile()

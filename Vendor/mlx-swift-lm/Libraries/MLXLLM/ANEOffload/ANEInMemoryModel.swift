@@ -168,7 +168,12 @@ public final class ANEInMemoryModel {
 
         // `hexStringIdentifier` is the descriptor-content hash
         // `_ANEInMemoryModel` uses to derive its own on-disk staging
-        // location under `NSTemporaryDirectory()`. Per oMLX (which never
+        // location under `NSTemporaryDirectory()`. It covers the NETWORK
+        // TEXT only (the weights dictionary passed above is empty and the
+        // blob is a staged side file), so two programs with the same MIL
+        // text share one identity, one staging directory, and one compiled
+        // program regardless of their weights. The MIL builders therefore
+        // stamp a unique `programTag` into `buildInfo`. Per oMLX (which never
         // calls `setModelURL:` on this path -- overriding the derived URL
         // breaks per-file bundle-hash verification on newer macOS), staging
         // `model.mil` and `weights/weight_data.bin` at that SAME derived

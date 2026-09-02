@@ -221,10 +221,21 @@ public func buildConvMILProgram(K: Int, F: Int, S: Int, weight: Data) -> Data {
 /// proves this text format compiles unentitled. Verbatim shape, with `w`'s
 /// weight bytes referenced via `BLOBFILE` at `weights/weight_data.bin`
 /// offset 64 (see `buildConvWeightBlob`).
-public func buildConvMILText(inputDim: Int, outputDim: Int, sequenceLength: Int) -> String {
+/// `programTag` is stamped into the program's `buildInfo` so that two
+/// programs with identical shapes but different weights get DIFFERENT
+/// descriptor identities. `_ANEInMemoryModel` derives `hexStringIdentifier`
+/// (its staging directory and compile-cache key) from the network text
+/// alone -- the weight blob is staged as a side file and is not hashed.
+/// Without the tag, all 64 Qwen layers collided on one identity: they
+/// overwrote each other's staged `weight.bin`, and only the first loaded
+/// program computed with its own weights (the 2026-09-02 hybrid collapse).
+public func buildConvMILText(
+    inputDim: Int, outputDim: Int, sequenceLength: Int,
+    programTag: String = UUID().uuidString
+) -> String {
     """
     program(1.3)
-    [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+    [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}, {"mlxfast-program-tag", "\(programTag)"}})]
     {
       func main<ios18>(tensor<fp16, [1, \(inputDim), 1, \(sequenceLength)]> x) {
         tensor<fp16, [\(outputDim), \(inputDim), 1, 1]> w = const()[name=string("w"), val=tensor<fp16, [\(outputDim), \(inputDim), 1, 1]>(BLOBFILE(path=string("@model_path/weights/weight_data.bin"), offset=uint64(64)))];
@@ -293,13 +304,62 @@ public func buildConvWeightBlob(_ fp16Weight: Data) -> Data {
 /// *inter* dimension across ANE/GPU, not along hidden). Weight `BLOBFILE`
 /// references point at `weights/weight.bin`, at the chunk-header offsets
 /// `buildMultiWeightBlob` returns for the gate/up/down chunks in that order.
+/// How the fused program computes `silu_out` from `gate`. All spellings are
+/// algebraically SiLU; their ANE lowerings differ in precision. `.silu` and
+/// `.sigmoidMul` go through the ANE's lookup-table sigmoid (measured error
+/// on real activations 10-30x the fp16 floor -- the cause of the hybrid's
+/// generation collapse). `.expDiv` (the production default, see
+/// `ANESplitConfig.activation`) and `.tanhForm` use the ANE's accurate
+/// `exp`/`tanh` and land at the conv rounding floor. `.none` skips the
+/// activation entirely (diagnostic: isolates the convs and mul).
+public enum ANEActivation: String, CaseIterable, Sendable {
+    case silu, sigmoidMul, expDiv, tanhForm, none
+
+    /// MIL statements defining `silu_out` (`[1, F, 1, S]` fp16) from `gate`.
+    func milLines(hiddenDim: Int, sequenceLength: Int) -> String {
+        let t = "tensor<fp16, [1, \(hiddenDim), 1, \(sequenceLength)]>"
+        switch self {
+        case .silu:
+            return "\(t) silu_out = silu(x=gate)[name=string(\"silu\")];"
+        case .sigmoidMul:
+            return """
+            \(t) sig = sigmoid(x=gate)[name=string("sig")];
+                    \(t) silu_out = mul(x=gate, y=sig)[name=string("silu")];
+            """
+        case .expDiv:
+            return """
+            fp16 negone = const()[name=string("negone"), val=fp16(-1.0)];
+                    fp16 one = const()[name=string("one"), val=fp16(1.0)];
+                    \(t) neg = mul(x=gate, y=negone)[name=string("neg")];
+                    \(t) e = exp(x=neg)[name=string("e")];
+                    \(t) den = add(x=e, y=one)[name=string("den")];
+                    \(t) silu_out = real_div(x=gate, y=den)[name=string("silu")];
+            """
+        case .tanhForm:
+            return """
+            fp16 half = const()[name=string("half"), val=fp16(0.5)];
+                    fp16 one = const()[name=string("one"), val=fp16(1.0)];
+                    \(t) hg = mul(x=gate, y=half)[name=string("hg")];
+                    \(t) th = tanh(x=hg)[name=string("th")];
+                    \(t) thp = add(x=th, y=one)[name=string("thp")];
+                    \(t) sg = mul(x=thp, y=half)[name=string("sg")];
+                    \(t) silu_out = mul(x=gate, y=sg)[name=string("silu")];
+            """
+        case .none:
+            return "\(t) silu_out = identity(x=gate)[name=string(\"silu\")];"
+        }
+    }
+}
+
 public func buildSwiGLUDownMILText(
     inputDim: Int, hiddenDim: Int, outputDim: Int, sequenceLength: Int,
-    gateOffset: UInt64, upOffset: UInt64, downOffset: UInt64
+    gateOffset: UInt64, upOffset: UInt64, downOffset: UInt64,
+    activation: ANEActivation = ANESplitConfig.activation,
+    programTag: String = UUID().uuidString
 ) -> String {
     """
     program(1.3)
-    [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+    [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}, {"mlxfast-program-tag", "\(programTag)"}})]
     {
       func main<ios18>(tensor<fp16, [1, \(inputDim), 1, \(sequenceLength)]> x) {
         tensor<fp16, [\(hiddenDim), \(inputDim), 1, 1]> gw = const()[name=string("gw"), val=tensor<fp16, [\(hiddenDim), \(inputDim), 1, 1]>(BLOBFILE(path=string("@model_path/weights/weight.bin"), offset=uint64(\(gateOffset))))];
@@ -312,7 +372,7 @@ public func buildSwiGLUDownMILText(
         int32 gr = const()[name=string("gr"), val=int32(1)];
         tensor<fp16, [1, \(hiddenDim), 1, \(sequenceLength)]> gate = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=gw, x=x)[name=string("gate")];
         tensor<fp16, [1, \(hiddenDim), 1, \(sequenceLength)]> up = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=uw, x=x)[name=string("up")];
-        tensor<fp16, [1, \(hiddenDim), 1, \(sequenceLength)]> silu_out = silu(x=gate)[name=string("silu")];
+        \(activation.milLines(hiddenDim: hiddenDim, sequenceLength: sequenceLength))
         tensor<fp16, [1, \(hiddenDim), 1, \(sequenceLength)]> act = mul(x=silu_out, y=up)[name=string("swiglu")];
         tensor<fp16, [1, \(outputDim), 1, \(sequenceLength)]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=dw, x=act)[name=string("down")];
       } -> (y);
