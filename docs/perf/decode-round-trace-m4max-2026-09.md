@@ -136,3 +136,23 @@ The session eval wall (59081 us, 74.4% of the round) and the session graph
 build (20153 us, 25.4%) together account for essentially the entire round
 (99.8%); every parent/worker/transport bucket combined is under 1,000 us.
 Task 2 is the next step.
+
+## Reading
+
+The protocol is exonerated: every parent, worker, and transport bucket
+combined is about 600 us, under 1% of the round. The excess is inside the
+session. The in-process width-1 reference splits the step build-heavy: at
+context depth ~10k the M=1 row of the verify-width sweep reads build 36.9 ms /
+eval 5.7 ms / total 42.6 ms (`docs/perf/raw-phase-sumTable.txt:90`; the same
+split holds at shallower context, `docs/perf/raw-phase-sumTable.txt:58`, build
+36.0 ms / eval 9.9 ms). That split is the ladder overlapping the GPU with the
+host's graph build, so most of the wall time reads as "build" even though the
+GPU is doing real work underneath it. In this worker trace the same step
+splits eval-heavy instead: build 20.2 ms / eval 59.1 ms. The overlap the
+in-process ladder relies on is not happening in the worker -- the GPU work
+that used to hide under the build window is showing up as wall-clock eval
+time instead. Candidates for Task 2 and Task 3: the worker host thread's
+scheduling class (does the thread doing the build actually get scheduled
+promptly enough to keep submitting into the ladder), and the ladder
+configuration inside the worker (is the same ladder that produces the
+in-process overlap actually engaged there).
