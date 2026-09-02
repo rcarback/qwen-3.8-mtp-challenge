@@ -112,8 +112,8 @@ session=64`); the script exited 0, so no derived bucket was negative.
   63 + 183 + 52 = 614 us.
 
 Note: `forward_excess` above is measured against `reference_us=42600`, a
-debug-build best-of-5 figure (every raw log under `docs/perf/raw-phase-*.txt:6`
-says "Building for debugging..."), while the worker session in this run is a
+debug-build best-of-5 figure. Every raw log under `docs/perf/raw-phase-*.txt:6`
+says "Building for debugging...". The worker session in this run is a
 release build. Some of the 36806 us excess may be build-mode overhead rather
 than real host-thread cost; read the triggers below with that in mind.
 
@@ -146,18 +146,26 @@ Task 2 is the next step.
 
 The protocol is exonerated: every parent, worker, and transport bucket
 combined is about 600 us, under 1% of the round. The excess is inside the
-session. The in-process width-1 reference splits the step build-heavy: at
-context depth ~10k the M=1 row of the verify-width sweep reads build 36.9 ms /
-eval 5.7 ms / total 42.6 ms (`docs/perf/raw-phase-sumTable.txt:90`; the same
-split holds at shallower context, `docs/perf/raw-phase-sumTable.txt:58`, build
-36.0 ms / eval 9.9 ms). That split is the ladder overlapping the GPU with the
-host's graph build, so most of the wall time reads as "build" even though the
-GPU is doing real work underneath it. In this worker trace the same step
-splits eval-heavy instead: build 20.2 ms / eval 59.1 ms. The overlap the
-in-process ladder relies on is not happening in the worker -- the GPU work
-that used to hide under the build window is showing up as wall-clock eval
-time instead. Candidates for Task 2 and Task 3: the worker host thread's
-scheduling class (does the thread doing the build actually get scheduled
-promptly enough to keep submitting into the ladder), and the ladder
-configuration inside the worker (is the same ladder that produces the
-in-process overlap actually engaged there).
+session.
+
+The in-process width-1 reference splits the step build-heavy. At context
+depth ~10k the M=1 row of the verify-width sweep reads build 36.9 ms / eval
+5.7 ms / total 42.6 ms (`docs/perf/raw-phase-sumTable.txt:90`). The same
+split holds at shallower context: build 36.0 ms / eval 9.9 ms
+(`docs/perf/raw-phase-sumTable.txt:58`).
+
+That split is the ladder overlapping the GPU with the host's graph build.
+Most of the wall time reads as "build," even though the GPU is doing real
+work underneath it.
+
+In this worker trace the same step splits eval-heavy instead: build 20.2 ms /
+eval 59.1 ms. The overlap the in-process ladder relies on is not happening in
+the worker. The GPU work that used to hide under the build window now shows
+up as wall-clock eval time instead.
+
+Candidates for Task 2 and Task 3: the worker host thread's scheduling class,
+and the ladder configuration inside the worker. For scheduling class, check
+whether the thread doing the build actually gets scheduled promptly enough
+to keep submitting into the ladder. For the ladder, check whether the same
+ladder that produces the in-process overlap is actually engaged in the
+worker.
