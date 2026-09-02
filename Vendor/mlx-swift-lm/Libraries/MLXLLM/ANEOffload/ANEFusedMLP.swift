@@ -11,6 +11,7 @@
 // interface is generic over what op the loaded program actually computes --
 // reused as-is, no duplicated padding/scatter-gather logic). See
 // `.superpowers/sdd/2026-08-31-ane-iosurface-procedure-bank/task-B-brief.md`.
+import CryptoKit
 import Foundation
 import MLX
 
@@ -39,10 +40,21 @@ public final class ANEFusedMLP {
         self.sequenceLength = sequenceLength
 
         let (blob, offsets) = buildMultiWeightBlob(chunks: [f16Bytes(gate), f16Bytes(up), f16Bytes(down)])
+        // The program identity the ANE runtime derives covers the MIL text
+        // only, so the tag stamped into `buildInfo` is what separates one
+        // layer's program from another's (see `ANEInMemoryModel`). A random
+        // tag did that, but it also made every process's 64 programs new to
+        // the ANE daemon's compiled-program cache: ~100 MB each, never hit
+        // again, ~6 GB of root-owned cache per hybrid process. Hashing the
+        // weight blob instead gives the same program the same identity in
+        // every process, so a rebuild of an unchanged layer at the same
+        // shape and activation is a cache hit: no recompile, no growth.
+        // Shape and activation are already in the text the hash sits in.
+        let programTag = "sha256:" + SHA256.hash(data: blob).map { String(format: "%02x", $0) }.joined()
         let milText = buildSwiGLUDownMILText(
             inputDim: hidden, hiddenDim: innerFraction, outputDim: hidden, sequenceLength: sequenceLength,
             gateOffset: offsets[0], upOffset: offsets[1], downOffset: offsets[2],
-            activation: activation
+            activation: activation, programTag: programTag
         )
         let m = try ANEInMemoryModel(milText: milText, weightBlob: blob, weightFileName: "weight.bin")
         try m.compile()
