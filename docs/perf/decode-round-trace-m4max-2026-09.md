@@ -123,8 +123,9 @@ than real host-thread cost; read the triggers below with that in mind.
   graph build is at least 5,000 us. Both conditions hold (36806 us and
   20153 us respectively) -- **Task 2 runs.**
 - Task 3 (command-buffer and ladder arms) runs if forward excess is still at
-  least 5,000 us after Task 2. Not yet evaluated -- Task 2 has not run yet.
-  **Pending Task 2's outcome.**
+  least 5,000 us after Task 2. After Task 2 the forward excess is 36,350 us
+  (see the Task 2 section) -- **Task 3 runs.** Its result is in the Task 3
+  section.
 - Task 4 (serial prefetch across the protocol gap) runs if the outside-session
   total is at least 4,000 us. 614 us is well under that threshold --
   **Task 4 does not run.**
@@ -234,14 +235,67 @@ run-to-run spread, and no bucket outside the session moved by more than
 100 us. `MLX_MTP_HOST_QOS` stays unset by default and stays unset for the
 Task 3 arms.
 
-The split inside the session did move. The host thread's CPU time halved
-(21.3 ms to 11.3 ms) and the graph-build bucket halved with it, while the
-eval-wall bucket grew by the same amount. The round total did not change. This means
-about 10 ms of the Task 1 "build" bucket was host scheduling that overlapped
-GPU work already in flight, not build work on the critical path. With the
-host thread promoted, that time shows up as waiting on the GPU instead. The
-round is bounded by the GPU work the session submits (about 68 ms of eval
-wall at width 1), not by host scheduling.
+The split inside the session did move: the host thread's CPU time halved
+(21.3 ms to 11.3 ms), the graph-build bucket halved with it, and the
+eval-wall bucket grew by the same amount. The round total did not change.
+The Task 3 arm A run below, same session and default QoS, reads build
+6.2 ms and eval wall 75.5 ms. The build/eval split is therefore run
+dependent, not QoS dependent. Only the sum (build + eval + readout) is
+stable across runs, at 79 to 83 ms. The round is bounded by the GPU work
+the session submits, not by host scheduling.
 
 Forward excess after Task 2 is 36,350 us, above the 5,000 us trigger, so
 Task 3 (command-buffer and ladder arms) runs.
+
+## Task 3: command-buffer and ladder arms (2026-09-02, gated runs)
+
+Five arms, each one wrapper run with the Task 1 Step 10 environment, default
+QoS (Task 2 did not win), and its own trace path. Arm A is the same-session,
+same-build baseline with no extra variables, run after the five arms. Every
+run reads `all_tokens_matched=true` on both legs.
+
+Thermal gate: arm B released at 39.6C, 39.9C and 39.2C. Arms C, D, E, F and A
+hit the implausible 1.6C sensor reading on every gate (the Task 1 caveat) and
+released after 0 to 20 s. Treat differences under 2% between those runs as
+noise.
+
+Lower medians over the 64 depth-0 rounds, in microseconds.
+
+| arm | variables | build | eval wall | build+eval+readout | parent round | host cpu | serial s/token | MTP s/token |
+|---|---|---|---|---|---|---|---|---|
+| Task 1 | (worktree, 2026-09-02 01:04) | 20153 | 59081 | 79406 | 79424 | 21297 | 0.131461 | 0.082493 |
+| Task 2 | `MLX_MTP_HOST_QOS=interactive` | 10565 | 68275 | 78950 | 80780 | 11285 | 0.135635 | 0.080477 |
+| A | none (same-session baseline) | 6214 | 75466 | 81716 | 81864 | 6665 | 0.135173 | 0.081435 |
+| B | `MLX_MAX_OPS_PER_BUFFER=200 MLX_MAX_MB_PER_BUFFER=50` | 13940 | 66355 | 80490 | 81074 | 14835 | 0.134412 | 0.085425 |
+| C | `MLX_MAX_OPS_PER_BUFFER=1000 MLX_MAX_MB_PER_BUFFER=500` | 7732 | 71945 | 79749 | 81899 | 8242 | 0.134442 | 0.080992 |
+| D | `MLX_QWEN_MTP_LADDER=off` | 3185 | 79506 | 82733 | 82777 | 6876 | 0.135126 | 0.081337 |
+| E | `MLX_QWEN_MTP_LADDER=front` | 3231 | 78987 | 82259 | 82309 | 6671 | 0.138804 | 0.083288 |
+| F | `MLX_QWEN_MTP_LADDER=dense` | 6477 | 75422 | 81936 | 82116 | 0.135665 | 0.081627 |
+
+The `mtp-cache:` line confirms each ladder arm engaged (`ladder=off`,
+`ladder=front`, `ladder=dense`); the command-buffer arms keep `ladder=default`.
+Arm D's derived closure bucket reads -2 us. The summary script exits 1 on any
+negative derived bucket. Here the value is the rounding of independently
+taken lower medians, two microseconds on an 82,777 us round, not a missing
+stamp. Its table is complete and is used as printed.
+
+Raw records: `docs/perf/raw-round-trace-2026-09-02-arm-{A,B,C,D,E,F}.log`.
+`bash tools/mtp-round-trace-summary.sh <file>` reproduces each row.
+
+### Decision
+
+No arm cleared 1,000 us. Against arm A (81,864 us), the closest arm is B at
+-790 us, under the margin and inside the sensor-caveat band. Against Task 1
+(79,424 us), every arm is slower. `tools/mtp-host-env.sh` is not created.
+`MLX_MAX_OPS_PER_BUFFER`, `MLX_MAX_MB_PER_BUFFER` and `MLX_QWEN_MTP_LADDER`
+stay unset by default.
+
+The ladder arms move time between the build and eval buckets (arm D:
+3.2 ms build, 79.5 ms eval) without moving the sum. This is the same shape
+as Task 2. The host is not on the critical path at width 1. The 36 to
+40 ms "forward excess" over the in-process 42.6 ms reference is GPU
+execution time the in-process reference hid under its ladder overlap, plus
+whatever debug-versus-release build difference that reference carries. The
+host-synchronization plan closes here: Task 4 did not fire, and neither
+host lever moved the round. The next lever is the GPU work inside the
+width-1 step itself.

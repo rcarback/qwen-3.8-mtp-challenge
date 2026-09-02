@@ -1,0 +1,364 @@
+mtp-trace: begin seed=512 build_us=1760161 eval_wall_us=1791815 wall_us=3551977 cpu_us=10214
+mtp-cache: layers=64 first4=MambaCache,MambaCache,MambaCache,KVCacheSimple kv_policy=bf16 ladder=dense compiled_decode=true
+mtp-row: pos=513 ids=550,248068 v=0x1.88p+4,0x1.68p+4
+mtp-trace0: round=1 offered=0 build_us=12372 eval_wall_us=25596 readout_us=69 round_us=38037 host_thread_cpu_ns=7983792 t0_ns=134007970931750 t_eval_done_ns=134008008900291
+mtp-worker: id=3 offered=0 decode_us=18 handle_us=38078 encode_us=47 write_us=5 worker_us=38149 bytes=261 t_read_ns=134007970912083 t_written_ns=134008009061875
+mtp-parent: round=1 offered=0 encode_write_us=20 wait_us=38178 decode_us=46 round_us=38251 gap_us=0 bytes=261 t0_ns=134007970877791 t1_ns=134008009129083
+mtp-row: pos=514 ids=38643,220 v=0x1.88p+4,0x1.dp+3
+mtp-trace0: round=2 offered=0 build_us=6780 eval_wall_us=30732 readout_us=48 round_us=37561 host_thread_cpu_ns=7127541 t0_ns=134008009292208 t_eval_done_ns=134008046805208
+mtp-worker: id=4 offered=0 decode_us=17 handle_us=37574 encode_us=23 write_us=4 worker_us=37619 bytes=260 t_read_ns=134008009274166 t_written_ns=134008046893916
+mtp-parent: round=2 offered=0 encode_write_us=17 wait_us=37643 decode_us=36 round_us=37702 gap_us=114 bytes=260 t0_ns=134008009243916 t1_ns=134008046946083
+mtp-row: pos=515 ids=2022,12415 v=0x1.9ep+4,0x1.acp+3
+mtp-trace0: round=3 offered=0 build_us=6504 eval_wall_us=34833 readout_us=39 round_us=41377 host_thread_cpu_ns=6784334 t0_ns=134008047003708 t_eval_done_ns=134008088341750
+mtp-worker: id=5 offered=0 decode_us=15 handle_us=41393 encode_us=19 write_us=3 worker_us=41432 bytes=267 t_read_ns=134008046987666 t_written_ns=134008088419666
+mtp-parent: round=3 offered=0 encode_write_us=14 wait_us=41453 decode_us=35 round_us=41506 gap_us=15 bytes=267 t0_ns=134008046961166 t1_ns=134008088467708
+mtp-row: pos=516 ids=28286,198 v=0x1.dep+4,0x1.0ep+4
+mtp-trace0: round=4 offered=0 build_us=7179 eval_wall_us=42172 readout_us=51 round_us=49403 host_thread_cpu_ns=7498125 t0_ns=134008088528666 t_eval_done_ns=134008137880916
+mtp-worker: id=6 offered=0 decode_us=20 handle_us=49419 encode_us=25 write_us=4 worker_us=49469 bytes=265 t_read_ns=134008088507041 t_written_ns=134008137976625
+mtp-parent: round=4 offered=0 encode_write_us=12 wait_us=49493 decode_us=49 round_us=49561 gap_us=14 bytes=265 t0_ns=134008088481791 t1_ns=134008138043500
+mtp-row: pos=517 ids=198,271 v=0x1.b8p+4,0x1.0ap+4
+mtp-trace0: round=5 offered=0 build_us=7194 eval_wall_us=53632 readout_us=39 round_us=60866 host_thread_cpu_ns=7515791 t0_ns=134008138110833 t_eval_done_ns=134008198937833
+mtp-worker: id=7 offered=0 decode_us=19 handle_us=60881 encode_us=21 write_us=3 worker_us=60925 bytes=262 t_read_ns=134008138090875 t_written_ns=134008199016375
+mtp-parent: round=5 offered=0 encode_write_us=20 wait_us=60948 decode_us=38 round_us=61011 gap_us=13 bytes=262 t0_ns=134008138057083 t1_ns=134008199068166
+mtp-row: pos=518 ids=760,550 v=0x1.eep+4,0x1p+4
+mtp-trace0: round=6 offered=0 build_us=7668 eval_wall_us=74895 readout_us=95 round_us=82659 host_thread_cpu_ns=8254167 t0_ns=134008199123041 t_eval_done_ns=134008281686958
+mtp-worker: id=8 offered=0 decode_us=15 handle_us=82684 encode_us=46 write_us=6 worker_us=82753 bytes=258 t_read_ns=134008199107000 t_written_ns=134008281860208
+mtp-parent: round=6 offered=0 encode_write_us=13 wait_us=82789 decode_us=64 round_us=82876 gap_us=12 bytes=258 t0_ns=134008199080791 t1_ns=134008281957708
+mtp-row: pos=519 ids=21568,85683 v=0x1.e8p+4,0x1.f4p+3
+mtp-trace0: round=7 offered=0 build_us=8868 eval_wall_us=106821 readout_us=51 round_us=115742 host_thread_cpu_ns=9418167 t0_ns=134008282031916 t_eval_done_ns=134008397722250
+mtp-worker: id=9 offered=0 decode_us=19 handle_us=115758 encode_us=27 write_us=4 worker_us=115810 bytes=264 t_read_ns=134008282010875 t_written_ns=134008397821375
+mtp-parent: round=7 offered=0 encode_write_us=20 wait_us=115841 decode_us=41 round_us=115909 gap_us=17 bytes=264 t0_ns=134008281974958 t1_ns=134008397884125
+mtp-row: pos=520 ids=1118,3765 v=0x1.eap+4,0x1.f2p+3
+mtp-trace0: round=8 offered=0 build_us=8245 eval_wall_us=93271 readout_us=42 round_us=101559 host_thread_cpu_ns=8583458 t0_ns=134008397954208 t_eval_done_ns=134008499471875
+mtp-worker: id=10 offered=0 decode_us=18 handle_us=101583 encode_us=17 write_us=3 worker_us=101623 bytes=268 t_read_ns=134008397934666 t_written_ns=134008499558208
+mtp-parent: round=8 offered=0 encode_write_us=16 wait_us=101647 decode_us=29 round_us=101696 gap_us=20 bytes=268 t0_ns=134008397904291 t1_ns=134008499600458
+mtp-row: pos=521 ids=84828,25419 v=0x1.dp+4,0x1.06p+4
+mtp-trace0: round=9 offered=0 build_us=6693 eval_wall_us=76563 readout_us=51 round_us=83308 host_thread_cpu_ns=7009042 t0_ns=134008499667916 t_eval_done_ns=134008582924875
+mtp-worker: id=11 offered=0 decode_us=27 handle_us=83323 encode_us=27 write_us=4 worker_us=83383 bytes=264 t_read_ns=134008499639083 t_written_ns=134008583022500
+mtp-parent: round=9 offered=0 encode_write_us=16 wait_us=83404 decode_us=24 round_us=83448 gap_us=9 bytes=264 t0_ns=134008499609583 t1_ns=134008583057833
+mtp-row: pos=522 ids=421,279 v=0x1.cp+4,0x1.ep+3
+mtp-trace0: round=10 offered=0 build_us=6446 eval_wall_us=65757 readout_us=45 round_us=72249 host_thread_cpu_ns=6732584 t0_ns=134008583097583 t_eval_done_ns=134008655301666
+mtp-worker: id=12 offered=0 decode_us=11 handle_us=72266 encode_us=22 write_us=3 worker_us=72304 bytes=257 t_read_ns=134008583085916 t_written_ns=134008655390375
+mtp-parent: round=10 offered=0 encode_write_us=9 wait_us=72324 decode_us=38 round_us=72375 gap_us=9 bytes=257 t0_ns=134008583066875 t1_ns=134008655442500
+mtp-row: pos=523 ids=279,264 v=0x1.bap+4,0x1.7ep+3
+mtp-trace0: round=11 offered=0 build_us=6723 eval_wall_us=68404 readout_us=39 round_us=75168 host_thread_cpu_ns=7052000 t0_ns=134008655485500 t_eval_done_ns=134008730613791
+mtp-worker: id=13 offered=0 decode_us=12 handle_us=75190 encode_us=17 write_us=2 worker_us=75222 bytes=264 t_read_ns=134008655472833 t_written_ns=134008730695750
+mtp-parent: round=11 offered=0 encode_write_us=10 wait_us=75239 decode_us=27 round_us=75280 gap_us=8 bytes=264 t0_ns=134008655451083 t1_ns=134008730731666
+mtp-row: pos=524 ids=5604,21118 v=0x1.dap+4,0x1.0ap+4
+mtp-trace0: round=12 offered=0 build_us=6565 eval_wall_us=73508 readout_us=40 round_us=80114 host_thread_cpu_ns=6845750 t0_ns=134008730772166 t_eval_done_ns=134008810846375
+mtp-worker: id=14 offered=0 decode_us=13 handle_us=80130 encode_us=24 write_us=3 worker_us=80170 bytes=266 t_read_ns=134008730758791 t_written_ns=134008810929166
+mtp-parent: round=12 offered=0 encode_write_us=10 wait_us=80189 decode_us=33 round_us=80237 gap_us=7 bytes=266 t0_ns=134008730739625 t1_ns=134008810977041
+mtp-row: pos=525 ids=28336,1558 v=0x1.f2p+4,0x1.2ap+4
+mtp-trace0: round=13 offered=0 build_us=6473 eval_wall_us=79933 readout_us=39 round_us=86446 host_thread_cpu_ns=6749334 t0_ns=134008811026541 t_eval_done_ns=134008897433416
+mtp-worker: id=15 offered=0 decode_us=14 handle_us=86460 encode_us=16 write_us=2 worker_us=86494 bytes=267 t_read_ns=134008811011833 t_written_ns=134008897506541
+mtp-parent: round=13 offered=0 encode_write_us=14 wait_us=86516 decode_us=27 round_us=86561 gap_us=9 bytes=267 t0_ns=134008810986875 t1_ns=134008897548166
+mtp-row: pos=526 ids=11,44424 v=0x1.dep+4,0x1.a4p+3
+mtp-trace0: round=14 offered=0 build_us=6466 eval_wall_us=80419 readout_us=34 round_us=86920 host_thread_cpu_ns=6778125 t0_ns=134008897593541 t_eval_done_ns=134008984479333
+mtp-worker: id=16 offered=0 decode_us=14 handle_us=86940 encode_us=15 write_us=5 worker_us=86974 bytes=266 t_read_ns=134008897578958 t_written_ns=134008984553916
+mtp-parent: round=14 offered=0 encode_write_us=11 wait_us=86994 decode_us=23 round_us=87031 gap_us=8 bytes=266 t0_ns=134008897557041 t1_ns=134008984589000
+mtp-row: pos=527 ids=44424,82637 v=0x1.eep+4,0x1p+4
+mtp-trace0: round=15 offered=0 build_us=6436 eval_wall_us=76240 readout_us=35 round_us=82713 host_thread_cpu_ns=6731958 t0_ns=134008984625333 t_eval_done_ns=134009067302958
+mtp-worker: id=17 offered=0 decode_us=10 handle_us=82727 encode_us=15 write_us=2 worker_us=82756 bytes=262 t_read_ns=134008984614541 t_written_ns=134009067370833
+mtp-parent: round=15 offered=0 encode_write_us=9 wait_us=82775 decode_us=25 round_us=82813 gap_us=7 bytes=262 t0_ns=134008984596250 t1_ns=134009067410083
+mtp-row: pos=528 ids=3425,999 v=0x1.f8p+4,0x1.04p+4
+mtp-trace0: round=16 offered=0 build_us=6439 eval_wall_us=77768 readout_us=36 round_us=84245 host_thread_cpu_ns=6726333 t0_ns=134009067463333 t_eval_done_ns=134009151671750
+mtp-worker: id=18 offered=0 decode_us=14 handle_us=84258 encode_us=15 write_us=3 worker_us=84292 bytes=263 t_read_ns=134009067449000 t_written_ns=134009151741166
+mtp-parent: round=16 offered=0 encode_write_us=9 wait_us=84313 decode_us=29 round_us=84360 gap_us=18 bytes=263 t0_ns=134009067429000 t1_ns=134009151789208
+mtp-row: pos=529 ids=11,7658 v=0x1.d6p+4,0x1.a2p+3
+mtp-trace0: round=17 offered=0 build_us=6514 eval_wall_us=75859 readout_us=34 round_us=82409 host_thread_cpu_ns=6803625 t0_ns=134009151830333 t_eval_done_ns=134009234204916
+mtp-worker: id=19 offered=0 decode_us=10 handle_us=82425 encode_us=14 write_us=2 worker_us=82453 bytes=265 t_read_ns=134009151819625 t_written_ns=134009234272666
+mtp-parent: round=17 offered=0 encode_write_us=12 wait_us=82475 decode_us=40 round_us=82533 gap_us=8 bytes=265 t0_ns=134009151797625 t1_ns=134009234330666
+mtp-row: pos=530 ids=7658,15710 v=0x1.02p+5,0x1.22p+4
+mtp-trace0: round=18 offered=0 build_us=6431 eval_wall_us=74037 readout_us=73 round_us=80542 host_thread_cpu_ns=6760291 t0_ns=134009234387333 t_eval_done_ns=134009314856166
+mtp-worker: id=20 offered=0 decode_us=13 handle_us=80568 encode_us=38 write_us=7 worker_us=80627 bytes=264 t_read_ns=134009234373375 t_written_ns=134009315001166
+mtp-parent: round=18 offered=0 encode_write_us=18 wait_us=80661 decode_us=62 round_us=80750 gap_us=13 bytes=264 t0_ns=134009234344083 t1_ns=134009315094375
+mtp-row: pos=531 ids=4528,14040 v=0x1.dap+4,0x1.d6p+3
+mtp-trace0: round=19 offered=0 build_us=7230 eval_wall_us=76329 readout_us=37 round_us=83598 host_thread_cpu_ns=7533834 t0_ns=134009315172291 t_eval_done_ns=134009398732750
+mtp-worker: id=21 offered=0 decode_us=16 handle_us=83611 encode_us=18 write_us=3 worker_us=83650 bytes=268 t_read_ns=134009315154625 t_written_ns=134009398805291
+mtp-parent: round=19 offered=0 encode_write_us=31 wait_us=83673 decode_us=30 round_us=83739 gap_us=16 bytes=268 t0_ns=134009315110375 t1_ns=134009398850208
+mtp-row: pos=532 ids=14040,855 v=0x1.f6p+4,0x1.0ap+4
+mtp-trace0: round=20 offered=0 build_us=6516 eval_wall_us=76381 readout_us=42 round_us=82940 host_thread_cpu_ns=6803833 t0_ns=134009398897166 t_eval_done_ns=134009481795291
+mtp-worker: id=22 offered=0 decode_us=12 handle_us=82966 encode_us=17 write_us=2 worker_us=82999 bytes=266 t_read_ns=134009398883875 t_written_ns=134009481883500
+mtp-parent: round=20 offered=0 encode_write_us=13 wait_us=83016 decode_us=31 round_us=83064 gap_us=9 bytes=266 t0_ns=134009398859708 t1_ns=134009481924000
+mtp-row: pos=533 ids=11,26 v=0x1.e4p+4,0x1.8cp+3
+mtp-trace0: round=21 offered=0 build_us=6498 eval_wall_us=76382 readout_us=36 round_us=82917 host_thread_cpu_ns=6769209 t0_ns=134009481970750 t_eval_done_ns=134009564851375
+mtp-worker: id=23 offered=0 decode_us=13 handle_us=82933 encode_us=16 write_us=3 worker_us=82967 bytes=262 t_read_ns=134009481956791 t_written_ns=134009564924458
+mtp-parent: round=21 offered=0 encode_write_us=11 wait_us=82987 decode_us=28 round_us=83031 gap_us=10 bytes=262 t0_ns=134009481934666 t1_ns=134009564966208
+mtp-row: pos=534 ids=321,18626 v=0x1.02p+5,0x1.26p+4
+mtp-trace0: round=22 offered=0 build_us=6464 eval_wall_us=75367 readout_us=34 round_us=81866 host_thread_cpu_ns=6743667 t0_ns=134009565007458 t_eval_done_ns=134009646838666
+mtp-worker: id=24 offered=0 decode_us=11 handle_us=81882 encode_us=14 write_us=3 worker_us=81911 bytes=263 t_read_ns=134009564996125 t_written_ns=134009646907375
+mtp-parent: round=22 offered=0 encode_write_us=10 wait_us=81934 decode_us=27 round_us=81975 gap_us=8 bytes=263 t0_ns=134009564975166 t1_ns=134009646950750
+mtp-row: pos=535 ids=18626,9041 v=0x1.eap+4,0x1.2p+4
+mtp-trace0: round=23 offered=0 build_us=6544 eval_wall_us=74045 readout_us=42 round_us=80632 host_thread_cpu_ns=6826375 t0_ns=134009647005750 t_eval_done_ns=134009727595500
+mtp-worker: id=25 offered=0 decode_us=17 handle_us=80661 encode_us=21 write_us=3 worker_us=80703 bytes=262 t_read_ns=134009646988000 t_written_ns=134009727691791
+mtp-parent: round=23 offered=0 encode_write_us=12 wait_us=80725 decode_us=25 round_us=80765 gap_us=13 bytes=262 t0_ns=134009646963750 t1_ns=134009727729208
+mtp-row: pos=536 ids=6522,19573 v=0x1.ep+4,0x1.cep+3
+mtp-trace0: round=24 offered=0 build_us=6445 eval_wall_us=74239 readout_us=33 round_us=80718 host_thread_cpu_ns=6709916 t0_ns=134009727775166 t_eval_done_ns=134009808459958
+mtp-worker: id=26 offered=0 decode_us=13 handle_us=80733 encode_us=22 write_us=3 worker_us=80773 bytes=265 t_read_ns=134009727761583 t_written_ns=134009808534625
+mtp-parent: round=24 offered=0 encode_write_us=16 wait_us=80792 decode_us=28 round_us=80839 gap_us=7 bytes=265 t0_ns=134009727736833 t1_ns=134009808576125
+mtp-row: pos=537 ids=2353,8798 v=0x1.f6p+4,0x1.dep+3
+mtp-trace0: round=25 offered=0 build_us=6511 eval_wall_us=75484 readout_us=37 round_us=82033 host_thread_cpu_ns=6891959 t0_ns=134009808616375 t_eval_done_ns=134009890611916
+mtp-worker: id=27 offered=0 decode_us=13 handle_us=82055 encode_us=16 write_us=3 worker_us=82089 bytes=267 t_read_ns=134009808602583 t_written_ns=134009890691625
+mtp-parent: round=25 offered=0 encode_write_us=10 wait_us=82110 decode_us=31 round_us=82155 gap_us=7 bytes=267 t0_ns=134009808583166 t1_ns=134009890738416
+mtp-row: pos=538 ids=279,21118 v=0x1.e4p+4,0x1.d8p+3
+mtp-trace0: round=26 offered=0 build_us=6506 eval_wall_us=77942 readout_us=38 round_us=84488 host_thread_cpu_ns=6799000 t0_ns=134009890789500 t_eval_done_ns=134009975238750
+mtp-worker: id=28 offered=0 decode_us=17 handle_us=84502 encode_us=18 write_us=3 worker_us=84541 bytes=264 t_read_ns=134009890772000 t_written_ns=134009975313541
+mtp-parent: round=26 offered=0 encode_write_us=13 wait_us=84563 decode_us=34 round_us=84613 gap_us=8 bytes=264 t0_ns=134009890747166 t1_ns=134009975361000
+mtp-row: pos=539 ids=21118,80946 v=0x1.02p+5,0x1.46p+4
+mtp-trace0: round=27 offered=0 build_us=6474 eval_wall_us=75330 readout_us=41 round_us=81845 host_thread_cpu_ns=6763875 t0_ns=134009975400833 t_eval_done_ns=134010057205625
+mtp-worker: id=29 offered=0 decode_us=12 handle_us=81859 encode_us=16 write_us=2 worker_us=81891 bytes=266 t_read_ns=134009975387958 t_written_ns=134010057279875
+mtp-parent: round=27 offered=0 encode_write_us=9 wait_us=81910 decode_us=25 round_us=81949 gap_us=7 bytes=266 t0_ns=134009975368458 t1_ns=134010057318291
+mtp-row: pos=540 ids=6343,2124 v=0x1.d4p+4,0x1.ep+3
+mtp-trace0: round=28 offered=0 build_us=6448 eval_wall_us=75520 readout_us=38 round_us=82007 host_thread_cpu_ns=6740000 t0_ns=134010057356875 t_eval_done_ns=134010139326291
+mtp-worker: id=30 offered=0 decode_us=11 handle_us=82030 encode_us=17 write_us=3 worker_us=82061 bytes=262 t_read_ns=134010057345416 t_written_ns=134010139407333
+mtp-parent: round=28 offered=0 encode_write_us=10 wait_us=82077 decode_us=25 round_us=82116 gap_us=7 bytes=262 t0_ns=134010057325875 t1_ns=134010139442416
+mtp-row: pos=541 ids=13,25 v=0x1.cep+4,0x1.8ep+3
+mtp-trace0: round=29 offered=0 build_us=6517 eval_wall_us=76584 readout_us=35 round_us=83137 host_thread_cpu_ns=6800209 t0_ns=134010139480041 t_eval_done_ns=134010222582000
+mtp-worker: id=31 offered=0 decode_us=10 handle_us=83152 encode_us=15 write_us=3 worker_us=83182 bytes=263 t_read_ns=134010139468958 t_written_ns=134010222651500
+mtp-parent: round=29 offered=0 encode_write_us=10 wait_us=83200 decode_us=32 round_us=83246 gap_us=8 bytes=263 t0_ns=134010139450416 t1_ns=134010222696875
+mtp-row: pos=542 ids=1049,2064 v=0x1.0cp+5,0x1.24p+4
+mtp-trace0: round=30 offered=0 build_us=6430 eval_wall_us=72378 readout_us=51 round_us=78860 host_thread_cpu_ns=6731958 t0_ns=134010222742375 t_eval_done_ns=134010301550541
+mtp-worker: id=32 offered=0 decode_us=14 handle_us=78880 encode_us=26 write_us=5 worker_us=78926 bytes=261 t_read_ns=134010222727875 t_written_ns=134010301654791
+mtp-parent: round=30 offered=0 encode_write_us=10 wait_us=78951 decode_us=40 round_us=79006 gap_us=9 bytes=261 t0_ns=134010222706083 t1_ns=134010301712625
+mtp-row: pos=543 ids=1179,20269 v=0x1.06p+5,0x1.f2p+3
+mtp-trace0: round=31 offered=0 build_us=6946 eval_wall_us=76493 readout_us=38 round_us=83478 host_thread_cpu_ns=7239333 t0_ns=134010301779458 t_eval_done_ns=134010385219666
+mtp-worker: id=33 offered=0 decode_us=13 handle_us=83492 encode_us=17 write_us=3 worker_us=83526 bytes=267 t_read_ns=134010301765166 t_written_ns=134010385291625
+mtp-parent: round=31 offered=0 encode_write_us=12 wait_us=83546 decode_us=27 round_us=83590 gap_us=28 bytes=267 t0_ns=134010301740916 t1_ns=134010385331875
+mtp-row: pos=544 ids=20269,25822 v=0x1.ccp+4,0x1p+4
+mtp-trace0: round=32 offered=0 build_us=6507 eval_wall_us=75800 readout_us=45 round_us=82353 host_thread_cpu_ns=6823167 t0_ns=134010385382125 t_eval_done_ns=134010467690458
+mtp-worker: id=34 offered=0 decode_us=13 handle_us=82367 encode_us=19 write_us=3 worker_us=82404 bytes=263 t_read_ns=134010385367833 t_written_ns=134010467771833
+mtp-parent: round=32 offered=0 encode_write_us=11 wait_us=82423 decode_us=25 round_us=82464 gap_us=13 bytes=263 t0_ns=134010385345708 t1_ns=134010467809750
+mtp-row: pos=545 ids=279,22773 v=0x1.dcp+4,0x1.ccp+3
+mtp-trace0: round=33 offered=0 build_us=6588 eval_wall_us=74865 readout_us=37 round_us=81491 host_thread_cpu_ns=6874750 t0_ns=134010467850291 t_eval_done_ns=134010549304250
+mtp-worker: id=35 offered=0 decode_us=12 handle_us=81503 encode_us=16 write_us=3 worker_us=81536 bytes=266 t_read_ns=134010467837166 t_written_ns=134010549373375
+mtp-parent: round=33 offered=0 encode_write_us=11 wait_us=81553 decode_us=23 round_us=81590 gap_us=7 bytes=266 t0_ns=134010467817666 t1_ns=134010549408250
+mtp-row: pos=546 ids=22773,15625 v=0x1.12p+5,0x1.24p+4
+mtp-trace0: round=34 offered=0 build_us=6421 eval_wall_us=77074 readout_us=34 round_us=83530 host_thread_cpu_ns=6697167 t0_ns=134010549447708 t_eval_done_ns=134010632943833
+mtp-worker: id=36 offered=0 decode_us=12 handle_us=83543 encode_us=14 write_us=2 worker_us=83573 bytes=265 t_read_ns=134010549435041 t_written_ns=134010633008583
+mtp-parent: round=34 offered=0 encode_write_us=10 wait_us=83591 decode_us=22 round_us=83626 gap_us=7 bytes=265 t0_ns=134010549415500 t1_ns=134010633042208
+mtp-row: pos=547 ids=13914,20467 v=0x1.eap+4,0x1.cep+3
+mtp-trace0: round=35 offered=0 build_us=6482 eval_wall_us=75184 readout_us=37 round_us=81704 host_thread_cpu_ns=6763416 t0_ns=134010633078541 t_eval_done_ns=134010714746041
+mtp-worker: id=37 offered=0 decode_us=11 handle_us=81721 encode_us=16 write_us=3 worker_us=81752 bytes=270 t_read_ns=134010633066750 t_written_ns=134010714819166
+mtp-parent: round=35 offered=0 encode_write_us=9 wait_us=81766 decode_us=28 round_us=81807 gap_us=6 bytes=270 t0_ns=134010633048916 t1_ns=134010714856458
+mtp-row: pos=548 ids=321,11 v=0x1.bcp+4,0x1.b8p+3
+mtp-trace0: round=36 offered=0 build_us=6472 eval_wall_us=77402 readout_us=35 round_us=83911 host_thread_cpu_ns=6741750 t0_ns=134010714909000 t_eval_done_ns=134010798784333
+mtp-worker: id=38 offered=0 decode_us=13 handle_us=83931 encode_us=15 write_us=3 worker_us=83964 bytes=262 t_read_ns=134010714894833 t_written_ns=134010798859000
+mtp-parent: round=36 offered=0 encode_write_us=17 wait_us=83983 decode_us=25 round_us=84028 gap_us=10 bytes=262 t0_ns=134010714866750 t1_ns=134010798895708
+mtp-row: pos=549 ids=25822,2649 v=0x1.ecp+4,0x1.0cp+4
+mtp-trace0: round=37 offered=0 build_us=6390 eval_wall_us=75277 readout_us=37 round_us=81704 host_thread_cpu_ns=6662000 t0_ns=134010798933583 t_eval_done_ns=134010880601250
+mtp-worker: id=39 offered=0 decode_us=10 handle_us=81722 encode_us=15 write_us=3 worker_us=81751 bytes=264 t_read_ns=134010798922916 t_written_ns=134010880674541
+mtp-parent: round=37 offered=0 encode_write_us=9 wait_us=81766 decode_us=27 round_us=81807 gap_us=8 bytes=264 t0_ns=134010798904208 t1_ns=134010880711416
+mtp-row: pos=550 ids=10756,3817 v=0x1.dcp+4,0x1.2ep+4
+mtp-trace0: round=38 offered=0 build_us=6430 eval_wall_us=73656 readout_us=42 round_us=80129 host_thread_cpu_ns=6703541 t0_ns=134010880748916 t_eval_done_ns=134010960836083
+mtp-worker: id=40 offered=0 decode_us=10 handle_us=80155 encode_us=17 write_us=3 worker_us=80186 bytes=267 t_read_ns=134010880738208 t_written_ns=134010960924458
+mtp-parent: round=38 offered=0 encode_write_us=9 wait_us=80205 decode_us=29 round_us=80246 gap_us=8 bytes=267 t0_ns=134010880720166 t1_ns=134010960966791
+mtp-row: pos=551 ids=14751,5305 v=0x1.fep+4,0x1.12p+4
+mtp-trace0: round=39 offered=0 build_us=6496 eval_wall_us=75424 readout_us=33 round_us=81954 host_thread_cpu_ns=6764416 t0_ns=134010961005208 t_eval_done_ns=134011042925750
+mtp-worker: id=41 offered=0 decode_us=11 handle_us=81970 encode_us=15 write_us=2 worker_us=82000 bytes=268 t_read_ns=134010960993833 t_written_ns=134011042993875
+mtp-parent: round=39 offered=0 encode_write_us=9 wait_us=82019 decode_us=32 round_us=82064 gap_us=8 bytes=268 t0_ns=134010960975166 t1_ns=134011043039916
+mtp-row: pos=552 ids=1931,3438 v=0x1.b6p+4,0x1.0cp+4
+mtp-trace0: round=40 offered=0 build_us=6477 eval_wall_us=76773 readout_us=40 round_us=83290 host_thread_cpu_ns=6746458 t0_ns=134011043079000 t_eval_done_ns=134011126329416
+mtp-worker: id=42 offered=0 decode_us=12 handle_us=83307 encode_us=16 write_us=3 worker_us=83339 bytes=266 t_read_ns=134011043066416 t_written_ns=134011126405875
+mtp-parent: round=40 offered=0 encode_write_us=10 wait_us=83358 decode_us=26 round_us=83398 gap_us=7 bytes=266 t0_ns=134011043047625 t1_ns=134011126446583
+mtp-row: pos=553 ids=3817,10885 v=0x1.eep+4,0x1.dp+3
+mtp-trace0: round=41 offered=0 build_us=6470 eval_wall_us=75402 readout_us=36 round_us=81909 host_thread_cpu_ns=6743666 t0_ns=134011126485541 t_eval_done_ns=134011208358083
+mtp-worker: id=43 offered=0 decode_us=11 handle_us=81925 encode_us=14 write_us=3 worker_us=81955 bytes=265 t_read_ns=134011126473125 t_written_ns=134011208428375
+mtp-parent: round=41 offered=0 encode_write_us=9 wait_us=81974 decode_us=29 round_us=82017 gap_us=8 bytes=265 t0_ns=134011126455041 t1_ns=134011208472166
+mtp-row: pos=554 ids=11988,1716 v=0x1.dep+4,0x1.08p+4
+mtp-trace0: round=42 offered=0 build_us=6425 eval_wall_us=75041 readout_us=72 round_us=81539 host_thread_cpu_ns=6847292 t0_ns=134011208508625 t_eval_done_ns=134011289975833
+mtp-worker: id=44 offered=0 decode_us=10 handle_us=81557 encode_us=31 write_us=6 worker_us=81606 bytes=265 t_read_ns=134011208497583 t_written_ns=134011290104083
+mtp-parent: round=42 offered=0 encode_write_us=10 wait_us=81630 decode_us=54 round_us=81702 gap_us=7 bytes=265 t0_ns=134011208479666 t1_ns=134011290181916
+mtp-row: pos=555 ids=1518,11 v=0x1.04p+5,0x1.eap+3
+mtp-trace0: round=43 offered=0 build_us=7234 eval_wall_us=75422 readout_us=41 round_us=82698 host_thread_cpu_ns=7532542 t0_ns=134011290244333 t_eval_done_ns=134011372901416
+mtp-worker: id=45 offered=0 decode_us=18 handle_us=82718 encode_us=21 write_us=4 worker_us=82762 bytes=264 t_read_ns=134011290225041 t_written_ns=134011372987666
+mtp-parent: round=43 offered=0 encode_write_us=18 wait_us=82786 decode_us=34 round_us=82844 gap_us=12 bytes=264 t0_ns=134011290194416 t1_ns=134011373038500
+mtp-row: pos=556 ids=866,17856 v=0x1.e6p+4,0x1.04p+4
+mtp-trace0: round=44 offered=0 build_us=6632 eval_wall_us=75252 readout_us=36 round_us=81920 host_thread_cpu_ns=6952041 t0_ns=134011373088125 t_eval_done_ns=134011454972291
+mtp-worker: id=46 offered=0 decode_us=15 handle_us=81937 encode_us=16 write_us=3 worker_us=81972 bytes=265 t_read_ns=134011373072041 t_written_ns=134011455044833
+mtp-parent: round=44 offered=0 encode_write_us=12 wait_us=81997 decode_us=34 round_us=82048 gap_us=9 bytes=265 t0_ns=134011373048458 t1_ns=134011455096791
+mtp-row: pos=557 ids=17856,19221 v=0x1.e2p+4,0x1.18p+4
+mtp-trace0: round=45 offered=0 build_us=6508 eval_wall_us=75032 readout_us=35 round_us=81577 host_thread_cpu_ns=6828125 t0_ns=134011455150750 t_eval_done_ns=134011536692208
+mtp-worker: id=47 offered=0 decode_us=14 handle_us=81591 encode_us=15 write_us=3 worker_us=81625 bytes=265 t_read_ns=134011455136041 t_written_ns=134011536761333
+mtp-parent: round=45 offered=0 encode_write_us=19 wait_us=81646 decode_us=26 round_us=81695 gap_us=8 bytes=265 t0_ns=134011455105458 t1_ns=134011536801333
+mtp-row: pos=558 ids=5284,369 v=0x1.eap+4,0x1.e4p+3
+mtp-trace0: round=46 offered=0 build_us=6467 eval_wall_us=75737 readout_us=35 round_us=82240 host_thread_cpu_ns=6745417 t0_ns=134011536867666 t_eval_done_ns=134011619072750
+mtp-worker: id=48 offered=0 decode_us=13 handle_us=82264 encode_us=14 write_us=3 worker_us=82295 bytes=266 t_read_ns=134011536854250 t_written_ns=134011619150208
+mtp-parent: round=46 offered=0 encode_write_us=10 wait_us=82310 decode_us=26 round_us=82350 gap_us=32 bytes=266 t0_ns=134011536833875 t1_ns=134011619184208
+mtp-row: pos=559 ids=369,6306 v=0x1.c4p+4,0x1.c4p+3
+mtp-trace0: round=47 offered=0 build_us=6455 eval_wall_us=76375 readout_us=33 round_us=82863 host_thread_cpu_ns=6726125 t0_ns=134011619231083 t_eval_done_ns=134011702061500
+mtp-worker: id=49 offered=0 decode_us=11 handle_us=82879 encode_us=13 write_us=2 worker_us=82907 bytes=264 t_read_ns=134011619219250 t_written_ns=134011702126541
+mtp-parent: round=47 offered=0 encode_write_us=10 wait_us=82927 decode_us=24 round_us=82965 gap_us=14 bytes=264 t0_ns=134011619198208 t1_ns=134011702163833
+mtp-row: pos=560 ids=6306,2814 v=0x1.0ap+5,0x1.2ep+4
+mtp-trace0: round=48 offered=0 build_us=6432 eval_wall_us=74719 readout_us=38 round_us=81189 host_thread_cpu_ns=6715292 t0_ns=134011702200833 t_eval_done_ns=134011783352125
+mtp-worker: id=50 offered=0 decode_us=11 handle_us=81202 encode_us=15 write_us=2 worker_us=81232 bytes=264 t_read_ns=134011702188958 t_written_ns=134011783421375
+mtp-parent: round=48 offered=0 encode_write_us=9 wait_us=81247 decode_us=26 round_us=81285 gap_us=7 bytes=264 t0_ns=134011702171083 t1_ns=134011783456833
+mtp-row: pos=561 ids=13,271 v=0x1.cp+4,0x1.a8p+3
+mtp-trace0: round=49 offered=0 build_us=6374 eval_wall_us=76153 readout_us=32 round_us=82559 host_thread_cpu_ns=6645125 t0_ns=134011783493916 t_eval_done_ns=134011866021666
+mtp-worker: id=51 offered=0 decode_us=10 handle_us=82575 encode_us=16 write_us=2 worker_us=82604 bytes=258 t_read_ns=134011783483791 t_written_ns=134011866088250
+mtp-parent: round=49 offered=0 encode_write_us=10 wait_us=82621 decode_us=25 round_us=82660 gap_us=7 bytes=258 t0_ns=134011783464083 t1_ns=134011866124250
+mtp-row: pos=562 ids=271,198 v=0x1.dcp+4,0x1.22p+4
+mtp-trace0: round=50 offered=0 build_us=6385 eval_wall_us=76156 readout_us=32 round_us=82574 host_thread_cpu_ns=6654667 t0_ns=134011866158666 t_eval_done_ns=134011948700416
+mtp-worker: id=52 offered=0 decode_us=9 handle_us=82588 encode_us=14 write_us=4 worker_us=82616 bytes=261 t_read_ns=134011866148833 t_written_ns=134011948765666
+mtp-parent: round=50 offered=0 encode_write_us=9 wait_us=82635 decode_us=23 round_us=82671 gap_us=7 bytes=261 t0_ns=134011866131416 t1_ns=134011948802583
+mtp-row: pos=563 ids=550,82040 v=0x1.fcp+4,0x1.0ep+4
+mtp-trace0: round=51 offered=0 build_us=6576 eval_wall_us=74103 readout_us=35 round_us=80714 host_thread_cpu_ns=6860458 t0_ns=134011948841333 t_eval_done_ns=134012029520666
+mtp-worker: id=53 offered=0 decode_us=11 handle_us=80728 encode_us=14 write_us=3 worker_us=80758 bytes=264 t_read_ns=134011948829291 t_written_ns=134012029587791
+mtp-parent: round=51 offered=0 encode_write_us=10 wait_us=80777 decode_us=24 round_us=80814 gap_us=7 bytes=264 t0_ns=134011948809833 t1_ns=134012029624333
+mtp-row: pos=564 ids=59542,34088 v=0x1.e8p+4,0x1.16p+4
+mtp-trace0: round=52 offered=0 build_us=6401 eval_wall_us=77501 readout_us=34 round_us=83938 host_thread_cpu_ns=6667375 t0_ns=134012029660791 t_eval_done_ns=134012113564250
+mtp-worker: id=54 offered=0 decode_us=10 handle_us=83955 encode_us=13 write_us=3 worker_us=83982 bytes=265 t_read_ns=134012029650541 t_written_ns=134012113632708
+mtp-parent: round=52 offered=0 encode_write_us=9 wait_us=84002 decode_us=28 round_us=84043 gap_us=7 bytes=265 t0_ns=134012029631875 t1_ns=134012113675291
+mtp-row: pos=565 ids=52369,36438 v=0x1.02p+5,0x1.26p+4
+mtp-trace0: round=53 offered=0 build_us=6373 eval_wall_us=76934 readout_us=32 round_us=83339 host_thread_cpu_ns=6643667 t0_ns=134012113712125 t_eval_done_ns=134012197019208
+mtp-worker: id=55 offered=0 decode_us=10 handle_us=83356 encode_us=13 write_us=4 worker_us=83383 bytes=268 t_read_ns=134012113701541 t_written_ns=134012197085291
+mtp-parent: round=53 offered=0 encode_write_us=9 wait_us=83398 decode_us=26 round_us=83437 gap_us=7 bytes=268 t0_ns=134012113683250 t1_ns=134012197120833
+mtp-row: pos=566 ids=198,271 v=0x1.cep+4,0x1.ap+3
+mtp-trace0: round=54 offered=0 build_us=6401 eval_wall_us=73674 readout_us=77 round_us=80153 host_thread_cpu_ns=6714250 t0_ns=134012197155458 t_eval_done_ns=134012277230916
+mtp-worker: id=56 offered=0 decode_us=9 handle_us=80173 encode_us=39 write_us=5 worker_us=80227 bytes=261 t_read_ns=134012197145791 t_written_ns=134012277372916
+mtp-parent: round=54 offered=0 encode_write_us=9 wait_us=80253 decode_us=44 round_us=80314 gap_us=7 bytes=261 t0_ns=134012197127875 t1_ns=134012277442458
+mtp-row: pos=567 ids=760,561 v=0x1.ecp+4,0x1.d6p+3
+mtp-trace0: round=55 offered=0 build_us=7094 eval_wall_us=74443 readout_us=41 round_us=81579 host_thread_cpu_ns=7391750 t0_ns=134012277496958 t_eval_done_ns=134012359035166
+mtp-worker: id=57 offered=0 decode_us=15 handle_us=81594 encode_us=20 write_us=4 worker_us=81634 bytes=263 t_read_ns=134012277480500 t_written_ns=134012359115041
+mtp-parent: round=55 offered=0 encode_write_us=15 wait_us=81657 decode_us=33 round_us=81709 gap_us=11 bytes=263 t0_ns=134012277453916 t1_ns=134012359163708
+mtp-row: pos=568 ids=24382,6579 v=0x1.fp+4,0x1.3p+4
+mtp-trace0: round=56 offered=0 build_us=6587 eval_wall_us=77495 readout_us=36 round_us=84118 host_thread_cpu_ns=6870708 t0_ns=134012359214875 t_eval_done_ns=134012443297750
+mtp-worker: id=58 offered=0 decode_us=18 handle_us=84135 encode_us=16 write_us=3 worker_us=84174 bytes=258 t_read_ns=134012359196083 t_written_ns=134012443370416
+mtp-parent: round=56 offered=0 encode_write_us=12 wait_us=84193 decode_us=31 round_us=84240 gap_us=9 bytes=258 t0_ns=134012359173291 t1_ns=134012443413833
+mtp-row: pos=569 ids=3644,2243 v=0x1.ecp+4,0x1.d8p+3
+mtp-trace0: round=57 offered=0 build_us=6459 eval_wall_us=73677 readout_us=32 round_us=80169 host_thread_cpu_ns=6723292 t0_ns=134012443451541 t_eval_done_ns=134012523588833
+mtp-worker: id=59 offered=0 decode_us=10 handle_us=80191 encode_us=14 write_us=3 worker_us=80220 bytes=265 t_read_ns=134012443441083 t_written_ns=134012523661125
+mtp-parent: round=57 offered=0 encode_write_us=10 wait_us=80238 decode_us=24 round_us=80275 gap_us=7 bytes=265 t0_ns=134012443421416 t1_ns=134012523697125
+mtp-row: pos=570 ids=7189,25367 v=0x1.12p+5,0x1.1ap+4
+mtp-trace0: round=58 offered=0 build_us=6478 eval_wall_us=76980 readout_us=41 round_us=83501 host_thread_cpu_ns=6855917 t0_ns=134012523740083 t_eval_done_ns=134012607199500
+mtp-worker: id=60 offered=0 decode_us=11 handle_us=83515 encode_us=16 write_us=3 worker_us=83546 bytes=266 t_read_ns=134012523728666 t_written_ns=134012607274958
+mtp-parent: round=58 offered=0 encode_write_us=14 wait_us=83563 decode_us=25 round_us=83606 gap_us=7 bytes=266 t0_ns=134012523705000 t1_ns=134012607311791
+mtp-row: pos=571 ids=829,279 v=0x1.e2p+4,0x1.f2p+3
+mtp-trace0: round=59 offered=0 build_us=6602 eval_wall_us=75128 readout_us=35 round_us=81766 host_thread_cpu_ns=6890625 t0_ns=134012607350875 t_eval_done_ns=134012689081583
+mtp-worker: id=61 offered=0 decode_us=11 handle_us=81784 encode_us=20 write_us=2 worker_us=81819 bytes=265 t_read_ns=134012607339000 t_written_ns=134012689158750
+mtp-parent: round=59 offered=0 encode_write_us=10 wait_us=81834 decode_us=24 round_us=81873 gap_us=8 bytes=265 t0_ns=134012607319916 t1_ns=134012689193000
+mtp-row: pos=572 ids=7320,37116 v=0x1.02p+5,0x1.6cp+4
+mtp-trace0: round=60 offered=0 build_us=6447 eval_wall_us=75807 readout_us=39 round_us=82294 host_thread_cpu_ns=6737459 t0_ns=134012689226041 t_eval_done_ns=134012771480916
+mtp-worker: id=62 offered=0 decode_us=10 handle_us=82308 encode_us=14 write_us=3 worker_us=82336 bytes=264 t_read_ns=134012689215416 t_written_ns=134012771551958
+mtp-parent: round=60 offered=0 encode_write_us=9 wait_us=82351 decode_us=23 round_us=82388 gap_us=7 bytes=264 t0_ns=134012689200250 t1_ns=134012771588250
+mtp-row: pos=573 ids=37972,72285 v=0x1.06p+5,0x1.16p+4
+mtp-trace0: round=61 offered=0 build_us=6446 eval_wall_us=76408 readout_us=51 round_us=82907 host_thread_cpu_ns=6742750 t0_ns=134012771624791 t_eval_done_ns=134012854479875
+mtp-worker: id=63 offered=0 decode_us=10 handle_us=82917 encode_us=14 write_us=3 worker_us=82945 bytes=267 t_read_ns=134012771613875 t_written_ns=134012854559208
+mtp-parent: round=61 offered=0 encode_write_us=10 wait_us=82962 decode_us=28 round_us=83003 gap_us=7 bytes=267 t0_ns=134012771595541 t1_ns=134012854598958
+mtp-row: pos=574 ids=364,11 v=0x1.cap+4,0x1.a2p+3
+mtp-trace0: round=62 offered=0 build_us=6431 eval_wall_us=76187 readout_us=34 round_us=82652 host_thread_cpu_ns=6702125 t0_ns=134012854634250 t_eval_done_ns=134012937252541
+mtp-worker: id=64 offered=0 decode_us=9 handle_us=82669 encode_us=13 write_us=2 worker_us=82696 bytes=265 t_read_ns=134012854624208 t_written_ns=134012937320708
+mtp-parent: round=62 offered=0 encode_write_us=9 wait_us=82716 decode_us=22 round_us=82752 gap_us=6 bytes=265 t0_ns=134012854605875 t1_ns=134012937358333
+mtp-row: pos=575 ids=279,8097 v=0x1.dap+4,0x1.f4p+3
+mtp-trace0: round=63 offered=0 build_us=6412 eval_wall_us=74622 readout_us=32 round_us=81067 host_thread_cpu_ns=6681042 t0_ns=134012937394083 t_eval_done_ns=134013018429166
+mtp-worker: id=65 offered=0 decode_us=10 handle_us=81080 encode_us=13 write_us=2 worker_us=81107 bytes=264 t_read_ns=134012937383541 t_written_ns=134013018490750
+mtp-parent: round=63 offered=0 encode_write_us=10 wait_us=81126 decode_us=23 round_us=81162 gap_us=6 bytes=264 t0_ns=134012937365250 t1_ns=134013018527791
+mtp-row: pos=576 ids=8097,99159 v=0x1.16p+5,0x1.48p+4
+mtp-trace0: round=64 offered=0 build_us=6432 eval_wall_us=75284 readout_us=30 round_us=81747 host_thread_cpu_ns=6706750 t0_ns=134013018561208 t_eval_done_ns=134013100277708
+mtp-worker: id=66 offered=0 decode_us=9 handle_us=81761 encode_us=13 write_us=2 worker_us=81788 bytes=263 t_read_ns=134013018551166 t_written_ns=134013100339166
+mtp-parent: round=64 offered=0 encode_write_us=9 wait_us=81805 decode_us=24 round_us=81841 gap_us=6 bytes=263 t0_ns=134013018534666 t1_ns=134013100375833
+mtp-trace: begin seed=512 build_us=1760898 eval_wall_us=1788813 wall_us=3549711 cpu_us=10180
+mtp-cache: layers=64 first4=MambaCache,MambaCache,MambaCache,KVCacheSimple kv_policy=bf16 ladder=dense compiled_decode=true
+mtp-row: pos=513 ids=550,248068 v=0x1.88p+4,0x1.68p+4
+mtp-row: pos=514 ids=38643,220 v=0x1.88p+4,0x1.dp+3
+mtp-row: pos=515 ids=2022,12415 v=0x1.9ep+4,0x1.acp+3
+mtp-row: pos=516 ids=28286,198 v=0x1.dep+4,0x1.0ep+4
+mtp-row: pos=517 ids=198,271 v=0x1.b8p+4,0x1.0ap+4
+mtp-trace: round=1 d=4 acc=4 draft_build_us=1080 d_pre_us=78 d_flush_us=40 d_head1_us=123 d_submit1_us=194 d_chain_us=190 d_submit2_us=452 verify_build_us=41624 eval_wall_us=54374 readout_us=25 commit_us=167 upkeep_us=104 round_us=97377 host_thread_cpu_ns=12186709 sel_env=unset sel_fused=0 sel_argpart=0 arm=ship m=5.312500 streak=0 cap=7 ema=0.850000,0.833000,0.816340,0.800013,0.784013,0.768333,0.752966,0.737907 sched=0:0.850000/0.850000/0.180000;1:0.833000/0.708050/0.282203;2:0.816340/0.578010/0.338565;3:0.800013/0.462415/0.366552;4:0.784013/0.362540/0.376585;
+mtp-anchor: round=1 d=4 acc=4 pid=40843 t_round0=134040086313958 t_draft0=134040086392750 t_flush_built=134040086433541 t_head1_built=134040086556916 t_submit1=134040086751416 t_chain_built=134040086941916 t_draft_built=134040087394333 t_snapshot_done=134040087514000 t_verify_built=134040129019000 t_eval_done=134040183393416 t_read_done=134040183418500 t_commit_done=134040183586083 t_tail_done=134040183691041
+mtp-worker: id=3 offered=8 decode_us=24 handle_us=97441 encode_us=63 write_us=6 worker_us=97535 bytes=407 t_read_ns=134040086288166 t_written_ns=134040183824000
+mtp-parent: round=1 offered=8 encode_write_us=18 wait_us=97570 decode_us=67 round_us=97662 gap_us=0 bytes=407 t0_ns=134040086255083 t1_ns=134040183917708
+mtp-row: pos=518 ids=760,550 v=0x1.eep+4,0x1p+4
+mtp-row: pos=519 ids=21568,85683 v=0x1.e8p+4,0x1.f4p+3
+mtp-row: pos=520 ids=1118,3765 v=0x1.eap+4,0x1.f2p+3
+mtp-row: pos=521 ids=84828,25419 v=0x1.dp+4,0x1.06p+4
+mtp-row: pos=522 ids=421,279 v=0x1.cp+4,0x1.ep+3
+mtp-row: pos=523 ids=279,264 v=0x1.bap+4,0x1.7ep+3
+mtp-trace: round=2 d=5 acc=5 draft_build_us=986 d_pre_us=43 d_flush_us=8 d_head1_us=94 d_submit1_us=166 d_chain_us=228 d_submit2_us=445 verify_build_us=51288 eval_wall_us=102578 readout_us=36 commit_us=270 upkeep_us=156 round_us=155315 host_thread_cpu_ns=11926375 sel_env=unset sel_fused=0 sel_argpart=0 arm=ship m=10.875000 streak=1 cap=7 ema=0.872500,0.858050,0.843889,0.830011,0.808911,0.768333,0.752966,0.737907 sched=0:0.872500/0.872500/0.180000;1:0.858050/0.748649/0.285636;2:0.843889/0.631776/0.346917;3:0.830011/0.524381/0.380212;4:0.808911/0.424178/0.395300;5:0.768333/0.325910/0.398035;
+mtp-anchor: round=2 d=5 acc=5 pid=40843 t_round0=134040184016750 t_draft0=134040184060333 t_flush_built=134040184068875 t_head1_built=134040184163583 t_submit1=134040184330000 t_chain_built=134040184558000 t_draft_built=134040185003125 t_snapshot_done=134040185107708 t_verify_built=134040236291208 t_eval_done=134040338870083 t_read_done=134040338906208 t_commit_done=134040339176208 t_tail_done=134040339332416
+mtp-worker: id=4 offered=8 decode_us=20 handle_us=155360 encode_us=69 write_us=8 worker_us=155459 bytes=435 t_read_ns=134040183995208 t_written_ns=134040339454875
+mtp-parent: round=2 offered=8 encode_write_us=23 wait_us=155496 decode_us=79 round_us=155606 gap_us=39 bytes=435 t0_ns=134040183957666 t1_ns=134040339564416
+mtp-row: pos=524 ids=5604,21118 v=0x1.dap+4,0x1.0ap+4
+mtp-row: pos=525 ids=28336,1558 v=0x1.f2p+4,0x1.2ap+4
+mtp-row: pos=526 ids=11,44424 v=0x1.dep+4,0x1.a4p+3
+mtp-row: pos=527 ids=44424,82637 v=0x1.eep+4,0x1p+4
+mtp-row: pos=528 ids=3425,999 v=0x1.f8p+4,0x1.04p+4
+mtp-row: pos=529 ids=11,7658 v=0x1.d6p+4,0x1.a2p+3
+mtp-trace: round=3 d=5 acc=5 draft_build_us=1082 d_pre_us=48 d_flush_us=14 d_head1_us=135 d_submit1_us=236 d_chain_us=239 d_submit2_us=408 verify_build_us=69161 eval_wall_us=131296 readout_us=30 commit_us=193 upkeep_us=100 round_us=201864 host_thread_cpu_ns=11646125 sel_env=unset sel_fused=0 sel_argpart=0 arm=ship m=15.687500 streak=2 cap=7 ema=0.891625,0.879343,0.867306,0.855510,0.837574,0.795583,0.752966,0.737907 sched=0:0.891625/0.891625/0.180000;1:0.879343/0.784044/0.288553;2:0.867306/0.680006/0.354133;3:0.855510/0.581751/0.392222;4:0.837574/0.487260/0.412056;5:0.795583/0.387656/0.419181;
+mtp-anchor: round=3 d=5 acc=5 pid=40843 t_round0=134040339647583 t_draft0=134040339695666 t_flush_built=134040339710166 t_head1_built=134040339845541 t_submit1=134040340082166 t_chain_built=134040340321666 t_draft_built=134040340730000 t_snapshot_done=134040340829791 t_verify_built=134040409891166 t_eval_done=134040541187458 t_read_done=134040541218166 t_commit_done=134040541411291 t_tail_done=134040541511916
+mtp-worker: id=5 offered=8 decode_us=24 handle_us=201902 encode_us=59 write_us=7 worker_us=201992 bytes=447 t_read_ns=134040339622250 t_written_ns=134040541614833
+mtp-parent: round=3 offered=8 encode_write_us=22 wait_us=202032 decode_us=86 round_us=202148 gap_us=19 bytes=447 t0_ns=134040339584000 t1_ns=134040541732375
+mtp-row: pos=530 ids=7658,15710 v=0x1.02p+5,0x1.22p+4
+mtp-row: pos=531 ids=4528,14040 v=0x1.dap+4,0x1.d6p+3
+mtp-row: pos=532 ids=14040,855 v=0x1.f6p+4,0x1.0ap+4
+mtp-row: pos=533 ids=11,26 v=0x1.e4p+4,0x1.8cp+3
+mtp-row: pos=534 ids=321,18626 v=0x1.02p+5,0x1.26p+4
+mtp-row: pos=535 ids=18626,9041 v=0x1.eap+4,0x1.2p+4
+mtp-row: pos=536 ids=6522,19573 v=0x1.ep+4,0x1.cep+3
+mtp-trace: round=4 d=6 acc=6 draft_build_us=1158 d_pre_us=44 d_flush_us=8 d_head1_us=100 d_submit1_us=182 d_chain_us=282 d_submit2_us=540 verify_build_us=73897 eval_wall_us=119469 readout_us=26 commit_us=192 upkeep_us=87 round_us=194832 host_thread_cpu_ns=11609541 sel_env=unset sel_fused=0 sel_argpart=0 arm=ship m=16.312500 streak=3 cap=7 ema=0.907881,0.897441,0.887210,0.877183,0.861938,0.818745,0.752966,0.737907 sched=0:0.907881/0.907881/0.180000;1:0.897441/0.814770/0.291033;2:0.887210/0.722872/0.360351;3:0.877183/0.634091/0.402723;4:0.861938/0.546547/0.426936;5:0.818745/0.447483/0.438268;6:0.752966/0.336940/0.439065;
+mtp-anchor: round=4 d=6 acc=6 pid=40843 t_round0=134040541811416 t_draft0=134040541855708 t_flush_built=134040541864666 t_head1_built=134040541965125 t_submit1=134040542147875 t_chain_built=134040542429875 t_draft_built=134040542970250 t_snapshot_done=134040543062833 t_verify_built=134040616867708 t_eval_done=134040736337208 t_read_done=134040736363875 t_commit_done=134040736556083 t_tail_done=134040736643708
+mtp-worker: id=6 offered=8 decode_us=20 handle_us=194890 encode_us=57 write_us=7 worker_us=194975 bytes=479 t_read_ns=134040541789708 t_written_ns=134040736765041
+mtp-parent: round=4 offered=8 encode_write_us=22 wait_us=195007 decode_us=69 round_us=195108 gap_us=19 bytes=479 t0_ns=134040541751875 t1_ns=134040736860291
+mtp-row: pos=537 ids=2353,8798 v=0x1.f6p+4,0x1.dep+3
+mtp-row: pos=538 ids=279,21118 v=0x1.e4p+4,0x1.d8p+3
+mtp-row: pos=539 ids=21118,80946 v=0x1.02p+5,0x1.46p+4
+mtp-row: pos=540 ids=6343,2124 v=0x1.d4p+4,0x1.ep+3
+mtp-row: pos=541 ids=13,25 v=0x1.cep+4,0x1.8ep+3
+mtp-row: pos=542 ids=1049,2064 v=0x1.0cp+5,0x1.24p+4
+mtp-row: pos=543 ids=1179,20269 v=0x1.06p+5,0x1.f2p+3
+mtp-trace: round=5 d=6 acc=6 draft_build_us=1080 d_pre_us=44 d_flush_us=9 d_head1_us=90 d_submit1_us=195 d_chain_us=277 d_submit2_us=463 verify_build_us=63822 eval_wall_us=109997 readout_us=23 commit_us=167 upkeep_us=80 round_us=175172 host_thread_cpu_ns=11264666 sel_env=unset sel_fused=0 sel_argpart=0 arm=ship m=15.562500 streak=4 cap=7 ema=0.921699,0.912825,0.904128,0.895606,0.882647,0.845934,0.782521,0.737907 sched=0:0.921699/0.921699/0.180000;1:0.912825/0.841350/0.293141;2:0.904128/0.760688/0.365698;3:0.895606/0.681277/0.411865;4:0.882647/0.601327/0.440060;5:0.845934/0.508683/0.455338;6:0.782521/0.398055/0.459954;
+mtp-anchor: round=5 d=6 acc=6 pid=40843 t_round0=134040736928541 t_draft0=134040736973041 t_flush_built=134040736982416 t_head1_built=134040737073333 t_submit1=134040737268583 t_chain_built=134040737545750 t_draft_built=134040738009125 t_snapshot_done=134040738106125 t_verify_built=134040801831416 t_eval_done=134040911829000 t_read_done=134040911852958 t_commit_done=134040912020500 t_tail_done=134040912100666
+mtp-worker: id=7 offered=8 decode_us=19 handle_us=175206 encode_us=49 write_us=5 worker_us=175281 bytes=478 t_read_ns=134040736908333 t_written_ns=134040912189458
+mtp-parent: round=5 offered=8 encode_write_us=20 wait_us=175310 decode_us=69 round_us=175406 gap_us=14 bytes=478 t0_ns=134040736874625 t1_ns=134040912280791
+mtp-row: pos=544 ids=20269,25822 v=0x1.ccp+4,0x1p+4
+mtp-row: pos=545 ids=279,22773 v=0x1.dcp+4,0x1.ccp+3
+mtp-row: pos=546 ids=22773,15625 v=0x1.12p+5,0x1.24p+4
+mtp-row: pos=547 ids=13914,20467 v=0x1.eap+4,0x1.cep+3
+mtp-row: pos=548 ids=321,11 v=0x1.bcp+4,0x1.b8p+3
+mtp-row: pos=549 ids=25822,2649 v=0x1.ecp+4,0x1.0cp+4
+mtp-row: pos=550 ids=10756,3817 v=0x1.dcp+4,0x1.2ep+4
+mtp-trace: round=6 d=6 acc=6 draft_build_us=1034 d_pre_us=45 d_flush_us=7 d_head1_us=85 d_submit1_us=164 d_chain_us=273 d_submit2_us=458 verify_build_us=63252 eval_wall_us=111848 readout_us=21 commit_us=159 upkeep_us=67 round_us=176383 host_thread_cpu_ns=11048250 sel_env=unset sel_fused=0 sel_argpart=0 arm=ship m=17.187500 streak=5 cap=7 ema=0.933444,0.925901,0.918509,0.911265,0.900250,0.869044,0.807643,0.737907 sched=0:0.933444/0.933444/0.180000;1:0.925901/0.864277/0.294932;2:0.918509/0.793846/0.370287;3:0.911265/0.723404/0.419794;4:0.900250/0.651245/0.451567;5:0.869044/0.565960/0.470484;6:0.807643/0.457094/0.478746;
+mtp-anchor: round=6 d=6 acc=6 pid=40843 t_round0=134040912347458 t_draft0=134040912393166 t_flush_built=134040912400958 t_head1_built=134040912485958 t_submit1=134040912650083 t_chain_built=134040912923291 t_draft_built=134040913381625 t_snapshot_done=134040913475541 t_verify_built=134040976634458 t_eval_done=134041088483208 t_read_done=134041088504291 t_commit_done=134041088663833 t_tail_done=134041088731000
+mtp-worker: id=8 offered=8 decode_us=19 handle_us=176414 encode_us=40 write_us=3 worker_us=176478 bytes=489 t_read_ns=134040912327916 t_written_ns=134041088805958
+mtp-parent: round=6 offered=8 encode_write_us=19 wait_us=176505 decode_us=52 round_us=176582 gap_us=14 bytes=489 t0_ns=134040912295166 t1_ns=134041088877916
+mtp-row: pos=551 ids=14751,5305 v=0x1.fep+4,0x1.12p+4
+mtp-row: pos=552 ids=1931,3438 v=0x1.b6p+4,0x1.0cp+4
+mtp-row: pos=553 ids=3817,10885 v=0x1.eep+4,0x1.dp+3
+mtp-row: pos=554 ids=11988,1716 v=0x1.dep+4,0x1.08p+4
+mtp-row: pos=555 ids=1518,11 v=0x1.04p+5,0x1.eap+3
+mtp-row: pos=556 ids=866,17856 v=0x1.e6p+4,0x1.04p+4
+mtp-row: pos=557 ids=17856,19221 v=0x1.e2p+4,0x1.18p+4
+mtp-row: pos=558 ids=5284,369 v=0x1.eap+4,0x1.e4p+3
+mtp-trace: round=7 d=7 acc=7 draft_build_us=1190 d_pre_us=40 d_flush_us=6 d_head1_us=82 d_submit1_us=154 d_chain_us=323 d_submit2_us=584 verify_build_us=70569 eval_wall_us=127124 readout_us=20 commit_us=182 upkeep_us=74 round_us=199161 host_thread_cpu_ns=11299334 sel_env=unset sel_fused=0 sel_argpart=0 arm=ship m=10.875000 streak=6 cap=7 ema=0.943428,0.937016,0.930733,0.924575,0.915213,0.888687,0.828997,0.737907 sched=0:0.943428/0.943428/0.180000;1:0.937016/0.884007/0.296455;2:0.930733/0.822774/0.374219;3:0.924575/0.760716/0.426648;4:0.915213/0.696217/0.461608;5:0.888687/0.618719/0.483835;6:0.828997/0.512916/0.495507;
+mtp-anchor: round=7 d=7 acc=7 pid=40843 t_round0=134041088950416 t_draft0=134041088990416 t_flush_built=134041088996416 t_head1_built=134041089078708 t_submit1=134041089233166 t_chain_built=134041089557041 t_draft_built=134041090141333 t_snapshot_done=134041090235083 t_verify_built=134041160710375 t_eval_done=134041287834625 t_read_done=134041287855166 t_commit_done=134041288038083 t_tail_done=134041288112125
+mtp-worker: id=9 offered=8 decode_us=17 handle_us=199197 encode_us=43 write_us=5 worker_us=199263 bytes=528 t_read_ns=134041088932291 t_written_ns=134041288196125
+mtp-parent: round=7 offered=8 encode_write_us=14 wait_us=199289 decode_us=53 round_us=199362 gap_us=28 bytes=528 t0_ns=134041088906041 t1_ns=134041288268125
+mtp-row: pos=559 ids=369,6306 v=0x1.c4p+4,0x1.c4p+3
+mtp-row: pos=560 ids=6306,2814 v=0x1.0ap+5,0x1.2ep+4
+mtp-row: pos=561 ids=13,271 v=0x1.cp+4,0x1.a8p+3
+mtp-row: pos=562 ids=271,198 v=0x1.dcp+4,0x1.22p+4
+mtp-row: pos=563 ids=550,82040 v=0x1.fcp+4,0x1.0ep+4
+mtp-row: pos=564 ids=59542,34088 v=0x1.e8p+4,0x1.16p+4
+mtp-row: pos=565 ids=52369,36438 v=0x1.02p+5,0x1.26p+4
+mtp-row: pos=566 ids=198,271 v=0x1.cep+4,0x1.ap+3
+mtp-trace: round=8 d=7 acc=7 draft_build_us=1190 d_pre_us=38 d_flush_us=5 d_head1_us=81 d_submit1_us=180 d_chain_us=330 d_submit2_us=553 verify_build_us=74700 eval_wall_us=125534 readout_us=27 commit_us=219 upkeep_us=111 round_us=201782 host_thread_cpu_ns=11453584 sel_env=unset sel_fused=0 sel_argpart=0 arm=ship m=15.500000 streak=7 cap=7 ema=0.951913,0.946464,0.941123,0.935889,0.927931,0.905384,0.854647,0.769721 sched=0:0.951913/0.951913/0.180000;1:0.946464/0.900951/0.297750;2:0.941123/0.847906/0.377585;3:0.935889/0.793546/0.432558;4:0.927931/0.736356/0.470335;5:0.905384/0.666684/0.495537;6:0.854647/0.569780/0.510348;
+mtp-anchor: round=8 d=7 acc=7 pid=40843 t_round0=134041288320416 t_draft0=134041288358791 t_flush_built=134041288364666 t_head1_built=134041288446250 t_submit1=134041288627083 t_chain_built=134041288957250 t_draft_built=134041289510875 t_snapshot_done=134041289606708 t_verify_built=134041364210916 t_eval_done=134041489745541 t_read_done=134041489773000 t_commit_done=134041489992041 t_tail_done=134041490103208
+mtp-worker: id=10 offered=8 decode_us=15 handle_us=201816 encode_us=73 write_us=9 worker_us=201915 bytes=505 t_read_ns=134041288304125 t_written_ns=134041490219125
+mtp-parent: round=8 offered=8 encode_write_us=14 wait_us=201949 decode_us=73 round_us=202045 gap_us=10 bytes=505 t0_ns=134041288278166 t1_ns=134041490324125
+mtp-row: pos=567 ids=760,561 v=0x1.ecp+4,0x1.d6p+3
+mtp-row: pos=568 ids=24382,6579 v=0x1.fp+4,0x1.3p+4
+mtp-row: pos=569 ids=3644,2243 v=0x1.ecp+4,0x1.d8p+3
+mtp-row: pos=570 ids=7189,25367 v=0x1.12p+5,0x1.1ap+4
+mtp-row: pos=571 ids=829,279 v=0x1.e2p+4,0x1.f2p+3
+mtp-row: pos=572 ids=7320,37116 v=0x1.02p+5,0x1.6cp+4
+mtp-row: pos=573 ids=37972,72285 v=0x1.06p+5,0x1.16p+4
+mtp-row: pos=574 ids=364,11 v=0x1.cap+4,0x1.a2p+3
+mtp-trace: round=9 d=7 acc=7 draft_build_us=1221 d_pre_us=43 d_flush_us=9 d_head1_us=98 d_submit1_us=175 d_chain_us=333 d_submit2_us=561 verify_build_us=71512 eval_wall_us=120824 readout_us=21 commit_us=175 upkeep_us=96 round_us=193851 host_thread_cpu_ns=11475875 sel_env=unset sel_fused=0 sel_argpart=0 arm=ship m=15.875000 streak=8 cap=7 ema=0.959126,0.954494,0.949954,0.945505,0.938741,0.919576,0.876450,0.796763 sched=0:0.959126/0.959126/0.180000;1:0.954494/0.915480/0.298850;2:0.949954/0.869665/0.380463;3:0.945505/0.822273/0.437642;4:0.938741/0.771901/0.477894;5:0.919576/0.709822/0.505747;6:0.876450/0.622124/0.523408;
+mtp-anchor: round=9 d=7 acc=7 pid=40843 t_round0=134041490387458 t_draft0=134041490431291 t_flush_built=134041490441041 t_head1_built=134041490539166 t_submit1=134041490714958 t_chain_built=134041491048166 t_draft_built=134041491609250 t_snapshot_done=134041491708583 t_verify_built=134041563121916 t_eval_done=134041683945958 t_read_done=134041683967666 t_commit_done=134041684142833 t_tail_done=134041684239041
+mtp-worker: id=11 offered=8 decode_us=16 handle_us=193881 encode_us=47 write_us=4 worker_us=193950 bytes=516 t_read_ns=134041490370208 t_written_ns=134041684320291
+mtp-parent: round=9 offered=8 encode_write_us=18 wait_us=193978 decode_us=58 round_us=194061 gap_us=14 bytes=516 t0_ns=134041490338583 t1_ns=134041684399875
+mtp-row: pos=575 ids=279,8097 v=0x1.dap+4,0x1.f4p+3
+mtp-row: pos=576 ids=8097,99159 v=0x1.16p+5,0x1.48p+4
+mtp-trace: round=10 d=1 acc=1 draft_build_us=269 d_pre_us=21 d_flush_us=6 d_head1_us=83 d_submit1_us=157 d_chain_us=0 d_submit2_us=1 verify_build_us=25250 eval_wall_us=49258 readout_us=14 commit_us=94 upkeep_us=26 round_us=74914 host_thread_cpu_ns=9281334 sel_env=unset sel_fused=0 sel_argpart=0 arm=ship m=15.562500 streak=9 cap=7 ema=0.965257,0.961320,0.957461,0.953680,0.947930,0.931640,0.894982,0.819748 sched=0:0.965257/0.965257/0.180000;
+mtp-anchor: round=10 d=1 acc=1 pid=40843 t_round0=134041684456833 t_draft0=134041684478291 t_flush_built=134041684484333 t_head1_built=134041684567750 t_submit1=134041684724916 t_chain_built=134041684725000 t_draft_built=134041684726500 t_snapshot_done=134041684822333 t_verify_built=134041709976666 t_eval_done=134041759234958 t_read_done=134041759249083 t_commit_done=134041759344000 t_tail_done=134041759370916
+mtp-worker: id=12 offered=1 decode_us=14 handle_us=74938 encode_us=22 write_us=3 worker_us=74979 bytes=297 t_read_ns=134041684441250 t_written_ns=134041759420958
+mtp-parent: round=10 offered=1 encode_write_us=16 wait_us=75003 decode_us=36 round_us=75059 gap_us=12 bytes=297 t0_ns=134041684412375 t1_ns=134041759472125
