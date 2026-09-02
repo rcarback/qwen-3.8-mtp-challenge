@@ -1605,6 +1605,16 @@ public final class Qwen36MTPBlockSession {
                 + "eval_wall_us=\((tBeginDone - tBeginBuilt) / 1000) "
                 + "wall_us=\((tBeginDone - tBegin0) / 1000) "
                 + "cpu_us=\((cpuBeginDone - cpuBegin0) / 1000)\n")
+            let classes = cache.prefix(4)
+                .map { String(describing: type(of: $0)) }
+                .joined(separator: ",")
+            let policy = kvQuantization.map { "b\($0.bits)g\($0.groupSize)" } ?? "bf16"
+            let ladder = ProcessInfo.processInfo
+                .environment["MLX_QWEN_MTP_LADDER"] ?? "default"
+            Self.traceWrite(
+                "mtp-cache: layers=\(cache.count) first4=\(classes) "
+                    + "kv_policy=\(policy) ladder=\(ladder) "
+                    + "compiled_decode=\(MLXHardwareInfo.isCompiledDecodeSupported)\n")
         }
         let readTail = (
             tailIDs.asArray(Int32.self).map { Int($0) },
@@ -2610,7 +2620,11 @@ public final class Qwen36MTPBlockSession {
             // throwaway slice ops, and no host read is taken from these
             // arrays. The 48 recurrent layers are unaffected -- `state` and
             // `innerState()` are the same expression there.
+            let tSerialBuilt = Self.traceRounds
+                ? DispatchTime.now().uptimeNanoseconds : 0
             eval(cache.flatMap { $0.innerState() } + [tailIDs, tailValues])
+            let tSerialEvalDone = Self.traceRounds
+                ? DispatchTime.now().uptimeNanoseconds : 0
             let readTail = (
                 tailIDs.asArray(Int32.self).map { Int($0) },
                 tailValues.asArray(Float.self).map { Double($0) }
@@ -2631,6 +2645,18 @@ public final class Qwen36MTPBlockSession {
             Self.traceRow(
                 pos: seedTokenCount + committedTokenCount,
                 ids: tailTokens, values: tailLogits)
+            if Self.traceRounds {
+                let tSerialDone = DispatchTime.now().uptimeNanoseconds
+                Self.traceWrite(
+                    "mtp-trace0: round=\(roundCount) offered=\(depth) "
+                        + "build_us=\((tSerialBuilt - tRound0) / 1000) "
+                        + "eval_wall_us=\((tSerialEvalDone - tSerialBuilt) / 1000) "
+                        + "readout_us=\((tSerialDone - tSerialEvalDone) / 1000) "
+                        + "round_us=\((tSerialDone - tRound0) / 1000) "
+                        + "host_thread_cpu_ns="
+                        + "\(Self.threadCPUNanoseconds() &- cpuRound0) "
+                        + "t0_ns=\(tRound0) t_eval_done_ns=\(tSerialEvalDone)\n")
+            }
             return Qwen36MTPRoundResult(
                 tokens: committed,
                 declaredRows: 1,

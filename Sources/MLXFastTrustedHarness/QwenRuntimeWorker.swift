@@ -2198,6 +2198,17 @@ final class RuntimeWorkerClient {
     private var nextID = 1
     private var closed = false
 
+    /// Boundary timing of the most recent `send`, for the local round trace.
+    /// Nanoseconds on the mach uptime clock. Zero before the first request.
+    struct RequestTiming {
+        var encodeWriteNanoseconds: UInt64 = 0
+        var waitNanoseconds: UInt64 = 0
+        var decodeNanoseconds: UInt64 = 0
+        var responseBytes = 0
+    }
+    private(set) var lastRequestTiming = RequestTiming()
+    private var lastResponseLineReadNanoseconds: UInt64 = 0
+
     init(
         options: RuntimeWorkerOptions,
         weightsPath: String,
@@ -2621,6 +2632,7 @@ final class RuntimeWorkerClient {
             conversationId: conversationId,
             turnBoundaries: turnBoundaries
         )
+        let tSend0 = DispatchTime.now().uptimeNanoseconds
         var data = try encoder.encode(request)
         guard data.count <= BufferedFileLineReader.defaultMaximumLineByteCount else {
             throw MLXFastError.invalidInput(
@@ -2637,7 +2649,14 @@ final class RuntimeWorkerClient {
         let response: RuntimeWorkerResponse
         do {
             try input.write(contentsOf: data)
+            let tWritten = DispatchTime.now().uptimeNanoseconds
             response = try readResponseLine(validateNonce: true)
+            let tDecoded = DispatchTime.now().uptimeNanoseconds
+            lastRequestTiming.encodeWriteNanoseconds = tWritten - tSend0
+            lastRequestTiming.waitNanoseconds =
+                lastResponseLineReadNanoseconds - tWritten
+            lastRequestTiming.decodeNanoseconds =
+                tDecoded - lastResponseLineReadNanoseconds
         } catch {
             if watchdog.cancelAndReturnDidFire() {
                 throw MLXFastError.invalidInput("runtime worker timed out handling request \(kind)")
@@ -2659,6 +2678,8 @@ final class RuntimeWorkerClient {
     private func readResponseLine(validateNonce: Bool) throws -> RuntimeWorkerResponse {
         while true {
             let data = try readWorkerOutputLine()
+            lastResponseLineReadNanoseconds = DispatchTime.now().uptimeNanoseconds
+            lastRequestTiming.responseBytes = data.count
             guard runtimeWorkerLineLooksLikeJSONResponse(data) else {
                 continue
             }

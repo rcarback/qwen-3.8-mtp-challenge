@@ -444,14 +444,23 @@ extension QwenRuntime {
 
         var state = QwenMTPWorkerState()
         var expectedRequestID = 1
+        let roundTrace = QwenMTPWorkerRoundTrace.fromEnvironment()
         while let line = try protocolIO.readLine() {
             guard !line.isEmpty else { continue }
+            let tLineRead = DispatchTime.now().uptimeNanoseconds
+            var tDecoded: UInt64 = 0
+            var tHandled: UInt64 = 0
+            var roundDepth: Int?
             let response: RuntimeWorkerResponse
             do {
                 let request = try decoder.decode(
                     RuntimeWorkerRequest.self,
                     from: Data(line.utf8)
                 )
+                tDecoded = DispatchTime.now().uptimeNanoseconds
+                if request.kind == "mtp_decode_round" {
+                    roundDepth = request.maxBlockSize ?? -1
+                }
                 guard request.id == expectedRequestID else {
                     throw MLXFastError.invalidInput(
                         "MTP request id must be monotonic; expected "
@@ -517,6 +526,7 @@ extension QwenRuntime {
                         session: session,
                         state: &state
                     )
+                    tHandled = DispatchTime.now().uptimeNanoseconds
                 } catch {
                     response = RuntimeWorkerResponse(
                         id: request.id,
@@ -533,7 +543,16 @@ extension QwenRuntime {
                     error: "\(error)"
                 )
             }
-            try protocolIO.writeLine(try encoder.encode(response))
+            let encoded = try encoder.encode(response)
+            let tEncoded = DispatchTime.now().uptimeNanoseconds
+            try protocolIO.writeLine(encoded)
+            if let roundTrace, let roundDepth, tHandled > 0 {
+                roundTrace.record(
+                    id: response.id, offered: roundDepth, bytes: encoded.count,
+                    lineRead: tLineRead, decoded: tDecoded, handled: tHandled,
+                    encoded: tEncoded,
+                    written: DispatchTime.now().uptimeNanoseconds)
+            }
         }
     }
 
@@ -1244,4 +1263,49 @@ private func waitForQwenMTPAsync<T>(
             "the MTP async model load completed without a result")
     }
     return try result.get()
+}
+
+/// Per-request boundary trace for the worker loop. LOCAL ONLY.
+///
+/// Same gate and sink as the session's `MLX_QWEN_MTP_TRACE` and
+/// `MLX_QWEN_MTP_TRACE_PATH`; the worker environment allowlist admits the
+/// `MLX_` prefix. Lines are prefixed `mtp-worker:` and carry the round's
+/// offered depth so a summary can select one leg of a two-leg wrapper run.
+struct QwenMTPWorkerRoundTrace {
+    private let sink: FileHandle
+
+    static func fromEnvironment(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> QwenMTPWorkerRoundTrace? {
+        guard environment["MLX_QWEN_MTP_TRACE"] == "1" else { return nil }
+        return QwenMTPWorkerRoundTrace(
+            sink: openTraceSink(path: environment["MLX_QWEN_MTP_TRACE_PATH"]))
+    }
+
+    /// Opened `O_APPEND` so the parent, the candidate worker and the reference
+    /// worker can write one file without a later process truncating an
+    /// earlier one's lines. Falls back to stderr when the path is empty or
+    /// cannot be opened. The sandboxed worker denies every write except
+    /// `/dev/null`, so a trace run needs `MLXFAST_NO_SANDBOX=1` on the parent.
+    static func openTraceSink(path: String?) -> FileHandle {
+        guard let path, !path.isEmpty else { return FileHandle.standardError }
+        let descriptor = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        guard descriptor >= 0 else { return FileHandle.standardError }
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+    }
+
+    func record(
+        id: Int, offered: Int, bytes: Int,
+        lineRead: UInt64, decoded: UInt64, handled: UInt64,
+        encoded: UInt64, written: UInt64
+    ) {
+        let line = "mtp-worker: id=\(id) offered=\(offered) "
+            + "decode_us=\((decoded - lineRead) / 1000) "
+            + "handle_us=\((handled - decoded) / 1000) "
+            + "encode_us=\((encoded - handled) / 1000) "
+            + "write_us=\((written - encoded) / 1000) "
+            + "worker_us=\((written - lineRead) / 1000) "
+            + "bytes=\(bytes) t_read_ns=\(lineRead) t_written_ns=\(written)\n"
+        sink.write(Data(line.utf8))
+    }
 }

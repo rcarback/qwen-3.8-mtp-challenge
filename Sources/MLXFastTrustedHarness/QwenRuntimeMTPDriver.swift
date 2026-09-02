@@ -118,6 +118,8 @@ extension QwenRuntime {
         var rounds: [QwenMTPObservedRound] = []
         var latencies: [Double] = []
 
+        let roundTrace = QwenMTPParentRoundTrace.fromEnvironment()
+        var previousRoundEndNanoseconds: UInt64 = 0
         while emitted.count < options.totalTokenCount {
             // THE OFFERED CEILING, and it lives HERE rather than in the worker.
             //
@@ -148,9 +150,19 @@ extension QwenRuntime {
                         options.depth,
                         MLXFastConstants.qwenMTPMaxDraftDepth,
                         remaining - 1))
+            let tRound0 = DispatchTime.now().uptimeNanoseconds
             let roundStart = Date()
             let response = try client.mtpDecodeRound(depth: requestedDepth)
             let latency = Date().timeIntervalSince(roundStart)
+            if let roundTrace {
+                let tRound1 = DispatchTime.now().uptimeNanoseconds
+                roundTrace.record(
+                    round: rounds.count + 1, offered: requestedDepth,
+                    start: tRound0, end: tRound1,
+                    previousEnd: previousRoundEndNanoseconds,
+                    timing: client.lastRequestTiming)
+                previousRoundEndNanoseconds = tRound1
+            }
             guard response.ok, let tokens = response.tokens, !tokens.isEmpty else {
                 throw MLXFastError.invalidInput(
                     "the MTP round request failed: "
@@ -810,5 +822,49 @@ extension QwenRuntime {
             seedTokenCount: plan.seedTokens.count,
             planOutputPath: planOutputPath
         )
+    }
+}
+
+/// Per-round boundary trace on the parent side. LOCAL ONLY.
+///
+/// Gated by the same `MLX_QWEN_MTP_TRACE=1` and `MLX_QWEN_MTP_TRACE_PATH`
+/// pair as the worker and the session, read from the parent's own
+/// environment. Lines are prefixed `mtp-parent:`. No scored quantity moves.
+struct QwenMTPParentRoundTrace {
+    private let sink: FileHandle
+
+    static func fromEnvironment(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> QwenMTPParentRoundTrace? {
+        guard environment["MLX_QWEN_MTP_TRACE"] == "1" else { return nil }
+        return QwenMTPParentRoundTrace(
+            sink: openTraceSink(path: environment["MLX_QWEN_MTP_TRACE_PATH"]))
+    }
+
+    /// Opened `O_APPEND` so the parent, the candidate worker and the reference
+    /// worker can write one file without a later process truncating an
+    /// earlier one's lines. Falls back to stderr when the path is empty or
+    /// cannot be opened. The sandboxed worker denies every write except
+    /// `/dev/null`, so a trace run needs `MLXFAST_NO_SANDBOX=1` on the parent.
+    static func openTraceSink(path: String?) -> FileHandle {
+        guard let path, !path.isEmpty else { return FileHandle.standardError }
+        let descriptor = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        guard descriptor >= 0 else { return FileHandle.standardError }
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+    }
+
+    func record(
+        round: Int, offered: Int, start: UInt64, end: UInt64,
+        previousEnd: UInt64, timing: RuntimeWorkerClient.RequestTiming
+    ) {
+        let gap = previousEnd == 0 ? 0 : (start - previousEnd) / 1000
+        let line = "mtp-parent: round=\(round) offered=\(offered) "
+            + "encode_write_us=\(timing.encodeWriteNanoseconds / 1000) "
+            + "wait_us=\(timing.waitNanoseconds / 1000) "
+            + "decode_us=\(timing.decodeNanoseconds / 1000) "
+            + "round_us=\((end - start) / 1000) "
+            + "gap_us=\(gap) bytes=\(timing.responseBytes) "
+            + "t0_ns=\(start) t1_ns=\(end)\n"
+        sink.write(Data(line.utf8))
     }
 }
