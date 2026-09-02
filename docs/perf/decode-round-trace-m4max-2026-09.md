@@ -51,9 +51,14 @@
   configuration.
 - GPU MHz busy lower median (samples with `gpu_usage[1] > 0.5`, i.e. under load,
   across the whole run including both legs): `858 MHz`, 83 samples.
-- Trace files: `.plans/trace/round-trace-2026-09-02.log` (364 lines: 74
-  `mtp-parent:`, 74 `mtp-worker:`, 64 `mtp-trace0:`, 2 `mtp-cache:`) and
-  `.plans/trace/round-trace-2026-09-02.log.macmon.jsonl`.
+- Trace files: recorded live at `.plans/trace/round-trace-2026-09-02.log` (364
+  lines: 74 `mtp-parent:`, 74 `mtp-worker:`, 64 `mtp-trace0:`, 2 `mtp-cache:`)
+  and `.plans/trace/round-trace-2026-09-02.log.macmon.jsonl`; both are
+  committed verbatim as the raw record this doc's numbers trace to, at
+  `docs/perf/raw-round-trace-2026-09-02.log` (51,684 bytes) and
+  `docs/perf/raw-round-trace-2026-09-02.macmon.jsonl` (148,127 bytes).
+  `bash tools/mtp-round-trace-summary.sh docs/perf/raw-round-trace-2026-09-02.log`
+  reproduces the summary table below exactly.
 - `all_tokens_matched` read `true` in both legs' reports (serial control:
   `rounds=64 accepted_draft_rate=0.0000 all_tokens_matched=true
   reference_checked_rows=64/64`; native-MTP: `rounds=10 accepted_draft_rate=1.0000
