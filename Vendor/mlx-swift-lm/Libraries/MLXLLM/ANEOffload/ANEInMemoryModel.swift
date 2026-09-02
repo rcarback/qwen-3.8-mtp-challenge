@@ -198,20 +198,40 @@ public final class ANEInMemoryModel {
     }
 
     deinit {
-        try? FileManager.default.removeItem(at: scratchURL)
+        removeStagingFiles()
     }
 
     public func compile(qos: Int = 0x15) throws {
         let msgSend = dlsym(dlopen(nil, RTLD_LAZY), "objc_msgSend")!
         let (ok, message) = ANEInMemoryModel.callBoolQoSErr(msgSend, raw, Selector(("compileWithQoS:options:error:")), qos: qos, options: NSDictionary())
-        if !ok { throw ANEError.compile(message ?? "unknown compile failure") }
+        if !ok {
+            removeStagingFiles()
+            throw ANEError.compile(message ?? "unknown compile failure")
+        }
     }
 
     public func load(qos: Int = 0x15) throws {
         let msgSend = dlsym(dlopen(nil, RTLD_LAZY), "objc_msgSend")!
         let (ok, message) = ANEInMemoryModel.callBoolQoSErr(msgSend, raw, Selector(("loadWithQoS:options:error:")), qos: qos, options: NSDictionary())
-        if !ok { throw ANEError.load(message ?? "unknown load failure") }
+        if !ok {
+            removeStagingFiles()
+            throw ANEError.load(message ?? "unknown load failure")
+        }
         programHandle = ANERuntime.sendUInt64(raw, Selector(("programHandle")))
+        // The staged `model.mil` and weight blob exist only for
+        // `compileWithQoS:`; the loaded program is held by the ANE service.
+        // Every program has its own staging directory since the identity fix
+        // (`programTag`), and a process that keeps its 64 per-layer programs
+        // resident never reaches `deinit`, so without this a hybrid run left
+        // ~100 MB per program behind: 886 directories and 87 GB filled the
+        // volume on 2026-09-02 and every later build failed with ENOSPC and
+        // fell back to the GPU silently.
+        removeStagingFiles()
+    }
+
+    /// Removes this program's staging directory. Safe to call more than once.
+    private func removeStagingFiles() {
+        try? FileManager.default.removeItem(at: scratchURL)
     }
 
     public func unload() {
