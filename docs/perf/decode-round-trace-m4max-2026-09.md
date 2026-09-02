@@ -169,3 +169,79 @@ whether the thread doing the build actually gets scheduled promptly enough
 to keep submitting into the ladder. For the ladder, check whether the same
 ladder that produces the in-process overlap is actually engaged in the
 worker.
+
+## Task 2: `MLX_MTP_HOST_QOS=interactive` (2026-09-02, gated run)
+
+Same command as the Step 10 block above, plus `MLX_MTP_HOST_QOS=interactive`
+and the trace path `.plans/trace/round-trace-2026-09-02-qos.log`. Run from the
+main tree (`local/perf-2026-08`, wall lane merged at `70eba8a`, host QoS code
+uncommitted at run time) at about 16:53 local, machine idle.
+
+Run conditions:
+
+- Thermal gate: all three gates read plausible temperatures and released at
+  39.7C, 39.8C and 39.8C after 70 s, 70 s and 60 s. The 1.6C sensor caveat on
+  the Task 1 run does not apply here. The two runs agree on the parent round
+  within 2%, so the caveat on the Task 1 absolute round is discharged.
+- `mtp-worker: host_qos=interactive status=0` appears three times, once per
+  worker process (reference worker, serial-control worker, native-MTP
+  worker). The QoS class was applied in every worker.
+- `mtp-cache:` line identical to the Task 1 run for both sessions.
+- GPU MHz busy lower median: 851 MHz, 79 samples (Task 1: 858 MHz).
+- `all_tokens_matched` read `true` in both legs (serial control: `rounds=64
+  accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=64/64
+  seconds_per_token=0.135635`; native-MTP: `rounds=10 accepted_draft_rate=1.0000
+  all_tokens_matched=true reference_checked_rows=64/64 seconds_per_token=0.080477`).
+  Local estimated decode speedup 1.6854 (Task 1: 1.5936).
+- Raw record: `docs/perf/raw-round-trace-2026-09-02-qos.log` (52,201 bytes,
+  215 parent/worker/trace0 lines) and
+  `docs/perf/raw-round-trace-2026-09-02-qos.macmon.jsonl`.
+  `bash tools/mtp-round-trace-summary.sh docs/perf/raw-round-trace-2026-09-02-qos.log`
+  reproduces the Task 2 column below.
+
+Lower medians over the 64 depth-0 rounds, in microseconds. The delta is
+Task 2 minus Task 1. Negative is faster.
+
+| bucket | Task 1 (default QoS) | Task 2 (`interactive`) | delta |
+|---|---|---|---|
+| parent encode + pipe write | 63 | 31 | -32 |
+| transport + scheduling (derived) | 72 | 55 | -17 |
+| worker JSON decode | 67 | 35 | -32 |
+| worker outside the session (derived) | 57 | 69 | +12 |
+| session graph build | 20153 | 10565 | -9588 |
+| session eval wall | 59081 | 68275 | +9194 |
+| session readout | 172 | 110 | -62 |
+| worker JSON encode | 104 | 63 | -41 |
+| worker pipe write | 16 | 10 | -6 |
+| parent JSON decode | 183 | 88 | -95 |
+| parent round (measured) | 79424 | 80780 | +1356 |
+| parent gap between rounds | 52 | 26 | -26 |
+| parent closure | 14 | 92 | +78 |
+| session build + eval + readout | 79406 | 78950 | -456 |
+| forward excess over in-process 42.6 ms | 36806 | 36350 | -456 |
+| session host thread cpu | 21297 | 11285 | -10012 |
+
+Parent seconds per token, both legs, from the wrapper's reports: serial
+control 0.135635 (Task 1: 0.131461), native-MTP 0.080477 (Task 1: 0.082493).
+The wrapper deletes its per-leg reports on exit, so the parent round bucket
+above (the lower median of the round request) stands in for
+`p50RoundRequestSeconds`.
+
+### Decision
+
+Task 2 does not win. The parent round moved by +1,356 us (+1.7%), inside the
+run-to-run spread, and no bucket outside the session moved by more than
+100 us. `MLX_MTP_HOST_QOS` stays unset by default and stays unset for the
+Task 3 arms.
+
+The split inside the session did move. The host thread's CPU time halved
+(21.3 ms to 11.3 ms) and the graph-build bucket halved with it, while the
+eval-wall bucket grew by the same amount. The round total did not change. This means
+about 10 ms of the Task 1 "build" bucket was host scheduling that overlapped
+GPU work already in flight, not build work on the critical path. With the
+host thread promoted, that time shows up as waiting on the GPU instead. The
+round is bounded by the GPU work the session submits (about 68 ms of eval
+wall at width 1), not by host scheduling.
+
+Forward excess after Task 2 is 36,350 us, above the 5,000 us trigger, so
+Task 3 (command-buffer and ladder arms) runs.

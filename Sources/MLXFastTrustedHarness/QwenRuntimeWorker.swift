@@ -2290,6 +2290,9 @@ final class RuntimeWorkerClient {
         process.standardInput = stdin
         process.standardOutput = stdout
         process.standardError = stderr
+        if let qos = QwenMTPParentQoSPolicy.resolve(ProcessInfo.processInfo.environment) {
+            process.qualityOfService = qos
+        }
         try process.run()
 
         self.process = process
@@ -2837,4 +2840,17 @@ func runtimeWorkerLineLooksLikeJSONResponse(_ data: Data) -> Bool {
         return byte == 0x7b
     }
     return false
+}
+
+/// LOCAL ONLY. Mirrors the worker's `MLX_MTP_HOST_QOS` on the spawned
+/// process, so the child starts in the requested class instead of promoting
+/// itself after launch.
+enum QwenMTPParentQoSPolicy {
+    static func resolve(_ environment: [String: String]) -> QualityOfService? {
+        switch environment["MLX_MTP_HOST_QOS"] {
+        case "interactive": return .userInteractive
+        case "initiated": return .userInitiated
+        default: return nil
+        }
+    }
 }

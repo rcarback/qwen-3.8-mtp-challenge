@@ -328,6 +328,7 @@ extension QwenRuntime {
         startRuntimeWorkerOrphanReaper()
         let protocolIO = try RuntimeWorkerProtocolIO.isolatingStandardIO()
         applyQwenMTPStartupMemoryProfile()
+        QwenMTPHostQoSPolicy.apply()
 
         let targetURL = URL(fileURLWithPath: targetWeightsPath)
         // An EMPTY head path is the headless local-research configuration --
@@ -1307,5 +1308,37 @@ struct QwenMTPWorkerRoundTrace {
             + "worker_us=\((written - lineRead) / 1000) "
             + "bytes=\(bytes) t_read_ns=\(lineRead) t_written_ns=\(written)\n"
         sink.write(Data(line.utf8))
+    }
+}
+
+/// LOCAL ONLY. `MLX_MTP_HOST_QOS=interactive` raises the worker's main thread
+/// to user-interactive QoS before the first MLX call, so the scheduler and
+/// encode threads MLX spawns from it inherit the class. `initiated` selects
+/// user-initiated. Absent or any other value leaves the default class.
+enum QwenMTPHostQoSPolicy {
+    static let environmentName = "MLX_MTP_HOST_QOS"
+
+    static func resolve(_ environment: [String: String]) -> qos_class_t? {
+        switch environment[environmentName] {
+        case "interactive": return QOS_CLASS_USER_INTERACTIVE
+        case "initiated": return QOS_CLASS_USER_INITIATED
+        default: return nil
+        }
+    }
+
+    static func apply(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
+        guard let qos = resolve(environment) else { return }
+        let status = pthread_set_qos_class_self_np(qos, 0)
+        // Worker stderr is discarded on `mtp-timed` (`forwardsWorkerStderr`
+        // stays false), so the outcome goes through the trace sink, where
+        // Task 1's summary run already looks.
+        guard environment["MLX_QWEN_MTP_TRACE"] == "1" else { return }
+        let sink = QwenMTPWorkerRoundTrace.openTraceSink(
+            path: environment["MLX_QWEN_MTP_TRACE_PATH"])
+        sink.write(Data(
+            ("mtp-worker: host_qos=\(environment[environmentName] ?? "") "
+                + "status=\(status)\n").utf8))
     }
 }
