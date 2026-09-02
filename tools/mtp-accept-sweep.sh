@@ -21,10 +21,23 @@ if [[ $# -lt 2 ]]; then
 fi
 out_dir="$1"; shift
 prompts=("$@")
+
+# --weights weights and ./benchmark-qwen-mtp.sh below are repo-root-relative;
+# run from the repo root regardless of the caller's cwd.
+cd "$(dirname "$0")/.."
+
 configs="${MLXFAST_ACCEPT_CONFIGS:-gpu dequant bf16}"
 depths="${MLXFAST_ACCEPT_DEPTHS:-8 2}"
 steps="${MLXFAST_ACCEPT_STEPS:-200}"
-swift_bin="${MLXFAST_SWIFT_BIN:-.build-worker/release/mlxfast-swift}"
+# Matches the wrapper's default (benchmark-qwen-mtp.sh) and its auto-rebuild
+# target (benchmark.sh writes only .build/release/mlxfast-swift), not the
+# separate .build-worker tree used for the sandboxed runtime worker.
+swift_bin="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
+# Pass MLXFAST_SWIFT_BIN through to benchmark-qwen-mtp.sh only when the
+# caller set it, so an unset caller env falls through to the wrapper's own
+# default instead of being pinned to this script's default.
+swift_bin_pass=()
+[[ -n "${MLXFAST_SWIFT_BIN:-}" ]] && swift_bin_pass=("MLXFAST_SWIFT_BIN=${MLXFAST_SWIFT_BIN}")
 stamp="$(date +%Y%m%d-%H%M%S)"
 csv="${out_dir}/mtp-accept-${stamp}.csv"
 
@@ -56,8 +69,10 @@ run() {
   if [[ "$dry_run" == "1" ]]; then printf '%q ' "$@"; echo; else "$@"; fi
 }
 
-mkdir -p "$out_dir"
-echo "config,prompt,depth,accepted_draft_rate,effective_mean_draft_len,serial_seconds_per_token,mtp_seconds_per_token,mtp_decode_speedup,all_tokens_matched" > "$csv"
+if [[ "$dry_run" == "0" ]]; then
+  mkdir -p "$out_dir"
+  echo "config,prompt,depth,accepted_draft_rate,effective_mean_draft_len,serial_seconds_per_token,mtp_seconds_per_token,mtp_decode_speedup,all_tokens_matched" > "$csv"
+fi
 
 for prompt in "${prompts[@]}"; do
   pname="$(basename "${prompt%.*}")"
@@ -72,14 +87,18 @@ for prompt in "${prompts[@]}"; do
       --name "${cfg}_${pname}" --steps "$steps"
     for depth in $depths; do
       score="${out_dir}/score-${cfg}-${pname}-d${depth}.json"
-      run env "${cfg_env[@]+"${cfg_env[@]}"}" \
-        MLXFAST_SWIFT_BIN="$swift_bin" \
-        MLXFAST_QWEN_MTP_LOCAL_ITERATE_TOKENS=128 \
-        MLXFAST_QWEN_MTP_DEPTH="$depth" \
-        MLXFAST_QWEN_MTP_LOCAL_GOLDEN_FIXTURE="$golden" \
-        MLXFAST_QWEN_MTP_LOCAL_WORK_DIR="${out_dir}/work-${cfg}-${pname}-d${depth}" \
-        MLXFAST_SCORE_PATH="$score" \
-        ./benchmark-qwen-mtp.sh --local-iterate
+      if [[ "$dry_run" == "0" && -f "$score" ]]; then
+        echo "skip: $score exists"
+      else
+        run env "${cfg_env[@]+"${cfg_env[@]}"}" \
+          "${swift_bin_pass[@]+"${swift_bin_pass[@]}"}" \
+          MLXFAST_QWEN_MTP_LOCAL_ITERATE_TOKENS=128 \
+          MLXFAST_QWEN_MTP_DEPTH="$depth" \
+          MLXFAST_QWEN_MTP_LOCAL_GOLDEN_FIXTURE="$golden" \
+          MLXFAST_QWEN_MTP_LOCAL_WORK_DIR="${out_dir}/work-${cfg}-${pname}-d${depth}" \
+          MLXFAST_SCORE_PATH="$score" \
+          ./benchmark-qwen-mtp.sh --local-iterate
+      fi
       if [[ "$dry_run" == "0" ]]; then
         python3 - "$score" "$cfg" "$pname" "$depth" >> "$csv" <<'PY'
 import json, sys

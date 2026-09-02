@@ -5,8 +5,10 @@ Usage: mtp-accept-summary.py CSV            # prints the table
        mtp-accept-summary.py --self-test    # runs the built-in check
 """
 import csv
+import os
 import statistics
 import sys
+import tempfile
 from collections import defaultdict
 
 COLS = ("accepted_draft_rate", "effective_mean_draft_len",
@@ -52,13 +54,36 @@ def self_test():
         dict(config="gpu", prompt="c", depth="8", accepted_draft_rate="0.6",
              effective_mean_draft_len="2.5", serial_seconds_per_token="0.10",
              mtp_seconds_per_token="0.07", mtp_decode_speedup="1.43", all_tokens_matched="false"),
+        dict(config="bf16", prompt="a", depth="2", accepted_draft_rate="0.9",
+             effective_mean_draft_len="1.8", serial_seconds_per_token="0.10",
+             mtp_seconds_per_token="0.05", mtp_decode_speedup="2.00", all_tokens_matched="true"),
     ]
     s = summarize(rows)
+    assert len(s) == 2, s  # two (config, depth) groups: ("bf16", 2) and ("gpu", 8)
     e = s[("gpu", 8)]
     assert e["n"] == 3, e
     assert abs(e["accepted_draft_rate"] - 0.6) < 1e-9, e
     assert abs(e["effective_mean_draft_len"] - 2.5) < 1e-9, e
     assert e["matched"] is False, e
+    e2 = s[("bf16", 2)]
+    assert e2["n"] == 1, e2
+    assert abs(e2["mtp_decode_speedup"] - 2.00) < 1e-9, e2
+    assert e2["matched"] is True, e2
+
+    lines = render(s).splitlines()
+    bf16_line = next(line for line in lines if line.startswith("bf16"))
+    assert "2.000" in bf16_line and "True" in bf16_line, bf16_line
+
+    with tempfile.TemporaryDirectory() as tmp:
+        csv_path = os.path.join(tmp, "accept.csv")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        with open(csv_path, newline="") as f:
+            s_from_csv = summarize(csv.DictReader(f))
+        assert s_from_csv == s, (s_from_csv, s)
+
     print("self-test ok")
 
 
