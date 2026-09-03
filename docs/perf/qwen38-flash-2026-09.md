@@ -769,3 +769,77 @@ numeric prefill speedup on this machine, at this session's noise floor, for
 either the round-0 or the round-1 code. Revisit with a resident-server
 measurement, matching the "Where the ANE lane's cost actually is" table's own
 method, before drawing a numeric conclusion.
+
+## Dense lane: program-key bucketing and the padding it costs
+
+Commit `00d4e270`. Two changes, one of which pays for the other.
+
+### The compile problem, and the bucket that fixes it
+
+`ANESplitMLPCache` keyed fixed-shape ANE programs on the exact prompt length,
+and the runtime prewarms only `S=512`. Any other length therefore rebuilt all
+64 layers. The rows at lines 468 to 470 above record what that costs: 31.83
+seconds at 732 tokens and 34.57 seconds at 1032, which is compile time and not
+compute.
+
+The key now rounds up to a power of two from a floor of 128, so five programs
+cover every prompt length this project measures.
+
+### The padding that bucketing costs
+
+A fixed-shape program compiled at the bucket needs its input padded up to the
+bucket. The first spelling padded at the caller and passed the padded array
+into `ANEFusedSplitMLP`, whose GPU suffix ran on the same rows. Both engines
+computed the padding.
+
+| Prompt tokens | Bucket | Both engines pad | ANE leg only |
+|---|---|---|---|
+| 732 | 1024 | 28.5 percent | 11.1 percent |
+| 1032 | 2048 | 49.6 percent | 23.5 percent |
+
+The column that matters is the second one. Only the ANE program is
+fixed-shape. `gpuPartial` is a `quantizedMM` chain and accepts any row count,
+and at the deployed `MLX_ANE_FRACTION` of 0.3125 the ANE holds `F` = 5440 of
+17408 intermediate channels while the GPU holds the other 11968, which is
+68.75 percent. Most of the discarded work was therefore on the side that never
+needed padding.
+
+The padding moved into `ANEFusedSplitMLP.padForANE`, scoped to the ANE leg.
+The class slices the padded rows off the ANE output before the two partials
+add.
+
+### What the tests measure
+
+`ANEFusedSplitMLPTests.paddingIsScopedToTheANELeg`, at `S=100` into a program
+compiled at 128, hidden 5120, inter 17408, `aneFraction` 0.125.
+
+| Quantity | Measured |
+|---|---|
+| max abs against the all-GPU reference | 0.015625 |
+| mean abs against the all-GPU reference | 0.0010453 |
+| max abs when the padding rows change | 0.0 |
+
+The first figure is the same 0.015625 the full-length tests record, so the
+short-input path adds no error of its own. The third is the load-bearing one.
+Zero padding rows are exact only if the fused ANE program has no cross-token
+mixing, and that had been an assumption. Running the same real rows under
+padding values 50 times their magnitude moves them by exactly zero, which
+measures the assumption instead of restating it. It would not hold for an
+attention program, where padded rows enter the softmax.
+
+When the caller's row count already equals the compiled one, the pad and the
+slice are both identities, so every existing caller and test sees a bit-exact
+no-op. All 8 tests in `ANEFusedSplitMLPTests` and `ANESplitMLPCacheTests`
+pass.
+
+### What is left
+
+Fixed-tile keying, one program per layer dispatched `ceil(S / tile)` times at
+a tile of 128 or 256 rows, caps the residual waste near 5 to 12 percent and
+removes the per-length recompile entirely. It also multiplies every
+per-dispatch fixed cost by the dispatch count, so it should land after the
+staging work that reduces those costs. Not built.
+
+No timing is reported here. The change removes work that was provably
+discarded, and the count of removed rows is exact, but no prefill measurement
+was taken on a quiet machine.
