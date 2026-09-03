@@ -28,6 +28,17 @@ private func prefetchShards(_ urls: [URL]) {
 private func prefetchShards(_ urls: [URL]) { }
 #endif
 
+/// Headroom left for the OS, the tokenizer, and the first forward's activations
+/// when deciding whether a weight tree has to be streamed shard by shard.
+private let streamShardHeadroomBytes = 8 << 30
+
+/// Total bytes of the shard files. Picks the load strategy below.
+private func totalShardBytes(_ urls: [URL]) -> Int {
+    urls.reduce(0) { total, url in
+        total + ((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+    }
+}
+
 /// Lock-protected scratch space used by the parallel shard reader. Wrapped in
 /// a final class so Swift 6 strict concurrency can see we mean to share it
 /// across the concurrent closures.
@@ -164,9 +175,17 @@ public func loadWeights(
     }
 
     // Gather the shard URLs first so we can fan them out concurrently.
+    //
+    // Top level only. FileManager's enumerator recurses by default, and a model
+    // may keep a separate artifact in a subdirectory that it maps itself rather
+    // than loading as a parameter: qwen4_exp keeps its 95 GiB n-gram table in
+    // `<weights>/ngram/`. Recursing swept that table in as 128 extra shards, so
+    // the loader tried to read 176 GiB on a 128 GiB machine. Shards live beside
+    // config.json in every checkpoint layout this loader supports.
     var shardURLs: [URL] = []
     let enumerator = FileManager.default.enumerator(
-        at: modelDirectory, includingPropertiesForKeys: nil)!
+        at: modelDirectory, includingPropertiesForKeys: nil,
+        options: [.skipsSubdirectoryDescendants, .skipsHiddenFiles])!
     for case let url as URL in enumerator where url.pathExtension == "safetensors" {
         shardURLs.append(url)
     }
@@ -178,7 +197,20 @@ public func loadWeights(
     // we ask for them. Net cost is one open/fcntl/close per shard. By the
     // time the DispatchQueue.concurrentPerform tasks below try to read, the
     // pages may already be resident.
-    prefetchShards(shardURLs)
+    // ...but only when the tree fits. A tree whose bytes plus their transient
+    // page-cache copy exceed RAM cannot be read the fast way: F_RDADVISE on
+    // every shard fills the unified buffer cache, and the concurrent eval()s
+    // below then allocate the same bytes again as Metal buffers. Measured on a
+    // 128 GiB M4 Max, the 81 GiB qwen4_exp tree drove free memory to zero in
+    // 11 s and the compressor to 100 GiB, and the process was killed before it
+    // reached the first forward. Trees that fit keep the fast path unchanged.
+    let shardBytes = totalShardBytes(shardURLs)
+    let streamShards =
+        shardBytes * 2 + streamShardHeadroomBytes
+        > Int(ProcessInfo.processInfo.physicalMemory)
+    if !streamShards {
+        prefetchShards(shardURLs)
+    }
     mark("rdadvise")
 
     // Load shards in parallel. Each task forces eval() on its arrays so MLX
@@ -189,18 +221,32 @@ public func loadWeights(
     let shared = ParallelShardState(shardCount: shardURLs.count)
     let urls = shardURLs  // immutable Sendable snapshot for the closure
 
-    DispatchQueue.concurrentPerform(iterations: urls.count) { idx in
-        do {
+    if streamShards {
+        // One shard at a time, with a single-shard read-ahead: the kernel gets
+        // to evict shard i-1's pages while shard i is copied into MLX buffers.
+        for idx in urls.indices {
+            if idx + 1 < urls.count { prefetchShards([urls[idx + 1]]) }
             let (w, m) = try loadArraysAndMetadata(url: urls[idx])
             if !w.isEmpty {
                 eval(Array(w.values))
             }
             shared.store(index: idx, result: (w, m))
-        } catch {
-            shared.recordError(error)
+            MLX.Memory.clearCache()
         }
+    } else {
+        DispatchQueue.concurrentPerform(iterations: urls.count) { idx in
+            do {
+                let (w, m) = try loadArraysAndMetadata(url: urls[idx])
+                if !w.isEmpty {
+                    eval(Array(w.values))
+                }
+                shared.store(index: idx, result: (w, m))
+            } catch {
+                shared.recordError(error)
+            }
+        }
+        if let err = shared.firstError { throw err }
     }
-    if let err = shared.firstError { throw err }
 
     var weights = [String: MLXArray]()
     var metadata = [String: String]()
@@ -211,7 +257,7 @@ public func loadWeights(
         // taking shard 0's, falling back to next non-empty for safety.
         if i == 0 || metadata.isEmpty { metadata = m }
     }
-    mark("read shards (parallel)")
+    mark(streamShards ? "read shards (streamed)" : "read shards (parallel)")
 
     // Merge any separately-pinned weight trees BEFORE sanitize and BEFORE the
     // quantization wiring below. Both orderings are load-bearing: `sanitize` is

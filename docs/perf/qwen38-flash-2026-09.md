@@ -30,9 +30,15 @@ Now:
   reference recomputes different multipliers from its seed formula, so the
   runtime never recomputes them.
 
-Next (waits on the 335 GiB download, which waits on disk):
+- The download and the transform are done. The runtime tree is on disk and
+  matches the design: routed experts 4-bit, dense tensors bf16.
+- The checkpoint uses two norm conventions and the port splits them correctly.
+  See "Norm conventions" below.
+- Loading an 81 GiB tree needed a change to `loadWeights`. See "Weight load
+  memory" below.
 
-- Transform of the real checkpoint (`qwen4exp-transform`).
+Next:
+
 - Greedy continuations of the public prompts, prefill seconds, and decode
   tokens per second at 64 and 512 prompt tokens (`qwen4exp-generate`).
 - Serve smoke through the headless MTP session.
@@ -44,4 +50,144 @@ Later:
 
 ## Measurements
 
-None yet. The download has not run.
+### Download and transform
+
+| Step | Result |
+|---|---|
+| Download | 144 files, `verify OK`, 74 min 29 s wall (`tools/qwen38-flash/download.sh`) |
+| Download transport | `huggingface_hub[hf_xet]` under Python 3.12, about 58 MB/s |
+| Source on disk | 335 GiB |
+| Transform | 2 min 52 s wall (`qwen4exp-transform`) |
+| Runtime tree | 81.16 GiB of model shards plus 95 GiB n-gram table |
+
+The Homebrew `hf` client runs on Python 3.14, which has no `hf_xet` wheel. It
+falls back to an HTTP bridge that measured about 27 MB/s. Routing `hf` through
+`uvx --python 3.12 --from 'huggingface_hub[hf_xet]'` about doubled the rate.
+
+Transform output by category, read from the shard headers:
+
+| Category | Bytes |
+|---|---|
+| Routed experts | 71.78 GiB |
+| Attention | 5.13 GiB |
+| Embedding and head | 2.38 GiB |
+| Other | 1.30 GiB |
+| Dense MLP | 0.57 GiB |
+| Total | 81.16 GiB in 1540 tensors |
+
+Dtypes are `U32` 57.42 GiB (4-bit expert payload), `BF16` 23.74 GiB (dense
+tensors plus expert scales and biases), and `I64` for the n-gram constants.
+
+### Weight load memory
+
+The first real-model run was killed by the kernel with `SIGKILL` about
+2.5 minutes in, before it printed anything. A sampler recorded the collapse.
+
+| Elapsed | Process RSS | Free RAM | Compressed |
+|---|---|---|---|
+| 1 s | 0.00 GB | 64.92 GB | 0.69 GB |
+| 11 s | 0.17 GB | 0.06 GB | 0.51 GB |
+| 23 s | 17.50 GB | 0.05 GB | 0.51 GB |
+| 29 s | 49.24 GB | 0.01 GB | 9.57 GB |
+| 39 s | 7.87 GB | 0.01 GB | 77.97 GB |
+| 50 s | 5.63 GB | 0.07 GB | 99.54 GB |
+
+Two defects produced this, and the first is the one that mattered.
+
+**The loader read the n-gram table as model weights.** `loadWeights` collected
+shards with `FileManager.enumerator(at:includingPropertiesForKeys:)`, which
+recurses into subdirectories by default. The runtime tree keeps its n-gram
+table in `<weights>/ngram/`, as 128 shards the model maps itself and never
+loads as parameters. The enumerator swept them in:
+
+| Enumerated | Shards | Bytes |
+|---|---|---|
+| Top level, the model | 20 | 81.16 GiB |
+| Nested, the n-gram table | 128 | 95.37 GiB |
+| Total the loader queued | 148 | 176.53 GiB |
+
+176 GiB does not fit in 128 GiB, so no amount of load pacing could have saved
+the run. The enumerator now passes `.skipsSubdirectoryDescendants` and
+`.skipsHiddenFiles`. Checkpoints keep their shards beside `config.json`, and
+the ranked tree is flat (3 shards at the top level, none nested), so the ranked
+path cannot observe the change. Note that `loadArrays(directory:)` still
+recurses; it is only reached for separately pinned weight trees, which are
+flat, so it was left alone.
+
+**Loading 81 GiB in parallel still doubles the footprint.** `loadWeights` was
+tuned for a 21.6 GB tree. It calls `F_RDADVISE` on every shard at once, then
+evaluates all shards concurrently. The advisory read fills the unified buffer
+cache while the concurrent evaluations allocate the same bytes again as Metal
+buffers. In the trace above, free memory reached zero at 11 seconds while
+process RSS was still 0.17 GB, which is the advisory read alone.
+
+`loadWeights` now measures the shard bytes against physical memory. A tree
+whose bytes, doubled, plus 8 GiB of headroom exceed physical memory loads one
+shard at a time with a single-shard read-ahead and clears the MLX allocator
+cache after each shard. Smaller trees keep the parallel path: the 21.6 GiB
+ranked tree needs 51 GiB against 128 GiB, so it never streams. The 81.16 GiB
+tree does stream. `Qwen4ExpGenerate` also caps the MLX allocator cache at
+4 GiB so freed buffers return to the operating system.
+
+### Real-model smoke
+
+`qwen4exp-generate` against the transformed tree, M4 Max 128 GiB, one run each.
+
+| Run | Prompt tokens | Prefill | Decode tokens | Decode tokens/s | MLX peak |
+|---|---|---|---|---|---|
+| Chat template, 160 max | 74 | 9.30 s | 160 | 12.29 | 87.49 GB |
+| Raw, 48 max | 4 | 10.71 s | 39 | 5.70 | 87.31 GB |
+
+Load stages for the raw run, from `BENCH_VERBOSE=1`:
+
+| Stage | Time |
+|---|---|
+| rdadvise | 1.6 ms |
+| read shards (streamed) | 14,862.7 ms |
+| sanitize | 1.4 ms |
+| quantize wire | 60.5 ms |
+| update params | 14.8 ms |
+| bf16 convert | 8.3 ms |
+| eval | 4.4 ms |
+
+Streaming reads the 81.16 GiB tree at about 5.5 GB/s, so the streaming branch
+costs nothing measurable against the parallel one. Peak process RSS was
+51.27 GB and the compressor peaked at 42.30 GB, then drained to 1.18 GB.
+
+Both continuations are coherent. The raw prompt "The quick brown fox" returns
+" jumps over the lazy dog." and then repeats that sentence, which is the
+expected greedy behaviour with no chat template. The chat prompt returns
+reasoning text about separate chaining and open addressing. Prefill of about
+10 s is dominated by first-forward kernel compilation, not by the prompt: the
+4-token prompt and the 74-token prompt take the same time.
+
+Decode differs between the two runs (12.29 against 5.70 tokens per second)
+because the n-gram table pages differ in residency, not because of the prompt
+length. These are single cold runs and are directional only.
+
+### Norm conventions
+
+The checkpoint stores two norm conventions, and the stored weights identify
+which is which. A weight clustered near 1.0 is a direct scale. A weight
+clustered near 0.0 is zero-centred, which means the runtime applies `1 + w`.
+
+| Tensor | Mean | Std | Range | Convention |
+|---|---|---|---|---|
+| `layers.0.linear_attn.norm.weight` | +0.9668 | 0.0326 | +0.875 to +1.023 | direct |
+| `layers.0.attn_hyper_connection.hc_norm.weight` | -0.0635 | 0.4729 | -5.938 to +6.625 | zero-centred |
+| `layers.0.mlp_hyper_connection.hc_norm.weight` | -0.1095 | 1.0008 | -2.188 to +3.625 | zero-centred |
+| `mtp.pre_fc_norm_hidden.weight` | -0.3284 | 0.3153 | -1.133 to +0.371 | zero-centred |
+| `mtp.pre_fc_norm_embedding.weight` | -0.7642 | 0.0673 | -0.879 to -0.275 | zero-centred |
+
+The port already splits these two cases. `Qwen4ExpRMSNormGated` holds the
+direct weights and initialises to ones. `Qwen4ExpRMSNorm` holds the
+zero-centred weights and initialises to zeros. The measured means match the
+initialisers, so the split is correct.
+
+The two `mtp.pre_fc_norm_*` tensors are not centred on zero, but they stay on
+the zero-centred side. Under `1 + w` their scales are 0.672 and 0.236, which
+attenuates each stream before the concatenation and the `fc` projection. Every
+element of `pre_fc_norm_embedding` is negative, so `1 + w` stays in
+[0.121, 0.725] and never changes sign. Under the direct convention the same
+tensor would flip the sign of the whole embedding stream. Numerical parity
+against the reference remains the deciding check.

@@ -30,6 +30,10 @@ public enum Qwen4ExpGenerate {
 
     public static func run(_ o: Options) throws {
         Qwen4ExpRuntime.weightsDirectory = o.weights
+        // The 81 GiB tree plus the mapped n-gram table leave little headroom on
+        // a 128 GiB box, so return freed buffers to the OS instead of pooling
+        // them in the allocator.
+        MLX.Memory.cacheLimit = 4 << 30
         let context = try waitForAsync {
             try await LLMModelFactory.shared.load(from: o.weights, using: #huggingFaceTokenizerLoader())
         }
