@@ -99,6 +99,15 @@ accounting is in "Byte accounting".
 
 ### int8 is rejected by the Core ML compiler
 
+> **SUPERSEDED 2026-09-03, and the heading is wrong.** This section generalised
+> from three spellings to "the opset refuses int8", and that inference does not
+> hold. Core ML does not express int8 by handing int8 tensors to `conv` or
+> `matmul`, which is all this section tested. Re-probed with the representation
+> Core ML actually uses, `constexpr_blockwise_shift_scale` (`data` / `scale` /
+> `offset`, scale shaped `[N,1,1,1]`), the compiler ACCEPTS int8 weights and
+> places the conv on the ANE. See "int8, re-probed" below. The three rejections
+> quoted here are real; the conclusion drawn from them was not.
+
 `tools/int8-probe` asks Apple's compiler directly through hand-authored MIL.
 Run in this session:
 
@@ -112,6 +121,47 @@ REJECTED  conv_quantized fp16 x uint8  Unknown operator 'conv_quantized'.
 
 Variant B needs an int8 activation tensor entering the conv. The ios18 opset
 that `ANEMILBuilder` emits refuses it.
+
+## int8, re-probed (2026-09-03)
+
+The earlier finding was drawn from a probe that never tested the supported
+spelling. Re-run on this M4 Max, all cases hand-authored MIL asked directly of
+Apple's compiler, with `MLComputePlan` reporting placement.
+
+| Spelling | Compiler | Placement |
+|---|---|---|
+| CONTROL: fp16 conv, no quantization | accepted | `conv=ANE` |
+| raw int8 operands to `matmul` | rejected | -- |
+| raw int8 weight const to `conv` | rejected | -- |
+| `conv_quantized` (iOS15) | rejected, unknown operator | -- |
+| runtime `dequantize` of an int8 const | accepted | whole graph `CPU` |
+| `constexpr_blockwise_shift_scale` weight | accepted | `conv=ANE` |
+| the same plus activation `quantize`/`dequantize` | accepted | `conv=ANE`, `quantize`/`dequantize`=`CPU` |
+
+Three things follow, and they are different from each other.
+
+**int8 WEIGHTS reach the ANE.** `constexpr_blockwise_shift_scale` is a
+compile-time op, so the int8 bytes are stored and expanded during compilation.
+Its runtime parameter names are `data`, `scale` and `offset`, which are NOT
+coremltools' Python names: `constexpr_affine_dequantize` with `quantized_data`
+is rejected as an undefined attribute. Per-output-channel scale is shaped
+`[N,1,1,1]` for a `[N,K,1,1]` weight, not `[N]`.
+
+**A runtime `dequantize` of a const is the trap.** It is accepted, so it looks
+like it works, and it silently moves the entire graph to the CPU -- including
+a conv that runs on the ANE when the same weight is fp16. The CONTROL row is
+what makes that visible; without it a CPU placement is unattributable.
+
+**int8 ACTIVATIONS do not pay in this form.** The `quantize`/`dequantize` pair
+compiles and the conv stays on the ANE, but the pair itself is placed on the
+CPU, which buys a CPU round trip per dispatch instead of int8-int8 compute.
+Apple documents int8-int8 ANE throughput from A17 Pro and M4 onward, and this
+box is an M4 Max, so the capability exists and this spelling does not reach
+it. Treat activation quantization as open, not closed: what is unresolved is
+the pattern the compiler's fusion pass wants, not the hardware.
+
+The error budget quoted further down is still unmeasured, and that criticism
+stands independently of the placement result.
 
 ## Target and arithmetic
 
