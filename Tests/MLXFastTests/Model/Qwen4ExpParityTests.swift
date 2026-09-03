@@ -55,6 +55,12 @@ final class Qwen4ExpParityTests: XCTestCase {
             weights.merge(try MLX.loadArrays(url: dst.appendingPathComponent(f))) { a, _ in a }
         }
         weights = model.sanitize(weights: weights)
+        // Both sides must compute in the same precision. The reference runs
+        // float32; the transform writes bf16, so upcast every float tensor and
+        // leave the packed 4-bit expert payload (uint32) alone.
+        for (key, value) in weights where value.dtype == .bfloat16 {
+            weights[key] = value.asType(.float32)
+        }
         weights["model.layers.1.ple.ple_embedding.layer_multipliers"] = MLXArray(mults)
         weights["model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes"] = MLXArray(sizes)
         weights["model.layers.1.ple.ple_embedding.ngram_heads_offsets"] = MLXArray(offsets)

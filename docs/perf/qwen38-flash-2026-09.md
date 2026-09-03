@@ -129,6 +129,45 @@ ranked tree needs 51 GiB against 128 GiB, so it never streams. The 81.16 GiB
 tree does stream. `Qwen4ExpGenerate` also caps the MLX allocator cache at
 4 GiB so freed buffers return to the operating system.
 
+### Reference parity
+
+`MLXFAST_RUN_QWEN4EXP_PY_PARITY=1 swift test --force-resolved-versions --filter Qwen4Exp`
+passes, 32 of 32. The parity case compares the Swift port against the mlx-lm
+reference (`tools/qwen38-flash/qwen4_exp.py`) on the tiny synthetic tree, at
+`max |logit delta| < 1e-2`.
+
+Getting there needed three harness corrections. None was a defect in the port.
+
+| Correction | Max logit delta |
+|---|---|
+| Reference could not be imported at all | no result |
+| Reference in float32 and unquantized, Swift in bf16 and 4-bit | 2.837607 |
+| Both quantized, both float32, reference scales in float32 | 0.080376 |
+| Both quantized, both float32, reference scales rounded to bf16 | under 1e-2, passes |
+
+The three corrections were:
+
+1. The reference file is a package module and imports its siblings relatively,
+   so it cannot be imported as a standalone file. `parity.py` now loads it under
+   the name `mlx_lm.models.qwen4_exp`, which makes those imports resolve.
+2. The reference sizes its n-gram table from `ngram_vocab_size_base`, which
+   defaults to 20,000,000 and produced a 40,000,064-row table against the tiny
+   tree's 16 rows. The tiny source now sets that base to 8 and the divisor to 2,
+   which yields the first four primes after 7, sizes [11, 13, 17, 19], and 30
+   rows per shard. The tiny source also stores the multipliers the reference
+   derives from the config seed, because the reference rebuilds them and ignores
+   what the checkpoint holds.
+3. The comparison has to be like for like. `parity.py` now quantizes the routed
+   experts to 4-bit affine at group size 32, matching the transform, and rounds
+   its scales and biases to bf16, matching what the transform stores. The Swift
+   side upcasts its bf16 tensors to float32, matching the reference's compute
+   precision.
+
+The last row is the informative one: once both sides hold the same values in
+the same precision, the port and the reference agree. A wrong norm convention,
+a wrong hash, or a wrong residual path would show as a delta of order 1, as the
+2.84 row shows. This also confirms the norm split recorded below.
+
 ### Real-model smoke
 
 `qwen4exp-generate` against the transformed tree, M4 Max 128 GiB, one run each.

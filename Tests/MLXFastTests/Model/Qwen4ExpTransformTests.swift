@@ -25,9 +25,16 @@ final class Qwen4ExpTransformTests: XCTestCase {
             "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight": bf([4, HC]),
             "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight": bf([HC, 4]),
             "model.visual.blocks.0.attn.qkv.weight": MLXArray.zeros([3, 3]).asType(.bfloat16),
-            "\(L).1.ple.ple_embedding.layer_multipliers": MLXArray([Int64(3), 5, 7]),
-            "\(L).1.ple.ple_embedding.ngram_heads_vocab_sizes": MLXArray([Int64(7), 7, 8, 8]),
-            "\(L).1.ple.ple_embedding.ngram_heads_offsets": MLXArray([Int64(0), 7, 14, 22]),
+            // The reference rebuilds these three from the config seed formula and
+            // ignores what the checkpoint stores, so the tiny source has to store
+            // exactly what it computes or the parity comparison is meaningless.
+            // Values printed by tools/qwen38-flash/qwen4_exp.py NGramEmbedding for
+            // this config: ngram_vocab_size_base 8 gives the first four primes
+            // after 7, and the multipliers depend only on seed and vocab_size.
+            "\(L).1.ple.ple_embedding.layer_multipliers":
+                MLXArray([Int64(10_256_280_814_223_215), 52_896_835_257_613_783, 78_656_110_748_828_819]),
+            "\(L).1.ple.ple_embedding.ngram_heads_vocab_sizes": MLXArray([Int64(11), 13, 17, 19]),
+            "\(L).1.ple.ple_embedding.ngram_heads_offsets": MLXArray([Int64(0), 11, 24, 41]),
             "\(L).1.ple.key_proj.weight": bf([HC, 8]),
             "\(L).1.ple.value_proj.weight": bf([H, 8]),
             "\(L).1.ple.norm_key.weight": zeros(HC),
@@ -36,7 +43,9 @@ final class Qwen4ExpTransformTests: XCTestCase {
             "\(L).1.ple.conv1d.weight": bf([HC, 1, 4]),
         ]
         for s in 0 ..< 2 {
-            t["\(L).1.ple.ple_embedding.ngram_embedding.shard_\(s).weight"] = bf([16, 2])
+            // 4 heads sized [11, 13, 17, 19] total 60 rows, padded to 60 and split
+            // across split_ngram_parts = 2, so 30 rows per shard at head dim 2.
+            t["\(L).1.ple.ple_embedding.ngram_embedding.shard_\(s).weight"] = bf([30, 2])
         }
         // keyDim = 2*32 = 64, valueDim = 4*32 = 128, convDim = 256
         for l in 0 ..< 2 {
@@ -83,6 +92,7 @@ final class Qwen4ExpTransformTests: XCTestCase {
              "linear_key_head_dim":32,"linear_value_head_dim":32,"linear_conv_kernel_dim":4,"output_gate_type":"sigmoid",
              "hc_count":2,"hc_lowrank":4,"indexer_n_heads":2,"indexer_kv_heads":1,"indexer_head_dim":4,"indexer_budget":64,
              "indexer_compress_ratio":2,"ngram_size":3,"heads_per_ngram":2,"split_ngram_parts":2,"ple_embed_dim":8,
+             "ngram_vocab_size_base":8,"make_ngram_vocab_size_divisible_by":2,
              "ple_layer_ids":[2],"ple_conv_kernel_size":4,"eos_token_id":7,"partial_rotary_factor":0.5,
              "rope_parameters":{"rope_theta":10000,"rope_type":"default"},"tie_word_embeddings":false,"mtp_num_hidden_layers":0},
              "vision_config":{"depth":1}}
@@ -108,7 +118,7 @@ final class Qwen4ExpTransformTests: XCTestCase {
             as! [String: Any]
         XCTAssertEqual(cfg["model_type"] as? String, "qwen4_exp_text")
         XCTAssertEqual((cfg["quantization"] as? [String: Any])?["group_size"] as? Int, 32)
-        XCTAssertEqual((cfg["ngram_table"] as? [String: Any])?["rows_per_shard"] as? Int, 16)
+        XCTAssertEqual((cfg["ngram_table"] as? [String: Any])?["rows_per_shard"] as? Int, 30)
         XCTAssertNil(cfg["vision_config"])
         XCTAssertNil(cfg["text_config"])
         // n-gram shards
