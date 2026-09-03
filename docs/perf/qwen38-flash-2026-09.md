@@ -408,7 +408,9 @@ stays fast, and the recurrent rebuild lands inside the decode window. The dense
 tower publishes a tape and pays nothing. For multi-turn serving this is the
 largest single optimization target on this model.
 
-**The ANE compile is a startup cost, and the lane is still not worth it.**
+**The ANE compile is a startup cost. The lane as built is not worth it, but
+the ANE is not the reason** -- see "Where the ANE lane's cost actually is",
+which isolates the micro-batching harness as the regression.
 Startup is 45 s with the lane against 34 and 32 s without, so the 48 programs
 compile once during the serve warm, not once per prompt. The earlier one-shot
 figure of 14.8 s was that same cost measured inside a process that answered one
@@ -419,6 +421,102 @@ warm prefill are untouched, as expected for a prefill-only lane. This also
 corrects the earlier inference on this page that ANE dispatch reaches GPU
 parity; that came from subtracting a compile constant from a cold run, and the
 direct post-load measurement disagrees with it.
+
+### Where the ANE lane's cost actually is
+
+Three arms, same tower, same prompts, resident serve, prefill tokens/s:
+
+| Arm | Structure | Projections | cold A | cold B |
+|---|---|---|---|---|
+| `moe_plain` | one fused lazy graph | GPU | **305.1** | **303.7** |
+| `moe_mb_gpu` | micro-batched, 144 evals | GPU | 252.6 | 235.4 |
+| `moe_mb_ane` | micro-batched, 144 evals | ANE | 267.5 | 233.8 |
+
+The regression is the micro-batching harness, not the ANE. Micro-batching alone
+costs 17 to 22 percent. Adding the ANE on top of that same structure *recovers*
+6 percent on prompt A and is a wash on prompt B. Measured against a fair
+baseline the ANE contributes throughput; it is the harness around it that
+loses more than the lane gains.
+
+Three costs in `forwardMicroBatched` are on the serial path, and only the
+middle one is overlapped:
+
+1. `makeInput(...)` materializes a lazy array into an IOSurface with a bf16 to
+   fp16 conversion, on the calling thread, before `ConcurrentEngines.run`.
+2. `predict` on the ANE, overlapped against the GPU's `finish`. This part works.
+3. `readOutput(...).asType(...)` copies back with an fp16 to bf16 conversion,
+   after the concurrent section.
+
+Plus one `eval(o)` per layer per micro-batch: 48 x 3 = 144 hard barriers for a
+732-token prefill, against a baseline that builds one graph and evaluates once.
+
+### ANE program shape stability
+
+The dense tower and the MoE tower cache ANE programs the same way, `[Int:
+Program]` keyed on a sequence length, but they key on different lengths, and it
+decides everything.
+
+| Tower | Key | Consequence |
+|---|---|---|
+| Dense | full prompt length, prewarmed only at `S=512` | every new prompt length recompiles all 64 layers |
+| MoE | fixed 256-token micro-batch | compiles once, reused at every prompt length |
+
+Measured on the dense tower with the ANE lane on, at unprewarmed lengths:
+
+| Request | Prompt | Prefill | Prefill tok/s |
+|---|---|---|---|
+| A, first | 732 | 31.83 s | 23.0 |
+| A, repeat | 732 | 0.178 s | 4105.7 |
+| B (1032, different length) | 1032 | 34.57 s | 29.9 |
+
+The repeat is a prompt-cache hit, not evidence of program reuse. The two cold
+requests at different lengths each pay about 34 s, which is the 64-layer
+compile, not compute. A dense ANE measurement is therefore only meaningful at a
+prewarmed shape; at an arbitrary prompt length the lane is compile-bound.
+
+Fixed-tile keying is the property to keep. The MoE lane already has it.
+
+### Expert distribution across both engines: what bounds it
+
+Offloading `in_proj` and `q_proj` is the wrong unit of work for an MoE. Those
+are small dense projections; the expert GEMMs are the load, and all 512 experts
+per layer currently run on the GPU while the ANE handles a sliver. The
+architecturally interesting split is by expert, so both engines carry expert
+work at once.
+
+What bounds it is memory, not ANE speed. Expert parameters across 48 layers:
+
+| Representation | Size |
+|---|---|
+| 4-bit affine with scales, as shipped | 71.78 GiB (77.1 GB) |
+| fp16, which the ANE weight const requires today | 241.6 GB |
+| int8 | 120.8 GB |
+| int4 | about 60.4 GB |
+
+Partitioning experts, so each lives on exactly one engine, costs
+`f * 241.6 + (1 - f) * 77.1` GB at fp16:
+
+| ANE share `f` | Total expert bytes | Fits in 128 GB with about 12 GB of KV and activations |
+|---|---|---|
+| 0.10 | 93.6 GB | yes |
+| 0.15 | 101.7 GB | tight |
+| 0.20 | 110.0 GB | no |
+
+So fp16 caps the ANE share near 0.12. If the ANE runs expert GEMMs at rate `r`
+relative to the GPU, the balanced split is `f* = r / (1 + r)` and the ceiling is
+`1 + r`. Even a slow ANE at `r = 0.5` wants `f* = 0.33` for a 1.5x prefill
+ceiling, and fp16 memory will not reach it: at `f = 0.12` the ceiling is 1.14x.
+
+An int8 ANE weight const moves `f*` into range (`f = 0.35` costs 92.4 GB). An
+int4 const would make a balanced 50/50 split *smaller* than the tree is today
+(30.2 + 38.6 = 68.8 GB against 77.1 GB). `ANEMILBuilder` already carries the
+dtype codes (`int8 = 21`, `int4 = 25`, `uint4 = 35`) and a const path for
+quantize and dequantize scales, but the builder emits an fp16 weight const only.
+
+The measurement that gates the whole design is `r`: ANE against GPU throughput
+on expert-shaped GEMMs, `[640, 2560]` and `[2560, 640]`, at the 256-token tile.
+Nothing above should be built before `r` is known, because `r` sets both the
+optimal split and whether the quantized weight path is worth implementing.
 
 ### Norm conventions
 

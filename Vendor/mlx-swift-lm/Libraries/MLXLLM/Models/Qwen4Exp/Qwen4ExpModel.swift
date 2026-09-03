@@ -99,9 +99,13 @@ public final class Qwen4ExpTextModel: Module {
     @ModuleInfo(key: "layers") var layers: [Qwen4ExpDecoderLayer]
     @ModuleInfo(key: "hyper_connection_mixer") var mixer: Qwen4ExpGatedResidual
 
-    /// Test hook: run the micro-batched prefill loop at this length with GPU
-    /// projections (no ANE), so the pipeline structure is checked without the lane.
-    nonisolated(unsafe) static var forcedMicroBatch: Int?
+    /// Test and diagnostic hook: run the micro-batched prefill loop at this
+    /// length with GPU projections (no ANE), so the pipeline structure is
+    /// exercised without the lane. Tests assign it directly; the environment
+    /// variable is the out-of-process hook, which is what lets the
+    /// micro-batching cost be measured apart from the ANE lane's own cost.
+    nonisolated(unsafe) static var forcedMicroBatch: Int? =
+        Int(ProcessInfo.processInfo.environment["MLX_QWEN4EXP_FORCE_MICROBATCH"] ?? "")
 
     init(_ args: Qwen4ExpTextConfiguration) {
         self.args = args
