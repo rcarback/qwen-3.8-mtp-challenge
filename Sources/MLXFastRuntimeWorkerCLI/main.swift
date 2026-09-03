@@ -121,6 +121,26 @@ private enum ParticipantWorkerCLI {
                     decodeCeiling: decodeCeiling
                 )
 
+            case "qwen4exp-transform":
+                // Local fork only: Qwen3.8-Flash-Next bf16 source -> runtime tree.
+                try options.requireOnly(
+                    values: ["--source", "--destination", "--expert-group-size", "--expert-bits"]
+                )
+                let source = options.value(for: "--source", default: "")
+                let destination = options.value(for: "--destination", default: "")
+                guard !source.isEmpty, !destination.isEmpty else {
+                    throw MLXFastError.invalidInput(
+                        "usage: qwen4exp-transform --source DIR --destination DIR [--expert-group-size 32] [--expert-bits 4]")
+                }
+                let groupSize = Int(options.value(for: "--expert-group-size", default: "32")) ?? 32
+                let bits = Int(options.value(for: "--expert-bits", default: "4")) ?? 4
+                try Qwen4ExpTransform.run(
+                    .init(
+                        source: URL(fileURLWithPath: source),
+                        destination: URL(fileURLWithPath: destination),
+                        expertGroupSize: groupSize, expertBits: bits))
+                print("qwen4exp-transform: wrote \(destination)")
+
             case "preflight":
                 try options.requireOnly(
                     values: ["--weights"]
