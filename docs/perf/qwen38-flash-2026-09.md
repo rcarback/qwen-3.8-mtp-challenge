@@ -636,6 +636,22 @@ inside one bucket's own run-to-run standard deviation -- so this section does
 not pick one point estimate; the whole table, and the range `f* ≈ 0.46-0.55`
 / ceiling `≈ 1.85-2.24` it implies, is the result.
 
+### This is the production-representative number, not a pessimistic floor
+
+`ANEDirectDispatch.Prepared` being a documented one-shot handoff object is not
+only a constraint on how this benchmark had to be written -- it is a
+constraint on the ANE offload itself, if Task 5 builds one. A real per-call
+ANE expert dispatch inside decode or prefill would build a `Prepared` from
+`Qwen4ExpANEProjection.callAsFunction` exactly the same way this benchmark's
+timed loop does: stage, predict, read, once, every call, because that is the
+only supported way to drive this API today. There is no cheaper "warm,
+reused-surface" path available to production that this benchmark failed to
+exercise. So the `r` table above is not a worst case awaiting a smarter
+integration to beat -- it is the number a straightforward integration would
+actually get. (Whether a *future* change to `ANEDirectDispatch` itself could
+add safe reuse is a separate question this task did not investigate; nothing
+here rules that out, but nothing here supports assuming it either.)
+
 One residual, known bias: `aneSeconds` in the table above does not include
 materialising the ANE's output into a usable MLX buffer (see
 `ANEGemmSample.aneSeconds`'s doc comment in `ANEGemmBench.swift` for why --
