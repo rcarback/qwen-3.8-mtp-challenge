@@ -121,6 +121,25 @@ private enum ParticipantWorkerCLI {
                     decodeCeiling: decodeCeiling
                 )
 
+            case "qwen4exp-generate":
+                // Local fork only: serial greedy generation with timing.
+                try options.requireOnly(
+                    values: ["--weights", "--prompt", "--max-tokens", "--raw", "--json"]
+                )
+                let weights = options.value(for: "--weights", default: "")
+                let prompt = options.value(for: "--prompt", default: "")
+                guard !weights.isEmpty, !prompt.isEmpty else {
+                    throw MLXFastError.invalidInput(
+                        "usage: qwen4exp-generate --weights DIR --prompt TEXT [--max-tokens N] [--raw 1] [--json PATH]")
+                }
+                let maxTokens = Int(options.value(for: "--max-tokens", default: "128")) ?? 128
+                let raw = options.value(for: "--raw", default: "0") == "1"
+                let json = options.value(for: "--json", default: "")
+                try Qwen4ExpGenerate.run(
+                    .init(
+                        weights: URL(fileURLWithPath: weights), prompt: prompt, maxTokens: maxTokens,
+                        chat: !raw, jsonOut: json.isEmpty ? nil : URL(fileURLWithPath: json)))
+
             case "qwen4exp-transform":
                 // Local fork only: Qwen3.8-Flash-Next bf16 source -> runtime tree.
                 try options.requireOnly(
