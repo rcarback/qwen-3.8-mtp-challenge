@@ -9,6 +9,10 @@ import MLXNN
 /// Gated DeltaNet block. Unlike Qwen3-Next the checkpoint splits the input
 /// projections (`in_proj_qkv`, `in_proj_z`, `in_proj_b`, `in_proj_a`) and the
 /// output gate is a sigmoid. The recurrence is the vendored `gatedDeltaUpdate`.
+///
+/// The forward is split in two phases so the ANE dense lane can run the fused
+/// `[in_proj_qkv; in_proj_z]` projection of the next micro-batch while the GPU
+/// finishes this one: `inProjection` then `finish`.
 final class Qwen4ExpGatedDeltaNet: Module {
     let numVHeads: Int
     let numKHeads: Int
@@ -28,6 +32,8 @@ final class Qwen4ExpGatedDeltaNet: Module {
     @ParameterInfo(key: "A_log") var aLog: MLXArray
     @ModuleInfo(key: "norm") var norm: Qwen4ExpRMSNormGated
     @ModuleInfo(key: "out_proj") var outProj: Linear
+
+    private let aneInProj = Qwen4ExpANEProjectionCache(label: "linear_attn.in_proj")
 
     init(_ args: Qwen4ExpTextConfiguration) {
         numVHeads = args.linearNumValueHeads
@@ -54,11 +60,36 @@ final class Qwen4ExpGatedDeltaNet: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray, mask: MLXArray?, cache: ArraysCache?) -> MLXArray {
+    // MARK: phase 1: the fused in-projection
+
+    /// GPU in-projection: `(mixedQKV [B, S, convDim], z [B, S, valueDim])`.
+    func inProjection(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        (inProjQKV(x), inProjZ(x))
+    }
+
+    /// The ANE program for the fused `[in_proj_qkv; in_proj_z]` at `sequenceLength`,
+    /// or nil when the lane is off or the program failed to build.
+    func aneInProjection(sequenceLength: Int) -> Qwen4ExpANEProjection? {
+        guard Qwen4ExpANELane.enabled else { return nil }
+        return aneInProj.program(
+            weight: { concatenated([inProjQKV.weight, inProjZ.weight], axis: 0) },
+            sequenceLength: sequenceLength)
+    }
+
+    /// Split a fused projection `[B, S, convDim + valueDim]` into `(mixedQKV, z)`.
+    func splitFused(_ y: MLXArray) -> (MLXArray, MLXArray) {
+        (y[.ellipsis, 0 ..< convDim], y[.ellipsis, convDim...])
+    }
+
+    // MARK: phase 2: conv, recurrence, gate, out-projection
+
+    func finish(_ x: MLXArray, mixedQKV mixedIn: MLXArray, z zFlat: MLXArray, mask: MLXArray?, cache: ArraysCache?)
+        -> MLXArray
+    {
         let B = x.dim(0)
         let S = x.dim(1)
-        var mixedQKV = inProjQKV(x)
-        let z = inProjZ(x).reshaped(B, S, numVHeads, headVDim)
+        var mixedQKV = mixedIn
+        let z = zFlat.reshaped(B, S, numVHeads, headVDim)
         let b = inProjB(x)
         let a = inProjA(x)
 
@@ -87,5 +118,10 @@ final class Qwen4ExpGatedDeltaNet: Module {
             cache.offset += S
         }
         return outProj(norm(out, gate: z).reshaped(B, S, valueDim))
+    }
+
+    func callAsFunction(_ x: MLXArray, mask: MLXArray?, cache: ArraysCache?) -> MLXArray {
+        let (mixedQKV, z) = inProjection(x)
+        return finish(x, mixedQKV: mixedQKV, z: z, mask: mask, cache: cache)
     }
 }

@@ -181,6 +181,9 @@ final class Qwen4ExpQSAIndexer: Module {
     }
 }
 
+/// Full attention with the QSA keep mask. Split in two phases so the ANE dense
+/// lane can run `q_proj` (query and output gate) of the next micro-batch while
+/// the GPU finishes this one: `qProjection` then `finish`.
 final class Qwen4ExpAttention: Module {
     let nHeads: Int
     let nKVHeads: Int
@@ -194,6 +197,8 @@ final class Qwen4ExpAttention: Module {
     @ModuleInfo(key: "q_norm") var qNorm: Qwen4ExpRMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: Qwen4ExpRMSNorm
     @ModuleInfo(key: "indexer") var indexer: Qwen4ExpQSAIndexer
+
+    private let aneQProj = Qwen4ExpANEProjectionCache(label: "self_attn.q_proj")
 
     init(_ args: Qwen4ExpTextConfiguration) {
         nHeads = args.attentionHeads
@@ -211,8 +216,16 @@ final class Qwen4ExpAttention: Module {
         super.init()
     }
 
-    func callAsFunction(
-        _ x: MLXArray, rope: Qwen4ExpRotary,
+    /// GPU `q_proj`: `[B, S, nHeads * 2 * headDim]` (query then gate per head).
+    func qProjection(_ x: MLXArray) -> MLXArray { qProj(x) }
+
+    func aneQProjection(sequenceLength: Int) -> Qwen4ExpANEProjection? {
+        guard Qwen4ExpANELane.enabled else { return nil }
+        return aneQProj.program(weight: { qProj.weight }, sequenceLength: sequenceLength)
+    }
+
+    func finish(
+        _ x: MLXArray, qg qgFlat: MLXArray, rope: Qwen4ExpRotary,
         mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: Qwen4ExpAttnCache?
     ) -> MLXArray {
         let B = x.dim(0)
@@ -220,7 +233,7 @@ final class Qwen4ExpAttention: Module {
         let offset = cache?.offset ?? 0
         let sparse = indexer.keepMask(x, rope: rope, cache: cache, offset: offset)
 
-        let qg = MLX.split(qProj(x).reshaped(B, S, nHeads, 2 * headDim), parts: 2, axis: -1)
+        let qg = MLX.split(qgFlat.reshaped(B, S, nHeads, 2 * headDim), parts: 2, axis: -1)
         let gate = qg[1].reshaped(B, S, nHeads * headDim)
         var q = qNorm(qg[0]).transposed(0, 2, 1, 3)
         var k = kNorm(kProj(x).reshaped(B, S, nKVHeads, headDim)).transposed(0, 2, 1, 3)
@@ -246,5 +259,12 @@ final class Qwen4ExpAttention: Module {
         let out = attentionWithCacheUpdate(
             queries: q, keys: k, values: v, cache: cache, scale: scale, mask: effective)
         return oProj(out.transposed(0, 2, 1, 3).reshaped(B, S, nHeads * headDim) * sigmoid(gate))
+    }
+
+    func callAsFunction(
+        _ x: MLXArray, rope: Qwen4ExpRotary,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: Qwen4ExpAttnCache?
+    ) -> MLXArray {
+        finish(x, qg: qProjection(x), rope: rope, mask: mask, cache: cache)
     }
 }

@@ -29,24 +29,66 @@ final class Qwen4ExpDecoderLayer: Module {
         super.init()
     }
 
-    func callAsFunction(
-        _ hIn: MLXArray, rope: Qwen4ExpRotary, mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        ssmMask: MLXArray?, cache: KVCache?, ids: MLXArray, prevContext: MLXArray?
-    ) -> MLXArray {
+    /// Phase 0: PLE injection (at the PLE layer) and the attention-side read gate.
+    /// Returns the updated wide residual, the mixed input, and the write gate.
+    func preMix(_ hIn: MLXArray, ids: MLXArray, prevContext: MLXArray?, cache: KVCache?)
+        -> (h: MLXArray, x: MLXArray, inject: MLXArray)
+    {
         var h = hIn
         if let ple, let prevContext {
             h = h + ple(hidden: h, ids: ids, prevContext: prevContext, cache: cache as? ArraysCache)
         }
-        let (x1, inject1) = attnHC.mix(h)
-        let branch1: MLXArray
+        let (x, inject) = attnHC.mix(h)
+        return (h, x, inject!)
+    }
+
+    /// Phase 1 on the GPU: the projection the ANE lane can also produce
+    /// (`[in_proj_qkv; in_proj_z]` for GDN layers, `q_proj` for attention layers).
+    func gpuProjection(_ x: MLXArray) -> MLXArray {
         if let linearAttn {
-            branch1 = linearAttn(x1, mask: ssmMask, cache: cache as? ArraysCache)
-        } else {
-            branch1 = selfAttn!(x1, rope: rope, mask: mask, cache: cache as? Qwen4ExpAttnCache)
+            let (mixedQKV, z) = linearAttn.inProjection(x)
+            return concatenated([mixedQKV, z], axis: -1)
         }
-        h = attnHC.combine(h, branch: branch1, inject: inject1!)
-        let (x2, inject2) = mlpHC.mix(h)
-        return mlpHC.combine(h, branch: mlp(x2), inject: inject2!)
+        return selfAttn!.qProjection(x)
+    }
+
+    /// The ANE program for phase 1 at `sequenceLength`, if the lane is on and the build succeeded.
+    func aneProjection(sequenceLength: Int) -> Qwen4ExpANEProjection? {
+        if let linearAttn { return linearAttn.aneInProjection(sequenceLength: sequenceLength) }
+        return selfAttn!.aneQProjection(sequenceLength: sequenceLength)
+    }
+
+    /// Phase 2: the rest of the layer from a phase-1 projection.
+    func finish(
+        _ h: MLXArray, x: MLXArray, inject: MLXArray, projection: MLXArray,
+        rope: Qwen4ExpRotary, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let branch: MLXArray
+        if let linearAttn {
+            let (mixedQKV, z) = linearAttn.splitFused(projection)
+            branch = linearAttn.finish(x, mixedQKV: mixedQKV, z: z, mask: nil, cache: cache as? ArraysCache)
+        } else {
+            branch = selfAttn!.finish(x, qg: projection, rope: rope, mask: mask, cache: cache as? Qwen4ExpAttnCache)
+        }
+        let h1 = attnHC.combine(h, branch: branch, inject: inject)
+        let (x2, inject2) = mlpHC.mix(h1)
+        return mlpHC.combine(h1, branch: mlp(x2), inject: inject2!)
+    }
+
+    func callAsFunction(
+        _ hIn: MLXArray, rope: Qwen4ExpRotary, mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?, cache: KVCache?, ids: MLXArray, prevContext: MLXArray?
+    ) -> MLXArray {
+        let (h, x, inject) = preMix(hIn, ids: ids, prevContext: prevContext, cache: cache)
+        let branch: MLXArray
+        if let linearAttn {
+            branch = linearAttn(x, mask: ssmMask, cache: cache as? ArraysCache)
+        } else {
+            branch = selfAttn!(x, rope: rope, mask: mask, cache: cache as? Qwen4ExpAttnCache)
+        }
+        let h1 = attnHC.combine(h, branch: branch, inject: inject)
+        let (x2, inject2) = mlpHC.mix(h1)
+        return mlpHC.combine(h1, branch: mlp(x2), inject: inject2!)
     }
 }
 
@@ -57,6 +99,10 @@ public final class Qwen4ExpTextModel: Module {
     @ModuleInfo(key: "layers") var layers: [Qwen4ExpDecoderLayer]
     @ModuleInfo(key: "hyper_connection_mixer") var mixer: Qwen4ExpGatedResidual
 
+    /// Test hook: run the micro-batched prefill loop at this length with GPU
+    /// projections (no ANE), so the pipeline structure is checked without the lane.
+    nonisolated(unsafe) static var forcedMicroBatch: Int?
+
     init(_ args: Qwen4ExpTextConfiguration) {
         self.args = args
         rope = Qwen4ExpRotary(dims: args.rotaryDims, base: args.ropeTheta)
@@ -66,35 +112,159 @@ public final class Qwen4ExpTextModel: Module {
         super.init()
     }
 
+    /// The n-gram context for `ids` (the last `ngramSize - 1` ids before this
+    /// call, EOS-padded at the start) and the context the NEXT call starts from.
+    private func nextPrevContext(ids: MLXArray, pleCache pc: ArraysCache?, prev: MLXArray?)
+        -> (context: MLXArray, next: MLXArray)
+    {
+        let ctxLen = args.ngramSize - 1
+        let context =
+            prev ?? pc?[3]
+            ?? broadcast(MLXArray(Int32(args.eosTokenId)).reshaped(1, 1), to: [ids.dim(0), ctxLen])
+        let history = concatenated([context, ids.asType(.int32)], axis: 1)
+        return (context, history[0..., (history.dim(1) - ctxLen)...])
+    }
+
     /// Returns the mixer output (`[B, S, hidden]`, the final "norm") and the
     /// wide residual before the mixer (`[B, S, hcDim]`, the MTP head's input).
     func forward(_ ids: MLXArray, cache: [KVCache]?) -> (hidden: MLXArray, wide: MLXArray) {
+        let S = ids.dim(1)
+        if ids.dim(0) == 1 {
+            if let forced = Self.forcedMicroBatch, S >= 2 * forced {
+                return forwardMicroBatched(ids, cache: cache, microBatch: forced, useANE: false)
+            }
+            if Qwen4ExpANELane.armed(sequenceLength: S) {
+                return forwardMicroBatched(
+                    ids, cache: cache, microBatch: Qwen4ExpANELane.microBatch, useANE: true)
+            }
+        }
         var h = tiled(embedTokens(ids), repetitions: [1, 1, args.hcCount])
         let caches: [KVCache?] = cache.map { $0.map { Optional($0) } } ?? Array(repeating: nil, count: layers.count)
         let firstAttn = layers.firstIndex { !$0.isLinear }
         let attnCache: KVCache? = firstAttn.flatMap { caches[$0] }
         let mask = createAttentionMask(h: h, cache: attnCache.map { [$0] }, returnArray: false)
 
-        // n-gram context: the last (ngramSize - 1) ids before this call, EOS-padded at the start.
         var prevContext: MLXArray? = nil
         if let pleIdx = args.pleLayerIndices.first {
-            let ctxLen = args.ngramSize - 1
             let pc = caches[pleIdx] as? ArraysCache
-            let prev =
-                pc?[3]
-                ?? broadcast(
-                    MLXArray(Int32(args.eosTokenId)).reshaped(1, 1), to: [ids.dim(0), ctxLen])
-            prevContext = prev
-            if let pc {
-                let history = concatenated([prev, ids.asType(.int32)], axis: 1)
-                pc[3] = history[0..., (history.dim(1) - ctxLen)...]
-            }
+            let (context, next) = nextPrevContext(ids: ids, pleCache: pc, prev: nil)
+            prevContext = context
+            pc?[3] = next
         }
         for (i, layer) in layers.enumerated() {
             h = layer(
                 h, rope: rope, mask: mask, ssmMask: nil, cache: caches[i], ids: ids, prevContext: prevContext)
         }
         return (mixer.mix(h).mixed, h)
+    }
+
+    /// Prefill as micro-batches of `microBatch` tokens (plus a shorter tail),
+    /// layer-major. Inside each layer the phase-1 projection of the NEXT
+    /// micro-batch runs on the ANE while the GPU finishes the current one; a
+    /// micro-batch the ANE cannot serve (no program, or the tail) projects on
+    /// the GPU. Recurrent and attention state advance in token order, so the
+    /// numerics differ from the plain path only by the fp16 ANE projection.
+    func forwardMicroBatched(_ ids: MLXArray, cache: [KVCache]?, microBatch m: Int, useANE: Bool)
+        -> (hidden: MLXArray, wide: MLXArray)
+    {
+        let S = ids.dim(1)
+        let caches: [KVCache?] = cache.map { $0.map { Optional($0) } } ?? Array(repeating: nil, count: layers.count)
+        var bounds = [(Int, Int)]()
+        var start = 0
+        while start < S {
+            let end = min(start + m, S)
+            bounds.append((start, end))
+            start = end
+        }
+        let n = bounds.count
+        let segIds = bounds.map { ids[0..., $0.0 ..< $0.1] }
+        var hs = segIds.map { tiled(embedTokens($0), repetitions: [1, 1, args.hcCount]) }
+
+        var contexts = [MLXArray?](repeating: nil, count: n)
+        if let pleIdx = args.pleLayerIndices.first {
+            let pc = caches[pleIdx] as? ArraysCache
+            var prev: MLXArray? = nil
+            for i in 0 ..< n {
+                let (context, next) = nextPrevContext(ids: segIds[i], pleCache: pc, prev: prev)
+                contexts[i] = context
+                prev = next
+            }
+            pc?[3] = prev
+        }
+
+        for (li, layer) in layers.enumerated() {
+            let c = caches[li]
+            var mixes = [(x: MLXArray, inject: MLXArray)]()
+            for i in 0 ..< n {
+                let (h, x, inject) = layer.preMix(hs[i], ids: segIds[i], prevContext: contexts[i], cache: c)
+                hs[i] = h
+                mixes.append((x, inject))
+            }
+            let program = useANE ? layer.aneProjection(sequenceLength: m) : nil
+            func aneServes(_ i: Int) -> Bool { program != nil && bounds[i].1 - bounds[i].0 == m }
+            func readANE(_ p: Qwen4ExpANEProjection, _ prepared: ANEDirectDispatch.Prepared, dtype: DType)
+                -> MLXArray
+            {
+                p.readOutput(prepared).asType(dtype).reshaped(1, m, -1)
+            }
+
+            var projections = [MLXArray?](repeating: nil, count: n)
+            if aneServes(0), let p = program, let prepared = try? p.makeInput(mixes[0].x.reshaped(m, -1)),
+                (try? p.predict(prepared)) != nil
+            {
+                projections[0] = readANE(p, prepared, dtype: hs[0].dtype)
+            } else {
+                projections[0] = layer.gpuProjection(mixes[0].x)
+            }
+
+            for i in 0 ..< n {
+                let next = i + 1
+                var nextPrepared: ANEDirectDispatch.Prepared? = nil
+                if next < n, aneServes(next), let p = program {
+                    nextPrepared = try? p.makeInput(mixes[next].x.reshaped(m, -1))
+                }
+                let mask: MLXFast.ScaledDotProductAttentionMaskMode =
+                    layer.isLinear
+                    ? .none : createAttentionMask(h: mixes[i].x, cache: c.map { [$0] }, returnArray: false)
+                var out: MLXArray? = nil
+                var aneFailed = false
+                do {
+                    let (_, o) = try ConcurrentEngines.run(
+                        ane: {
+                            if let np = nextPrepared, let p = program { try p.predict(np) }
+                        },
+                        gpu: { () -> MLXArray in
+                            let o = layer.finish(
+                                hs[i], x: mixes[i].x, inject: mixes[i].inject, projection: projections[i]!,
+                                rope: rope, mask: mask, cache: c)
+                            eval(o)
+                            return o
+                        })
+                    out = o
+                } catch {
+                    // The ANE side failed; the GPU side either finished or threw the same way.
+                    aneFailed = true
+                    if Qwen4ExpANELane.log {
+                        fputs("[qwen4exp-ane] predict failed at layer \(li): \(error)\n", stderr)
+                    }
+                }
+                if out == nil {
+                    out = layer.finish(
+                        hs[i], x: mixes[i].x, inject: mixes[i].inject, projection: projections[i]!,
+                        rope: rope, mask: mask, cache: c)
+                }
+                hs[i] = out!
+                if next < n {
+                    if !aneFailed, let np = nextPrepared, let p = program {
+                        projections[next] = readANE(p, np, dtype: hs[i].dtype)
+                    } else {
+                        projections[next] = layer.gpuProjection(mixes[next].x)
+                    }
+                }
+            }
+        }
+        let wide = concatenated(hs, axis: 1)
+        return (mixer.mix(wide).mixed, wide)
     }
 }
 
