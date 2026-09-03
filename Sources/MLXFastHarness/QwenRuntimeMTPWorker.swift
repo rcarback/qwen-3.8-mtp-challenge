@@ -347,6 +347,8 @@ extension QwenRuntime {
         // `Qwen36MTPTarget`. Accepting only one of them is what made this worker
         // unloadable in both directions: the transformed tree builds the bare
         // text model, and the raw pinned reference builds the wrapper.
+        // Qwen3.8-Flash-Next resolves its memory-mapped n-gram table from here.
+        Qwen4ExpRuntime.weightsDirectory = targetURL
         var backboneLayout = Qwen36MTPHeadAttachment.BackboneLayout.textModel
         let context = try Qwen36MTPHeadAttachment.withHeadAttached(
             backboneDirectory: targetURL,
@@ -366,7 +368,8 @@ extension QwenRuntime {
                     + "which is not an MTP-capable Qwen 3.6 model. This track "
                     + "serves Qwen35TextModel (the transformed weights/ tree, "
                     + "model_type qwen3_5_text) and Qwen35Model (the raw pinned "
-                    + "reference, model_type qwen3_5) and nothing else.")
+                    + "reference, model_type qwen3_5) and Qwen4ExpModel "
+                    + "(Qwen3.8-Flash-Next, model_type qwen4_exp_text), and nothing else.")
         }
         fputs(
             "mlxfast-worker: qwen-mtp backbone layout=\(backboneLayout.rawValue) "

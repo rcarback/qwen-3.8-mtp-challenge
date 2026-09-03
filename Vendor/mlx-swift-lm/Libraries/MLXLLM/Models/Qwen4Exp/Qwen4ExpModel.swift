@@ -108,6 +108,15 @@ public class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public var loraLayers: [Module] { model.layers }
 
+    /// Token embedding (the MTP head borrows it). Public for the serve conformance.
+    public func embed(_ ids: MLXArray) -> MLXArray { model.embedTokens(ids) }
+
+    /// The vocabulary projection applied to post-mixer hidden rows.
+    public func projectToVocab(_ x: MLXArray) -> MLXArray { lmHead(x) }
+
+    /// Collapse a wide residual `[.., hcDim]` with the final mixer (the model's "norm").
+    public func collapseWide(_ x: MLXArray) -> MLXArray { model.mixer.mix(x).mixed }
+
     public init(_ configuration: Qwen4ExpConfiguration) {
         self.configuration = configuration
         let t = configuration.textConfig

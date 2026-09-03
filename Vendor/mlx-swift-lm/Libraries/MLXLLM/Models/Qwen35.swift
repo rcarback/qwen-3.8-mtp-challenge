@@ -6268,6 +6268,13 @@ public struct Qwen35ForwardOutput {
     public let hidden: MLXArray
     public let normed: MLXArray?
     public let layerHidden: MLXArray?
+
+    public init(logits: MLXArray, hidden: MLXArray, normed: MLXArray?, layerHidden: MLXArray?) {
+        self.logits = logits
+        self.hidden = hidden
+        self.normed = normed
+        self.layerHidden = layerHidden
+    }
 }
 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {

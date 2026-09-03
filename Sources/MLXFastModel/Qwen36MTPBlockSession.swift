@@ -965,7 +965,7 @@ public final class Qwen36MTPBlockSession {
         // `qwen3_5_text` towers (0.8B/4B/9B), which publish no MTP head, and
         // it is reachable only when the parent passed an empty head path.
         self.headless = !model.hasMTPHead
-        guard model.hasMTPHead || Qwen35Config.geometryUnpinned() else {
+        guard model.hasMTPHead || model is Qwen4ExpModel || Qwen35Config.geometryUnpinned() else {
             throw Qwen36MTPSessionError.headNotAttached
         }
         self.model = model
