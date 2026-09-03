@@ -39,13 +39,15 @@ Now:
   projections; the ANE program itself is verified only by the opt-in runtime
   test.
 
-Next, and both wait on the operator:
+- The ANE dense lane is measured and stays off. It costs 48 one-off program
+  compiles and it is not token-identical. See "ANE dense lane A/B".
 
-- ANE dense lane A/B at 512 and 2048 prompt tokens, with the identical-token
-  gate. This needs an idle machine and the root-owned ANE caches cleared
-  (`/private/var/db/neuralengine`, `/Library/Caches/com.apple.aned`), which
-  takes sudo.
+Next:
+
 - Accept rate and decode across the varied-prose set rather than one prompt.
+- If the lane is ever wanted, measure it inside a persistent server where the
+  48 compiles are paid once, and decide whether an fp16 argmax flip is
+  acceptable there.
 
 ## Measurements
 
@@ -287,6 +289,48 @@ allows.
 
 One prompt is one prompt. Treat these as directional until they are measured
 across the varied-prose set.
+
+### ANE dense lane A/B
+
+`MLX_ANE_DIRECT=1` puts the gated-delta in-projection and the attention
+`q_proj` on the ANE in fp16 during prefill. The lane arms only when a prefill
+holds at least two full micro-batches, so at the default micro-batch of 256 it
+needs 512 or more tokens. A first pass at 336 tokens never armed it; that run is
+discarded.
+
+Four prompts, greedy, 32 decode tokens, one cold run per arm.
+
+| Prompt | Tokens | GPU prefill | ANE prefill | Overhead | Tokens identical |
+|---|---|---|---|---|---|
+| 1 | 720 | 6.98 s | 21.79 s | +14.81 s | yes |
+| 1 long | 2112 | 9.56 s | 24.33 s | +14.76 s | yes |
+| 2 | 900 | 9.39 s | 21.94 s | +12.55 s | yes |
+| 3 | 810 | 8.15 s | 21.97 s | +13.82 s | **no** |
+
+**The cost is compilation, not dispatch.** Both prompt-1 runs build exactly 48
+ANE programs, one per layer, and the overhead is 14.81 s and 14.76 s against a
+prompt three times longer. Subtracting that constant leaves 6.99 s of ANE
+prefill at 720 tokens against 6.98 s on the GPU, and 9.53 s at 2112 tokens
+against 9.56 s. ANE dispatch is therefore at parity with the GPU per token, and
+the whole penalty is roughly 0.31 s per program paid once. A single-shot
+process never amortizes it. A long-lived server that compiles once would.
+
+**The lane is not token-identical.** Prompt 3 diverges at character 67, after
+"...so that a":
+
+| Arm | Continuation |
+|---|---|
+| GPU | `\n\nThe gated delta network keeps a recurr` |
+| ANE | ` linear attention layer can summarise an` |
+
+That is a near-tie argmax flip, the expected consequence of computing those
+projections in fp16 where the GPU uses bf16. One divergence in four runs across
+three prompts is enough: the lane changes output, so it cannot be used where
+token identity is required.
+
+Both findings point the same way, and the lane already ships off by default.
+Leave `MLX_ANE_DIRECT` unset. It would become interesting only in a persistent
+server, and only where an fp16-induced argmax flip is acceptable.
 
 ### Norm conventions
 
