@@ -549,93 +549,102 @@ against the reference remains the deciding check.
 
 `ANEGemmBench` (`Vendor/mlx-swift-lm/Libraries/MLXLLM/ANEOffload/ANEGemmBench.swift`)
 builds one fp16 ANE 1x1-conv program per shape through
-`Qwen4ExpANEProjection` and times it against the equivalent MLX GPU matmul, in
-float32 on both weight and activation for the GPU side. No model and no
-routing are involved; the sweep measures the two engines only. The worker
-verb `qwen4exp-ane-bench` (`Sources/MLXFastHarness/Qwen4ExpANEBench.swift`,
-dispatched from `Sources/MLXFastRuntimeWorkerCLI/main.swift`) sweeps the token
-dimension `m` at `[8, 16, 32, 64, 128, 256, 512]` against the two expert
-shapes for this tower: gate/up at `[640, 2560]` and down at `[2560, 640]`, 5
-iterations per shape, minimum time kept per shape per run.
+`Qwen4ExpANEProjection` and times it against the GPU kernel an ANE offload
+would actually replace: `MLX.quantizedMM` against a 4-bit affine, group-64
+quantized weight (matching this checkpoint's own conversion) with bf16
+activations, not a dense fp32 matmul. No model and no routing are involved;
+the sweep measures the two engines only. The worker verb `qwen4exp-ane-bench`
+(`Sources/MLXFastHarness/Qwen4ExpANEBench.swift`, dispatched from
+`Sources/MLXFastRuntimeWorkerCLI/main.swift`) sweeps the token dimension `m`
+at `[8, 16, 32, 64, 128, 256, 512]` against the two expert shapes for this
+tower: gate/up at `[640, 2560]` and down at `[2560, 640]`, 5 iterations per
+shape, minimum time kept per shape per run. Every sample also passes a
+per-shape correctness gate (the ANE output's mean relative error against a
+dense fp32 reference must be under 2e-2, the same tolerance
+`Qwen4ExpANEDenseLaneTests.testProjectionMatchesGPUWithinFP16` uses); a shape
+that fails is dropped and logged rather than reported at an unvalidated
+speed. All 140 samples across the 10 runs behind this section passed that
+gate, at a relative error around 0.0003 -- roughly 70x inside tolerance.
 
 With 512 experts at top-10 routing for this tower, a 256-token tile sends an
 average of `256 * 10 / 512 = 5` tokens to each expert, so the bucket sizes
 below span the range from under- to over-provisioned relative to that
 average.
 
-### Measured rate is noisy at this shape scale
+### Revision note
 
-The sweep ran three times back to back on an idle machine (no other
-model-holding process resident, confirmed by `ps aux` before each run). All
-timings are sub-millisecond, so ANE and GPU dispatch overhead is a large
-fraction of the measured time, and the single-run rate at a given bucket
-varies by up to 2x between runs. The table below reports both a single run
-and the three-run median per shape, so the size of that variation is visible
-directly.
+A first pass at this section (superseded, not reproduced here) measured the
+ANE against a dense float32 GPU matmul and reported `r` in the 0.78-1.20
+range at a naive per-call timing, then, in a first fix attempt, an amortised
+timing that turned out to rest on an unsafe measurement pattern. Both
+readings are retracted. The GPU comparator was wrong (a real offload
+displaces the quantized gather-GEMM the model actually runs, not a dense
+fp32 matmul), and a later attempt to fix that by amortising per-call
+overhead -- reusing one staged ANE program across many `predict` calls,
+materialising the ANE's read on every repeat of a tight loop, batching many
+independent GPU calls into one `eval`, and running the ANE and GPU timed
+loops as separate sequential blocks -- was found, by bisection, to
+reproducibly corrupt process memory under this project's own required
+verification command (`MLXFAST_RUN_MLX_RUNTIME_TESTS=1 swift test`, a debug
+build). None of those patterns survived into the version below. The
+corruption's actual source looks like a pre-existing issue in the private-API
+`ANEDirectDispatch`/`ANEInMemoryModel` bridging this file calls into (outside
+this task's edited files) -- its symptom was sensitive to unrelated
+allocation-size changes elsewhere in the same function, which is the
+signature of heap corruption surfacing at an unrelated site, not of a bug in
+whichever line happened to be varied at the time. The measurement below does
+not attempt to amortise ANE per-call overhead; it reports one dispatch per
+timed repeat on both engines, interleaved, which was the configuration
+verified stable across 6 consecutive debug-build test runs and 10
+five-shape-sweep release-build runs with zero crashes or dropped shapes.
 
-Per-shape rate (`rate = gpuSeconds / aneSeconds`), run 1 only:
+### Measured rate, 10 runs
 
-| m | down `[2560,640]` rate | gate/up `[640,2560]` rate |
-|---|---|---|
-| 8 | 0.6672 | 0.9491 |
-| 16 | 0.5590 | 0.9891 |
-| 32 | 0.6627 | 1.4121 |
-| 64 | 0.9031 | 0.9215 |
-| 128 | 0.9690 | 1.0434 |
-| 256 | 0.9649 | 1.0695 |
-| 512 | 0.7997 | 1.2200 |
+The sweep ran 10 times back to back on an idle machine (no other
+model-holding process resident, confirmed by `ps aux` before each run),
+across two sessions of 5 runs each. All 10 runs returned all 14 samples with
+no correctness-gate drops. Per-shape rate is still noisy at this scale (the
+GPU quantized kernel is fast enough that both legs are still partly
+dispatch-bound at the smallest buckets -- achieved throughput rises from
+roughly 50-70 GFLOP/s at `m=8` to 1.5-2.7 TFLOP/s at `m=512` on both engines,
+visible in the sweep's per-shape stderr log, so the smaller buckets are not
+yet at whatever this hardware's ceiling is), but combining across bucket size
+and 2x-weighting gate/up against down (below) averages enough of that out to
+show a clear, monotonic-with-a-late-dip trend rather than the flat, noisy
+scatter the retracted first pass showed.
 
-Per-shape median across three runs (median of aneSeconds and of gpuSeconds
-taken separately, then divided):
+Combined rate per bucket (one full expert forward is 2x gate/up + 1x down),
+mean and standard deviation across the 10 runs:
 
-| m | down ane_med (s) | down gpu_med (s) | down rate | gate/up ane_med (s) | gate/up gpu_med (s) | gate/up rate |
+| m | r (mean) | r (std) | r (min) | r (max) | f* = r/(1+r) | ceiling = 1+r |
 |---|---|---|---|---|---|---|
-| 8 | 0.000395 | 0.000499 | 1.2635 | 0.000606 | 0.000639 | 1.0543 |
-| 16 | 0.000492 | 0.000275 | 0.5590 | 0.000372 | 0.000356 | 0.9567 |
-| 32 | 0.000426 | 0.000245 | 0.5754 | 0.000365 | 0.000331 | 0.9069 |
-| 64 | 0.000422 | 0.000294 | 0.6966 | 0.000369 | 0.000317 | 0.8591 |
-| 128 | 0.000422 | 0.000392 | 0.9291 | 0.000412 | 0.000421 | 1.0220 |
-| 256 | 0.000559 | 0.000534 | 0.9554 | 0.000452 | 0.000501 | 1.1084 |
-| 512 | 0.000956 | 0.000881 | 0.9214 | 0.000560 | 0.000810 | 1.4467 |
+| 8 | 0.8545 | 0.0778 | 0.7598 | 1.0471 | 0.4608 | 1.8545 |
+| 16 | 0.8773 | 0.0876 | 0.7140 | 1.0408 | 0.4673 | 1.8773 |
+| 32 | 0.9654 | 0.0474 | 0.8904 | 1.0345 | 0.4912 | 1.9654 |
+| 64 | 1.1113 | 0.1425 | 1.0024 | 1.4800 | 0.5264 | 2.1113 |
+| 128 | 1.2160 | 0.1103 | 1.0905 | 1.4598 | 0.5487 | 2.2160 |
+| 256 | 1.2387 | 0.0830 | 1.1121 | 1.4152 | 0.5533 | 2.2387 |
+| 512 | 1.1641 | 0.0943 | 0.9710 | 1.2734 | 0.5379 | 2.1641 |
 
-Run 1's m=32 gate/up spike (rate 1.4121, the highest single-shape reading in
-the whole sweep) did not reproduce: run 2 measured 1.0405 and run 3 measured
-0.9046 at the same shape. Full raw per-run JSON is at
-`/tmp/ane-sweep{,-run2,-run3}.json` on this machine.
+`r` rises from the smallest bucket to a peak around `m = 256` and eases back
+slightly at `m = 512`; every bucket's mean is comfortably above the `0.15`
+stop threshold (the lowest single-run reading across all 140 samples was
+`0.71`, still well clear), so the sweep does not hit the stop condition (`r <
+0.15` at every bucket size). No single bucket stands out as uniquely "best" --
+the means across `m = 64` through `512` sit within about 0.15 of each other,
+inside one bucket's own run-to-run standard deviation -- so this section does
+not pick one point estimate; the whole table, and the range `f* ≈ 0.46-0.55`
+/ ceiling `≈ 1.85-2.24` it implies, is the result.
 
-### Combined rate per bucket
+One residual, known bias: `aneSeconds` in the table above does not include
+materialising the ANE's output into a usable MLX buffer (see
+`ANEGemmSample.aneSeconds`'s doc comment in `ANEGemmBench.swift` for why --
+doing that on every repeat was one of the patterns found unsafe). `gpuSeconds`
+does include full materialisation. That asymmetry biases every `r` in this
+table upward (toward making the ANE look faster than a fully realised
+comparison would show), by an amount this sweep does not measure. The
+direction of the bias is known; its size is not.
 
-One full expert forward dispatches gate and up (each `[640,2560]`) plus down
-(`[2560,640]`): two gate/up calls for every one down call. Combined rate per
-bucket, using the three-run median timings above and weighting 2x gate/up +
-1x down:
-
-| m | combined ANE seconds | combined GPU seconds | r |
-|---|---|---|---|
-| 8 | 0.001607 | 0.001777 | 1.1057 |
-| 16 | 0.001236 | 0.000987 | 0.7984 |
-| 32 | 0.001156 | 0.000907 | 0.7847 |
-| 64 | 0.001160 | 0.000928 | 0.8000 |
-| 128 | 0.001246 | 0.001234 | 0.9905 |
-| 256 | 0.001463 | 0.001536 | 1.0499 |
-| 512 | 0.002076 | 0.002501 | 1.2048 |
-
-Every bucket's combined `r` is above 0.15, so the sweep does not hit the stop
-condition (r < 0.15 at every bucket size).
-
-### Arithmetic at the best bucket
-
-Best bucket by three-run-median combined rate: `m = 512`, `r = 1.2048`.
-
-```
-f* = r / (1 + r) = 1.2048 / 2.2048 = 0.5464
-ceiling = 1 + r = 2.2048
-```
-
-For reference, the single-run-1 reading at its own best combined bucket
-(`m = 8`, `r = gpu/ane` computed the same way from run 1's own down and
-gate/up numbers at m=8: combined_ane = 2(0.0006890297) + 0.0007479191 =
-0.0021259785, combined_gpu = 2(0.0006539822) + 0.0004990101 = 0.0018069744,
-`r = 0.8500`) gives `f* = 0.4595`, `ceiling = 1.8500`. The three-run-median
-number above is the one carried forward because it damps the run-to-run
-noise documented above.
+Full per-run JSON and stderr (per-shape relative error and achieved GFLOP/s)
+for both 5-run sessions are recorded in the fix-round section of
+`.superpowers/sdd/2026-09-03-ane-expert-distribution-plan/task-1-report.md`.
