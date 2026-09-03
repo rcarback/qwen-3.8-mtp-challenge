@@ -843,3 +843,94 @@ staging work that reduces those costs. Not built.
 No timing is reported here. The change removes work that was provably
 discarded, and the count of removed rows is exact, but no prefill measurement
 was taken on a quiet machine.
+
+## Dense lane measured after bucketing (2026-09-03)
+
+M4 Max, 128 GiB, quiet machine, resident `serve` on the dense tower
+(`./weights`, hidden 5120, intermediate 17408), `--mtp-depth 0`, greedy,
+`max_tokens` 8. Prefill rate is `prompt_tokens / seed_prefill_seconds` read
+from the response. Arms differ only by `MLX_ANE_DIRECT`.
+
+### One compile now covers every length in a bucket
+
+Four distinct prompt lengths, sent cold in order to one process. 561, 754 and
+966 tokens all bucket to 1024; 1136 buckets to 2048.
+
+| Prompt tokens | GPU arm | ANE arm |
+|---|---|---|
+| 561 | 3.954 s | 33.648 s |
+| 754 | 5.568 s | 5.345 s |
+| 966 | 7.098 s | 6.612 s |
+| 1136 | 8.497 s | 7.922 s |
+
+Only the first prompt compiles. The serve log shows two program sets ever
+built, 64 at bucket 512 from the startup prewarm and 53 at bucket 1024, and no
+further build after the first request. Before bucketing each new length
+rebuilt all 64 layers, which the rows above at lines 466 to 470 record as
+31.83 s and 34.57 s for two different lengths. A second run in reversed arm
+order reproduced this within 1 percent.
+
+Note what the 1136-token prompt shows: it never triggered a bucket-2048 build.
+Prefill is chunked, so the sequence length the cache sees is not the prompt
+length. The first build logs `S=554` for a 561-token prompt.
+
+### Steady state, paired, seven prompts
+
+One process per arm, eight distinct prompts of increasing length sent cold.
+The first is the ANE arm's compile and is excluded. The remaining seven are
+paired by token count across the two arms.
+
+| Prompt tokens | GPU tok/s | ANE tok/s | Ratio |
+|---|---|---|---|
+| 675 | 121.3 | 126.9 | 1.046 |
+| 692 | 128.3 | 136.6 | 1.065 |
+| 723 | 119.8 | 128.8 | 1.075 |
+| 735 | 120.4 | 130.5 | 1.084 |
+| 765 | 129.0 | 137.8 | 1.068 |
+| 782 | 113.5 | 130.6 | 1.151 |
+| 809 | 126.8 | 138.8 | 1.095 |
+
+Mean ratio 1.083, median 1.075, seven wins from seven pairs. The ANE lane is
+about 8 percent faster than the GPU path on this tower in steady state.
+
+This corrects the reading at lines 414 to 422 above, which concluded the lane
+is 11 to 25 percent slower per token. That measurement was on the MoE tower and
+still stands there. It does not describe the dense tower, where no valid
+post-compile comparison existed until now.
+
+### The compile still has to be earned back
+
+| Quantity | Value |
+|---|---|
+| Mean prefill, GPU | 6.042 s |
+| Mean prefill, ANE | 5.571 s |
+| Saving per prompt | 0.471 s |
+| One-time compile above the GPU cost | 28.4 s |
+| Break-even | about 60 prompts |
+
+So the lane is worth arming in a persistent server and is a clear loss in a
+process that answers a handful of prompts and exits. That is the same
+conclusion the earlier one-shot measurements reached, now with the steady-state
+half measured instead of inferred.
+
+### Ten of sixty-four layers do not load
+
+The serve log records 10 build failures per bucket-1024 set:
+
+```text
+BUILD FAILED S=554 bucket=1024 hidden=5120 inter=17408
+error=load("createProgramInstanceForModel:...: Program load failure (0x50004)")
+```
+
+So 54 layers run on the ANE and 10 fall back to the GPU, and the 8 percent
+above is what a lane at 84 percent strength delivers. The failure appears after
+about 54 programs are resident, which points at an ANE program-memory limit
+rather than a defect in any one layer: the prefix weights are
+3 x 5440 x 5120 fp16 values per layer, about 167 MB, so 54 layers hold roughly
+9 GB.
+
+That is the direct link to the int8 finding recorded in
+`docs/perf/ane-unified-activation-plan.md`. int8 weights through
+`constexpr_blockwise_shift_scale` compile and place the conv on the ANE, and
+they halve exactly the bytes that appear to be exhausting this limit. Whether
+that admits the remaining 10 layers is unmeasured and is the next thing to try.
