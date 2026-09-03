@@ -204,10 +204,6 @@ public final class Qwen4ExpTextModel: Module {
                 hs[i] = h
                 mixes.append((x, inject))
             }
-            // Materialise every micro-batch's projection input up front, on the
-            // calling thread, so the ane closure only copies already-resident
-            // bytes into its IOSurface and never drives MLX evaluation.
-            eval(mixes.map { $0.x })
             let program = useANE ? layer.aneProjection(sequenceLength: m) : nil
             func aneServes(_ i: Int) -> Bool { program != nil && bounds[i].1 - bounds[i].0 == m }
             func readANE(_ p: Qwen4ExpANEProjection, _ prepared: ANEDirectDispatch.Prepared, dtype: DType)
@@ -227,23 +223,25 @@ public final class Qwen4ExpTextModel: Module {
 
             for i in 0 ..< n {
                 let next = i + 1
+                // Staging (makeInput) must stay on the calling thread: it builds
+                // its own transpose/contiguous/cast graph and calls MLX eval on
+                // it internally (ANEDirectDispatch.prepare), so it cannot run
+                // inside the ane closure alongside the gpu closure's MLX graph
+                // construction. Only predict, which touches no MLX state, is
+                // safe to overlap.
+                var nextPrepared: ANEDirectDispatch.Prepared? = nil
+                if next < n, aneServes(next), let p = program {
+                    nextPrepared = try? p.makeInput(mixes[next].x.reshaped(m, -1))
+                }
                 let mask: MLXFast.ScaledDotProductAttentionMaskMode =
                     layer.isLinear
                     ? .none : createAttentionMask(h: mixes[i].x, cache: c.map { [$0] }, returnArray: false)
-                // Staging the NEXT micro-batch's input is an IOSurface write plus
-                // a bf16 to fp16 conversion. It used to run on the calling thread
-                // before the concurrent section, so it was never overlapped; it
-                // belongs inside the ane closure with the predict it feeds.
-                let stagedBox = ANEStagedBox()
                 var out: MLXArray? = nil
                 var aneFailed = false
                 do {
                     let (_, o) = try ConcurrentEngines.run(
                         ane: {
-                            guard next < n, aneServes(next), let p = program else { return }
-                            let prepared = try p.makeInput(mixes[next].x.reshaped(m, -1))
-                            try p.predict(prepared)
-                            stagedBox.prepared = prepared
+                            if let np = nextPrepared, let p = program { try p.predict(np) }
                         },
                         gpu: { () -> MLXArray in
                             layer.finish(
@@ -264,8 +262,8 @@ public final class Qwen4ExpTextModel: Module {
                 }
                 hs[i] = out!
                 if next < n {
-                    if !aneFailed, let prepared = stagedBox.prepared, let p = program {
-                        projections[next] = readANE(p, prepared, dtype: hs[i].dtype)
+                    if !aneFailed, let np = nextPrepared, let p = program {
+                        projections[next] = readANE(p, np, dtype: hs[i].dtype)
                     } else {
                         projections[next] = layer.gpuProjection(mixes[next].x)
                     }
@@ -279,12 +277,6 @@ public final class Qwen4ExpTextModel: Module {
         let wide = concatenated(hs, axis: 1)
         return (mixer.mix(wide).mixed, wide)
     }
-}
-
-/// Carries one prepared ANE dispatch out of the concurrent closure. A final
-/// class so Swift 6 strict concurrency can see the sharing is deliberate.
-private final class ANEStagedBox: @unchecked Sendable {
-    var prepared: ANEDirectDispatch.Prepared?
 }
 
 public class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {

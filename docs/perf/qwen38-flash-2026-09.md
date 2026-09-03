@@ -681,15 +681,34 @@ overlapped. And `eval(o)` inside the GPU closure forced one hard barrier per
 `(layer, micro-batch)` pair, 144 for a 732-token prefill at 3 micro-batches,
 against a baseline that builds one graph and evaluates once.
 
-The fix moves staging inside the `ane` closure, so it runs concurrently with
-the GPU `finish` call it used to precede, and moves `eval` to once per layer
-(`eval(hs)` after the micro-batch loop) instead of once per micro-batch. The
-staging materialization line
-(`eval(mixes.map { $0.x })`, run once per layer before the loop) stays on the
-calling thread, because `ConcurrentEngines` documents that its `ane` closure
-must never call MLX `eval`. `makeInput`'s `asType` and buffer read force
-materialization, so the values it touches must already be resident before the
-closure runs.
+### Correction, round 1
+
+The paragraph above still describes the two defects correctly. This paragraph
+originally described a fix that moved `makeInput` (staging) inside the `ane`
+closure alongside `predict`, plus an `eval(mixes.map { $0.x })` hoist that was
+supposed to keep that closure MLX-free. Code review found that claim false and
+the code unsafe, not merely mis-described. `makeInput` calls
+`ANEDirectDispatch.prepare`, which builds its own transpose, contiguous, and
+cast graph from its input and calls MLX `eval` on that graph itself
+(`ANEDirectDispatch.swift:142-144`), on a background queue. The
+`eval(mixes.map { $0.x })` hoist materializes `mixes[next].x`, not the fresh
+graph `prepare` builds from it, so it does not stop `prepare` from driving MLX
+evaluation off the calling thread, concurrently with the `gpu` closure's own
+MLX graph construction. `ConcurrentEngines.swift`, `Qwen4ExpANEDenseLane.swift`,
+and `ANEDirectDispatch.swift` all document `makeInput`/`prepare` as
+caller-thread-only for exactly this reason, and the commit message's claim
+that "the ane closure only copies resident bytes and never drives MLX
+evaluation" was therefore wrong, along with the same sentence originally here.
+
+The staging move is reverted. `makeInput` runs on the calling thread again,
+before `ConcurrentEngines.run`, matching the pre-Task-2 code. Only `predict`,
+which `Qwen4ExpANEDenseLane.swift` marks `BACKGROUND-SAFE`, runs inside the
+`ane` closure. `ANEStagedBox` and the `eval(mixes.map { $0.x })` hoist are
+both removed. Neither serves a purpose once staging is back on the calling
+thread. The barrier consolidation (removing `eval(o)` from the `gpu` closure,
+replacing it with one `eval(hs)` per layer, once per layer instead of once per
+micro-batch) is unaffected by this correction and is the whole of this task's
+change against the pre-Task-2 baseline.
 
 `testMicroBatchedPrefillMatchesPlainForwardAfterRestructure`
 (`Tests/MLXFastTests/Model/Qwen4ExpANEDenseLaneTests.swift`) is an equivalence
@@ -700,6 +719,14 @@ code, as expected. `swift test --force-resolved-versions --filter Qwen4Exp`
 passes 33 of 33 with the fix in place (32 pre-existing plus this one).
 
 ### Benchmark result: inconclusive at the CLI's measurement scale
+
+The numbers in this subsection were measured against the round-0 code (the
+retracted staging-overlap version), before the round-1 correction above. They
+are reproduced unchanged because the CLI methodology problem they document
+applies equally to the corrected code: both versions carry the same
+per-process compile cost, and neither this task nor the round-1 correction
+re-ran this benchmark against the corrected barrier-only version. A
+resident-serve measurement against the corrected code is pending.
 
 The plan brief's prescribed command
 (`qwen4exp-generate --raw 1`, a fresh process per run, `MLX_QWEN4EXP_FORCE_MICROBATCH=256`,
@@ -733,9 +760,12 @@ a reliable read needs either many more samples or the doc's own resident
 `serve` methodology (as used for the `moe_plain` and `moe_mb_gpu` rows above),
 neither of which this task ran.
 
-What is established: the structural fix (fewer barriers, overlapped staging)
-is implemented as designed and verified equivalent to the plain forward path.
-What is not established, from this task's measurements: a numeric prefill
-speedup on this machine, at this session's noise floor. Revisit with a
-resident-server measurement, matching the "Where the ANE lane's cost actually
-is" table's own method, before drawing a numeric conclusion.
+What is established: the barrier consolidation (144 to 48 hard syncs for a
+732-token, 3-micro-batch prefill on the `useANE: false` arm this task
+targets) is implemented and verified equivalent to the plain forward path.
+The staging-overlap half of the original fix is retracted; see "Correction,
+round 1" above. What is not established, from this task's measurements: a
+numeric prefill speedup on this machine, at this session's noise floor, for
+either the round-0 or the round-1 code. Revisit with a resident-server
+measurement, matching the "Where the ANE lane's cost actually is" table's own
+method, before drawing a numeric conclusion.
