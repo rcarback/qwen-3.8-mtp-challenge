@@ -275,10 +275,13 @@ Same prompt as the depth-0 run above, same session shape.
 | End to end | 14.3 tokens/s | 16.8 tokens/s |
 | Seed prefill | 0.32 s | 0.24 s |
 
-Depth 2 decodes 1.16 times faster. The completion is character-for-character
-identical to the depth-0 completion, which is the correctness signal that
-matters here: the target verifies every drafted token, so the head can change
-speed and nothing else.
+The completion is character-for-character identical to the depth-0 completion,
+which is the correctness signal that matters here: the target verifies every
+drafted token, so the head can change speed and nothing else.
+
+The 1.16 times decode speedup in this table does NOT generalise. This prompt is
+23 tokens, where fixed per-round cost dominates. At a realistic 732 tokens
+depth 2 is a 17 percent LOSS on this tower; see "Throughput matrix".
 
 Accept rate of 0.889 is high against the roughly 0.75 the DFlash track reports
 on prose. Two differences explain it. This head ships with the checkpoint
@@ -307,13 +310,15 @@ Four prompts, greedy, 32 decode tokens, one cold run per arm.
 | 2 | 900 | 9.39 s | 21.94 s | +12.55 s | yes |
 | 3 | 810 | 8.15 s | 21.97 s | +13.82 s | **no** |
 
-**The cost is compilation, not dispatch.** Both prompt-1 runs build exactly 48
-ANE programs, one per layer, and the overhead is 14.81 s and 14.76 s against a
-prompt three times longer. Subtracting that constant leaves 6.99 s of ANE
-prefill at 720 tokens against 6.98 s on the GPU, and 9.53 s at 2112 tokens
-against 9.56 s. ANE dispatch is therefore at parity with the GPU per token, and
-the whole penalty is roughly 0.31 s per program paid once. A single-shot
-process never amortizes it. A long-lived server that compiles once would.
+**The cost is compilation.** Both prompt-1 runs build exactly 48 ANE programs,
+one per layer, and the overhead is 14.81 s and 14.76 s against a prompt three
+times longer, so it is not per-token and not per-micro-batch.
+
+These are cold single-shot processes, so the compile lands inside the measured
+prefill. The resident-server measurement in "Throughput matrix" separates the
+two: the compile is a one-time startup cost, and post-load ANE prefill is still
+11 to 25 percent SLOWER than the GPU. Do not read dispatch parity out of the
+subtraction above; the direct measurement contradicts it.
 
 **The lane is not token-identical.** Prompt 3 diverges at character 67, after
 "...so that a":
@@ -331,6 +336,89 @@ token identity is required.
 Both findings point the same way, and the lane already ships off by default.
 Leave `MLX_ANE_DIRECT` unset. It would become interesting only in a persistent
 server, and only where an fp16-induced argmax flip is acceptable.
+
+### Throughput matrix, both towers, post-load
+
+Every number below comes from a resident `serve` process after its startup
+warm, so kernel and ANE compilation is already paid. M4 Max, 128 GiB, one run
+per cell, `max_tokens` 32. "Warm" repeats the previous prompt so the session
+resumes from its recorded resume point; "cold" is a prompt the process has not
+seen. Prefill rate is `prompt_tokens / seed_prefill_seconds`.
+
+| Session | Startup | Phase | Prompt | Prefill | Prefill tok/s | Decode tok/s |
+|---|---|---|---|---|---|---|
+| MoE depth 0 | 34 s | cold A | 732 | 2.382 s | 307.3 | 16.50 |
+| MoE depth 0 | | warm A | 732 | 0.504 s | 1453.3 | 2.38 |
+| MoE depth 0 | | cold B | 1032 | 3.144 s | 328.3 | 15.75 |
+| MoE depth 2 | 32 s | cold A | 732 | 2.048 s | 357.4 | 13.77 |
+| MoE depth 2 | | warm A | 732 | 0.427 s | 1714.7 | 3.61 |
+| MoE depth 2 | | cold B | 1032 | 3.141 s | 328.5 | 10.21 |
+| MoE depth 0, ANE | 45 s | cold A | 732 | 2.669 s | 274.3 | 16.48 |
+| MoE depth 0, ANE | | warm A | 732 | 0.502 s | 1457.0 | 2.32 |
+| MoE depth 0, ANE | | cold B | 1032 | 4.164 s | 247.9 | 15.65 |
+| Dense depth 0 | 21 s | cold A | 732 | 5.402 s | 135.5 | 13.03 |
+| Dense depth 0 | | warm A | 732 | 0.162 s | 4522.2 | 12.38 |
+| Dense depth 0 | | cold B | 1032 | 7.313 s | 141.1 | 12.47 |
+| Dense depth 2 | 19 s | cold A | 732 | 5.608 s | 130.5 | 18.65 |
+| Dense depth 2 | | warm A | 732 | 0.146 s | 5019.7 | 20.46 |
+| Dense depth 2 | | cold B | 1032 | 7.309 s | 141.2 | 18.29 |
+
+Drafting statistics for the depth-2 sessions:
+
+| Session | Phase | Accept | Tokens/round |
+|---|---|---|---|
+| MoE depth 2 | cold A | 0.769 | 2.46 |
+| MoE depth 2 | cold B | 0.633 | 2.13 |
+| MoE depth 2 | warm A | 0.808 | 2.46 |
+| Dense depth 2 | cold A | 0.548 | 2.00 |
+| Dense depth 2 | cold B | 0.562 | 2.00 |
+| Dense depth 2 | warm A | 0.643 | 2.29 |
+
+Four things this says.
+
+**The MoE prefills about 2.3 times faster.** 307 against 135 tokens per second
+on the same prompt. It activates 10 of 512 experts per token where the dense
+tower reads every weight, and prefill is weight-bandwidth bound.
+
+**Drafting helps the dense tower and hurts the MoE.** Dense depth 2 decodes
+18.65 against 13.03 at depth 0, a clear win. MoE depth 2 decodes 13.77 against
+16.50, a 17 percent loss, and this is *despite* the MoE head drafting better:
+it accepts 0.769 of its drafts against the dense head's 0.548, and lands 2.46
+tokens per round against 2.00. The head is not the problem. A verify row is.
+For a dense tower the extra rows in a verify are nearly free, because the same
+weights are read whichever rows are present. For an MoE each extra row can
+route to a different expert set, so verifying three rows can touch up to three
+times the expert weights. Speculation does not amortize on this architecture
+the way it does on a dense one.
+
+This corrects an earlier claim on this page that depth 2 gives the MoE a 1.16
+times speedup. That was measured on a 23-token prompt, where fixed per-round
+cost dominates. On a realistic 732-token prompt depth 2 is a net loss for the
+MoE.
+
+**The MoE's warm-cache decode collapses.** On a resumed prompt MoE decode falls
+to 2.38 tokens per second from 16.50, about seven times slower, while the dense
+tower holds at 12.38 and its prefill drops to 0.162 s as expected. The collapse
+reproduces across three independent MoE sessions (2.38, 2.32, 3.61) and never
+appears on the dense tower. The likely mechanism, stated as a hypothesis rather
+than a measurement: this tower publishes no recurrent replay tape, so
+`replayRecurrentPrefix` declines and the session repairs its 36 gated-delta
+layers generically. The attention KV resumes cheaply, which is why prefill
+stays fast, and the recurrent rebuild lands inside the decode window. The dense
+tower publishes a tape and pays nothing. For multi-turn serving this is the
+largest single optimization target on this model.
+
+**The ANE compile is a startup cost, and the lane is still not worth it.**
+Startup is 45 s with the lane against 34 and 32 s without, so the 48 programs
+compile once during the serve warm, not once per prompt. The earlier one-shot
+figure of 14.8 s was that same cost measured inside a process that answered one
+prompt and exited. But amortizing it does not rescue the lane: post-load ANE
+prefill is 274.3 and 247.9 tokens per second against the GPU's 307.3 and 328.3,
+so the lane is 11 to 25 percent slower per token in steady state. Decode and
+warm prefill are untouched, as expected for a prefill-only lane. This also
+corrects the earlier inference on this page that ANE dispatch reaches GPU
+parity; that came from subtracting a compile constant from a cold run, and the
+direct post-load measurement disagrees with it.
 
 ### Norm conventions
 
