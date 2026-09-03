@@ -2509,8 +2509,16 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
                 hidden: hidden, inter: g.weight.dim(0))
             {
                 let x2 = x.reshaped([tokens, hidden])
+                // The program is compiled at `bucketedSequenceLength(tokens)`,
+                // not at the exact token count. `ANEFusedSplitMLP` owns that
+                // gap: it pads up to the compiled row count for the ANE leg
+                // ONLY and runs its GPU suffix on the real rows, so the GPU
+                // -- which holds 68.75% of the intermediate channels at the
+                // deployed fraction -- never computes a row that is thrown
+                // away. Pass the real rows and let it decide.
                 if let y2 = try? split(x2) {
                     if ANESplitConfig.verify {
+                        let key = ANESplitMLPCache.bucketedSequenceLength(tokens)
                         let ref = downProjection(silu(gateProj(x)) * upProj(x))
                             .reshaped([tokens, hidden]).asType(.float32)
                         let d = MLX.abs(y2.asType(.float32) - ref)
@@ -2518,8 +2526,8 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
                         let worst = argMax(rowMax)
                         eval(d, rowMax, worst)
                         aneLog(String(
-                            format: "verify layer %d S=%d: maxAbs=%.4f max|ref|=%.2f worstRow=%d",
-                            aneLayerIndex, tokens, d.max().item(Float.self),
+                            format: "verify layer %d S=%d bucket=%d: maxAbs=%.4f max|ref|=%.2f worstRow=%d",
+                            aneLayerIndex, tokens, key, d.max().item(Float.self),
                             MLX.abs(ref).max().item(Float.self), worst.item(Int32.self)))
                     }
                     return y2.reshaped(x.shape)

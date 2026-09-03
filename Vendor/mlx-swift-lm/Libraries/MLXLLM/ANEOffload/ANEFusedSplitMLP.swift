@@ -25,6 +25,10 @@ public final class ANEFusedSplitMLP {
     private let hidden: Int
     private let inter: Int
     private let f: Int
+    /// The row count the ANE program was compiled at. `callAsFunction`
+    /// accepts any `S <= sequenceLength` and pads up to it for the ANE leg
+    /// only; see `padForANE`.
+    private let sequenceLength: Int
     private let aneMLP: ANEFusedMLP?
     // GPU-fp16 ablation (MLX_ANE_FP16_GPU=1): the dequantized fp16 prefix
     // weights, kept so the prefix partial can run as a pure-GPU fp16 matmul
@@ -74,6 +78,7 @@ public final class ANEFusedSplitMLP {
         self.hidden = hidden
         self.inter = inter
         self.f = f
+        self.sequenceLength = sequenceLength
 
         self.ablate = ANESplitConfig.fp16GpuAblate
         if f > 0 {
@@ -177,6 +182,35 @@ public final class ANEFusedSplitMLP {
         }
     }
 
+    /// Pads `[S, hidden] -> [sequenceLength, hidden]` with zero rows.
+    ///
+    /// The ANE program is compiled at one fixed row count, so a shorter
+    /// input has to be padded up to it. Only the ANE leg needs that. The
+    /// GPU suffix is a shape-agnostic `quantizedMM` chain, so it runs on
+    /// the real rows alone, and padding it computes rows that are thrown
+    /// away.
+    ///
+    /// That matters because the GPU owns the larger share. At the deployed
+    /// `MLX_ANE_FRACTION` of 0.3125 the ANE holds `F` of `inter` channels
+    /// and the GPU holds the other 68.75%, so 68.75% of any padding waste
+    /// is GPU-side and removable here. A 732-token prompt compiled at 1024
+    /// discards 28.5% of all MLP work when both engines pad, and 12.5%
+    /// when only the ANE does.
+    ///
+    /// Zero rows are exact for the same reason the padding is legal at
+    /// all: this is a per-token MLP (gate/up/down plus SwiGLU) with no
+    /// cross-token mixing, so an all-zero input row can only produce an
+    /// output row that the caller discards. It would NOT be legal for an
+    /// attention program, where padded rows enter the softmax.
+    private func padForANE(_ x: MLXArray) -> MLXArray {
+        let s = x.dim(0)
+        precondition(
+            s <= sequenceLength,
+            "ANEFusedSplitMLP: input has \(s) rows but the ANE program was compiled at \(sequenceLength)")
+        if s == sequenceLength { return x }
+        return concatenated([x, MLXArray.zeros([sequenceLength - s, hidden], dtype: x.dtype)], axis: 0)
+    }
+
     /// `x: [S, hidden] -> [S, hidden]`. When `0<F<inter` the ANE and GPU
     /// partials run concurrently (Task D1): `makeInput` prepares the ANE
     /// request on this thread (MLX `eval` inside), `ConcurrentEngines.run`
@@ -210,13 +244,17 @@ public final class ANEFusedSplitMLP {
             preconditionFailure("ANEFusedSplitMLP: F=\(f)>0 but no ANEFusedMLP was built")
         }
         if f == inter {
-            let y = try aneMLP(x.asType(.float16)).asType(.bfloat16)
+            let padded = try aneMLP(padForANE(x.asType(.float16))).asType(.bfloat16)
+            let y = padded[0 ..< x.dim(0), 0...]
             eval(y)
             return y
         }
 
         // CALLER thread: prepares the ANE input (MLX eval inside makeInput).
-        let prepared = try aneMLP.makeInput(x.asType(.float16))
+        // Only this leg is padded to the program's compiled row count; the
+        // GPU partial below runs on the caller's real rows.
+        let tokens = x.dim(0)
+        let prepared = try aneMLP.makeInput(padForANE(x.asType(.float16)))
         let (_, gpu) = try ConcurrentEngines.run(
             ane: { try aneMLP.predict(prepared) }, // background: ObjC evaluate ONLY, no MLX
             gpu: {
@@ -224,9 +262,11 @@ public final class ANEFusedSplitMLP {
                 eval(g)
                 return g
             })
-        // CALLER thread: reads the ANE output back into MLX.
+        // CALLER thread: reads the ANE output back into MLX, dropping the
+        // padded rows before the add so both operands are `[tokens, hidden]`.
         let anePartial = aneMLP.readOutput(prepared)
-        let y = anePartial.asType(gpu.dtype) + gpu
+        let anePrefix = tokens == sequenceLength ? anePartial : anePartial[0 ..< tokens, 0...]
+        let y = anePrefix.asType(gpu.dtype) + gpu
         eval(y)
         return y
     }
@@ -241,7 +281,9 @@ public final class ANEFusedSplitMLP {
         guard let aneMLP else {
             preconditionFailure("ANEFusedSplitMLP: F=\(f)>0 but no ANEFusedMLP was built")
         }
-        let anePartial = try aneMLP(x.asType(.float16))
+        let tokens = x.dim(0)
+        let anePadded = try aneMLP(padForANE(x.asType(.float16)))
+        let anePartial = tokens == sequenceLength ? anePadded : anePadded[0 ..< tokens, 0...]
         let gpu = try gpuPartial(x)
         let y = anePartial.asType(gpu.dtype) + gpu
         eval(y)

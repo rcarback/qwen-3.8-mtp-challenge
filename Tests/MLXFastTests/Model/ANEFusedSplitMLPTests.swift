@@ -268,4 +268,76 @@ struct ANEFusedSplitMLPTests {
         print("ANEFusedSplitMLPTests concurrent-vs-sequential: maxAbsDiff=\(maxAbsDiff)")
         #expect(maxAbsDiff < 1e-4, "concurrent forward diverged from sequential forward: maxAbsErr=\(maxAbsDiff)")
     }
+
+    // MARK: - Padding is scoped to the ANE leg
+
+    /// `ANEFusedSplitMLP` is compiled at one fixed row count, but the caller
+    /// passes whatever the prompt actually is. The class pads up to the
+    /// compiled count for the ANE leg ONLY and runs its GPU suffix on the
+    /// real rows, so the GPU -- which owns `inter-F` of the `inter` channels
+    /// -- never computes a row that is discarded.
+    ///
+    /// Two independent things can break, and this test separates them.
+    ///
+    /// First, the slice offset. The ANE returns `[sequenceLength, hidden]`
+    /// and only rows `0..<tokens` are real. Taking the wrong window still
+    /// produces a correctly-SHAPED answer, so shape assertions cannot catch
+    /// it. Comparing against the all-GPU reference computed on `x` alone
+    /// can: a shifted window is wrong by whole rows, not by a rounding step.
+    ///
+    /// Second, contamination. The padded rows must not reach the real ones.
+    /// Running the same real rows under two different sets of padding rows
+    /// -- zeros, which `padForANE` supplies, against deliberately large
+    /// values near this model's recorded maximum activation of 50 -- must
+    /// give the same answer for the real rows. A per-token MLP has no
+    /// cross-token mixing, so any difference here means the fused program
+    /// is mixing rows and the padding is not legal after all.
+    @Test("ANEFusedSplitMLP pads only the ANE leg: S=100 into a program compiled at 128")
+    func paddingIsScopedToTheANELeg() throws {
+        try #require(ANERuntime.available())
+        let hidden = Self.hidden, inter = Self.inter
+        let tokens = 100, compiled = 128
+        let w = Self.makeWeights(hidden: hidden, inter: inter, seed: 11)
+
+        MLXRandom.seed(11)
+        let x = MLXRandom.normal([tokens, hidden]).asType(.bfloat16)
+        // Padding rows an order of magnitude above the real ones, so any
+        // leak across rows is unmissable rather than marginal.
+        let loud = (MLXRandom.normal([compiled - tokens, hidden]) * 50).asType(.bfloat16)
+        let xLoud = concatenated([x, loud], axis: 0)
+        eval(x, loud, xLoud)
+
+        // aneFraction 0.125 matches the fraction `Self.tolerance` was
+        // calibrated at. The property under test is the padding scope, which
+        // does not depend on the fraction.
+        let split = try ANEFusedSplitMLP(
+            gateW: w.gateWq, gateScales: w.gateScales, gateBiases: w.gateBiases,
+            upW: w.upWq, upScales: w.upScales, upBiases: w.upBiases,
+            downW: w.downWq, downScales: w.downScales, downBiases: w.downBiases,
+            hidden: hidden, inter: inter, sequenceLength: compiled, aneFraction: 0.125)
+
+        let y = try split(x)
+        #expect(y.shape == [tokens, hidden], "short input must return the caller's row count")
+
+        let ref = Self.referenceForward(
+            x, gateWq: w.gateWq, gateScales: w.gateScales, gateBiases: w.gateBiases,
+            upWq: w.upWq, upScales: w.upScales, upBiases: w.upBiases,
+            downWq: w.downWq, downScales: w.downScales, downBiases: w.downBiases)
+        let d = MLX.abs(y.asType(.float32) - ref.asType(.float32))
+        eval(d)
+        let maxAbs = d.max().item(Float.self), meanAbs = d.mean().item(Float.self)
+        print("padding-scope S=\(tokens)/compiled=\(compiled): maxAbs=\(maxAbs) meanAbs=\(meanAbs)")
+        #expect(maxAbs < Self.tolerance, "maxAbs=\(maxAbs)")
+        #expect(meanAbs < Self.meanTolerance, "meanAbs=\(meanAbs)")
+
+        let yLoud = try split(xLoud)
+        #expect(yLoud.shape == [compiled, hidden], "full-length input must return the compiled row count")
+        let dRows = MLX.abs(y.asType(.float32) - yLoud[0 ..< tokens, 0...].asType(.float32))
+        eval(dRows)
+        let rowMax = dRows.max().item(Float.self)
+        print("padding-scope contamination: maxAbs=\(rowMax)")
+        #expect(rowMax < Self.tolerance,
+                "real rows moved when the padding rows changed: maxAbs=\(rowMax)")
+    }
+
 }

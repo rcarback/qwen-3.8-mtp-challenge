@@ -115,8 +115,10 @@ public func aneLog(_ message: String) {
     }
 }
 
-/// Per-layer cache of fixed-shape ANE split programs, keyed by sequence
-/// length. A reference type so it can live as a stored property on
+/// Per-layer cache of fixed-shape ANE split programs, keyed by
+/// `bucketedSequenceLength(s)` rather than the exact prompt length, so a
+/// bounded set of programs covers every prompt instead of recompiling on
+/// every new length. A reference type so it can live as a stored property on
 /// `Qwen35FusedMLP` and be shared across forwards of that layer. Not
 /// thread-safe against concurrent forwards of the SAME layer; the Qwen35
 /// prefill path runs layers sequentially on one caller thread, and the
@@ -129,6 +131,18 @@ public final class ANESplitMLPCache: @unchecked Sendable {
     private var failed: Set<Int> = []
 
     public init() {}
+
+    /// Programs are fixed-shape, so keying them on an exact prompt length makes
+    /// every new length recompile all 64 layers: measured 31.8 s at 732 tokens
+    /// and 34.6 s at 1032. Round up to a power-of-two tile so a bounded set of
+    /// programs covers every prompt. The input is padded to the tile by the
+    /// caller and the surplus rows are discarded.
+    public static func bucketedSequenceLength(_ s: Int) -> Int {
+        let floor = 128
+        var bucket = floor
+        while bucket < s { bucket <<= 1 }
+        return bucket
+    }
 
     /// Returns a cached/newly-built split program for this `S`, or nil to
     /// signal "use the GPU path" (disabled, too short, unsupported weights,
@@ -155,10 +169,12 @@ public final class ANESplitMLPCache: @unchecked Sendable {
               downBits == 4, downGroupSize == 64
         else { return nil }
 
+        let key = Self.bucketedSequenceLength(s)
+
         lock.lock()
         defer { lock.unlock() }
-        if let cached = programs[s] { return cached }
-        if failed.contains(s) { return nil }
+        if let cached = programs[key] { return cached }
+        if failed.contains(key) { return nil }
 
         do {
             // bf16 base slices for this layer, when configured. A missing or
@@ -183,14 +199,14 @@ public final class ANESplitMLPCache: @unchecked Sendable {
                 gateW: gateW, gateScales: gateScales, gateBiases: gateBiases,
                 upW: upW, upScales: upScales, upBiases: upBiases,
                 downW: downW, downScales: downScales, downBiases: downBiases,
-                hidden: hidden, inter: inter, sequenceLength: s,
+                hidden: hidden, inter: inter, sequenceLength: key,
                 aneFraction: ANESplitConfig.fraction, prefixFP16: prefix)
-            programs[s] = split
-            aneLog("built split program S=\(s) fraction=\(ANESplitConfig.fraction) hidden=\(hidden) inter=\(inter) source=\(prefix == nil ? "dequant4" : "bf16")")
+            programs[key] = split
+            aneLog("built split program S=\(s) bucket=\(key) fraction=\(ANESplitConfig.fraction) hidden=\(hidden) inter=\(inter) source=\(prefix == nil ? "dequant4" : "bf16")")
             return split
         } catch {
-            failed.insert(s)
-            aneLog("BUILD FAILED S=\(s) hidden=\(hidden) inter=\(inter) error=\(error)")
+            failed.insert(key)
+            aneLog("BUILD FAILED S=\(s) bucket=\(key) hidden=\(hidden) inter=\(inter) error=\(error)")
             return nil
         }
     }
