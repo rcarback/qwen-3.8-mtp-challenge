@@ -382,7 +382,7 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
 
 /// Standard KV cache implementation based on Python's KVCache
 /// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
-public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
+open class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
     public var step = 256
@@ -395,7 +395,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         [self.keys, self.values].compactMap { $0 }
     }
 
-    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+    open override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let previous = self.offset
 
         let reset =
@@ -440,7 +440,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return (returnedKeys, returnedValues)
     }
 
-    public override var state: [MLXArray] {
+    open override var state: [MLXArray] {
         get {
             guard let keys = self.keys, let values = self.values else { return [] }
             if offset == keys.dim(2) {
@@ -465,7 +465,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     public override var isTrimmable: Bool { true }
 
     @discardableResult
-    public override func trim(_ n: Int) -> Int {
+    open override func trim(_ n: Int) -> Int {
         let trimmed = min(offset, n)
         offset -= trimmed
         return trimmed
@@ -513,7 +513,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return quantizedCache
     }
 
-    public override func copy() -> any KVCache {
+    open override func copy() -> any KVCache {
         let new = KVCacheSimple()
         new.step = self.step
         let s = self.state
