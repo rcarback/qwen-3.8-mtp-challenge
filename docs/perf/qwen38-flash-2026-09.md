@@ -550,9 +550,12 @@ against the reference remains the deciding check.
 `ANEGemmBench` (`Vendor/mlx-swift-lm/Libraries/MLXLLM/ANEOffload/ANEGemmBench.swift`)
 builds one fp16 ANE 1x1-conv program per shape through
 `Qwen4ExpANEProjection` and times it against the GPU kernel an ANE offload
-would actually replace: `MLX.quantizedMM` against a 4-bit affine, group-64
-quantized weight (matching this checkpoint's own conversion) with bf16
-activations, not a dense fp32 matmul. No model and no routing are involved;
+would actually replace: `MLX.quantizedMM` against a 4-bit affine, group-32
+quantized weight (matching this tower's routed-expert conversion --
+`Sources/MLXFastModel/Qwen4ExpTransform.swift`'s `expertGroupSize` default;
+group 64 is the separate main-backbone dense-tensor conversion, a different
+set of tensors) with bf16 activations, not a dense fp32 matmul. No model and
+no routing are involved;
 the sweep measures the two engines only. The worker verb `qwen4exp-ane-bench`
 (`Sources/MLXFastHarness/Qwen4ExpANEBench.swift`, dispatched from
 `Sources/MLXFastRuntimeWorkerCLI/main.swift`) sweeps the token dimension `m`
@@ -606,7 +609,7 @@ across two sessions of 5 runs each. All 10 runs returned all 14 samples with
 no correctness-gate drops. Per-shape rate is still noisy at this scale (the
 GPU quantized kernel is fast enough that both legs are still partly
 dispatch-bound at the smallest buckets -- achieved throughput rises from
-roughly 50-70 GFLOP/s at `m=8` to 1.5-2.7 TFLOP/s at `m=512` on both engines,
+roughly 60-75 GFLOP/s at `m=8` to 1.4-2.9 TFLOP/s at `m=512` on both engines,
 visible in the sweep's per-shape stderr log, so the smaller buckets are not
 yet at whatever this hardware's ceiling is), but combining across bucket size
 and 2x-weighting gate/up against down (below) averages enough of that out to
@@ -614,27 +617,31 @@ show a clear, monotonic-with-a-late-dip trend rather than the flat, noisy
 scatter the retracted first pass showed.
 
 Combined rate per bucket (one full expert forward is 2x gate/up + 1x down),
-mean and standard deviation across the 10 runs:
+mean and standard deviation across the 10 runs, at the corrected group-32
+quantization (a prior version of this table, retracted, used group 64 --
+see the fix-round-2 note in the report; the correction moves every `r` up by
+roughly 0.04-0.11, no bucket crosses the `0.15` stop threshold or moves `f*`
+across the 0.12 fp16-memory line discussed earlier in this document):
 
 | m | r (mean) | r (std) | r (min) | r (max) | f* = r/(1+r) | ceiling = 1+r |
 |---|---|---|---|---|---|---|
-| 8 | 0.8545 | 0.0778 | 0.7598 | 1.0471 | 0.4608 | 1.8545 |
-| 16 | 0.8773 | 0.0876 | 0.7140 | 1.0408 | 0.4673 | 1.8773 |
-| 32 | 0.9654 | 0.0474 | 0.8904 | 1.0345 | 0.4912 | 1.9654 |
-| 64 | 1.1113 | 0.1425 | 1.0024 | 1.4800 | 0.5264 | 2.1113 |
-| 128 | 1.2160 | 0.1103 | 1.0905 | 1.4598 | 0.5487 | 2.2160 |
-| 256 | 1.2387 | 0.0830 | 1.1121 | 1.4152 | 0.5533 | 2.2387 |
-| 512 | 1.1641 | 0.0943 | 0.9710 | 1.2734 | 0.5379 | 2.1641 |
+| 8 | 0.9193 | 0.1062 | 0.7344 | 1.0993 | 0.4790 | 1.9193 |
+| 16 | 0.9311 | 0.0720 | 0.8551 | 1.0837 | 0.4822 | 1.9311 |
+| 32 | 0.9922 | 0.0745 | 0.8950 | 1.1376 | 0.4981 | 1.9922 |
+| 64 | 1.1251 | 0.0787 | 0.9864 | 1.2201 | 0.5294 | 2.1251 |
+| 128 | 1.2348 | 0.0700 | 1.1468 | 1.3384 | 0.5525 | 2.2348 |
+| 256 | 1.2884 | 0.0388 | 1.2150 | 1.3440 | 0.5630 | 2.2884 |
+| 512 | 1.1427 | 0.0936 | 1.0401 | 1.2868 | 0.5333 | 2.1427 |
 
 `r` rises from the smallest bucket to a peak around `m = 256` and eases back
 slightly at `m = 512`; every bucket's mean is comfortably above the `0.15`
 stop threshold (the lowest single-run reading across all 140 samples was
-`0.71`, still well clear), so the sweep does not hit the stop condition (`r <
+`0.73`, still well clear), so the sweep does not hit the stop condition (`r <
 0.15` at every bucket size). No single bucket stands out as uniquely "best" --
 the means across `m = 64` through `512` sit within about 0.15 of each other,
 inside one bucket's own run-to-run standard deviation -- so this section does
-not pick one point estimate; the whole table, and the range `f* ≈ 0.46-0.55`
-/ ceiling `≈ 1.85-2.24` it implies, is the result.
+not pick one point estimate; the whole table, and the range `f* ≈ 0.48-0.56`
+/ ceiling `≈ 1.92-2.29` it implies, is the result.
 
 ### This is the production-representative number, not a pessimistic floor
 
@@ -662,5 +669,5 @@ comparison would show), by an amount this sweep does not measure. The
 direction of the bias is known; its size is not.
 
 Full per-run JSON and stderr (per-shape relative error and achieved GFLOP/s)
-for both 5-run sessions are recorded in the fix-round section of
+for this corrected 10-run set are recorded in the fix-round-2 section of
 `.superpowers/sdd/2026-09-03-ane-expert-distribution-plan/task-1-report.md`.

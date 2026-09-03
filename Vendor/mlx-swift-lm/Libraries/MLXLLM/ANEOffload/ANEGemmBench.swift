@@ -50,12 +50,17 @@ public enum ANEGemmBench {
     /// matching `Qwen4ExpANEDenseLaneTests.testProjectionMatchesGPUWithinFP16`.
     static let correctnessTolerance: Double = 2e-2
 
-    /// The quantization the deployed expert weights actually use -- 4-bit
-    /// affine, group size 64 (see docs/perf/qwen38-flash-2026-09.md, "our
-    /// own MLX 4-bit affine / group-64 conversion"). The GPU leg is measured
-    /// against this kernel, not a dense fp32 matmul, because the quantized
-    /// gather-GEMM is the op an ANE offload would actually replace.
-    static let expertGroupSize = 64
+    /// The quantization the deployed Qwen4Exp routed expert weights actually
+    /// use -- 4-bit affine, group size 32 (see
+    /// `Sources/MLXFastModel/Qwen4ExpTransform.swift`'s `expertGroupSize`
+    /// default, and docs/perf/qwen38-flash-2026-09.md: "routed experts
+    /// affine 4-bit group 32"). Group 64 is the separate main-backbone
+    /// dense-tensor conversion described elsewhere in that doc -- a
+    /// different set of tensors, not the routed experts this bench
+    /// characterises. The GPU leg is measured against this kernel, not a
+    /// dense fp32 matmul, because the quantized gather-GEMM is the op an ANE
+    /// offload would actually replace.
+    static let expertGroupSize = 32
     static let expertBits = 4
 
     /// `m` tokens, `k` input features, `n` output features. Shapes the ANE
