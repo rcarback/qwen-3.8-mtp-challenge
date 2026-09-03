@@ -41,6 +41,27 @@ final class Qwen4ExpANEDenseLaneTests: XCTestCase {
         XCTAssertTrue(allClose(nextPiped, nextPlain, rtol: 2e-2, atol: 2e-3).item())
     }
 
+    /// Equivalence guard for the restructured loop. There is no public hook to
+    /// count eval calls, so this asserts the property that actually matters:
+    /// after moving staging into the concurrent closure and hoisting the
+    /// barrier, the micro-batched path still matches the plain path exactly.
+    func testMicroBatchedPrefillMatchesPlainForwardAfterRestructure() throws {
+        let (model, dir) = try Qwen4ExpModelTests().makeModel()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ids = MLXArray([Int32(1), 2, 3, 7, 5, 6]).reshaped(1, 6)  // 3 micro-batches of 2
+        Qwen4ExpTextModel.forcedMicroBatch = 2
+        defer { Qwen4ExpTextModel.forcedMicroBatch = nil }
+        let cache = model.newCache(parameters: nil)
+        let piped = model(ids, cache: cache)
+        XCTAssertEqual(piped.dim(1), 6)
+        XCTAssertEqual(cache[3].offset, 6)
+        // Same tokens through the plain path must agree.
+        Qwen4ExpTextModel.forcedMicroBatch = nil
+        let plainCache = model.newCache(parameters: nil)
+        let plain = model(ids, cache: plainCache)
+        XCTAssertTrue(allClose(piped, plain, rtol: 2e-2, atol: 2e-3).item())
+    }
+
     func testLaneIsOffByDefault() {
         if ProcessInfo.processInfo.environment["MLX_ANE_DIRECT"] != "1" {
             XCTAssertFalse(Qwen4ExpANELane.armed(sequenceLength: 4096))

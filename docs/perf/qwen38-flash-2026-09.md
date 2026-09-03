@@ -671,3 +671,71 @@ direction of the bias is known; its size is not.
 Full per-run JSON and stderr (per-shape relative error and achieved GFLOP/s)
 for this corrected 10-run set are recorded in the fix-round-2 section of
 `.superpowers/sdd/2026-09-03-ane-expert-distribution-plan/task-1-report.md`.
+
+## Micro-batch harness: staging overlap and barrier count
+
+Task 2 targeted the two defects "Where the ANE lane's cost actually is" named.
+`makeInput` staged the next micro-batch's input on the calling thread, before
+the concurrent section, so the copy and its bf16 to fp16 conversion were never
+overlapped. And `eval(o)` inside the GPU closure forced one hard barrier per
+`(layer, micro-batch)` pair, 144 for a 732-token prefill at 3 micro-batches,
+against a baseline that builds one graph and evaluates once.
+
+The fix moves staging inside the `ane` closure, so it runs concurrently with
+the GPU `finish` call it used to precede, and moves `eval` to once per layer
+(`eval(hs)` after the micro-batch loop) instead of once per micro-batch. The
+staging materialization line
+(`eval(mixes.map { $0.x })`, run once per layer before the loop) stays on the
+calling thread, because `ConcurrentEngines` documents that its `ane` closure
+must never call MLX `eval`. `makeInput`'s `asType` and buffer read force
+materialization, so the values it touches must already be resident before the
+closure runs.
+
+`testMicroBatchedPrefillMatchesPlainForwardAfterRestructure`
+(`Tests/MLXFastTests/Model/Qwen4ExpANEDenseLaneTests.swift`) is an equivalence
+guard, not a red-green driver: there is no public hook to count `eval` calls,
+so the test checks the property that matters, that the restructured loop still
+matches the plain forward path. It passes on both the unmodified and the fixed
+code, as expected. `swift test --force-resolved-versions --filter Qwen4Exp`
+passes 33 of 33 with the fix in place (32 pre-existing plus this one).
+
+### Benchmark result: inconclusive at the CLI's measurement scale
+
+The plan brief's prescribed command
+(`qwen4exp-generate --raw 1`, a fresh process per run, `MLX_QWEN4EXP_FORCE_MICROBATCH=256`,
+a 520-token prompt) does not show the fix at this scale. Three runs before the
+fix and three after, on an otherwise idle machine, all land in the 40-55
+tokens per second range, against the 252.6 and 235.4 tokens per second the
+"Where the ANE lane's cost actually is" table recorded for the equivalent
+`moe_mb_gpu` arm.
+
+The reason is a measurement mismatch, not a regression. `moe_mb_gpu` was
+measured from a resident `serve` process, after its startup warm, so kernel
+compilation was already paid before the timed request. `qwen4exp-generate` is
+a fresh process every run: `prefill_seconds` starts after weight load but
+still includes each op family's first-call Metal kernel compile, which this
+build's JIT-compiled kernel families pay fresh every process launch. For a
+520-token prompt at a true 250 to 300 tokens per second, compute alone is
+about 1.7 to 2.1 seconds. The measured 9.4 to 13.1 seconds implies roughly 7
+to 11 seconds of fixed, per-process compile cost that swamps a few hundred
+milliseconds of harness overhead.
+
+A temporary, uncommitted warmup pass (call `model()` once on the same prompt
+and cache shape, discard the result, then time a second call) confirmed the
+mechanism: warm prefill dropped from about 10.6 seconds to 2.3 to 3.2 seconds,
+in the 165 to 222 tokens per second range, on both the fixed and the
+unmodified code. But at that range, three to four runs per side were not
+enough to separate the two: pre-fix samples averaged about 195 tokens per
+second (n=3), post-fix about 183 (n=4), with the per-run spread (165 to 222)
+larger than the gap between the two averages. This warmup diagnostic was not
+committed; it is not part of the editable surface this task's brief named, and
+a reliable read needs either many more samples or the doc's own resident
+`serve` methodology (as used for the `moe_plain` and `moe_mb_gpu` rows above),
+neither of which this task ran.
+
+What is established: the structural fix (fewer barriers, overlapped staging)
+is implemented as designed and verified equivalent to the plain forward path.
+What is not established, from this task's measurements: a numeric prefill
+speedup on this machine, at this session's noise floor. Revisit with a
+resident-server measurement, matching the "Where the ANE lane's cost actually
+is" table's own method, before drawing a numeric conclusion.
