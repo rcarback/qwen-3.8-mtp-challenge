@@ -13,6 +13,25 @@ import Testing
 /// once from the environment at process start.
 @Suite(.serialized)
 struct Qwen35ANESplitOffloadTests {
+    /// These gates used to be `guard ... else { return }` inside each test
+    /// body, which reports a test that never executed as PASSING. That is a
+    /// silent false green: the two ANE-path tests below both returned in
+    /// 0.001 s and printed nothing whenever `MLX_ANE_DIRECT` was unset, and
+    /// two separate readers took that as evidence the ANE path had been
+    /// exercised. As `.enabled(if:)` traits the same condition reports the
+    /// test as SKIPPED instead, so an unflagged run cannot be mistaken for a
+    /// covered one.
+    ///
+    /// `MLX_ANE_DIRECT` has to be set in the ENVIRONMENT rather than flipped
+    /// in-process, because `ANESplitConfig.enabled` is read once at process
+    /// start.
+    static var runtimeTestsEnabled: Bool {
+        ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1"
+    }
+    static var aneDirectEnabled: Bool {
+        runtimeTestsEnabled && ProcessInfo.processInfo.environment["MLX_ANE_DIRECT"] == "1"
+    }
+
     private static func quantizedLinear(out: Int, inn: Int, seed: UInt64) -> QuantizedLinear {
         MLXRandom.seed(seed)
         let w = (MLXRandom.normal([out, inn]) * Float(1.0 / Double(inn).squareRoot())).asType(.bfloat16)
@@ -35,11 +54,9 @@ struct Qwen35ANESplitOffloadTests {
         m.downProj(silu(m.gateProj(x)) * m.upProj(x))
     }
 
-    @Test("Qwen35FusedMLP.callAsFunction ANE path equals the all-GPU SwiGLU at [1,512,hidden]")
+    @Test("Qwen35FusedMLP.callAsFunction ANE path equals the all-GPU SwiGLU at [1,512,hidden]",
+          .enabled(if: Qwen35ANESplitOffloadTests.aneDirectEnabled))
     func forwardMatchesGPU() throws {
-        let env = ProcessInfo.processInfo.environment
-        guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
-              env["MLX_ANE_DIRECT"] == "1" else { return }
         try #require(ANERuntime.available())
         try #require(ANESplitConfig.enabled, "ANESplitConfig.enabled must be true under MLX_ANE_DIRECT=1")
 
@@ -71,10 +88,9 @@ struct Qwen35ANESplitOffloadTests {
     /// so the cache returns nil regardless of MLX_ANE_DIRECT, exercising
     /// the exact fallback branch that runs in production when the flag is
     /// unset.
-    @Test("Qwen35FusedMLP.callAsFunction equals the GPU SwiGLU exactly when the ANE path is skipped")
+    @Test("Qwen35FusedMLP.callAsFunction equals the GPU SwiGLU exactly when the ANE path is skipped",
+          .enabled(if: Qwen35ANESplitOffloadTests.runtimeTestsEnabled))
     func fallbackEqualsGPUExact() throws {
-        let env = ProcessInfo.processInfo.environment
-        guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else { return }
         let hidden = 5_120, inter = 17_408, S = 100 // not a multiple of 32 -> no ANE
         let m = Self.mlp(hidden: hidden, inter: inter)
         let x = MLXRandom.normal([1, S, hidden]).asType(.bfloat16)
@@ -97,11 +113,9 @@ struct Qwen35ANESplitOffloadTests {
     /// this traps here instead of in a live serve.
     ///
     /// 732 is the prompt length `docs/perf/qwen38-flash-2026-09.md` measures.
-    @Test("Qwen35FusedMLP.callAsFunction ANE path equals the all-GPU SwiGLU at a non-bucket-aligned S=732")
+    @Test("Qwen35FusedMLP.callAsFunction ANE path equals the all-GPU SwiGLU at a non-bucket-aligned S=732",
+          .enabled(if: Qwen35ANESplitOffloadTests.aneDirectEnabled))
     func forwardMatchesGPUAtNonBucketAlignedLength() throws {
-        let env = ProcessInfo.processInfo.environment
-        guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
-              env["MLX_ANE_DIRECT"] == "1" else { return }
         try #require(ANERuntime.available())
         try #require(ANESplitConfig.enabled, "ANESplitConfig.enabled must be true under MLX_ANE_DIRECT=1")
 
@@ -131,11 +145,9 @@ struct Qwen35ANESplitOffloadTests {
         #expect(meanAbs < 0.02, "meanAbs=\(meanAbs)")
     }
 
-    @Test("Qwen35FusedMLP.callAsFunction is the untouched GPU path for decode width S=1")
+    @Test("Qwen35FusedMLP.callAsFunction is the untouched GPU path for decode width S=1",
+          .enabled(if: Qwen35ANESplitOffloadTests.aneDirectEnabled))
     func decodeStaysGPU() throws {
-        let env = ProcessInfo.processInfo.environment
-        guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
-              env["MLX_ANE_DIRECT"] == "1" else { return }
         let hidden = 5_120, inter = 17_408
         let m = Self.mlp(hidden: hidden, inter: inter)
         let x = MLXRandom.normal([1, 1, hidden]).asType(.bfloat16)
@@ -151,10 +163,9 @@ struct Qwen35ANESplitOffloadTests {
     /// `minSequenceLength` (128) the cache must refuse to build a program
     /// regardless of the flag, and 4-bit/group-64 triples above the
     /// threshold succeed only when the flag is enabled.
-    @Test("ANESplitMLPCache refuses short sequences and honors the enabled flag")
+    @Test("ANESplitMLPCache refuses short sequences and honors the enabled flag",
+          .enabled(if: Qwen35ANESplitOffloadTests.runtimeTestsEnabled))
     func cacheGuardLogic() throws {
-        let env = ProcessInfo.processInfo.environment
-        guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else { return }
         let hidden = 5_120, inter = 17_408
         let m = Self.mlp(hidden: hidden, inter: inter)
         guard let g = m.gateProj as? QuantizedLinear,
@@ -186,7 +197,7 @@ struct Qwen35ANESplitOffloadTests {
             downW: d.weight, downScales: d.scales, downBiases: db,
             downBits: d.bits, downGroupSize: d.groupSize,
             hidden: hidden, inter: inter)
-        if env["MLX_ANE_DIRECT"] == "1" {
+        if Qwen35ANESplitOffloadTests.aneDirectEnabled {
             #expect(longResult != nil, "S=512 with 4-bit/group-64 weights must build under the flag")
         } else {
             #expect(longResult == nil, "the cache must refuse when MLX_ANE_DIRECT is unset")
