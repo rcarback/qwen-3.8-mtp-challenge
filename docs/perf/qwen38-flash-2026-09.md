@@ -998,3 +998,59 @@ appears to exhaust the program-load limit at 54 layers.
 `MLX_ANE_FRACTION` 0.3125 was previously carried without an end-to-end
 measurement behind it. It is the best of the six sampled, and the curve falls
 away sharply above it.
+
+## MoE tower, re-measured by resident serve (2026-09-03)
+
+The note at the end of "Micro-batch harness" asked for a resident-server
+measurement before drawing a numeric conclusion. This is it. Same machine, same
+six prompts as the dense measurements above, one serve per arm, 81 GiB tree,
+`--mtp-depth 0`.
+
+| Prompt tokens | plain | micro-batched GPU | micro-batched ANE |
+|---|---|---|---|
+| 653 | 270.4 | 206.1 | 196.5 |
+| 675 | 287.7 | 214.5 | 215.9 |
+| 692 | 295.1 | 216.0 | 217.3 |
+| 723 | 298.9 | 215.0 | 217.6 |
+| 735 | 301.6 | 228.4 | 231.7 |
+| 765 | 308.3 | 234.8 | 238.2 |
+| mean | **293.7** | **219.1** | **219.5** |
+
+| Effect | Result |
+|---|---|
+| Micro-batching against plain | **-25.4 percent** |
+| ANE on top of micro-batching | **+0.2 percent** |
+| The lane, net against plain | **-25.2 percent** |
+
+The `plain` arm reproduces the earlier `moe_plain` row of 305.1 within the
+difference the shorter prompts explain. The micro-batching cost reproduces at
+the high end of the earlier 17 to 22 percent range.
+
+What is new is the middle row. Adding the ANE on top of micro-batching returns
+0.2 percent, which is inside the run-to-run spread, on six of six prompts. The
+earlier table put that recovery at about 6 percent. Either figure is far too
+small to pay for the 25 percent the restructuring costs.
+
+### Why the two towers disagree
+
+The dense lane wins 5.7 percent and the MoE lane loses 25.2 percent, on the
+same machine, with the same second engine. The difference is not the ANE. It is
+what each lane has to do to the forward pass to reach it.
+
+The dense lane splits the MLP by intermediate channel. Both halves run inside
+one forward, the graph keeps its shape, and the ANE prefix overlaps the GPU
+suffix. Nothing is restructured, so the only cost is the dispatch, and the
+engine gain survives.
+
+The MoE lane splits by micro-batch. Reaching the ANE at all requires cutting
+the prefill into 256-token pieces, which multiplies the per-layer dispatch and
+barrier count and forfeits the single fused lazy graph. That costs 25.4 percent
+before the ANE contributes anything, and the ANE then contributes nothing
+measurable.
+
+This is the direct answer to the idea that a mixture-of-experts model should
+suit two engines particularly well, because experts can be spread across them.
+The hardware argument is sound and the measurement still says no: the
+mechanism that distributes the work costs more than the second engine returns.
+An MoE ANE lane becomes interesting only if experts can be reached without
+micro-batching the prefill.
