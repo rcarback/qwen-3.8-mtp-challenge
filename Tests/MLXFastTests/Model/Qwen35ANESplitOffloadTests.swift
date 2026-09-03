@@ -87,6 +87,50 @@ struct Qwen35ANESplitOffloadTests {
         #expect(maxAbs == 0.0, "fallback path must be bit-identical to GPU SwiGLU; maxAbs=\(maxAbs)")
     }
 
+    /// The production case the S=512 test above does NOT cover. 512 is its
+    /// own bucket, so that test never exercises padding at all. A real
+    /// prompt is not bucket-aligned: 732 tokens compiles at 1024, so the
+    /// ANE program runs 292 padded rows while the GPU suffix runs only the
+    /// 732 real ones. Both `ANEDirectDispatch.swift:112` and
+    /// `ANEGemm.swift:117` assert `x.shape[0] == sequenceLength`, so if
+    /// `ANEFusedSplitMLP.padForANE` ever stops covering an ANE entry point
+    /// this traps here instead of in a live serve.
+    ///
+    /// 732 is the prompt length `docs/perf/qwen38-flash-2026-09.md` measures.
+    @Test("Qwen35FusedMLP.callAsFunction ANE path equals the all-GPU SwiGLU at a non-bucket-aligned S=732")
+    func forwardMatchesGPUAtNonBucketAlignedLength() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
+              env["MLX_ANE_DIRECT"] == "1" else { return }
+        try #require(ANERuntime.available())
+        try #require(ANESplitConfig.enabled, "ANESplitConfig.enabled must be true under MLX_ANE_DIRECT=1")
+
+        let hidden = 5_120, inter = 17_408, S = 732
+        #expect(ANESplitMLPCache.bucketedSequenceLength(S) == 1_024,
+                "this test is only meaningful while 732 buckets to 1024")
+        #expect(S >= ANESplitConfig.minSequenceLength,
+                "732 must clear the cache's admission floor or the ANE path is never taken")
+
+        let m = Self.mlp(hidden: hidden, inter: inter)
+        let x = MLXRandom.normal([1, S, hidden]).asType(.bfloat16)
+        eval(x)
+
+        let ref = Self.gpuSwiGLU(x, m)
+        eval(ref)
+
+        let y = m(x)
+        eval(y)
+        #expect(y.shape == [1, S, hidden], "padded rows must be sliced off, got \(y.shape)")
+
+        let diff = MLX.abs(y.asType(.float32) - ref.asType(.float32))
+        eval(diff)
+        let maxAbs = diff.max().item(Float.self)
+        let meanAbs = diff.mean().item(Float.self)
+        print("QWEN35-ANE-MLP S=732/bucket=1024 maxAbs=\(maxAbs) meanAbs=\(meanAbs)")
+        #expect(maxAbs < 0.09375, "maxAbs=\(maxAbs)")
+        #expect(meanAbs < 0.02, "meanAbs=\(meanAbs)")
+    }
+
     @Test("Qwen35FusedMLP.callAsFunction is the untouched GPU path for decode width S=1")
     func decodeStaysGPU() throws {
         let env = ProcessInfo.processInfo.environment
