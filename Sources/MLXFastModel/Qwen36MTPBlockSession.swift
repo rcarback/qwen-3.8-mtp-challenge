@@ -1327,8 +1327,13 @@ public final class Qwen36MTPBlockSession {
                 // Warm arbitrary-prefix replay T=2...8. Restore all but the
                 // final verify row and trim that same row from attention so the
                 // throwaway cache remains aligned for the next width.
-                precondition(model.replayRecurrentPrefix(
-                    cache: warmCache, committedRows: width - 1))
+                // A target with no replay tape dispatches no replay kernel, so
+                // there is nothing to warm; the trims below still run, because
+                // it is the row counts that select the next width's shapes.
+                if model.publishesRecurrentReplayTape {
+                    precondition(model.replayRecurrentPrefix(
+                        cache: warmCache, committedRows: width - 1))
+                }
                 for entry in warmCache where !(entry is ArraysCache) {
                     if entry.isTrimmable { _ = entry.trim(1) }
                 }
@@ -1359,8 +1364,10 @@ public final class Qwen36MTPBlockSession {
                 if let wideNormed { wideBundle.append(wideNormed) }
                 eval(wideBundle)
                 eval(warmCache.flatMap { $0.state })
-                precondition(model.replayRecurrentPrefix(
-                    cache: warmCache, committedRows: width - 1))
+                if model.publishesRecurrentReplayTape {
+                    precondition(model.replayRecurrentPrefix(
+                        cache: warmCache, committedRows: width - 1))
+                }
                 for entry in warmCache where !(entry is ArraysCache) {
                     if entry.isTrimmable { _ = entry.trim(1) }
                 }
@@ -1380,8 +1387,10 @@ public final class Qwen36MTPBlockSession {
         if let oneRowReplayNormed { oneRowBundle.append(oneRowReplayNormed) }
         eval(oneRowBundle)
         eval(oneRowReplayCache.flatMap { $0.state })
-        precondition(model.replayRecurrentPrefix(
-            cache: oneRowReplayCache, committedRows: 1))
+        if model.publishesRecurrentReplayTape {
+            precondition(model.replayRecurrentPrefix(
+                cache: oneRowReplayCache, committedRows: 1))
+        }
         eval(oneRowReplayCache.flatMap { $0.state })
 
         // SEED-PREFILL SHAPE WARM (M=512 backbone). Keep this as the final

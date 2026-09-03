@@ -93,6 +93,13 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// decide which drafting shape a round takes.
     var externalProposalHead: (any Qwen35ProposalHead)? { get }
 
+    /// False when the target keeps no recurrent replay tape at all, so
+    /// `replayRecurrentPrefix` always declines and the session always repairs
+    /// generically. Distinct from a per-call decline: there is no replay kernel
+    /// for the warm to compile, and asserting one would trap. Defaults to true,
+    /// so a target that publishes a tape says nothing.
+    var publishesRecurrentReplayTape: Bool { get }
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.
@@ -152,6 +159,8 @@ public protocol Qwen36MTPTarget: AnyObject {
 }
 
 extension Qwen36MTPTarget {
+    public var publishesRecurrentReplayTape: Bool { true }
+
     public func callWithHiddenAndNormed(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray, MLXArray?) {

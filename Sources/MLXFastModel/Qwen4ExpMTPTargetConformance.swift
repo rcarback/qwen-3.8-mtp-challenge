@@ -42,6 +42,11 @@ extension Qwen4ExpModel: Qwen36MTPTarget {
 
     public var externalProposalHead: (any Qwen35ProposalHead)? { nil }
 
+    /// This tower keeps no replay tape: its gated-delta layers carry recurrent
+    /// state the session cannot rewind, so every rollback goes through the
+    /// generic repair path and there is no replay kernel to warm.
+    public var publishesRecurrentReplayTape: Bool { false }
+
     public func replayRecurrentPrefix(cache: [any KVCache], committedRows: Int) -> Bool {
         false
     }

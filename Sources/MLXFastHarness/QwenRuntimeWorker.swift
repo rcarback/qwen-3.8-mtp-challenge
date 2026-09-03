@@ -96,10 +96,19 @@ extension QwenRuntime {
         let response: RuntimeWorkerPreflightResponse
         do {
             try validateRuntimeWorkerPinnedConfiguration(weightsPath: weightsPath)
-            let config = try Qwen35Config.load(from: weightsPath)
-            let loader = try Qwen35WeightLoader(weightsPath: weightsPath)
-            try loader.denseStore.validateReadableByteRanges()
-            try loader.validateRequiredMetadata(config: config)
+            // The checks below are the Qwen 3.8 tower's eager-loader contract:
+            // Qwen35WeightLoader's dense byte ranges and required metadata. The
+            // local qwen4_exp family does not use that loader at all -- the MTP
+            // worker builds it through LLMModelFactory -- so there is nothing
+            // here to validate beyond the pinned config already checked above,
+            // and running Qwen35Config.load on it only reports the absence of
+            // fields that family does not have.
+            if try !runtimeWorkerWeightsAreQwen4Exp(weightsPath: weightsPath) {
+                let config = try Qwen35Config.load(from: weightsPath)
+                let loader = try Qwen35WeightLoader(weightsPath: weightsPath)
+                try loader.denseStore.validateReadableByteRanges()
+                try loader.validateRequiredMetadata(config: config)
+            }
             response = RuntimeWorkerPreflightResponse(ok: true)
         } catch {
             response = RuntimeWorkerPreflightResponse(
@@ -634,6 +643,15 @@ private struct RuntimeWorkerPinnedQuantization: Decodable, Equatable {
     }
 }
 
+/// True when the tree at `weightsPath` is the local Qwen3.8-Flash-Next family.
+/// Read from the already-validated `config.json`, so it cannot disagree with the
+/// branch the pinned-configuration gate took.
+func runtimeWorkerWeightsAreQwen4Exp(weightsPath: String) throws -> Bool {
+    let path = URL(fileURLWithPath: weightsPath).appendingPathComponent("config.json")
+    let json = try JSONSerialization.jsonObject(with: Data(contentsOf: path))
+    return (json as? [String: Any])?["model_type"] as? String == "qwen4_exp_text"
+}
+
 func validateRuntimeWorkerPinnedConfiguration(weightsPath: String) throws {
     let path = URL(fileURLWithPath: weightsPath).appendingPathComponent("config.json")
     let values = try path.resourceValues(
@@ -676,6 +694,16 @@ func validateRuntimeWorkerPinnedConfiguration(weightsPath: String) throws {
 /// than by re-pinning the constants' geometry to a second checkpoint.
 func validateRuntimeWorkerPinnedConfigurationData(_ data: Data) throws {
     try validateRuntimeWorkerPinnedConfigurationSchema(data)
+
+    // Family branch, as in the schema check above. A ranked config declares
+    // `qwen3_5_text` and never reaches this, so the pinned Qwen 3.8 gate below
+    // is untouched.
+    if let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+       root["model_type"] as? String == "qwen4_exp_text"
+    {
+        try validateQwen4ExpRuntimeWorkerPinnedConfiguration(root)
+        return
+    }
 
     let decoded: RuntimeWorkerPinnedConfiguration
     do {
@@ -777,6 +805,15 @@ private func validateRuntimeWorkerPinnedConfigurationSchema(
         )
     }
 
+    // Family branch. The pinned key set below describes the ranked Qwen 3.8
+    // backbone artifact and stays exact, so a ranked config never reaches the
+    // branch. The local qwen4_exp transform emits a different but equally fixed
+    // key set; it gets its own pinned list rather than a relaxation of this one.
+    if root["model_type"] as? String == "qwen4_exp_text" {
+        try validateQwen4ExpRuntimeWorkerConfigurationSchema(root)
+        return
+    }
+
     try requireExactRuntimeWorkerKeys(
         Set(root.keys),
         expected: [
@@ -850,6 +887,241 @@ private func validateRuntimeWorkerPinnedConfigurationSchema(
         Set(quantization.keys),
         expected: ["bits", "group_size", "mode"],
         field: "runtime worker config.json quantization"
+    )
+}
+
+/// Field-by-field restatement of the LOCAL Qwen3.8-Flash-Next tower, the
+/// qwen4_exp counterpart of the pinned Qwen 3.8 gate above. This family is local
+/// research only and is never ranked, so the gate exists to catch a corrupted or
+/// mismatched transform rather than to resist tampering.
+///
+/// The shape, scheme and vocabulary pins bind unconditionally: head dim 256,
+/// linear key and value head dim 128, conv kernel 4, the 4-layer repeat with
+/// full attention at `index % 4 == 3`, sigmoid output gate, bf16 storage with
+/// float32 SSM state, group-32 4-bit affine quantization, and the bf16 n-gram
+/// table under `ngram/`. The size-dependent pins honour the same
+/// `DARKBLOOM_QWEN_GEOMETRY_UNPINNED` escape the ranked gate uses, so a sibling
+/// tower loads on this worker.
+private func validateQwen4ExpRuntimeWorkerPinnedConfiguration(
+    _ root: [String: Any]
+) throws {
+    let sizeUnpinned = ProcessInfo.processInfo
+        .environment["DARKBLOOM_QWEN_GEOMETRY_UNPINNED"] == "1"
+    func int(_ key: String) -> Int? { (root[key] as? NSNumber)?.intValue }
+    func dbl(_ key: String) -> Double? { (root[key] as? NSNumber)?.doubleValue }
+    func str(_ key: String) -> String? { root[key] as? String }
+    func bool(_ key: String) -> Bool? { (root[key] as? NSNumber)?.boolValue }
+    /// Present-and-well-typed when the size escape is on, exact otherwise.
+    func sizePin(_ actual: Int?, _ expected: Int) -> Bool {
+        sizeUnpinned ? actual != nil : actual == expected
+    }
+
+    guard let layers = int("num_hidden_layers"),
+          let interval = int("full_attention_interval"),
+          let layerTypes = root["layer_types"] as? [String],
+          let rope = root["rope_parameters"] as? [String: Any],
+          let quantization = root["quantization"] as? [String: Any],
+          let ngramTable = root["ngram_table"] as? [String: Any],
+          let mtp = root["mtp"] as? [String: Any]
+    else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json is missing or has invalid qwen4_exp architecture fields"
+        )
+    }
+    let expectedLayerTypes = (0 ..< layers).map {
+        $0 % interval == interval - 1 ? "full_attention" : "linear_attention"
+    }
+
+    guard str("model_type") == "qwen4_exp_text",
+          interval == 4,
+          layerTypes == expectedLayerTypes,
+          int("head_dim") == 256,
+          int("linear_value_head_dim") == 128,
+          int("linear_key_head_dim") == 128,
+          int("linear_conv_kernel_dim") == 4,
+          int("indexer_head_dim") == 128,
+          dbl("rms_norm_eps") == 1e-6,
+          str("hidden_act") == "silu",
+          str("output_gate_type") == "sigmoid",
+          str("mamba_ssm_dtype") == "float32",
+          str("dtype") == "bfloat16",
+          bool("attention_bias") == false,
+          dbl("attention_dropout") == 0,
+          bool("use_cache") == true,
+          bool("output_router_logits") == false,
+          root["pad_token_id"] is NSNull,
+          dbl("initializer_range") == 0.02,
+          sizePin(int("vocab_size"), 248_320),
+          sizePin(int("hidden_size"), 2560),
+          sizePin(int("num_hidden_layers"), 48),
+          sizePin(int("num_attention_heads"), 24),
+          sizePin(int("num_key_value_heads"), 2),
+          sizePin(int("linear_num_value_heads"), 48),
+          sizePin(int("linear_num_key_heads"), 16),
+          sizePin(int("num_experts"), 512),
+          sizePin(int("num_experts_per_tok"), 10),
+          sizePin(int("moe_intermediate_size"), 640),
+          sizePin(int("shared_expert_intermediate_size"), 640),
+          sizePin(int("hc_count"), 4),
+          sizePin(int("hc_lowrank"), 320),
+          sizePin(int("max_position_embeddings"), 262_144),
+          sizePin(int("bos_token_id"), 248_044),
+          sizePin(int("eos_token_id"), 248_044),
+          sizeUnpinned || dbl("partial_rotary_factor") == 0.25,
+          sizeUnpinned || bool("tie_word_embeddings") == false,
+          (rope["rope_type"] as? String) == "default",
+          (rope["mrope_interleaved"] as? NSNumber)?.boolValue == true,
+          (rope["rope_theta"] as? NSNumber)?.doubleValue == 10_000_000,
+          (quantization["bits"] as? NSNumber)?.intValue == 4,
+          (quantization["group_size"] as? NSNumber)?.intValue == 32,
+          (quantization["mode"] as? String) == "affine",
+          (ngramTable["dtype"] as? String) == "bfloat16",
+          (ngramTable["directory"] as? String) == "ngram",
+          (ngramTable["shards"] as? NSNumber)?.intValue ?? 0 > 0,
+          (ngramTable["rows_per_shard"] as? NSNumber)?.intValue ?? 0 > 0,
+          (ngramTable["dim"] as? NSNumber)?.intValue ?? 0 > 0,
+          (mtp["num_hidden_layers"] as? NSNumber)?.intValue ?? -1 >= 0,
+          (mtp["layer_types"] as? [String]) != nil
+    else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json does not match the qwen4_exp_text architecture"
+        )
+    }
+}
+
+/// Exact-key schema check for the LOCAL Qwen3.8-Flash-Next (`qwen4_exp`) tree.
+///
+/// Same contract as the ranked check above and for the same reason: the key set
+/// is fixed by `Qwen4ExpTransform`, so require it exactly rather than letting
+/// `Decodable` ignore an extra behaviour-bearing field. This family has no
+/// `attn_output_gate` or `intermediate_size`; it carries the MoE, indexer,
+/// hyper-connection, PLE and n-gram blocks instead, plus the `ngram_table`
+/// locator and the native `mtp` head description.
+private func validateQwen4ExpRuntimeWorkerConfigurationSchema(
+    _ root: [String: Any]
+) throws {
+    try requireExactRuntimeWorkerKeys(
+        Set(root.keys),
+        expected: [
+            "attention_bias",
+            "attention_dropout",
+            "bos_token_id",
+            "dtype",
+            "eos_token_id",
+            "full_attention_interval",
+            "hc_count",
+            "hc_lowrank",
+            "head_dim",
+            "heads_per_ngram",
+            "hidden_act",
+            "hidden_size",
+            "indexer_budget",
+            "indexer_compress_ratio",
+            "indexer_head_dim",
+            "indexer_kv_heads",
+            "indexer_n_heads",
+            "initializer_range",
+            "layer_types",
+            "linear_conv_kernel_dim",
+            "linear_key_head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "linear_value_head_dim",
+            "make_ngram_vocab_size_divisible_by",
+            "mamba_ssm_dtype",
+            "max_position_embeddings",
+            "model_type",
+            "moe_intermediate_size",
+            "mtp",
+            "mtp_num_hidden_layers",
+            "mtp_use_dedicated_embeddings",
+            "ngram_size",
+            "ngram_table",
+            "ngram_vocab_size_base",
+            "num_attention_heads",
+            "num_experts",
+            "num_experts_per_tok",
+            "num_hidden_layers",
+            "num_key_value_heads",
+            "output_gate_type",
+            "output_router_logits",
+            "pad_token_id",
+            "partial_rotary_factor",
+            "ple_conv_kernel_size",
+            "ple_embed_dim",
+            "ple_layer_ids",
+            "quantization",
+            "rms_norm_eps",
+            "rope_parameters",
+            "router_aux_loss_coef",
+            "shared_expert_intermediate_size",
+            "split_ngram_parts",
+            "tie_word_embeddings",
+            "use_cache",
+            "vocab_size",
+        ],
+        field: "runtime worker config.json"
+    )
+
+    guard root["pad_token_id"] is NSNull else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json pad_token_id must be null"
+        )
+    }
+    guard let rope = root["rope_parameters"] as? [String: Any] else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json rope_parameters must be an object"
+        )
+    }
+    try requireExactRuntimeWorkerKeys(
+        Set(rope.keys),
+        expected: [
+            "mrope_interleaved",
+            "mrope_section",
+            "partial_rotary_factor",
+            "rope_theta",
+            "rope_type",
+        ],
+        field: "runtime worker config.json rope_parameters"
+    )
+
+    guard let quantization = root["quantization"] as? [String: Any] else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json quantization must be an object"
+        )
+    }
+    try requireExactRuntimeWorkerKeys(
+        Set(quantization.keys),
+        expected: ["bits", "group_size", "mode"],
+        field: "runtime worker config.json quantization"
+    )
+
+    guard let ngramTable = root["ngram_table"] as? [String: Any] else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json ngram_table must be an object"
+        )
+    }
+    try requireExactRuntimeWorkerKeys(
+        Set(ngramTable.keys),
+        expected: ["dim", "directory", "dtype", "rows_per_shard", "shards"],
+        field: "runtime worker config.json ngram_table"
+    )
+
+    guard let mtp = root["mtp"] as? [String: Any] else {
+        throw MLXFastError.invalidInput(
+            "runtime worker config.json mtp must be an object"
+        )
+    }
+    try requireExactRuntimeWorkerKeys(
+        Set(mtp.keys),
+        expected: [
+            "hybrid",
+            "layer_types",
+            "mtp_use_hidden_state_from_layer",
+            "num_hidden_layers",
+            "rope_theta",
+        ],
+        field: "runtime worker config.json mtp"
     )
 }
 

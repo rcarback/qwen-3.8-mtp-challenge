@@ -125,11 +125,15 @@ public enum Qwen36MTPHeadAttachment {
             throw MLXFastError.invalidInput(
                 "the Qwen MTP backbone config.json declares no model_type")
         }
+        // `qwen4_exp` is the LOCAL Qwen3.8-Flash-Next tower. It reaches the same
+        // block session through `Qwen4ExpMTPTargetConformance`, and its transform
+        // writes a flat text config, so it takes the flat branch below.
         guard modelType.hasPrefix("qwen3_5") || modelType.hasPrefix("qwen3_6")
+            || modelType.hasPrefix("qwen4_exp")
         else {
             throw MLXFastError.invalidInput(
                 "the Qwen MTP backbone declares model_type \(modelType), which is "
-                    + "not a Qwen 3.5/3.6 family checkpoint")
+                    + "not a Qwen 3.5/3.6 or qwen4_exp family checkpoint")
         }
         // A nested `text_config` is what makes the factory build the wrapper. The
         // model_type suffix agrees with it on every checkpoint this track pins,

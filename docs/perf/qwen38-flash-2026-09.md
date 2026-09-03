@@ -204,6 +204,57 @@ Decode differs between the two runs (12.29 against 5.70 tokens per second)
 because the n-gram table pages differ in residency, not because of the prompt
 length. These are single cold runs and are directional only.
 
+### Serve
+
+`mlxfast-swift serve` answers on the qwen4_exp tree at draft depth 0, the serial
+control. Command and result:
+
+```text
+DARKBLOOM_QWEN_GEOMETRY_UNPINNED=1 MLXFAST_NO_SANDBOX=1 .build/release/mlxfast-swift serve \
+  --weights <weights> --mtp-head none --mtp-depth 0 --port 8080
+```
+
+| Measure | Value |
+|---|---|
+| Prompt tokens | 23 |
+| Seed prefill | 0.32 s |
+| Completion tokens | 49 in 50 rounds |
+| Decode | 15.85 tokens/s |
+| End to end | 14.3 tokens/s |
+| Accept rate | not applicable, depth 0 offers no drafts |
+
+The answer is correct: it names Rayleigh scattering and the wavelength
+dependence. `--mtp-head none` under `DARKBLOOM_QWEN_GEOMETRY_UNPINNED=1` is the
+existing headless escape; this tower carries its MTP head inside the checkpoint
+rather than as a separately pinned artifact.
+
+Four gates stood between the tree and a served answer. Each was a Qwen 3.8
+assumption in a shared path, and each fix branches on the family so the ranked
+path keeps its exact behaviour.
+
+| Gate | Where | Fix |
+|---|---|---|
+| Exact config key set | `QwenRuntimeWorker.validateRuntimeWorkerPinnedConfigurationSchema` | Branch on `model_type`, with a second pinned key list for qwen4_exp |
+| Pinned architecture values | `QwenRuntimeWorker.validateRuntimeWorkerPinnedConfigurationData` | Branch on `model_type`, with a qwen4_exp value gate honouring the same geometry escape |
+| Qwen35 eager-loader contract | `QwenRuntimeWorker.runPreflightWorker` | Skip the `Qwen35WeightLoader` checks for a family that does not use that loader |
+| Backbone family allow list | `Qwen36MTPHeadAttachment.backboneLayout` | Accept the `qwen4_exp` prefix |
+
+A fifth failure was a trap rather than a gate. `Qwen36MTPBlockSession`
+warms the recurrent replay kernel behind `precondition(replayRecurrentPrefix(...))`
+at three call sites. This tower keeps no replay tape, so it returns false by
+contract and the session repairs generically, but the assertion took the process
+down with a precondition failure before it could. The protocol gained
+`publishesRecurrentReplayTape`, which defaults to true and is false only for
+qwen4_exp; the three warms skip the assertion when there is no replay kernel to
+compile. The trims around them still run, since it is the cache row counts that
+select the next width's dispatch shapes.
+
+The ranked tree still passes `preflight`, and
+`swift test --force-resolved-versions --filter "Qwen36|Qwen35|QwenMTP|Qwen4Exp"`
+passes 32 of 32, which covers every file this work touched. The unfiltered
+suite was not run to completion: it was still executing after 40 minutes with
+no output, and it was stopped rather than waited out.
+
 ### Norm conventions
 
 The checkpoint stores two norm conventions, and the stored weights identify
