@@ -17,36 +17,35 @@ Every number below names the command that produced it.
 
 Now:
 
-- Model code, transform, and generate verb are in the tree with 26 unit tests
-  on small synthetic configurations (`swift test --force-resolved-versions --filter Qwen4Exp`).
+- Model code, transform, generate verb, serve wiring and the native MTP head
+  are in the tree and run on the real checkpoint. 32 unit tests pass, the
+  mlx-lm reference parity case included
+  (`MLXFAST_RUN_QWEN4EXP_PY_PARITY=1 swift test --force-resolved-versions --filter Qwen4Exp`).
+- The download and the transform are done. The runtime tree matches the
+  design: routed experts 4-bit, dense tensors bf16, n-gram table mapped.
+- The port agrees with the mlx-lm reference to under 1e-2 max logit delta.
+  See "Reference parity".
+- Serve answers at draft depth 0 and at depth 2, where the native head accepts
+  0.889 of its drafts and decodes 1.16 times faster with identical output.
+  See "Native MTP head at depth 2".
+- The checkpoint uses two norm conventions and the port splits them correctly.
+  See "Norm conventions".
+- The n-gram hash constants come from the checkpoint tensors. The mlx-lm
+  reference recomputes different multipliers from its seed formula, so the
+  runtime never recomputes them.
 - The ANE dense lane and its micro-batched, layer-major prefill are in the tree
   (`MLX_ANE_DIRECT=1`, `MLX_QWEN4EXP_ANE_MICROBATCH`, default 256). The
   pipeline structure is verified against the plain forward with GPU
   projections; the ANE program itself is verified only by the opt-in runtime
   test.
-- The native MTP head is in the tree behind `mtp_num_hidden_layers` in the
-  runtime config; its math follows the llama.cpp draft-head graph.
-- The n-gram hash constants come from the checkpoint tensors. The mlx-lm
-  reference recomputes different multipliers from its seed formula, so the
-  runtime never recomputes them.
 
-- The download and the transform are done. The runtime tree is on disk and
-  matches the design: routed experts 4-bit, dense tensors bf16.
-- The checkpoint uses two norm conventions and the port splits them correctly.
-  See "Norm conventions" below.
-- Loading an 81 GiB tree needed a change to `loadWeights`. See "Weight load
-  memory" below.
+Next, and both wait on the operator:
 
-Next:
-
-- Greedy continuations of the public prompts, prefill seconds, and decode
-  tokens per second at 64 and 512 prompt tokens (`qwen4exp-generate`).
-- Serve smoke through the headless MTP session.
-
-Later:
-
-- ANE dense lane A/B at 512 and 2048 prompt tokens (identical-token gate).
-- Native MTP head accept rate at depth 2.
+- ANE dense lane A/B at 512 and 2048 prompt tokens, with the identical-token
+  gate. This needs an idle machine and the root-owned ANE caches cleared
+  (`/private/var/db/neuralengine`, `/Library/Caches/com.apple.aned`), which
+  takes sudo.
+- Accept rate and decode across the varied-prose set rather than one prompt.
 
 ## Measurements
 
