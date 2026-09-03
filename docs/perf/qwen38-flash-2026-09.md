@@ -544,3 +544,98 @@ element of `pre_fc_norm_embedding` is negative, so `1 + w` stays in
 [0.121, 0.725] and never changes sign. Under the direct convention the same
 tensor would flip the sign of the whole embedding stream. Numerical parity
 against the reference remains the deciding check.
+
+## ANE against GPU on expert GEMMs
+
+`ANEGemmBench` (`Vendor/mlx-swift-lm/Libraries/MLXLLM/ANEOffload/ANEGemmBench.swift`)
+builds one fp16 ANE 1x1-conv program per shape through
+`Qwen4ExpANEProjection` and times it against the equivalent MLX GPU matmul, in
+float32 on both weight and activation for the GPU side. No model and no
+routing are involved; the sweep measures the two engines only. The worker
+verb `qwen4exp-ane-bench` (`Sources/MLXFastHarness/Qwen4ExpANEBench.swift`,
+dispatched from `Sources/MLXFastRuntimeWorkerCLI/main.swift`) sweeps the token
+dimension `m` at `[8, 16, 32, 64, 128, 256, 512]` against the two expert
+shapes for this tower: gate/up at `[640, 2560]` and down at `[2560, 640]`, 5
+iterations per shape, minimum time kept per shape per run.
+
+With 512 experts at top-10 routing for this tower, a 256-token tile sends an
+average of `256 * 10 / 512 = 5` tokens to each expert, so the bucket sizes
+below span the range from under- to over-provisioned relative to that
+average.
+
+### Measured rate is noisy at this shape scale
+
+The sweep ran three times back to back on an idle machine (no other
+model-holding process resident, confirmed by `ps aux` before each run). All
+timings are sub-millisecond, so ANE and GPU dispatch overhead is a large
+fraction of the measured time, and the single-run rate at a given bucket
+varies by up to 2x between runs. The table below reports both a single run
+and the three-run median per shape, so the size of that variation is visible
+directly.
+
+Per-shape rate (`rate = gpuSeconds / aneSeconds`), run 1 only:
+
+| m | down `[2560,640]` rate | gate/up `[640,2560]` rate |
+|---|---|---|
+| 8 | 0.6672 | 0.9491 |
+| 16 | 0.5590 | 0.9891 |
+| 32 | 0.6627 | 1.4121 |
+| 64 | 0.9031 | 0.9215 |
+| 128 | 0.9690 | 1.0434 |
+| 256 | 0.9649 | 1.0695 |
+| 512 | 0.7997 | 1.2200 |
+
+Per-shape median across three runs (median of aneSeconds and of gpuSeconds
+taken separately, then divided):
+
+| m | down ane_med (s) | down gpu_med (s) | down rate | gate/up ane_med (s) | gate/up gpu_med (s) | gate/up rate |
+|---|---|---|---|---|---|---|
+| 8 | 0.000395 | 0.000499 | 1.2635 | 0.000606 | 0.000639 | 1.0543 |
+| 16 | 0.000492 | 0.000275 | 0.5590 | 0.000372 | 0.000356 | 0.9567 |
+| 32 | 0.000426 | 0.000245 | 0.5754 | 0.000365 | 0.000331 | 0.9069 |
+| 64 | 0.000422 | 0.000294 | 0.6966 | 0.000369 | 0.000317 | 0.8591 |
+| 128 | 0.000422 | 0.000392 | 0.9291 | 0.000412 | 0.000421 | 1.0220 |
+| 256 | 0.000559 | 0.000534 | 0.9554 | 0.000452 | 0.000501 | 1.1084 |
+| 512 | 0.000956 | 0.000881 | 0.9214 | 0.000560 | 0.000810 | 1.4467 |
+
+Run 1's m=32 gate/up spike (rate 1.4121, the highest single-shape reading in
+the whole sweep) did not reproduce: run 2 measured 1.0405 and run 3 measured
+0.9046 at the same shape. Full raw per-run JSON is at
+`/tmp/ane-sweep{,-run2,-run3}.json` on this machine.
+
+### Combined rate per bucket
+
+One full expert forward dispatches gate and up (each `[640,2560]`) plus down
+(`[2560,640]`): two gate/up calls for every one down call. Combined rate per
+bucket, using the three-run median timings above and weighting 2x gate/up +
+1x down:
+
+| m | combined ANE seconds | combined GPU seconds | r |
+|---|---|---|---|
+| 8 | 0.001607 | 0.001777 | 1.1057 |
+| 16 | 0.001236 | 0.000987 | 0.7984 |
+| 32 | 0.001156 | 0.000907 | 0.7847 |
+| 64 | 0.001160 | 0.000928 | 0.8000 |
+| 128 | 0.001246 | 0.001234 | 0.9905 |
+| 256 | 0.001463 | 0.001536 | 1.0499 |
+| 512 | 0.002076 | 0.002501 | 1.2048 |
+
+Every bucket's combined `r` is above 0.15, so the sweep does not hit the stop
+condition (r < 0.15 at every bucket size).
+
+### Arithmetic at the best bucket
+
+Best bucket by three-run-median combined rate: `m = 512`, `r = 1.2048`.
+
+```
+f* = r / (1 + r) = 1.2048 / 2.2048 = 0.5464
+ceiling = 1 + r = 2.2048
+```
+
+For reference, the single-run-1 reading at its own best combined bucket
+(`m = 8`, `r = gpu/ane` computed the same way from run 1's own down and
+gate/up numbers at m=8: combined_ane = 2(0.0006890297) + 0.0007479191 =
+0.0021259785, combined_gpu = 2(0.0006539822) + 0.0004990101 = 0.0018069744,
+`r = 0.8500`) gives `f* = 0.4595`, `ceiling = 1.8500`. The three-run-median
+number above is the one carried forward because it damps the run-to-run
+noise documented above.

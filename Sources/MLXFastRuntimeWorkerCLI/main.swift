@@ -160,6 +160,11 @@ private enum ParticipantWorkerCLI {
                         expertGroupSize: groupSize, expertBits: bits))
                 print("qwen4exp-transform: wrote \(destination)")
 
+            case "qwen4exp-ane-bench":
+                // Local fork only: ANE vs GPU on expert-shaped GEMMs. No model.
+                try options.requireOnly(values: [])
+                try Qwen4ExpANEBench.run()
+
             case "preflight":
                 try options.requireOnly(
                     values: ["--weights"]
