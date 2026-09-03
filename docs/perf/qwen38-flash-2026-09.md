@@ -934,3 +934,67 @@ That is the direct link to the int8 finding recorded in
 `constexpr_blockwise_shift_scale` compile and place the conv on the ANE, and
 they halve exactly the bytes that appear to be exhausting this limit. Whether
 that admits the remaining 10 layers is unmeasured and is the next thing to try.
+
+## Is a uniform fp16 split worth building? No, and here is the number
+
+The split is not uniform in precision. The ANE prefix runs fp16, dequantized
+from the 4-bit weights, while `gpuPartial` runs native 4-bit `quantizedMM` at
+group 64. That confounds two variables whenever the lane is compared against
+the GPU: the engine changes and the weight precision changes together.
+
+`MLX_ANE_FP16_GPU=1` separates them. It computes the SAME fp16 prefix on the
+GPU instead of the ANE, keeping the identical 4-bit suffix, so a three-arm
+comparison isolates each variable. One serve per arm, five prompts, first
+dropped because it carries the ANE compile.
+
+| Arm | Prefix | Suffix | Mean tok/s |
+|---|---|---|---|
+| baseline | GPU 4-bit | GPU 4-bit | 126.7 |
+| ablation | GPU fp16 | GPU 4-bit | 122.0 |
+| lane | ANE fp16 | GPU 4-bit | 133.9 |
+
+| Effect | Isolated by | Result |
+|---|---|---|
+| Precision, engine held at GPU | 4-bit against fp16 | **-3.7 percent** |
+| Engine, precision held at fp16 | GPU against ANE | **+9.8 percent** |
+| Net against the all-GPU baseline | | +5.7 percent |
+
+Paired per prompt, the fp16-on-GPU arm loses on four of four (0.941, 0.950,
+0.970, 0.991) and the ANE arm wins on four of four (1.077, 1.040, 1.055,
+1.056).
+
+Two conclusions follow, and the first one settles the question.
+
+**fp16 is not what helps. A second engine is.** Moving the prefix from 4-bit to
+fp16 while staying on the GPU makes it slower, because prefill is
+weight-bandwidth bound and fp16 is four times the bytes of 4-bit. The lane wins
+in spite of its precision, not because of it.
+
+**So a uniform fp16 split would be worse, not better.** The measured penalty is
+3.7 percent for putting 31.25 percent of the intermediate channels in fp16. The
+GPU suffix holds the other 68.75 percent, so applying the same change there
+moves considerably more weight bytes. Nothing in this data supports building
+it, and the fraction sweep agrees independently: 0.0 gives 125.5, 0.3125 gives
+130.8, 0.5 gives 98.8, 0.75 gives 68.5, and 1.0 did not finish four prompts in
+ten minutes.
+
+The same bandwidth argument applies to int8 on the GPU side, which is twice the
+bytes of 4-bit rather than four times, so it should lose by less and still
+lose. int8 on the ANE side is the opposite case and remains worth trying: it
+halves the 167 MB of fp16 prefix weights each ANE program holds, which is what
+appears to exhaust the program-load limit at 54 layers.
+
+### The deployed fraction is defensible
+
+| Fraction | Programs built | Failed | Steady-state tok/s |
+|---|---|---|---|
+| 0.0 | 0 | 0 | 125.5 |
+| 0.125 | 117 | 10 | 120.1 |
+| 0.3125 | 117 | 10 | 130.8 |
+| 0.5 | 78 | 0 | 98.8 |
+| 0.75 | 77 | 0 | 68.5 |
+| 1.0 | -- | -- | did not finish |
+
+`MLX_ANE_FRACTION` 0.3125 was previously carried without an end-to-end
+measurement behind it. It is the best of the six sampled, and the curve falls
+away sharply above it.
