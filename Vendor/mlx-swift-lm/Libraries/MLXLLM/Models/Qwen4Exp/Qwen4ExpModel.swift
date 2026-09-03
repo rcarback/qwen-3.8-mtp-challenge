@@ -273,8 +273,24 @@ public class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
     public var kvHeads: [Int]
     @ModuleInfo(key: "model") var model: Qwen4ExpTextModel
     @ModuleInfo(key: "lm_head") var lmHead: Linear
-    /// Wide residual from the most recent forward (MTP head input; Task 13).
+    /// The native multi-token-prediction head, present when the runtime config
+    /// declares `mtp_num_hidden_layers > 0` and the `mtp.*` tensors load.
+    @ModuleInfo(key: "mtp") public var mtp: Qwen4ExpMTPHead?
+    /// Wide residual from the most recent forward (the MTP head's input).
     public var lastWideResidual: MLXArray?
+
+    /// Width of the hyper-connection residual (`hc_count * hidden_size`).
+    public var wideWidth: Int { configuration.textConfig.hcDim }
+
+    /// One MTP draft step on wide residual rows and the embeddings of the tokens
+    /// that follow them. Returns collapsed rows for the vocabulary projection and
+    /// the head's post-block wide residual for the next step.
+    public func mtpStep(wide: MLXArray, nextTokenIds: MLXArray, cache: [KVCache]) -> (hidden: MLXArray, wide: MLXArray) {
+        guard let mtp else { fatalError("Qwen4ExpModel has no MTP head attached") }
+        return mtp.forward(wide: wide, tokenEmbedding: embed(nextTokenIds), cache: cache)
+    }
+
+    public func makeMTPHeadCache() -> [KVCache] { mtp?.newCache() ?? [] }
 
     public var loraLayers: [Module] { model.layers }
 
@@ -293,6 +309,7 @@ public class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
         kvHeads = t.layerTypes.map { $0 == "full_attention" ? t.kvHeads : 0 }
         _model.wrappedValue = Qwen4ExpTextModel(t)
         _lmHead.wrappedValue = Linear(t.hiddenSize, t.vocabularySize, bias: false)
+        _mtp.wrappedValue = t.mtpNumHiddenLayers > 0 ? Qwen4ExpMTPHead(t) : nil
         super.init()
     }
 

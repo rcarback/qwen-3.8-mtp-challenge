@@ -1,19 +1,22 @@
 // LOCAL FORK ONLY. Qwen3.8-Flash-Next (qwen4_exp) served through the MTP
-// block session. Until the native MTP head lands (plan Task 13) the model
-// reports `hasMTPHead == false` and the session runs headless; every
-// head-side member below is unreachable in that mode and traps if called.
+// block session.
+//
+// The "hidden" currency on this model is the WIDE hyper-connection residual
+// (`hc_count * hidden_size`): `callWithHidden` returns it, the native head
+// consumes and re-emits it (llama.cpp PR 27836 `graph_mtp`), and the session
+// chains draft steps on it. The trunk's final mixer is the only "norm", so
+// `applyFinalNorm` is the identity and the lm-head helpers collapse a wide row
+// with the mixer before projecting.
 import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
 
 extension Qwen4ExpModel: Qwen36MTPTarget {
-    public var hasMTPHead: Bool { false }
+    public var hasMTPHead: Bool { mtp != nil }
 
     public var decoderLayerCount: Int { configuration.textConfig.hiddenLayers }
 
-    /// Backbone forward returning `(logits, pre-mixer wide residual)`. The wide
-    /// residual is the head's input, so it plays the "pre-norm hidden" role.
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
@@ -46,13 +49,14 @@ extension Qwen4ExpModel: Qwen36MTPTarget {
     public func mtpForwardWithHidden(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> (MLXArray, MLXArray) {
-        fatalError("Qwen4ExpModel has no MTP head attached")
+        let (collapsed, wide) = mtpStep(wide: hidden, nextTokenIds: nextTokenIds, cache: cache)
+        return (projectToVocab(collapsed), wide)
     }
 
     public func mtpHeadHiddenForward(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray {
-        fatalError("Qwen4ExpModel has no MTP head attached")
+        mtpStep(wide: hidden, nextTokenIds: nextTokenIds, cache: cache).wide
     }
 
     public func mtpHeadLastHiddenWithKVOnlyHistory(
@@ -61,12 +65,17 @@ extension Qwen4ExpModel: Qwen36MTPTarget {
         nil
     }
 
+    /// Wide rows are collapsed by the mixer first; already-collapsed rows project directly.
+    private func vocabLogits(_ x: MLXArray) -> MLXArray {
+        x.dim(-1) == wideWidth ? projectToVocab(collapseWide(x)) : projectToVocab(x)
+    }
+
     public func applyLMHead(_ x: MLXArray) -> MLXArray {
-        projectToVocab(x)
+        vocabLogits(x)
     }
 
     public func applyDraftLMHead(_ x: MLXArray) -> MLXArray {
-        projectToVocab(x)
+        vocabLogits(x)
     }
 
     public func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray {
@@ -74,17 +83,16 @@ extension Qwen4ExpModel: Qwen36MTPTarget {
     }
 
     public func draftTokenID(_ x: MLXArray) -> MLXArray {
-        argMax(projectToVocab(x), axis: -1).asType(.int32).reshaped(1, 1)
+        argMax(vocabLogits(x), axis: -1).asType(.int32).reshaped(1, 1)
     }
 
     public func makeMTPCache() -> [any KVCache] {
-        []
+        makeMTPHeadCache()
     }
 
-    /// The wide residual is collapsed by the mixer, which doubles as the final
-    /// norm; applying the mixer here reconciles the pre-mixer hidden with the
-    /// post-norm rows the session expects.
+    /// Identity: the head normalises the wide residual itself (`pre_fc_norm_hidden`),
+    /// and the trunk's mixer is applied inside `vocabLogits` where a projection needs it.
     public func applyFinalNorm(_ x: MLXArray) -> MLXArray {
-        collapseWide(x)
+        x
     }
 }

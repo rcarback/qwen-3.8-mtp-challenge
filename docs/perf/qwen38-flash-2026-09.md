@@ -19,6 +19,13 @@ Now:
 
 - Model code, transform, and generate verb are in the tree with 26 unit tests
   on small synthetic configurations (`swift test --force-resolved-versions --filter Qwen4Exp`).
+- The ANE dense lane and its micro-batched, layer-major prefill are in the tree
+  (`MLX_ANE_DIRECT=1`, `MLX_QWEN4EXP_ANE_MICROBATCH`, default 256). The
+  pipeline structure is verified against the plain forward with GPU
+  projections; the ANE program itself is verified only by the opt-in runtime
+  test.
+- The native MTP head is in the tree behind `mtp_num_hidden_layers` in the
+  runtime config; its math follows the llama.cpp draft-head graph.
 - The n-gram hash constants come from the checkpoint tensors. The mlx-lm
   reference recomputes different multipliers from its seed formula, so the
   runtime never recomputes them.
