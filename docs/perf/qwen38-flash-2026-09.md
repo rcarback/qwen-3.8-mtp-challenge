@@ -255,6 +255,40 @@ passes 32 of 32, which covers every file this work touched. The unfiltered
 suite was not run to completion: it was still executing after 40 minutes with
 no output, and it was stopped rather than waited out.
 
+### Native MTP head at depth 2
+
+The head is native to this checkpoint: 38 `mtp.*` tensors, 1672.7 MiB, carried
+in the same tree as the backbone. `--mtp-head none` disables only the external
+head the ranked track merges; the session reads `model.hasMTPHead`, so the
+native head stays live.
+
+Same prompt as the depth-0 run above, same session shape.
+
+| Measure | Depth 0 | Depth 2 |
+|---|---|---|
+| Rounds | 50 | 18 |
+| Tokens per round | 0.98 | 2.72 |
+| Accept rate | not applicable | 0.889 (32 of 36) |
+| Effective draft depth | 0 | 2.00 |
+| Decode | 15.85 tokens/s | 18.32 tokens/s |
+| End to end | 14.3 tokens/s | 16.8 tokens/s |
+| Seed prefill | 0.32 s | 0.24 s |
+
+Depth 2 decodes 1.16 times faster. The completion is character-for-character
+identical to the depth-0 completion, which is the correctness signal that
+matters here: the target verifies every drafted token, so the head can change
+speed and nothing else.
+
+Accept rate of 0.889 is high against the roughly 0.75 the DFlash track reports
+on prose. Two differences explain it. This head ships with the checkpoint
+rather than being trained separately, and it conditions on the wide
+hyper-connection residual the trunk already computes. Depth 2 admits at most 3
+tokens per round, so 2.72 tokens per round is close to the ceiling that depth
+allows.
+
+One prompt is one prompt. Treat these as directional until they are measured
+across the varied-prose set.
+
 ### Norm conventions
 
 The checkpoint stores two norm conventions, and the stored weights identify
