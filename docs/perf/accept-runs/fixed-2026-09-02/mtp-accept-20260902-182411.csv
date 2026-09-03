@@ -1,0 +1,3 @@
+config,prompt,depth,accepted_draft_rate,effective_mean_draft_len,serial_seconds_per_token,mtp_seconds_per_token,mtp_decode_speedup,all_tokens_matched
+gpu,README,8,0.5401459854014599,2.4909090909090907,0.10856745298951864,0.07783310208469629,1.3948750606313738,True
+gpu,README,2,0.6194690265486725,1.9482758620689655,0.10569425765424967,0.07481933571398258,1.4126596640512146,True

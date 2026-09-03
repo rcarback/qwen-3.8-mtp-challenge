@@ -223,23 +223,26 @@ Task 2 minus Task 1. Negative is faster.
 | session host thread cpu | 21297 | 11285 | -10012 |
 
 Parent seconds per token, both legs, from the wrapper's reports: serial
-control 0.135635 (Task 1: 0.131461), native-MTP 0.080477 (Task 1: 0.082493).
+control 0.135635 (Task 1: 0.131461), native-MTP 0.080477 (Task 1: 0.082493;
+both Task 1 figures from the Run conditions above).
 The wrapper deletes its per-leg reports on exit, so the parent round bucket
 above (the lower median of the round request) stands in for
 `p50RoundRequestSeconds`.
 
 ### Decision
 
-Task 2 does not win. The parent round moved by +1,356 us (+1.7%), inside the
-run-to-run spread, and no bucket outside the session moved by more than
-100 us. `MLX_MTP_HOST_QOS` stays unset by default and stays unset for the
+Task 2 does not win. The parent round reads 1,356 us (1.7%) above the Task 1
+run and 1,084 us below the same-session arm A of Task 3 (81,864 us, default
+QoS). No configuration was repeated, so the run-to-run spread is not
+measured, and no bucket outside the session moved by more than 100 us. The
+reading is no effect. `MLX_MTP_HOST_QOS` stays unset by default and stays unset for the
 Task 3 arms.
 
 The split inside the session did move. The host thread's CPU time and the
 graph-build bucket both halved (21.3 ms to 11.3 ms of CPU), while the
 eval-wall bucket grew by the same amount. The round total did not change.
 The Task 3 arm A run below, same session and default QoS, reads build
-6.2 ms and eval wall 75.5 ms. So the build/eval split is run
+6.2 ms and eval wall 75.5 ms. The build/eval split is run
 dependent, not QoS dependent. Only the sum (build + eval + readout) is
 stable across runs, at 79 to 83 ms. The round is bounded by the GPU work
 the session submits, not by host scheduling.
@@ -254,23 +257,26 @@ QoS (Task 2 did not win), and its own trace path. Arm A is the same-session,
 same-build baseline with no extra variables, run after the five arms. Every
 run reads `all_tokens_matched=true` on both legs.
 
-Thermal gate: arm B released at 39.6C, 39.9C and 39.2C. Arms C, D, E, F and A
-hit the implausible 1.6C sensor reading on every gate (the Task 1 caveat) and
-released after 0 to 20 s. Treat differences under 2% between those runs as
-noise.
+Thermal gate: arm B released at 39.6C, 39.9C and 39.2C. Arm C's first gate
+read plausible values for 20 s and released after 30 s on a 1.6C reading;
+every other gate of arms C, D, E, F and A hit the implausible 1.6C reading
+(the Task 1 caveat) and released after 0 to 20 s. No macmon sampling ran
+during the arm runs, so no GPU clock is recorded for them. Differences under
+2% between those runs are treated as noise. That is a judgment. Every arm
+ran once.
 
 Lower medians over the 64 depth-0 rounds, in microseconds.
 
 | arm | variables | build | eval wall | build+eval+readout | parent round | host cpu | serial s/token | MTP s/token |
 |---|---|---|---|---|---|---|---|---|
-| Task 1 | (worktree, 2026-09-02 01:04) | 20153 | 59081 | 79406 | 79424 | 21297 | 0.131461 | 0.082493 |
+| Task 1 | (worktree, run started about 01:01) | 20153 | 59081 | 79406 | 79424 | 21297 | 0.131461 | 0.082493 |
 | Task 2 | `MLX_MTP_HOST_QOS=interactive` | 10565 | 68275 | 78950 | 80780 | 11285 | 0.135635 | 0.080477 |
 | A | none (same-session baseline) | 6214 | 75466 | 81716 | 81864 | 6665 | 0.135173 | 0.081435 |
 | B | `MLX_MAX_OPS_PER_BUFFER=200 MLX_MAX_MB_PER_BUFFER=50` | 13940 | 66355 | 80490 | 81074 | 14835 | 0.134412 | 0.085425 |
 | C | `MLX_MAX_OPS_PER_BUFFER=1000 MLX_MAX_MB_PER_BUFFER=500` | 7732 | 71945 | 79749 | 81899 | 8242 | 0.134442 | 0.080992 |
 | D | `MLX_QWEN_MTP_LADDER=off` | 3185 | 79506 | 82733 | 82777 | 6876 | 0.135126 | 0.081337 |
 | E | `MLX_QWEN_MTP_LADDER=front` | 3231 | 78987 | 82259 | 82309 | 6671 | 0.138804 | 0.083288 |
-| F | `MLX_QWEN_MTP_LADDER=dense` | 6477 | 75422 | 81936 | 82116 | 0.135665 | 0.081627 |
+| F | `MLX_QWEN_MTP_LADDER=dense` | 6477 | 75422 | 81936 | 82116 | 6764 | 0.135665 | 0.081627 |
 
 The `mtp-cache:` line confirms each ladder arm engaged (`ladder=off`,
 `ladder=front`, `ladder=dense`); the command-buffer arms keep `ladder=default`.
