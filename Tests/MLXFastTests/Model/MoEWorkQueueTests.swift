@@ -2,7 +2,7 @@ import Foundation
 import MLX
 import XCTest
 
-@testable import MLXFastModel
+@testable import MLXLMCommon
 
 final class MoEWorkQueueTests: XCTestCase {
     func testRowOffsetsOnSortedIndices() throws {

@@ -589,5 +589,17 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
             weight[index], scales: scales[index], biases: biases?[index],
             groupSize: groupSize, bits: bits, mode: mode)
     }
+
+    /// The raw packed weight, scales and biases, for cross-module call sites
+    /// that need to hand the quantized buffers straight to a kernel (e.g. a
+    /// fused routed-MoE Metal kernel) instead of going through
+    /// `callAsFunction` or `denseExpertWeight`'s dequantizing gather. `weight`
+    /// (inherited from `SwitchLinear`) and `scales`/`biases` stay `internal`
+    /// -- `Quantized`'s own contract only requires `groupSize`/`bits`/`mode`
+    /// to be public -- so these three computed properties are the sanctioned
+    /// public surface for a caller outside `MLXLMCommon`.
+    public var quantizedWeight: MLXArray { weight }
+    public var quantizedScales: MLXArray { scales }
+    public var quantizedBiases: MLXArray? { biases }
 }
 

@@ -4,7 +4,8 @@ import MLXNN
 import MLXRandom
 import XCTest
 
-@testable import MLXFastModel
+@testable import MLXLLM
+@testable import MLXLMCommon
 
 final class FusedRoutedMoETests: XCTestCase {
     func testQuantizedFusedMatchesMLXQuantizedMatmul() throws {
@@ -69,5 +70,51 @@ final class FusedRoutedMoETests: XCTestCase {
         XCTAssertEqual(got.shape, [rows, inDim])
         let maxAbs = MLX.abs(got.asType(.float32) - want.asType(.float32)).max().item(Float.self)
         XCTAssertLessThan(maxAbs, 3e-2, "fused quantized output diverged from quantizedMatmul")
+    }
+
+    /// The gate must not change the routed sum. Runs both arms in one process
+    /// against the same synthetic block, because this test does not load the
+    /// real checkpoint. Uses the `forceFusedRoutedMoE` debug override instead
+    /// of `MLX_QWEN4EXP_FUSED_MOE` because `Qwen4ExpSparseMoeBlock.fusedRoutedMoE`
+    /// is a `static let`: it is read once per process, and other tests in this
+    /// target construct and forward `Qwen4ExpSparseMoeBlock`s before this one
+    /// runs, which would already have cached it `false` regardless of the
+    /// environment at the time this test executes.
+    func testFusedGateProducesSameRoutedSumAsControl() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
+            "needs a real GPU")
+
+        var args = Qwen4ExpTextConfiguration()
+        args.hiddenSize = 128
+        args.numExperts = 32
+        args.numExpertsPerTok = 4
+        args.moeIntermediateSize = 64
+        args.sharedExpertIntermediateSize = 64
+
+        MLXRandom.seed(3)
+        let block = Qwen4ExpSparseMoeBlock(args)
+        // Quantization preserves the weight's dtype in its scales/biases, and
+        // the fused kernel's Metal source hard-codes `half` for those buffers
+        // (see FusedRoutedMoEKernel.swift), so the pre-quantization weights
+        // must be fp16 -- matching Task 3's own kernel test and Task 5's
+        // brief, which both quantize fp16 arrays for the same reason.
+        block.update(parameters: block.mapParameters(map: { $0.asType(.float16) }))
+        quantize(model: block) { path, _ in path.contains("switch_mlp") ? (32, 4, .affine) : nil }
+
+        let x = MLXRandom.normal([1, 40, args.hiddenSize]).asType(.float16)
+
+        // Control arm first, gate still off, so this is the ordinary MLX path.
+        let control = block(x)
+
+        block.forceFusedRoutedMoE = true
+        let fused = try XCTUnwrap(block.fusedRoutedForward(x))
+
+        control.eval()
+        fused.eval()
+
+        let maxAbs = MLX.abs(control.asType(.float32) - fused.asType(.float32))
+            .max().item(Float.self)
+        XCTAssertLessThan(maxAbs, 5e-2, "fused routed path changed the block output")
     }
 }

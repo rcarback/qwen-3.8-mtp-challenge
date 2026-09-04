@@ -12,6 +12,8 @@ import MLXNN
 final class Qwen4ExpSparseMoeBlock: Module {
     let topK: Int
     let numExperts: Int
+    let hiddenSize: Int
+    let moeIntermediateSize: Int
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -24,6 +26,8 @@ final class Qwen4ExpSparseMoeBlock: Module {
     init(_ args: Qwen4ExpTextConfiguration) {
         topK = args.numExpertsPerTok
         numExperts = args.numExperts
+        hiddenSize = args.hiddenSize
+        moeIntermediateSize = args.moeIntermediateSize
         _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: args.hiddenSize, hiddenDims: args.moeIntermediateSize, numExperts: args.numExperts)
@@ -31,6 +35,15 @@ final class Qwen4ExpSparseMoeBlock: Module {
             dimensions: args.hiddenSize, hiddenDimensions: args.sharedExpertIntermediateSize)
         _sharedExpertGate.wrappedValue = Linear(args.hiddenSize, 1, bias: false)
         super.init()
+        if Self.fusedRoutedMoE {
+            // Ruling C1 part 1: MLX_QWEN4EXP_FUSED_MOE=1 must IMPLY the fused
+            // gate_up layout the kernel requires, rather than depend on the
+            // operator also remembering MLX_SWITCH_FUSE_GATE_UP=1. Repeated,
+            // idempotently, in `fusedRoutedForward` itself so the debug-only
+            // per-instance override (`forceFusedRoutedMoE`, set after this
+            // initializer has already run) stays honest too.
+            switchMLP.forceFuseGateUp = true
+        }
     }
 
     /// `MLX_QWEN4EXP_ROUTE_STATS=1`. Diagnostic only: on the first prefill,
@@ -133,6 +146,44 @@ final class Qwen4ExpSparseMoeBlock: Module {
         return m
     }
 
+    /// `MLX_QWEN4EXP_FUSED_MOE`. Routes the gate/up/silu/down quartet through
+    /// one persistent Metal kernel (`FusedRoutedMoE`, in `MLXLMCommon` next to
+    /// `SwitchLayers.swift`). Default off. Requires the fused `gate_up` stack
+    /// and 4-bit affine group-32 expert weights; falls back to the control
+    /// path when either is absent, logging the specific reason once (see
+    /// `fusedRoutedForward` and Ruling C1: this env var must IMPLY the fused
+    /// gate_up layout rather than depend on a second one).
+    static let fusedRoutedMoE: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN4EXP_FUSED_MOE"] == "1"
+
+    #if DEBUG
+        /// Per-instance override for ``fusedRoutedMoE``, mirroring
+        /// `SwitchGLU.forceFuseGateUp`. `fusedRoutedMoE` is a `static let`
+        /// read once per process, so a test that wants to exercise the fused
+        /// path in the same process as the control path -- without relying on
+        /// environment-variable timing against every other test in this
+        /// target that also touches this static -- sets this instead.
+        /// Debug-only: never read by the release worker binary.
+        var forceFusedRoutedMoE = false
+    #endif
+
+    /// One-shot stderr log for a fused-routed-MoE decline. `MLX_QWEN4EXP_FUSED_MOE=1`
+    /// makes the fused path mandatory in intent, so silently falling back to
+    /// the control path when a guard declines would be indistinguishable from
+    /// an honest negative measurement result (Ruling C1 part 2). Logged once
+    /// per PROCESS, not once per layer per token -- 48 layers x hundreds of
+    /// forwards would flood stderr for a condition that, once true, stays true.
+    nonisolated(unsafe) private static var fusedRoutedFallbackLogged = false
+
+    private static func logFusedRoutedFallbackOnce(_ reason: String) {
+        guard !fusedRoutedFallbackLogged else { return }
+        fusedRoutedFallbackLogged = true
+        fputs(
+            "[qwen4exp-fused-moe] MLX_QWEN4EXP_FUSED_MOE=1 but \(reason); "
+                + "falling back to the control path for this and every later call\n",
+            stderr)
+    }
+
     /// Router: float32 logits, top-k by `argPartition`, weights = softmax over the
     /// SELECTED logits (equal to softmax-all followed by renormalisation).
     func route(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
@@ -157,7 +208,88 @@ final class Qwen4ExpSparseMoeBlock: Module {
         return (idx, w)
     }
 
+    /// The fused routed-expert path: one persistent Metal kernel replaces the
+    /// gate/up/silu/down launch quartet (`FusedRoutedMoE.forward`, in
+    /// `MLXLMCommon`). Returns `nil` -- silently -- when the gate is off, and
+    /// -- loudly, once per process via `logFusedRoutedFallbackOnce` -- when
+    /// the gate is on but a guard declines, per Ruling C1 parts 2 and 3.
+    func fusedRoutedForward(_ x: MLXArray) -> MLXArray? {
+        #if DEBUG
+            let gateOn = Self.fusedRoutedMoE || forceFusedRoutedMoE
+        #else
+            let gateOn = Self.fusedRoutedMoE
+        #endif
+        guard gateOn else { return nil }
+
+        // Idempotent belt-and-suspenders: the initializer already sets this
+        // when the process-wide static gate is on (Ruling C1 part 1). Setting
+        // it again here, cheaply, also covers the debug-only per-instance
+        // override above, which by construction is set AFTER `init` has
+        // already run and so could not see it there.
+        switchMLP.forceFuseGateUp = true
+
+        guard let gateUpBase = switchMLP.gateUpProj ?? switchMLP.fusedGateUp() else {
+            Self.logFusedRoutedFallbackOnce(
+                "the fused gate_up stack is unavailable (checkpoint ships separate "
+                    + "gate_proj/up_proj and they could not be concatenated -- are the "
+                    + "expert stacks quantized?)")
+            return nil
+        }
+        guard let gateUp = gateUpBase as? QuantizedSwitchLinear else {
+            Self.logFusedRoutedFallbackOnce(
+                "the gate_up stack is not quantized (expected QuantizedSwitchLinear, "
+                    + "got \(type(of: gateUpBase)))")
+            return nil
+        }
+        guard let down = switchMLP.downProj as? QuantizedSwitchLinear else {
+            Self.logFusedRoutedFallbackOnce(
+                "down_proj is not quantized (expected QuantizedSwitchLinear, "
+                    + "got \(type(of: switchMLP.downProj)))")
+            return nil
+        }
+        guard gateUp.groupSize == 32, gateUp.bits == 4, gateUp.mode == .affine,
+            down.groupSize == 32, down.bits == 4, down.mode == .affine
+        else {
+            Self.logFusedRoutedFallbackOnce(
+                "expert stacks are not 4-bit affine group-32 (gate_up: group=\(gateUp.groupSize) "
+                    + "bits=\(gateUp.bits) mode=\(gateUp.mode); down: group=\(down.groupSize) "
+                    + "bits=\(down.bits) mode=\(down.mode))")
+            return nil
+        }
+        guard let gb = gateUp.quantizedBiases, let db = down.quantizedBiases else {
+            Self.logFusedRoutedFallbackOnce("expert stacks are missing quantization biases")
+            return nil
+        }
+
+        let (idx, w) = route(x)
+        // Match SwitchGLU.callAsFunction's own expand-then-gatherSort shape
+        // exactly (SwitchLayers.swift): expand to [..., 1, 1, D] first so
+        // gatherSort's `flattened(start:0,end:-3)` collapses batch/sequence
+        // into one row axis of length rows = tokens * topK, one row per
+        // (token, selected expert) pair, in the same order SwitchGLU uses.
+        let xExpanded = MLX.expandedDimensions(x, axes: [-2, -3])
+        let (xSorted, sortedIdx, invOrder) = gatherSort(x: xExpanded, indices: idx)
+        let flat = xSorted.reshaped(xSorted.dim(0), -1)
+
+        let rowOffsets = MoEWorkQueue.rowOffsets(sortedIndices: sortedIdx, numExperts: numExperts)
+        let blockOffsets = MoEWorkQueue.blockOffsets(
+            rowOffsets: rowOffsets, blockRows: FusedRoutedMoE.blockRows)
+
+        let ySorted = FusedRoutedMoE.forward(
+            xSorted: flat,
+            gateUpWeight: gateUp.quantizedWeight, gateUpScales: gateUp.quantizedScales,
+            gateUpBiases: gb,
+            downWeight: down.quantizedWeight, downScales: down.quantizedScales, downBiases: db,
+            rowOffsets: rowOffsets, blockOffsets: blockOffsets,
+            hiddenDim: moeIntermediateSize, inDim: hiddenSize, numExperts: numExperts)
+
+        let y = scatterUnsort(x: ySorted, invOrder: invOrder, shape: idx.shape)
+        let routed = (y * w.expandedDimensions(axis: -1).asType(y.dtype)).sum(axis: -2)
+        return routed.asType(x.dtype) + sigmoid(sharedExpertGate(x)) * sharedExpert(x)
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if let out = fusedRoutedForward(x) { return out }
         if Qwen4ExpANEFused.expertsEnabled, Qwen4ExpANEFused.armed(tokens: x.dim(1), batch: x.dim(0)) {
             do {
                 if let out = try groupedExpertForward(x) { return out }
