@@ -112,6 +112,106 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
     return x
 }
 
+
+// MARK: - Fused gate/up gather-GEMM
+
+/// `MLX_SWITCH_FUSE_GATE_UP`. When on, a ``SwitchGLU`` that loaded SEPARATE
+/// `gate_proj` / `up_proj` expert stacks concatenates them once, on first
+/// forward, into a single `[E, 2 * hiddenDims, inputDims]` stack and issues ONE
+/// gather-GEMM per MoE layer instead of two (SonicMoE, arXiv 2512.14080: one
+/// pass over the gathered input tiles, activation applied on the split halves).
+///
+/// The concatenation is along the OUTPUT-channel axis. Affine group
+/// quantization groups along the INPUT axis, so every group stays inside the row
+/// it was quantized in and the packed weight, `scales` and `biases` concatenate
+/// row-wise with no regrouping. The arithmetic per output row is therefore the
+/// same dot product over the same input groups in the same order as the unfused
+/// call.
+///
+/// The unfused stacks are released once the fused stack is materialized, so the
+/// steady-state expert-weight footprint is unchanged; the transient peak during
+/// the build is one layer's `gate + up`.
+public enum SwitchGLUFusion {
+    public static let fuseGateUp: Bool =
+        ProcessInfo.processInfo.environment["MLX_SWITCH_FUSE_GATE_UP"] == "1"
+}
+
+/// Holds the lazily built fused `gate_up` stack for one ``SwitchGLU``.
+/// Deliberately NOT a `@ModuleInfo` child: the checkpoint has no `gate_up_proj`
+/// key, so a real child would break weight loading and quantization discovery.
+final class FusedGateUpStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var attempted = false
+    private var fused: SwitchLinear?
+
+    /// Builds the fused stack once. Returns nil (and never retries) when the
+    /// two stacks cannot be concatenated compatibly.
+    func get(gate: SwitchLinear, up: SwitchLinear) -> SwitchLinear? {
+        lock.lock()
+        defer { lock.unlock() }
+        if attempted { return fused }
+        attempted = true
+        fused = Self.build(gate: gate, up: up)
+        return fused
+    }
+
+    var built: SwitchLinear? {
+        lock.lock()
+        defer { lock.unlock() }
+        return fused
+    }
+
+    private static func build(gate: SwitchLinear, up: SwitchLinear) -> SwitchLinear? {
+        guard gate.inputDims == up.inputDims, gate.outputDims == up.outputDims,
+            gate.numExperts == up.numExperts
+        else { return nil }
+
+        let outputDims = gate.outputDims + up.outputDims
+        // The additive bias, when present, must be present on both sides.
+        let addBias: MLXArray?
+        switch (gate.bias, up.bias) {
+        case (nil, nil): addBias = nil
+        case let (g?, u?): addBias = concatenated([g, u], axis: -1)
+        default: return nil
+        }
+
+        if let qg = gate as? QuantizedSwitchLinear {
+            guard let qu = up as? QuantizedSwitchLinear,
+                qg.groupSize == qu.groupSize, qg.bits == qu.bits, qg.mode == qu.mode
+            else { return nil }
+            // Row-wise concat: axis -2 is the output-channel axis for the packed
+            // weight and for scales/biases alike, and quantization groups run
+            // along the (untouched) input axis.
+            guard qg.weight.ndim == 3, qg.scales.ndim == 3 else { return nil }
+            let w = concatenated([qg.weight, qu.weight], axis: -2)
+            let sc = concatenated([qg.scales, qu.scales], axis: -2)
+            let bi: MLXArray?
+            switch (qg.biases, qu.biases) {
+            case (nil, nil): bi = nil
+            case let (g?, u?): bi = concatenated([g, u], axis: -2)
+            default: return nil
+            }
+            var toEval = [w, sc]
+            if let bi { toEval.append(bi) }
+            if let addBias { toEval.append(addBias) }
+            eval(toEval)
+            return QuantizedSwitchLinear(
+                inputDims: qg.inputDims, outputDims: outputDims, numExperts: qg.numExperts,
+                weight: w, scales: sc, biases: bi, bias: addBias,
+                groupSize: qg.groupSize, bits: qg.bits, mode: qg.mode)
+        }
+
+        guard !(up is QuantizedSwitchLinear), gate.weight.ndim == 3 else { return nil }
+        let w = concatenated([gate.weight, up.weight], axis: -2)
+        var toEval = [w]
+        if let addBias { toEval.append(addBias) }
+        eval(toEval)
+        return SwitchLinear(
+            inputDims: gate.inputDims, outputDims: outputDims, numExperts: gate.numExperts,
+            weight: w, bias: addBias)
+    }
+}
+
 // MARK: - SwitchGLU
 
 public class SwitchGLU: Module {
@@ -138,6 +238,15 @@ public class SwitchGLU: Module {
     /// equivalent fast path — it can never change results.
     let isSiluActivation: Bool
     let isGeluActivation: Bool
+
+    /// Lazily built fused `[E, 2 * hiddenDims, inputDims]` stack for the
+    /// separate-`gate_proj`/`up_proj` checkpoint layout. See ``SwitchGLUFusion``.
+    private let fusedGateUpStore = FusedGateUpStore()
+
+    /// Per-instance override for ``SwitchGLUFusion/fuseGateUp``. The env knob is
+    /// a `static let` read once, so tests that need both arms in one process
+    /// set this instead.
+    public var forceFuseGateUp = false
 
     /// Default SiLU GLU path -- uses the compiled fused (silu * up) kernel.
     public init(
@@ -214,6 +323,47 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// The fused `gate_up` stack, built on first use and cached, or nil when the
+    /// knob is off, the checkpoint already ships a fused stack, or the two
+    /// stacks are not concatenation-compatible.
+    ///
+    /// Releases the unfused `gate_proj` / `up_proj` children on success so the
+    /// steady-state footprint is unchanged. ``denseGateUpDown(expert:)`` reads
+    /// the released halves back out of the fused stack.
+    public func fusedGateUp() -> SwitchLinear? {
+        guard SwitchGLUFusion.fuseGateUp || forceFuseGateUp, gateUpProj == nil else { return nil }
+        if let already = fusedGateUpStore.built { return already }
+        guard let gateProj, let upProj else { return nil }
+        guard let fused = fusedGateUpStore.get(gate: gateProj, up: upProj) else { return nil }
+        // Release the big unfused stacks. A `@ModuleInfo` child cannot be set
+        // to nil directly (Module.swift refuses the direct mutation), so both
+        // are replaced with 1x1x1 placeholders; the checkpoint-sized arrays go
+        // away with their last reference.
+        var released = ModuleChildren()
+        released["gate_proj"] = .value(Self.placeholderStack())
+        released["up_proj"] = .value(Self.placeholderStack())
+        update(modules: released)
+        return fused
+    }
+
+    private static func placeholderStack() -> SwitchLinear {
+        SwitchLinear(
+            inputDims: 1, outputDims: 1, numExperts: 1, weight: MLXArray.zeros([1, 1, 1]))
+    }
+
+    /// One expert's dense `gate`, `up` and `down` weights, in the
+    /// `[hiddenDims, inputDims]` / `[inputDims, hiddenDims]` shapes an offload
+    /// lane wants. Works whether or not the gate/up stacks have been fused.
+    public func denseGateUpDown(expert: Int) -> (MLXArray, MLXArray, MLXArray)? {
+        let down = downProj.denseExpertWeight(expert)
+        if let gateProj, let upProj, fusedGateUpStore.built == nil {
+            return (gateProj.denseExpertWeight(expert), upProj.denseExpertWeight(expert), down)
+        }
+        guard let fused = gateUpProj ?? fusedGateUpStore.built else { return nil }
+        let both = fused.denseExpertWeight(expert)  // [2 * hiddenDims, inputDims]
+        return (both[0 ..< hiddenDims, 0...], both[hiddenDims ..< (2 * hiddenDims), 0...], down)
+    }
+
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
@@ -232,6 +382,12 @@ public class SwitchGLU: Module {
             // Pre-fused gate_up_proj weight from checkpoint — one gathered
             // matmul via the polymorphic SwitchLinear call, then split.
             let xGateUp = gateUpProj(x, idx, sortedIndices: doSort)
+            xGate = xGateUp[.ellipsis, ..<hiddenDims]
+            xUp = xGateUp[.ellipsis, hiddenDims...]
+        } else if let fused = fusedGateUp() {
+            // Separate gate_proj / up_proj checkpoints, concatenated once into a
+            // single stack — ONE gathered matmul, split into halves.
+            let xGateUp = fused(x, idx, sortedIndices: doSort)
             xGate = xGateUp[.ellipsis, ..<hiddenDims]
             xUp = xGateUp[.ellipsis, hiddenDims...]
         } else {
@@ -359,6 +515,29 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         super.init(
             inputDims: other.inputDims, outputDims: other.outputDims, numExperts: other.numExperts,
             weight: quantizedWeight, bias: other.bias)
+
+        self.freeze()
+    }
+
+    /// Init from already-quantized arrays (no re-quantization).
+    ///
+    /// Used to build a fused `gate_up` stack by concatenating two loaded stacks
+    /// along the output-channel axis; re-quantizing there would change the
+    /// numbers, so the arrays are adopted as they are.
+    public init(
+        inputDims: Int, outputDims: Int, numExperts: Int,
+        weight: MLXArray, scales: MLXArray, biases: MLXArray?, bias: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+        self._scales.wrappedValue = scales
+        self._biases.wrappedValue = biases
+
+        super.init(
+            inputDims: inputDims, outputDims: outputDims, numExperts: numExperts,
+            weight: weight, bias: bias)
 
         self.freeze()
     }

@@ -138,8 +138,6 @@ final class Qwen4ExpSparseMoeBlock: Module {
     /// measured losing 25% to. So this lane overlaps work; it does not yet
     /// delete GPU work.
     func groupedExpertForward(_ x: MLXArray) throws -> MLXArray? {
-        guard let gateProj = switchMLP.gateProj, let upProj = switchMLP.upProj else { return nil }
-        let downProj = switchMLP.downProj
         let tokens = x.dim(1)
         let hidden = x.dim(2)
         let (idx, w) = route(x)
@@ -149,8 +147,9 @@ final class Qwen4ExpSparseMoeBlock: Module {
             let resolved = aneExperts.resolve(
                 indices: indices2D, numExperts: numExperts,
                 dequantizedExpert: { expert in
-                    (gateProj.denseExpertWeight(expert), upProj.denseExpertWeight(expert),
-                     downProj.denseExpertWeight(expert))
+                    // Reads the gate/up halves out of the fused stack when
+                    // MLX_SWITCH_FUSE_GATE_UP released the unfused children.
+                    self.switchMLP.denseGateUpDown(expert: expert)!
                 })
         else { return nil }
 
