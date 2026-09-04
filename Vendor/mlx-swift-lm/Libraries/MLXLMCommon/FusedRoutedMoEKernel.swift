@@ -156,7 +156,13 @@ public enum FusedRoutedMoE {
         downWeight: MLXArray, downScales: MLXArray, downBiases: MLXArray,
         rowOffsets: MLXArray, blockOffsets: MLXArray,
         hiddenDim: Int, inDim: Int, numExperts: Int,
-        threadgroups: Int = 256
+        // Task 5, 2026-09-04, real per-layer geometry (512 experts, inDim
+        // 2560, hidden 640, 7000 rows, one 574-row hot expert, 190 idle):
+        // control (naive per-expert quantizedMM loop) 109.3ms; tg32 939.2ms;
+        // tg64 680.5ms (winner); tg128 754.5ms; tg256 920.9ms; tg512 922.3ms.
+        // See .superpowers/sdd/2026-09-04-fused-moe-kernel/task-5-report.md
+        // for the full arm table.
+        threadgroups: Int = 64
     ) -> MLXArray {
         let rows = xSorted.dim(0)
 
