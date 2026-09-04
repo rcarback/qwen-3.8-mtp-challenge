@@ -163,4 +163,98 @@ final class MoEGatherTileTests: XCTestCase {
         }
         print(String(format: "[fuse-isolated] arm=%@  %7.3f ms", arm, best))
     }
+
+    /// Rank-1 candidate from the literature pass: replace the 512-way sorted
+    /// gather GEMM with a dense batched GEMM over a fixed per-expert capacity
+    /// buffer [E, C, in]. It does more multiply work (C rows per expert instead
+    /// of the ~13.7 actually routed) but issues one regular batched matmul
+    /// instead of an indirect gather. Worth 16 to 24 hours of plumbing only if
+    /// the kernel is faster; this measures that in minutes.
+    /// Select with MOE_CAP_ARM=gather or MOE_CAP_ARM=cap<C>, e.g. cap32.
+    func testCapacityBatchedAgainstGather() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
+            "needs a real GPU")
+        guard let arm = ProcessInfo.processInfo.environment["MOE_CAP_ARM"] else {
+            throw XCTSkip("set MOE_CAP_ARM=gather|cap16|cap32|cap64")
+        }
+        let experts = 512, inDim = 2560, outDim = 640, rows = 7000
+        let wf = MLXRandom.normal([experts, outDim, inDim]).asType(.bfloat16)
+        let q = MLX.quantized(wf, groupSize: 32, bits: 4)
+        let bias = q.biases ?? MLXArray.zeros(q.scales.shape, dtype: q.scales.dtype)
+        eval(q.wq, q.scales, bias)
+
+        var body: () -> Void
+        if arm == "gather" {
+            let x = MLXRandom.normal([rows, 1, inDim]).asType(.bfloat16)
+            var ids = (0 ..< rows).map { Int32(($0 * experts) / rows) }
+            ids.sort()
+            let idx = MLXArray(ids).reshaped(rows)
+            eval(x, idx)
+            body = {
+                let r = MLX.gatherQuantizedMM(
+                    x, q.wq, scales: q.scales, biases: bias, rhsIndices: idx,
+                    transpose: true, groupSize: 32, bits: 4, sortedIndices: true)
+                eval(r)
+            }
+        } else {
+            let cap = Int(arm.dropFirst(3)) ?? 32
+            // The capacity buffer: every expert gets exactly `cap` rows,
+            // zero-padded. This is the shape a static-tier design would build.
+            let xc = MLXRandom.normal([experts, cap, inDim]).asType(.bfloat16)
+            eval(xc)
+            body = {
+                let r = MLX.quantizedMatmul(
+                    xc, q.wq, scales: q.scales, biases: bias,
+                    transpose: true, groupSize: 32, bits: 4)
+                eval(r)
+            }
+        }
+        body()
+        var best = Double.infinity
+        for _ in 0 ..< 5 {
+            let t0 = Date()
+            for _ in 0 ..< 20 { body() }
+            best = min(best, Date().timeIntervalSince(t0) / 20 * 1000)
+        }
+        let padded = arm == "gather" ? rows : experts * (Int(arm.dropFirst(3)) ?? 32)
+        print(String(
+            format: "[capacity] arm=%-7@ padded_rows=%6d  %7.3f ms", arm as NSString, padded, best))
+    }
+
+    /// The capacity form only pays if building its [E, C, in] buffer and
+    /// scattering the result back costs less than the 2.3 ms the GEMM saves.
+    /// This times exactly that plumbing, with no matmul in it.
+    func testCapacityBufferPlumbingCost() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
+            "needs a real GPU")
+        let experts = 512, inDim = 2560, outDim = 640, rows = 7000, cap = 16
+        let xSorted = MLXRandom.normal([rows, inDim]).asType(.bfloat16)
+        // Row index each capacity slot reads from. Slots past an expert's real
+        // row count read row 0 and are masked; the cost is the same either way.
+        let src = MLXArray((0 ..< experts * cap).map { Int32($0 % rows) })
+        let outRows = MLXRandom.normal([experts * cap, outDim]).asType(.bfloat16)
+        let dst = MLXArray((0 ..< rows).map { Int32($0 % (experts * cap)) })
+        eval(xSorted, src, outRows, dst)
+
+        func timeIt(_ label: String, _ body: () -> Void) {
+            body()
+            var best = Double.infinity
+            for _ in 0 ..< 5 {
+                let t0 = Date()
+                for _ in 0 ..< 20 { body() }
+                best = min(best, Date().timeIntervalSince(t0) / 20 * 1000)
+            }
+            print(String(format: "[cap-plumbing] %-22@ %7.3f ms", label as NSString, best))
+        }
+        timeIt("gather into buffer") {
+            let b = xSorted[src].reshaped(experts, cap, inDim)
+            eval(b)
+        }
+        timeIt("scatter result back") {
+            let r = outRows[dst]
+            eval(r)
+        }
+    }
 }

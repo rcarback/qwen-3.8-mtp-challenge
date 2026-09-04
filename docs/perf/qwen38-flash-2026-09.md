@@ -1520,3 +1520,45 @@ because the 12 full-attention layers grow quadratically while the expert path
 improves slowly. Rows per expert do rise with prompt length, but not fast
 enough to pay for the attention growth.
 
+### The capacity-padded batched GEMM is faster than the sorted gather
+
+The literature pass ranked this first among untested methods and estimated 16
+to 24 hours to build it. A microbenchmark answers whether that is worth
+spending. One routed projection, 512 experts, 2560 in, 640 out, 4-bit
+group-32, 7000 routed rows, minimum of five passes, each arm in its own
+process.
+
+| Arm | Rows the kernel computes | Time |
+|---|---:|---:|
+| Sorted gather GEMM, as shipped | 7000 | 6.267 ms |
+| Capacity buffer, C=16 | 8192 | 3.954 ms |
+| Capacity buffer, C=32 | 16384 | 6.040 ms |
+
+At C=16 the dense batched form does 17 percent more multiply work in 63
+percent of the time. The sorted gather kernel is the slow part, not the
+arithmetic.
+
+The buffer is not free, so its plumbing was timed separately with no matmul in
+it:
+
+| Step | Time |
+|---|---:|
+| Gather 8192 rows into the capacity buffer | 0.648 ms |
+| Scatter the result back to token order | 0.307 ms |
+
+The GEMM saves 2.313 ms and the plumbing costs 0.955 ms, so one projection
+goes from 6.267 ms to 4.909 ms, a factor of 1.28. A layer runs three
+projections that would share one buffer build, which amortises the plumbing
+further: 18.80 ms becomes 13.13 ms, a factor of 1.43.
+
+Two costs are not in these numbers and both must be paid by a real
+implementation. Experts holding more than C rows overflow, and those rows need
+the existing gather path or a second tier. At a mean of 13.7 rows and C=16 the
+overflow is on the order of a tenth of all rows. And C=32 already erases the
+win, so the design lives inside a narrow band of C and is sensitive to the
+per-layer routing imbalance, which has not been measured on this tower.
+
+The finding is that the method is worth building, and that the first thing to
+measure in that work is the real imbalance ratio, because it decides C and C
+decides everything.
+
