@@ -1728,3 +1728,35 @@ Combining top-k=6 with the fused gate+up measures 18.0 percent, against 19.1
 percent for top-k=6 alone in the previous round. The fusion adds nothing here,
 consistent with it measuring as a wash on its own.
 
+### The expert-pool curve: the speed side of pruning and merging
+
+Expert pruning and expert merging are both too large to build here, but their
+speed benefit is exactly what `MLX_QWEN4EXP_POOL` measures: fewer distinct
+experts, same top-k, same multiply-accumulates per token. Sweeping it gives the
+speed curve those methods would deliver, without their quality machinery.
+
+| Experts in the pool | Mean tok/s, prompts 2 to 6 | Against plain |
+|---:|---:|---:|
+| 512, as shipped | 294.60 | |
+| 256 | 325.18 | +10.4 percent |
+| 128 | 347.72 | +18.0 percent |
+| 64 | 368.42 | +25.1 percent |
+
+And it composes with top-k, which the mechanism predicts, since both reduce the
+number of distinct experts a layer visits:
+
+| Configuration | Mean tok/s | Against plain |
+|---|---:|---:|
+| Pool 128 with top-k=6 | 402.90 | **+36.8 percent** |
+
+That is the largest measurement in this document. Halving the pool twice and
+dropping four of ten experts costs nothing in arithmetic per token beyond the
+top-k part, and returns more than a third of prefill.
+
+The quality side is untouched and is the whole risk. This knob keeps the first
+N experts by index, which is an arbitrary subset and certainly worse than a
+calibrated selection. A real pruning or merging pass would choose by
+popularity or by output similarity and would recover much of what this loses.
+What the curve establishes is that the speed prize is real and large enough to
+justify that work, which was the open question.
+
