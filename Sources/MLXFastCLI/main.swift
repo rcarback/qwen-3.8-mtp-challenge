@@ -57,6 +57,9 @@ private enum MLXFastCLI {
             case "checkpoint-shards":
                 try runCheckpointShards(options)
                 return 0
+            case "quantize-ngram-table":
+                try runQuantizeNGramTable(options)
+                return 0
             case "dflash-benchmark":
                 try runDFlashBenchmark(options)
                 return 0
@@ -88,6 +91,39 @@ private enum MLXFastCLI {
             fputs("mlxfast-swift: \(error)\n", stderr)
             return 1
         }
+    }
+
+    /// Re-encodes the n-gram embedding table to per-row affine int8 or int4.
+    ///
+    /// Footprint, not speed. The bf16 table is 102.4 GB and the tower is
+    /// 87.2 GB, so the pair needs 189.6 GB. int8 gives 52.5 GB and int4 gives
+    /// 26.9 GB. Measured gather cost is 1.609 ms per forward against about
+    /// 1060 ms of MoE work, so no speed argument exists; see
+    /// docs/perf/qwen38-flash-2026-09.md for the quality measurements that
+    /// decide whether a given width is adoptable.
+    private static func runQuantizeNGramTable(_ options: ParsedOptions) throws {
+        try options.validate(valueOptions: ["--source", "--dest", "--bits"])
+        let source = options.value(for: "--source", default: "")
+        let dest = options.value(for: "--dest", default: "")
+        guard !source.isEmpty, !dest.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "quantize-ngram-table needs --source <dir> and --dest <dir>")
+        }
+        guard let bits = Int(options.value(for: "--bits", default: "")), bits == 8 || bits == 4
+        else {
+            throw MLXFastError.invalidInput("quantize-ngram-table needs --bits 8 or --bits 4")
+        }
+        let sourceURL = URL(fileURLWithPath: source)
+        let destURL = URL(fileURLWithPath: dest)
+        guard sourceURL.standardizedFileURL != destURL.standardizedFileURL else {
+            throw MLXFastError.invalidInput("--source and --dest must differ")
+        }
+        let started = Date()
+        try NGramTableQuantize.convert(sourceDir: sourceURL, destDir: destURL, bits: bits)
+        let elapsed = Date().timeIntervalSince(started)
+        print(
+            "quantize-ngram-table: wrote int\(bits) shards to \(dest) in "
+                + String(format: "%.1f s", elapsed))
     }
 
     private static func runTransform(_ options: ParsedOptions) throws {
@@ -2836,6 +2872,7 @@ private enum MLXFastCLI {
               mlxfast-swift analyze-ngram-similarity --golden PATH [--case NAME] [--orders 1,2,3] [--max-hit-rate RATE]
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
+              mlxfast-swift quantize-ngram-table --source DIR --dest DIR --bits 8|4
               mlxfast-swift dflash-benchmark --drafter PATH --golden PATH [--weights PATH] [--block-size N] [--tokens N] [--schedule-seed N] [--output PATH]
               mlxfast-swift dflash-probe --drafter PATH --golden PATH [--weights PATH] [--tokens N] [--schedule-seed N] [--output PATH]
               mlxfast-swift dflash-reference --drafter PATH --emitted PATH --output PATH [--weights PATH]

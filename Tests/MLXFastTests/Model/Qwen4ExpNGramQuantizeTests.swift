@@ -221,4 +221,38 @@ final class Qwen4ExpNGramQuantizeTests: XCTestCase {
             XCTAssertEqual(s.rows / 5, 11_200)
         }
     }
+    /// A quantized directory must announce its own width, so production can
+    /// open one without a config key that could disagree with the bytes.
+    /// This is what makes the int8 and int4 encodings reachable outside the
+    /// test suite: the runtime load site calls the two-argument initializer.
+    func testTwoArgumentInitDetectsTheEncodingOnDisk() throws {
+        let src = try Qwen4ExpNGramTable.fixtureDirectory(rowsPerShard: 256, dim: 160, shards: 2)
+        let spec = Qwen4ExpNGramTableSpec(
+            directory: src.lastPathComponent, shards: 2, rowsPerShard: 256, dim: 160,
+            dtype: "bfloat16")
+        XCTAssertEqual(try Qwen4ExpNGramTable.detectBits(directory: src, spec: spec), 16)
+
+        let gids: [[Int64]] = [[0, 1, 255, 256, 300, 511, 7, 9, 11, 13, 17, 19, 23, 29, 31, 37]]
+        for bits in [8, 4] {
+            let dst = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("ngram-detect-\(bits)-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: dst) }
+            try NGramTableQuantize.convert(sourceDir: src, destDir: dst, bits: bits)
+
+            XCTAssertEqual(
+                try Qwen4ExpNGramTable.detectBits(directory: dst, spec: spec), bits,
+                "int\(bits) shards must be detected as int\(bits)")
+
+            // The detected open must equal the explicit open, value for value.
+            let detected = try Qwen4ExpNGramTable(directory: dst, spec: spec)
+            let explicit = try Qwen4ExpNGramTable(directory: dst, spec: spec, bits: bits)
+            let a = detected.gather(gids).asType(.float32)
+            let b = explicit.gather(gids).asType(.float32)
+            a.eval(); b.eval()
+            XCTAssertEqual(
+                MLX.abs(a - b).max().item(Float.self), 0,
+                "detected open disagreed with explicit bits: \(bits)")
+        }
+    }
+
 }

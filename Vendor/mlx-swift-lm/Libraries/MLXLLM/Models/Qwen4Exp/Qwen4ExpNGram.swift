@@ -174,8 +174,41 @@ final class Qwen4ExpNGramTable {
         return try Qwen4ExpNGramTable(directory: dir, spec: spec)
     }
 
+    /// Opens the table at whatever encoding its shards actually carry.
+    ///
+    /// The directory describes itself: a bf16 shard names one `BF16` tensor,
+    /// and a shard written by `NGramTableQuantize` names a `U8` `weight`
+    /// beside `scales` and `biases`. Reading that beats a config key or an
+    /// environment variable, because the encoding cannot then disagree with
+    /// the bytes on disk. Per-shard validation in the designated initializer
+    /// still runs afterwards, so a directory holding a mixture still fails.
     convenience init(directory: URL, spec: Qwen4ExpNGramTableSpec) throws {
-        try self.init(directory: directory, spec: spec, bits: 16)
+        try self.init(
+            directory: directory, spec: spec,
+            bits: Self.detectBits(directory: directory, spec: spec))
+    }
+
+    /// Reads shard 0's header and reports the encoding width: 16, 8 or 4.
+    static func detectBits(directory: URL, spec: Qwen4ExpNGramTableSpec) throws -> Int {
+        let url = directory.appendingPathComponent("shard_000.safetensors")
+        let data = try Data(contentsOf: url, options: [.alwaysMapped])
+        guard data.count >= 8 else { throw Qwen4ExpNGramError.badShard(url.path) }
+        let headerLength = Int(
+            data.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian })
+        guard 8 + headerLength <= data.count else { throw Qwen4ExpNGramError.badShard(url.path) }
+        let header =
+            try JSONSerialization.jsonObject(with: data.subdata(in: 8 ..< (8 + headerLength)))
+            as? [String: Any]
+        guard let info = header?["weight"] as? [String: Any],
+            let dtype = info["dtype"] as? String,
+            let shape = info["shape"] as? [Int], shape.count == 2
+        else { throw Qwen4ExpNGramError.badShard(url.path) }
+        if dtype == "BF16" { return 16 }
+        guard dtype == "U8", header?["scales"] != nil, header?["biases"] != nil
+        else { throw Qwen4ExpNGramError.badShard(url.path) }
+        if shape[1] == spec.dim { return 8 }
+        if shape[1] == spec.dim / 2 { return 4 }
+        throw Qwen4ExpNGramError.badShard(url.path)
     }
 
     /// `bits` selects the on-disk row encoding: 16 reads the checkpoint's bf16

@@ -2149,3 +2149,17 @@ int4 remains the only variant that makes the table and the tower resident
 together, so the footprint case for it is real. Deciding it needs an
 end-to-end logit-divergence check against the bf16 table on real prose. That
 check is separate work.
+
+### Both variants are reachable from the command line
+
+`mlxfast-swift quantize-ngram-table --source DIR --dest DIR --bits 8|4`
+produces the table. The runtime then opens whatever the directory holds: the
+loader reads shard 0's safetensors header and selects the width from it, so no
+configuration key can disagree with the bytes on disk. A bf16 shard names one
+`BF16` tensor, and a quantized shard names a `U8` `weight` beside `scales` and
+`biases`. Per-shard validation still runs against the detected width, so a
+directory holding a mixture fails.
+
+One real shard converts to int4 in 1.1 seconds, 800,003,960 bytes to
+210,001,251 bytes. The whole 128-shard table therefore takes about 2.4 minutes
+and lands at 26.9 GB.
