@@ -1851,13 +1851,94 @@ model quality, which nothing in this document measures.
 | Fused router kernel | not executed | custom Metal kernel, and the router is 1.2 percent of the tower |
 | Re-quantize experts smaller | not executed | tower is at 6 percent of bus, traffic does not bind |
 | Expert merging, weight averaging | not executed | requires dequantising, averaging and requantising 24,576 experts |
-| BaseRT single-launch fused MoE kernel | not executed | a from-scratch Metal grouped GEMM, estimated 60 to 120 hours |
+| BaseRT single-launch fused MoE kernel | executed, refuted | untiled prototype is 48x slower than the gather path; see the 2026-09-04 section |
 | Expert offload and streaming | not applicable | every expert is resident; there is nothing to stream |
 | Expert prefetching | not applicable | same reason |
 | Expert-parallel sharding | not applicable | one device |
 
 Nineteen configurations covering sixteen distinct methods were measured. Four
 entries are inapplicable to a single-device, fully resident deployment rather
-than skipped. Four were not executed and each is named above with its reason;
-the largest, BaseRT, is a multi-week kernel project.
+than skipped. Three were not executed and each is named above with its reason.
 
+BaseRT was the fourth until 2026-09-04, when a prototype was built and refuted.
+The section below that date records the measurement.
+
+
+## BaseRT fused MoE kernel, prototyped and refuted (2026-09-04)
+
+A working prototype of the BaseRT single-launch fused MoE kernel was built and
+measured. It is 48 times slower than the production gather path. The deficit is
+architectural, not a tuning problem, so the entry moves from "not executed" to
+"executed and refuted".
+
+### What was built
+
+Seven commits on `local/perf-2026-08`, from `8ee411e0` to `8f305436`:
+
+- A work-queue index builder. A Metal binary search turns the sorted routing
+  indices into per-expert row offsets, then a second pass decomposes each
+  expert's rows into fixed blocks.
+- A fused routed kernel, `moe_fused_q4g32`, that dequantizes 4-bit affine
+  group-32 weights inline and computes gate, up, SiLU product and down for a
+  block of rows in one launch.
+- A gated call site in `Qwen4ExpSparseMoeBlock`, behind
+  `MLX_QWEN4EXP_FUSED_MOE`, which declines to five fallback reasons and
+  logs the specific reason once.
+
+The kernel is numerically correct. It matches `quantizedMatmul` on the same
+weights to within the tolerance the dequantization test sets.
+
+### Measurement
+
+The fixture uses real per-layer geometry. It holds 512 experts, 2560 input
+channels, 640 hidden channels and 7000 rows, under the measured routing skew of
+190 idle experts and one expert at 574 rows. Best of five, one process per arm, a fixed 180 second rest before each
+arm, machine confirmed quiescent.
+
+| arm | time | against gather |
+|---|---|---|
+| gather (production `SwitchGLU`) | 22.0 ms | 1.0x |
+| control (per-expert Swift loop) | 111.9 ms | 5.1x slower |
+| tg64 (best fused) | 1057.3 ms | 48.1x slower |
+| tg32 | 1062.3 ms | 48.3x slower |
+| tg256 | 1079.6 ms | 49.1x slower |
+| tg128 | 1114.7 ms | 50.7x slower |
+| tg512 | 1120.3 ms | 50.9x slower |
+
+The six threadgroup arms are within 6 percent of each other. Threadgroup count
+is not the binding constraint.
+
+### Why it is slow
+
+The kernel computes a scalar dot product per output element. Each row in a work
+item independently streams the expert's whole weight matrix from global memory.
+Weight traffic is one full expert weight per row, not per block.
+
+This fixture moves 21.5 GB of weight traffic, from 7000 rows at 3.07 MB per
+expert. The floor is 0.989 GB, from 322 active experts at the same 3.07 MB.
+The kernel moves 21.7 times the traffic it needs. The hot expert alone re-reads its
+weights 574 times.
+
+The 21.7x traffic multiplier is the right order of magnitude but does not
+account for the whole 48x. The rest is the absence of vectorization: the
+dequantization helper reads one nibble at a time.
+
+A tiled GEMM stages a weight tile in threadgroup memory once and reuses it
+across every row in the block. This kernel never does. Adding that is the
+60 to 120 hour project the catalogue entry always described, and the prototype
+was not a shortcut to it.
+
+### What this establishes
+
+The production path is already good. `gatherQuantizedMM` is a tuned fused
+gather GEMM, and at 22.0 ms it beats a naive per-expert loop by 5.1 times. Any
+replacement has to beat that, not the loop.
+
+The earlier roofline reading stands and is not contradicted. The tower runs at
+about 6 percent of memory bus and about 8 percent of compute peak, so it is
+dispatch-bound and tile-bound. A kernel that multiplies weight traffic by 21.7
+attacks the wrong term.
+
+The code stays in the tree, gated off by default. It is the scaffold and the
+baseline for the tiled version, and the arm harness reproduces every number
+above.
