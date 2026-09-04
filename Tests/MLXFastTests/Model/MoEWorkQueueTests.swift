@@ -40,14 +40,19 @@ final class MoEWorkQueueTests: XCTestCase {
         XCTAssertEqual(blocks.asArray(Int32.self), [0, 0, 1, 3, 3])
     }
 
-    /// The other three tests all run at numExperts = 4, far from the real
-    /// 512-expert geometry: there `grid == threadGroup == (5,1,1)`, so Metal
-    /// never pads the dispatch and the kernel's `e > n_experts` overflow
-    /// guard is never exercised, and the binary search never runs over more
-    /// than 5 rows. At the production geometry `grid = (513,1,1)` dispatches
-    /// across three threadgroups of 256 (the last holding a single active
-    /// thread), which is exactly the case that guard exists for, and the
-    /// search runs over thousands of rows.
+    /// The other three tests all run at numExperts = 4, where the binary
+    /// search never runs over more than 5 rows. This one runs it over
+    /// thousands, and is the only full-array comparison of the [numExperts+1]
+    /// output against a Swift reference.
+    ///
+    /// It does NOT exercise the kernel's `e > n_experts` overflow guard, and
+    /// an earlier version of this comment wrongly claimed it did. MLX
+    /// dispatches custom kernels with `dispatch_threads`, which uses Metal's
+    /// NON-uniform threadgroups (custom_kernel.cpp), so the final threadgroup
+    /// is sized to the remainder and `thread_position_in_grid.x` never exceeds
+    /// the grid. That guard is unreachable on every geometry; it is retained
+    /// only because the kernel would be wrong without it under a uniform
+    /// dispatch, which is a change a future edit could make.
     ///
     /// This test builds a skewed, gappy 512-expert distribution — a long run
     /// of idle experts, a body of lightly (and irregularly) loaded experts,

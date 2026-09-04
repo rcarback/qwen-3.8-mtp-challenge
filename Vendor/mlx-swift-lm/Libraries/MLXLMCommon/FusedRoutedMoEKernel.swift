@@ -6,12 +6,21 @@ import MLXFast
 /// gate/up/silu/down launch quartet; the router, sort, unsort and weighted sum
 /// stay on the MLX side so the final reduction order is unchanged.
 ///
-/// This variant dequantizes 4-bit affine group-32 expert weights inline
-/// (Task 3). Task 2's dense fp16 variant (`denseForward`, the
-/// `moe_fused_dense` kernel) debugged the persistent work-queue scheduler in
-/// isolation from dequantization and has been deleted outright — replaced,
-/// not kept alongside this one, per the project's replace-do-not-deprecate
-/// rule.
+/// This variant dequantizes 4-bit affine group-32 expert weights inline.
+///
+/// **This kernel is RETAINED AS A REFUTED PROTOTYPE, not as a fast path.** It
+/// measured 1057ms against the production `gatherQuantizedMM` path's 22.0ms at
+/// real per-layer geometry — 48x slower — and the deficit is architectural: one
+/// output element per thread, a serial 2560-iteration dependent FMA chain, and
+/// a nibble-at-a-time scalar unpack, achieving ~65 GFLOP/s against the gather
+/// path's ~3.13 TFLOP/s. It is kept as the scaffold and the baseline a tiled
+/// version must beat. See `docs/perf/qwen38-flash-2026-09.md`, the 2026-09-04
+/// section, and bead `qwen-3_8-mtp-challenge-ccj`.
+///
+/// It also requires fp16 activations and fp16 scales/biases: the source below
+/// hard-codes `half`, and the reference checkpoint is bf16, so the call site
+/// declines rather than dispatching (see `Qwen4ExpSparseMoeBlock`). A tiled
+/// rewrite should template on the element type from the start.
 ///
 /// **The packing contract** (verified empirically against `MLX.quantized` /
 /// `MLX.dequantized` before relying on it): MLX affine 4-bit storage packs
@@ -186,6 +195,36 @@ public enum FusedRoutedMoE {
                 + "(got inDim=\(inDim), hiddenDim=\(hiddenDim)); the dequantization "
                 + "index arithmetic (idx >> 3, idx >> 5) is only correct under that "
                 + "constraint.")
+
+        // Shapes, not just dimensions. Every index below is computed from the
+        // template constants rather than read from the arrays, so a shape that
+        // disagrees with them is an out-of-range GPU read -- silent garbage,
+        // not a crash. Fail here with the mismatch named instead.
+        precondition(
+            xSorted.dim(1) == inDim,
+            "FusedRoutedMoE: xSorted has \(xSorted.dim(1)) columns, expected inDim=\(inDim).")
+        precondition(
+            gateUpWeight.dim(0) == numExperts && gateUpWeight.dim(1) == 2 * hiddenDim
+                && gateUpWeight.dim(2) == inDim / 8,
+            "FusedRoutedMoE: gateUpWeight is \(gateUpWeight.shape), expected "
+                + "[\(numExperts), \(2 * hiddenDim), \(inDim / 8)] (4-bit, 8 per uint32).")
+        precondition(
+            downWeight.dim(0) == numExperts && downWeight.dim(1) == inDim
+                && downWeight.dim(2) == hiddenDim / 8,
+            "FusedRoutedMoE: downWeight is \(downWeight.shape), expected "
+                + "[\(numExperts), \(inDim), \(hiddenDim / 8)].")
+        precondition(
+            rowOffsets.dim(0) == numExperts + 1,
+            "FusedRoutedMoE: rowOffsets has \(rowOffsets.dim(0)) entries, expected "
+                + "numExperts + 1 = \(numExperts + 1).")
+        // `inter` is a threadgroup array of BLOCK_ROWS * HIDDEN_DIM halves.
+        // Metal caps threadgroup memory at 32 KiB; exceeding it fails at JIT
+        // compile time with a message that does not name this cause.
+        precondition(
+            blockRows * hiddenDim * 2 <= 32768,
+            "FusedRoutedMoE: the threadgroup intermediate needs "
+                + "\(blockRows * hiddenDim * 2) bytes (blockRows=\(blockRows) x "
+                + "hiddenDim=\(hiddenDim) x 2), over Metal's 32768-byte limit.")
 
         let out = quantizedKernel(
             [

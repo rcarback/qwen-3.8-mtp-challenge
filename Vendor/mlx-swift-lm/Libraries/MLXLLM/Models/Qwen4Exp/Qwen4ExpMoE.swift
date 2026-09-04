@@ -180,7 +180,9 @@ final class Qwen4ExpSparseMoeBlock: Module {
         fusedRoutedFallbackLogged = true
         fputs(
             "[qwen4exp-fused-moe] MLX_QWEN4EXP_FUSED_MOE=1 but \(reason); "
-                + "falling back to the control path for this and every later call\n",
+                + "falling back to the stock SwitchGLU path for this and every later "
+                + "call -- note this gate already forced the fused gate_up stack, so a "
+                + "declining process is NOT a clean control for timing purposes\n",
             stderr)
     }
 
@@ -258,6 +260,26 @@ final class Qwen4ExpSparseMoeBlock: Module {
         }
         guard let gb = gateUp.quantizedBiases, let db = down.quantizedBiases else {
             Self.logFusedRoutedFallbackOnce("expert stacks are missing quantization biases")
+            return nil
+        }
+        // The kernel's Metal source hard-codes `half` for the activation and
+        // for every scale/bias pointer, while MLX generates the signature from
+        // the ACTUAL input dtypes (`get_type_string` in compiled.cpp maps
+        // bfloat16 to the distinct type `bfloat16_t`). A bf16 checkpoint --
+        // which the reference Qwen3.8-Flash-Next tree is, `config.json` says
+        // `"dtype": "bfloat16"` and the switch_mlp scales/biases are BF16 --
+        // therefore does not decline here without this guard, it aborts the
+        // process inside the Metal JIT. Decline loudly and by name instead.
+        guard x.dtype == .float16, gateUp.quantizedScales.dtype == .float16,
+            gb.dtype == .float16, down.quantizedScales.dtype == .float16,
+            db.dtype == .float16
+        else {
+            Self.logFusedRoutedFallbackOnce(
+                "the kernel requires fp16 activations and fp16 scales/biases, but got "
+                    + "x=\(x.dtype), gate_up scales=\(gateUp.quantizedScales.dtype)/"
+                    + "biases=\(gb.dtype), down scales=\(down.quantizedScales.dtype)/"
+                    + "biases=\(db.dtype) -- a bf16 checkpoint needs a kernel templated "
+                    + "on the element type, not a cast")
             return nil
         }
 

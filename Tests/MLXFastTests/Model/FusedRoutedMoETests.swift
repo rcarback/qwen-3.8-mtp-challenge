@@ -118,6 +118,56 @@ final class FusedRoutedMoETests: XCTestCase {
         XCTAssertLessThan(maxAbs, 5e-2, "fused routed path changed the block output")
     }
 
+    /// The gate must DECLINE on a bf16 checkpoint, not abort the process.
+    ///
+    /// The kernel's Metal source hard-codes `half` for the activation and for
+    /// every scale/bias pointer, but MLX builds the kernel signature from the
+    /// ACTUAL input dtypes -- `get_type_string` maps bfloat16 to the distinct
+    /// type `bfloat16_t`. The reference Qwen3.8-Flash-Next checkpoint is bf16
+    /// (`config.json` says `"dtype": "bfloat16"` and the switch_mlp
+    /// scales/biases are BF16), so without a dtype guard every one of the
+    /// other five guards passes -- the weights really are 4-bit affine
+    /// group-32 with biases -- and the failure lands in the Metal JIT as a
+    /// process abort rather than as a named fallback.
+    ///
+    /// This asserts the behaviour the gate advertises (decline and fall back),
+    /// not the implementation's fp16 limitation. The sibling test above is
+    /// the fp16 case; together they pin both sides of the guard.
+    func testFusedGateDeclinesOnBFloat16Weights() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
+            "needs a real GPU")
+
+        var args = Qwen4ExpTextConfiguration()
+        args.hiddenSize = 128
+        args.numExperts = 32
+        args.numExpertsPerTok = 4
+        args.moeIntermediateSize = 64
+        args.sharedExpertIntermediateSize = 64
+
+        MLXRandom.seed(3)
+        let block = Qwen4ExpSparseMoeBlock(args)
+        // bf16, as the real checkpoint is -- deliberately NOT cast to fp16.
+        block.update(parameters: block.mapParameters(map: { $0.asType(.bfloat16) }))
+        quantize(model: block) { path, _ in path.contains("switch_mlp") ? (32, 4, .affine) : nil }
+
+        let x = MLXRandom.normal([1, 40, args.hiddenSize]).asType(.bfloat16)
+
+        block.forceFusedRoutedMoE = true
+        XCTAssertNil(
+            block.fusedRoutedForward(x),
+            "the fused path must decline on bf16 scales/biases; dispatching would "
+                + "abort in the Metal JIT rather than fall back")
+
+        // And the block as a whole still answers, through the fallback.
+        let y = block(x)
+        y.eval()
+        XCTAssertEqual(y.shape, [1, 40, args.hiddenSize])
+        XCTAssertTrue(
+            MLX.all(MLX.isFinite(y.asType(.float32))).item(Bool.self),
+            "fallback output must be finite")
+    }
+
     /// One arm per process -- a combined test holding several weight stacks
     /// resident measures the allocator and residency behaviour rather than the
     /// kernel (see `MoEGatherTileTests.testFusedGateUpIsolated`'s doc comment
@@ -126,10 +176,13 @@ final class FusedRoutedMoETests: XCTestCase {
     ///     MOE_FUSED_ARM=$a MLXFAST_RUN_MLX_RUNTIME_TESTS=1 \
     ///       swift test --force-resolved-versions --filter testFusedArmTiming
     ///   done
-    /// Ruling R4: the static work partition (see FusedRoutedMoEKernel.swift's
-    /// Ruling C3 note) loses only its ragged final round, and that loss grows
-    /// with threadgroup count G -- so this sweeps DOWN from the shipped
-    /// default of 256 rather than up. If tg64 wins, rerun with MOE_FUSED_ARM=tg32.
+    /// Ruling R4 predicted that the static work partition loses only its
+    /// ragged final round and that the loss grows with threadgroup count G,
+    /// so the sweep ran DOWN from the then-default of 256. The direction held
+    /// from 512 to 64, but tg32 came out slower than tg64, so the curve has an
+    /// interior optimum. The whole sweep is now moot for tuning purposes: in a
+    /// rested round every arm clusters within ~6%, all of them 30-48x slower
+    /// than `gather`. 64 is pinned as the argmin, not as a meaningful win.
     ///
     /// `gather` is the actual production path the fused kernel replaces --
     /// NOT `control`'s per-expert Swift loop, which no real code path takes.
@@ -260,7 +313,8 @@ final class FusedRoutedMoETests: XCTestCase {
             run = { switchGLU(xTokens, gatherIdx) }
         default:
             guard arm.hasPrefix("tg"), let tg = Int(arm.dropFirst(2)) else {
-                throw XCTSkip("unknown arm \(arm); expected control|tg<N> (e.g. tg64, tg128)")
+                throw XCTSkip(
+                    "unknown arm \(arm); expected gather|control|tg<N> (e.g. tg64, tg128)")
             }
             run = {
                 FusedRoutedMoE.forward(

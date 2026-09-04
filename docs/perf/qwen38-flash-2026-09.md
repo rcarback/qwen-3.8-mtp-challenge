@@ -1885,8 +1885,16 @@ Seven commits on `local/perf-2026-08`, from `8ee411e0` to `8f305436`:
   `MLX_QWEN4EXP_FUSED_MOE`, which declines to five fallback reasons and
   logs the specific reason once.
 
-The kernel is numerically correct. It matches `quantizedMatmul` on the same
-weights to within the tolerance the dequantization test sets.
+The kernel is numerically correct on fp16 inputs. It matches `quantizedMatmul`
+on the same weights to within the tolerance the dequantization test sets.
+
+It has never run against the real checkpoint, and cannot. The Metal source
+hard-codes `half` for the activation and for every scale and bias pointer,
+while the reference tree is bfloat16. MLX builds the kernel signature from the
+actual input dtypes, so a bf16 checkpoint produced a Metal compile abort rather
+than a clean decline. The call site now carries a sixth guard that declines by
+name on any dtype other than fp16. A tiled rewrite should template on the
+element type from the start.
 
 ### Measurement
 
@@ -1910,23 +1918,46 @@ is not the binding constraint.
 
 ### Why it is slow
 
-The kernel computes a scalar dot product per output element. Each row in a work
-item independently streams the expert's whole weight matrix from global memory.
-Weight traffic is one full expert weight per row, not per block.
+The kernel is starved of arithmetic throughput, not of bandwidth.
 
-This fixture moves 21.5 GB of weight traffic, from 7000 rows at 3.07 MB per
-expert. The floor is 0.989 GB, from 322 active experts at the same 3.07 MB.
-The kernel moves 21.7 times the traffic it needs. The hot expert alone re-reads its
-weights 574 times.
+The fixture performs 6.88e10 floating-point operations, from 7000 rows at
+4,915,200 multiply-accumulates each. Divide that by each arm's time:
 
-The 21.7x traffic multiplier is the right order of magnitude but does not
-account for the whole 48x. The rest is the absence of vectorization: the
-dequantization helper reads one nibble at a time.
+| arm | time | achieved |
+|---|---|---|
+| gather | 22.0 ms | 3.13 TFLOP/s |
+| fused tg64 | 1057 ms | 65 GFLOP/s |
 
-A tiled GEMM stages a weight tile in threadgroup memory once and reuses it
-across every row in the block. This kernel never does. Adding that is the
-60 to 120 hour project the catalogue entry always described, and the prototype
-was not a shortcut to it.
+65 GFLOP/s is under 1 percent of fp16 peak. Three properties of the kernel
+produce it. It computes one output element per thread. Each thread then runs a
+serial 2560-iteration dependent multiply-accumulate chain, which leaves no
+instruction-level parallelism to hide latency. And the dequantization helper
+unpacks one nibble at a time instead of taking eight weights from each 32-bit
+load.
+
+The kernel also issues many more weight loads than it needs. Each row
+re-streams its expert's whole 3.07 MB weight matrix, so the fixture issues
+21.5 GB of loads against a 0.989 GB floor, or 21.7 times more than necessary.
+The hot expert alone re-reads its weights 574 times.
+
+That redundancy is real, but it is not what costs the time. 21.5 GB in 1057 ms
+is 20.3 GB/s, under 4 percent of this machine's bus. One expert's 3.07 MB
+working set also fits in cache, so most of those repeated loads are cache hits
+rather than bus traffic. The 21.5 GB figure counts loads issued. It is not a
+measurement of memory traffic, and an earlier revision of this section
+presented it as one.
+
+The remedy leads with arithmetic, not with staging:
+
+- Vectorize the dequantization. Unpack a whole 32-bit word per load.
+- Accumulate several output elements per thread, in registers.
+- Use simdgroup matrix operations for the inner product.
+
+Staging weight tiles in threadgroup memory belongs in a tiled GEMM as well,
+but it is the second-order term here.
+
+Building that is the 60 to 120 hour project the catalogue entry always
+described. The prototype was not a shortcut to it.
 
 ### What this establishes
 
