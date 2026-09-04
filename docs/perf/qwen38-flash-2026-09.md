@@ -2115,14 +2115,23 @@ about 0.15 percent of a forward.
 real table than on any fixture. The real table is sparsely touched and its
 pages do not stay resident, so fewer pages touched means fewer faults taken.
 
-### The timing numbers in this run are contaminated
+### Quantized gather costs about 7 percent more than bf16
 
-Do not quote per-variant gather times from this run. The suite executed 11
-tests in one process, which violates the one-arm-per-process rule this
-document applies to every other timing claim. The isolated bf16 measurement of
-1.609 ms stands; the 2.1 to 2.3 ms figures this run printed for all three
-encodings reflect a dirtied process and serve only to show that quantized
-gather stays in the same range as bf16.
+| encoding | isolated release gather | distinct 16 KiB pages |
+|---|---|---|
+| bf16 | 1.609 ms, 1.630 ms | 392 |
+| int8 | 1.746 ms | 200 |
+| int4 | 1.730 ms | 104 |
+
+Each figure above comes from a run holding one timed arm, per the
+one-arm-per-process rule this document applies to every timing claim. The
+dequantization work costs roughly 0.12 ms per forward, or about 0.01 percent
+of a forward. Neither variant wins on speed and neither loses meaningfully.
+
+An earlier revision of this section reported 2.1 to 2.3 ms for all three
+encodings and told the reader not to quote them. Those figures came from a run
+executing 11 tests in one process, which inflated every arm. The isolated
+numbers above replace them.
 
 ### Recommendation
 
