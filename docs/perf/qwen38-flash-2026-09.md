@@ -1087,3 +1087,164 @@ numbers behind that prediction.
 
 The practical consequence is that transfer-reduction work cannot rescue this
 lane. Only reaching the experts without segmenting the prefill can.
+
+## MoE tower, fused single-split lanes (2026-09-03)
+
+The prior section closed on one path forward: reach the MoE experts without
+segmenting the prefill. This section measures that path. The fused lane keeps
+each piece of work as one independent unit with one join per layer, and does
+not micro-batch. Two features were measured together and separately:
+
+- Feature A, split: an ANE prefix over a channel slice of the linear-attention
+  `in_proj_qkv` and attention `q_proj` projections, joined once per layer with
+  a GPU suffix over the remaining channels.
+- Feature B, shared: the whole shared expert MLP (`mlp.shared_expert`) run
+  entirely on the ANE, with no split.
+
+### Env knobs
+
+| Variable | Effect |
+|---|---|
+| `MLX_ANE_DIRECT` | enables the ANE-direct path |
+| `MLX_QWEN4EXP_ANE_MODE` | selects `split`, `shared`, or `both` |
+| `MLX_QWEN4EXP_ANE_LOG` | turns on the `[qwen4exp-ane]` build/failure log |
+| `MLX_QWEN4EXP_ANE_SPLIT_FRACTION` | fraction of intermediate channels sent to the ANE prefix in split mode (not swept this run) |
+
+### Program budget from the spec
+
+The design spec for this lane set a budget of 4096 MB and 256 programs for
+`Qwen4ExpANEFused`, and projected in its section 5.7 that the `both` mode's
+1.65 GB across 96 programs sits well below the point where ANE program loads
+start failing.
+
+### Measurement table
+
+Five arms ran on one machine, one serve process at a time, six fixed prompts
+per arm, `--mtp-depth 0`. Figures are copied verbatim from the measurement
+report.
+
+Per-prompt tok/s (prompt tokens = prompt_tokens divided by seed-prefill
+seconds):
+
+| tokens | plain | split | shared | both | plain2 |
+|---:|---:|---:|---:|---:|---:|
+| 653 | 260.1 | 109.3 | 104.1 | 63.0 | 181.2 |
+| 675 | 258.1 | 185.3 | 253.6 | 262.2 | 268.5 |
+| 692 | 257.8 | 182.3 | 265.9 | 270.0 | 270.7 |
+| 723 | 250.6 | 181.7 | 265.3 | 265.6 | 272.1 |
+| 735 | 266.4 | 184.0 | 272.5 | 272.3 | 276.7 |
+| 765 | 270.1 | 189.2 | 281.0 | 269.3 | 282.7 |
+
+Mean across all six prompts:
+
+| arm | mean tok/s | vs plain |
+|---|---:|---:|
+| plain (control) | 260.52 | -- |
+| split | 171.97 | -34.0 percent |
+| shared | 240.40 | -7.7 percent |
+| both | 233.73 | -10.3 percent |
+| plain2 (control repeat) | 258.65 | -0.7 percent |
+
+Mean across prompts 2 to 6, excluding the first-prefill-after-load cost that
+every arm pays regardless of mode:
+
+| arm | mean tok/s (2-6) | vs plain (2-6) |
+|---|---:|---:|
+| plain (control) | 260.60 | -- |
+| split | 184.50 | -29.2 percent |
+| shared | 267.66 | +2.7 percent |
+| both | 267.88 | +2.8 percent |
+| plain2 (control repeat) | 274.14 | +5.2 percent |
+
+The measurement report treats the prompts 2-6 view as the more trustworthy
+comparison, since the first prompt in every arm after a fresh process load
+pays a large, mode-independent tax that swamps any per-mode effect if left in
+the mean. The plain2 repeat itself measures +5.2 percent over the original
+plain on prompts 2-6, using byte-identical code, which sets a floor for what
+counts as run-to-run drift rather than a code effect.
+
+### Build and failure counts
+
+The `both` arm is the only one with a surviving build log (188 tagged lines).
+The `split` and `shared` arms wrote no lines to the served log at all,
+including two lines that fire unconditionally regardless of the logging flag,
+so their build and failure counts could not be read from this run. The
+measurement report attributes this to stdio buffering combined with an
+ungraceful process kill, not to the lanes being inert (see the token-head
+differences below).
+
+From the `both` arm's log:
+
+| Event | Count |
+|---|---:|
+| split `in_proj_qkv` built | 47 |
+| split `q_proj` built | 16 |
+| split `in_proj_qkv` BUILD FAILED (bucket=1024) | 23 |
+| split `q_proj` BUILD FAILED (bucket=1024) | 8 |
+| shared built (49 at bucket=512, 14 at bucket=1024) | 63 |
+| shared BUILD FAILED (bucket=1024) | 31 |
+
+At bucket 1024, 31 of 45 shared-expert attempts and 31 of 54 split attempts
+failed to build (`Program load failure (0x50004)`) and fell back to GPU. This
+reproduces the known ANE program-memory limit reported elsewhere in this
+document, at a smaller byte count than the design spec's own projection: the
+spec argued the `both` mode's 1.65 GB across 96 programs sits well below the
+observed failure point, and on this run it does not.
+
+### Token-head differences
+
+Every arm that touches the ANE (split, shared, both) diverges from the
+plain/plain2 control on at least one of the six prompts, and never on the same
+prompt for all three ANE-touching arms:
+
+| tokens | plain / plain2 | split | shared | both |
+|---:|---|---|---|---|
+| 653 | same across all arms | same | same | same |
+| 675 | baseline text | same | diverges (word swap) | same |
+| 692 | baseline text | diverges | diverges (same alternate as split) | same |
+| 723 | same across all arms | same | same | same |
+| 735 | same across all arms | same | same | diverges |
+| 765 | same across all arms | same | same | same |
+
+Plain and plain2 agree exactly on all six prompts, as expected for
+byte-identical greedy decoding. The divergences are consistent with fp16
+representation differences in the ANE lanes, the same effect the design spec
+anticipates. Because a silently inert lane cannot change model output, these
+divergences are evidence that split and shared genuinely executed ANE compute
+on this run, even where the confirming build log lines were lost.
+
+### Reading against the other two lanes
+
+| Lane | Net effect vs its control |
+|---|---:|
+| MoE, micro-batch (prior section) | -25.2 percent |
+| Dense, single-split fp16-on-ANE (earlier section) | +5.7 percent |
+| MoE, fused split (this section, prompts 2-6) | -29.2 percent |
+| MoE, fused shared (this section, prompts 2-6) | +2.7 percent |
+| MoE, fused both (this section, prompts 2-6) | +2.8 percent |
+
+Shared and both, on the prompts 2-6 view, land close to the plain2 drift floor
+of +5.2 percent, so neither shows a result distinguishable from run-to-run
+noise on this single pass. Split is the one clear signal in this table: a
+sustained loss close in size to the micro-batch lane's loss, even though split
+does not micro-batch and keeps one graph per layer. This suggests the earlier
+reading that micro-batching itself is the tax needs a caveat: a single-split,
+single-join structure can also lose, at least for the channel-prefix
+projections split targets here.
+
+Shared, which moves a whole expert MLP to the ANE with no split, does not show
+the same loss and sits near parity with plain. That is closer in shape to the
+dense tower's win, where the split also stays inside one graph per layer, but
+the shared result here is too close to the drift floor to call a win on this
+one pass.
+
+The `both` arm's bucket-1024 build failure rate means roughly half its ANE
+program load attempts fell back to GPU, so its throughput number is a blend of
+ANE and GPU compute and should not be read as a clean measurement of the fused
+design at full strength.
+
+Missing log evidence for split and shared, no thermal cooldown gate between
+arms, and a single pass per arm mean none of these MoE fused-lane numbers
+should be treated as final. A rerun with the stdio-buffering fix from the
+measurement report, and a proper cooldown gate between arms, is needed before
+drawing a conclusion about split or shared on this workload.
