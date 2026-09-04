@@ -51,12 +51,16 @@ public enum Qwen4ExpANEFused {
         return v * 1024 * 1024
     }()
 
-    /// `MLX_QWEN4EXP_ANE_MAX_PROGRAMS`, default 256. Mode `both` wants 96
-    /// programs per bucket, so 128 would refuse the second bucket mid-tower.
+    /// `MLX_QWEN4EXP_ANE_MAX_PROGRAMS`, default 126. Measured: one process
+    /// holds at most 126 loaded ANE programs, at 8 KB and at 26 MB alike
+    /// (`ANEProgramCountLimitTests`), so the 127th load fails with 0x50004.
+    /// Refusing at the limit turns that failure into a logged, cached refusal.
+    /// Mode `both` wants 96 programs per bucket, so a second bucket is refused
+    /// part way through the tower; the refused layers stay on the GPU.
     public static let programCountLimit: Int = {
         guard let raw = ProcessInfo.processInfo.environment["MLX_QWEN4EXP_ANE_MAX_PROGRAMS"],
             let v = Int(raw)
-        else { return 256 }
+        else { return 126 }
         return v
     }()
 

@@ -59,9 +59,10 @@ final class Qwen4ExpSparseMoeBlock: Module {
             do {
                 return try offloadedForward(x, program: program)
             } catch {
-                if Qwen4ExpANEFused.log {
-                    fputs("[qwen4exp-ane] shared expert run failed: \(error); GPU path for this call\n", stderr)
-                }
+                // Unconditional: a repeating run failure recomputes the routed
+                // sum below on every call, and that doubled work must be visible
+                // without the log flag.
+                fputs("[qwen4exp-ane] shared expert run failed: \(error); GPU path for this call\n", stderr)
             }
         }
         let (idx, w) = route(x)
