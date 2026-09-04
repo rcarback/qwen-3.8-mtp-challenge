@@ -2131,7 +2131,10 @@ final class WorkerStderrDrain: @unchecked Sendable {
 
     private func drainToEOF() {
         while true {
-            let chunk = handle.readData(ofLength: 8192)
+            // `availableData`, not `readData(ofLength:)`: on a pipe the latter
+            // blocks until the full length arrives, so a worker that prints
+            // under 8 KB before it exits never has a line forwarded.
+            let chunk = handle.availableData
             if chunk.isEmpty {
                 break
             }
