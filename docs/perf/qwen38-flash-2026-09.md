@@ -1983,16 +1983,20 @@ had tried, not a demonstrated ceiling.
 
 A sweep of one program at increasing size (5120, 10240, 20480, 40960, 81920 and
 163840 output channels against 2560 input channels, fp16, sequence length 128,
-so 26 MB to 839 MB) did not answer the question. The process stopped making
-progress and sat at 0.0 percent CPU for 39 minutes, with
-`ANECompilerService` also at 0.0 percent. That is a hang, not a slow compile.
+so 26 MB to 839 MB) did not answer the question, for two reasons that are both
+measurement errors rather than properties of the ANE.
 
-The finding is therefore negative and partial: at some size in this range the
-ANE program load stops returning instead of refusing. A clean refusal is what
-the count probe gets at the 127th program (`0x50004`), so the size path and the
-count path fail differently.
+First, the run was abandoned after 39 minutes on a wrong reading. The
+`swift-test` wrapper showed 0.0 percent CPU, which looked like a hang. The
+wrapper was idle because it waits on a child: the `swiftpm-testing-helper`
+process doing the real work was at 100 percent CPU the whole time. The probe
+was computing, not stuck. Sample the worker, not the wrapper.
 
-Two things must change before this is retried. The sweep needs a per-size
-timeout so one hang does not consume the whole run, and its output must not be
-piped through a block-buffering filter, which is why no partial result survived
-this attempt.
+Second, no partial result survived, because the command piped its output
+through `grep`, which block-buffers. Every completed size line was still in a
+buffer when the process was terminated.
+
+Nothing is therefore known about the maximum program size beyond the 26 MB that
+the count probe already demonstrated. A retry needs unbuffered output, a
+per-size timeout so one slow size cannot consume the run, and a liveness check
+that samples the worker process.
