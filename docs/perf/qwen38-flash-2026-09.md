@@ -1336,3 +1336,116 @@ they cannot be reached from a fixed-shape program. This closes the ANE
 question for this tower: the micro-batch lane loses 25 percent, the fused
 lanes lose about 3 percent, and there is no third shape.
 
+## MoE acceleration methods from the literature (2026-09-04)
+
+An analyst pass read the MoE acceleration literature and scored each method
+against this tower's own geometry: 48 layers, hidden 2560, 512 routed
+experts, top-k 10, moe_intermediate 640, one shared expert, 4-bit affine
+group-32 routed weights. Two arms from the catalogue were built and measured
+tonight. The rest were scored on paper only, and the table below says so
+plainly.
+
+The tower is dispatch-bound and tile-bound inside the routed-expert gather
+GEMM, not bandwidth-bound and not FLOP-bound. Measured against a 700-token
+prompt at 280 tokens per second, the achieved weight bandwidth is about 30
+GB per second, roughly 6 percent of bus speed, and achieved compute is about
+2.7 TFLOP per second, roughly 8 percent of peak. Every method below is
+judged against that fact.
+
+### Consolidated method table
+
+| Method | Source | ANE/GPU splittable | Status | Effect | Why |
+|---|---|---|---|---|---|
+| Fuse gate_proj + up_proj into one gather GEMM | SonicMoE, arXiv 2512.14080 | No | Built, not measured | Estimated 2 to 5 percent of prefill | Removes one of three gather-GEMM launches per layer and halves the input-tile reads; bit-identical output, proven by quantized concat and exact-equality tests |
+| Grouped expert execution on the ANE (hot-expert lane) | NPUMoE, arXiv 2604.18788, technique 2 | Yes, structurally | Built, not measured at full scale; a related mode was measured | Measured -6.84 percent on the shipped `experts` ANE mode; the newly built grouped lane serves only about 4.7 percent of routed assignments by the program budget | The ANE program budget (126 programs, 4096 MiB) covers at most about 1.56 percent of experts per layer; the shipped `experts` mode also changed the greedy continuation on 2 of 6 prompts |
+| Static-capacity dense batched MoE with exact overflow tail | NPUMoE technique 1, executed on GPU | No | Not built | Estimated 1.25 to 1.55x prefill, sensitive to the padding constant C | Replaces the 512-way indirect gather GEMM with one dense batched GEMM plus an exact remainder path for overflow rows; output is unchanged if the overflow tail is computed |
+| Retune the gather_qmm tile shape for small row counts | Standard GEMM autotuning; SonicMoE token-rounding | No | Not built | Estimated 1.15 to 1.44x prefill | At about 14 rows per expert, a tile sized for large row counts wastes 2.3x to 4.7x of the multiply work; needs a source read to confirm the waste before building |
+| Custom single-launch grouped MoE kernel (routing and experts fused) | BaseRT, arXiv 2607.00501 | No | Not built | Estimated 1.34x prefill | Removes three kernel launches and two intermediate round-trips per layer by fusing gate, routing, and the SwiGLU epilogue into one persistent kernel; highest ceiling in the catalogue, also the highest cost |
+| Remove the float32 router upcast | Local code reading | No (zero concurrency window; do not offload to ANE) | Not built | Estimated 1 to 3 percent of prefill | The router currently upcasts a wide activation tensor to fp32 before a small GEMM; removing the wide upcast saves traffic and compute at native rate |
+| Token rounding to the tile multiple | SonicMoE, arXiv 2512.14080 | No | Not built | Estimated near 0 percent standalone; 3 to 6 percent only after a smaller tile ships | Only recovers waste once the row tile is smaller than the row count; depends on the gather_qmm tile retune landing first |
+| Static expert pruning by calibrated popularity | NPUMoE technique 3; standard expert-pruning literature | Indirectly, but confirmed dead for ANE | Not built | Estimated 1.10 to 1.25x prefill | Removes weight bytes by dropping the coldest experts and renormalizing the router; this is a target-model edit and is very likely outside the frozen quantization envelope for the ranked track |
+| Expert-major weight relayout and co-tiling | Standard practice | No | Not built | Estimated 2 to 5 percent of MoE time, or much larger if a transpose is materializing | Depends on whether `SwitchLinear`'s axis swap is folded into the gather kernel; a single timing measurement would resolve which case applies, and it was not taken tonight |
+| Fuse the router GEMM, top-k, and softmax into one kernel | BaseRT routing-fusion claim, narrowed | No (zero concurrency window) | Not built | Estimated 1 to 3 percent of prefill | Removes three launches and two round-trips of a small tensor per layer, bounded by the router's small share of MoE FLOPs; the argPartition tie-break order is a real risk |
+| Grouped expert execution on the ANE, packed to cover most experts | NPUMoE technique 2, full form | Yes in principle, no in practice | Dead on arrival | Zero | The 126-program limit forces at least 197 experts per program, which needs 93 GB of resident fp16 weight against a 4 GiB budget; off by about 23x |
+| Load-aware hot-expert ANE residency | NPUMoE technique 3 | Yes, best-shaped ANE idea in the catalogue, still not enough | Near-dead by budget | Estimated 1 to 2 percent at best; every ANE lane measured so far scored negative | The 4 GiB program budget covers about 1.7 percent of experts across the whole tower, and the ANE's lower fp16 throughput compounds the small share |
+| Capacity-factor token dropping with saliency pruning | NPUMoE technique 1, lossy form; GShard and Switch capacity factors | No | Not built | Estimated 1 to 3 percent above the exact-tail version, at the cost of correctness | Drops overflow tokens instead of computing them exactly; a dropped token silently loses one of its ten experts, which is a poor trade for a small additional gain |
+| Adaptive or dynamic top-k routing | Expert-choice and threshold-routing literature | No, and it makes shapes dynamic | Not built | Estimated well under 8 percent, likely near 0 | Cutting the mean number of experts per token still leaves nearly all 512 experts touched by some token in the batch, so weight traffic barely falls even though FLOPs do |
+| Increase the prefill chunk or batch several prompts | Derived from the tower's own rows-per-expert arithmetic | No | Not built; contract-blocked | Estimated more than 2x MoE efficiency if it were allowed | Rows per expert scale linearly with batch size, and larger batches would cross into compute-bound territory; the benchmark serves one prompt at a time, so there is no room to grow the batch inside one request |
+| Push MTP draft depth toward the trusted maximum | This repository's own MTP track | No; this is a decode-time schedule change, not a MoE method | Not built | Estimated as the largest untouched lever in the repository; not quantified for this table | At speculative decode block sizes used here, the marginal cost of a verified row is close to free because decode stays weight-bandwidth-bound regardless of block depth; the shipped depth-2 schedule likely leaves throughput on the table |
+| Activation sparsity or ReLU-fication | Deja Vu, ProSparse, and the ReLU-ification line | No, dynamic sparsity is not fixed shape | Dead, out of scope | Zero without retraining | SiLU is smoothly nonzero everywhere, the intermediate is only 640 wide, and any usable sparsity needs a finetune this track cannot run |
+| Expert merging or low-rank expert factorization | MC-SMoE, HC-SMoE, and the expert-merging line | Indirectly; still too large for the ANE byte budget | Not built; contract-blocked | Estimated 1.35x prefill | Reduces 512 experts to a smaller merged set, cutting traffic and raising rows per expert past the compute-bound ridge; this is a full model edit and the target weights are frozen on the ranked track |
+| Re-quantize routed experts to a smaller footprint | Standard practice | No | Not built; sequencing and contract concerns | Estimated small, and only after the kernel itself is efficient | The tower is at about 6 percent of bus bandwidth today, so shrinking weight bytes buys almost nothing until the kernel work above lands; likely outside the frozen quantization envelope regardless |
+| Shared expert on the ANE | This repository, already shipped as a lane | Yes, cleanest split available, still lost | Measured | -2.8 percent and -3.3 percent across two rounds | The shared expert is about 8.9 percent of MoE work per token per layer, so perfect overlap could hide at most that share, and the two mandatory join barriers per layer cost more than the overlap returns |
+| Fused projection channel split on the ANE | This repository, already shipped as a lane | Yes, but everything downstream waits on it | Measured | -3.6 percent | The ANE leg sits on the critical path with the next GPU operation waiting on its output, so the ANE latency adds instead of overlapping |
+| Micro-batched ANE prefill | This repository, already shipped and tested | Yes, but shrinks chunk size | Measured | -25.2 percent, with a GPU-only control at -25.4 percent | Shrinking the prefill chunk quarters the rows-per-expert ratio, which quarters arithmetic intensity, compounding with lazy-graph fragmentation; this closes the entire family of methods that shrink the prefill chunk |
+
+### Measurement detail from tonight's run
+
+Both arms ran against six real prompts, 653 to 765 tokens, through the
+existing prefill measurement driver, with two adjacent plain (no-lane)
+control runs bracketing the feature runs to bound run-to-run drift.
+
+| Arm | Mean tokens per second, prompts 2 to 6 | Delta against the plain mean | Note |
+|---|---:|---:|---|
+| plain1 (control) | 299.58 | +0.41 percent | |
+| plain2 (control) | 297.14 | -0.41 percent | Plain-versus-plain drift is +0.82 percent, the noise floor for this sample size |
+| experts (ANE grouped expert lane, `MLX_QWEN4EXP_ANE_MODE=experts`) | 277.94 | -6.84 percent | Diverged from the shared greedy continuation on 2 of 6 prompts; this is a correctness flag, separate from the throughput loss |
+| fusedgemm (`MLX_SWITCH_FUSE_GATE_UP=1`) | 296.58 | -0.60 percent | Inside the plain-versus-plain drift band; head strings were byte-identical to both plain runs on all six prompts |
+
+Prompt 1 (653 tokens) was excluded from the means in every arm because it
+pays a cold-start or compile cost in every arm alike.
+
+The fused gate/up gather GEMM change is proven correct by exact equality
+tests, including one at the tower's real per-expert geometry, and by a clean
+`swift test --force-resolved-versions --filter Qwen4Exp` regression pass (50
+tests, 7 skipped by the ANE runtime gate, 0 failures). It was not measured
+tonight in a resident serve; the -0.60 percent figure above is one throughput
+sample against a drift band of about 0.8 percent, not a conclusive
+measurement in either direction. It ships default off.
+
+### Build feasibility notes
+
+**Grouped ANE expert lane (NPUMoE technique 2, hot-expert form).** The lane
+was built and is off by default. One expert's fp16 weight is 9.375 MiB; the
+whole routed expert set across 48 layers is 225 GiB of fp16, far past any ANE
+program budget. With 8 experts grouped per program, the byte budget of 4096
+MiB binds before the 126-program count limit, at 48 programs of 75 MiB each,
+covering 8 of 512 experts per layer. Hot-expert selection concentrates on the
+busiest experts, so those 8 slots carry roughly 4.7 percent of a layer's
+routed assignments at a routing imbalance ratio near 3, by the report's own
+estimate. The lane overlaps work rather than deleting it: served assignments
+still pass through the GPU gather with their combine weight zeroed, so the
+GPU cost is unchanged and only the ANE result is added on top. The expected
+prefill effect at default settings is neutral to slightly negative, in the
+same family as the shared-expert and projection-split lanes already measured.
+It is committed off for that reason. Three files implement the routing plan,
+program build, and forward-path wiring; one test file covers the gather and
+combine logic without loading the real checkpoint, plus one runtime-gated
+test that skips unless the real ANE is present.
+
+**Fused gate/up gather GEMM (SonicMoE, call-level fusion).** The concat of
+the two quantized weight stacks is safe because quantization groups run along
+the input axis and the concat runs along the output axis, so no group
+straddles the concat boundary. The fused stack replaces the two originals
+after first use, so steady-state expert-weight memory is unchanged; the
+one-time cost is roughly 838 MiB of copying per MoE layer during the first
+forward, spread across the tower's 48 layers, and that one-time cost was not
+priced against the timed prefill window tonight. Seven correctness tests
+pass, including bit-identical output at the tower's real geometry. It ships
+default off, specifically because the first-forward copy cost and the
+transient per-layer memory peak were not measured in a resident serve.
+
+### What was actually run tonight and what was not
+
+Two arms were built and run against real prompts tonight: the ANE grouped
+expert lane in its shipped `experts` mode, and the fused gate/up gather GEMM
+in its shipped `MLX_SWITCH_FUSE_GATE_UP=1` mode. Both are measurements, not
+estimates, and both are recorded in the table above with their percent
+deltas.
+
+Every other method in the consolidated table is an estimate from the
+catalogue analysis, not a measurement. The estimates come from the tower's
+own FLOP and byte arithmetic, worked out from measured tokens-per-second and
+weight sizes, not from running the method. Where the table says "estimated,"
+no code for that specific method exists yet, or no timed run of it was taken
+tonight. Do not read an estimate as a result.
