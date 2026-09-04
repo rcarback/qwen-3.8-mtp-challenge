@@ -1781,3 +1781,30 @@ express.
 Greedy continuations diverged from the plain arm on several prompts, so the
 method costs output quality and returns no time. It is executed and closed.
 
+### Calibrated pruning: the same speed as naive pruning, with the quality back
+
+`MLX_QWEN4EXP_POOL_CALIBRATED` keeps the N most popular experts of each layer,
+learned from the first prefill that layer sees, instead of the first N by
+index. This is what the pruning literature specifies and it is the practical
+half of expert merging.
+
+| Arm | Mean tok/s, prompts 2 to 6 | Against plain |
+|---|---:|---:|
+| plain | 296.70 | |
+| Naive pool, first 128 by index | 347.72 | +18.0 percent |
+| Calibrated pool, 128 most popular | 349.36 | +17.7 percent |
+
+The speed is the same, which the mechanism predicts: both visit 128 distinct
+experts per layer and the cost follows expert count.
+
+The outputs are not the same. Naive pruning produced degenerate continuations
+of the form "The passage describes various behaviors of different phenome",
+losing the prompt's content. Calibrated pruning produced "In survey 1 the
+behaviour of lock", "In survey 3, the behaviour of", which track the prompt in
+the way the unpruned model does. Selection is what costs quality, not the
+pruning.
+
+This is a visual inspection of six continuations, not a quality measurement. It
+is enough to say that a calibrated selection is the right form and that a
+proper evaluation is the next step, not that the quality is acceptable.
+

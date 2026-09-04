@@ -101,11 +101,49 @@ final class Qwen4ExpSparseMoeBlock: Module {
         return v
     }()
 
+    /// `MLX_QWEN4EXP_POOL_CALIBRATED`. Keep only the N most POPULAR experts of
+    /// this layer, learned from the first prefill this block sees, instead of
+    /// the first N by index. This is what the pruning literature actually
+    /// specifies, and it is the practical half of expert merging: same speed
+    /// mechanism as the naive pool knob, far better selection.
+    static let calibratedPool: Int? = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_QWEN4EXP_POOL_CALIBRATED"],
+            let v = Int(raw), v > 0
+        else { return nil }
+        return v
+    }()
+
+    /// Per-layer keep-mask, learned once. Additive: 0 for kept, -1e9 for dropped.
+    private var calibratedMask: MLXArray?
+
+    /// Learn the mask from one prefill's own routing, then reuse it forever.
+    private func calibratedKeepMask(_ idx: MLXArray) -> MLXArray? {
+        guard let keep = Self.calibratedPool, keep < numExperts else { return nil }
+        if let m = calibratedMask { return m }
+        let flat = idx.flattened()
+        guard flat.size >= numExperts else { return nil }  // decode step; wait for a prefill
+        eval(flat)
+        var counts = [Int](repeating: 0, count: numExperts)
+        for v in flat.asArray(Int32.self) { counts[Int(v)] += 1 }
+        let ranked = counts.enumerated().sorted { $0.element > $1.element }.prefix(keep)
+        var allow = Set<Int>(); for r in ranked { allow.insert(r.offset) }
+        let m = MLXArray((0 ..< numExperts).map { Float(allow.contains($0) ? 0 : -1e9) })
+        eval(m)
+        calibratedMask = m
+        return m
+    }
+
     /// Router: float32 logits, top-k by `argPartition`, weights = softmax over the
     /// SELECTED logits (equal to softmax-all followed by renormalisation).
     func route(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
         let logits = Self.routerNative ? gate(x).asType(.float32) : gate(x.asType(.float32))
         var logitsMasked = logits
+        if Self.calibratedPool != nil {
+            // First prefill routes unmasked and teaches the mask; later ones use it.
+            let raw = MLX.argPartition(logits, kth: numExperts - min(Self.topKOverride ?? topK, numExperts), axis: -1)[
+                .ellipsis, (numExperts - min(Self.topKOverride ?? topK, numExperts))...]
+            if let m = calibratedKeepMask(raw) { logitsMasked = logits + m }
+        }
         if let pool = Self.poolLimit, pool < numExperts {
             // Push everything outside the pool below any real logit.
             let keep = MLXArray((0 ..< numExperts).map { Float($0 < pool ? 0 : -1e9) })
