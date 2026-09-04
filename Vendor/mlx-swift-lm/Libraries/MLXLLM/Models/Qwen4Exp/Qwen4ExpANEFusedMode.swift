@@ -12,6 +12,7 @@ public enum Qwen4ExpANEFusedMode: String, Sendable, CaseIterable {
     case split
     case shared
     case both
+    case experts
 }
 
 public enum Qwen4ExpANEFused {
@@ -104,6 +105,76 @@ public enum Qwen4ExpANEFused {
         Qwen4ExpANELane.enabled && !forcedMicroBatchProbe && (mode == .shared || mode == .both)
     }
 
+    /// `MLX_QWEN4EXP_ANE_EXPERT_GROUP`, default 8. Experts fused into ONE
+    /// grouped-conv ANE program. One expert is `3 * inter * hidden * 2` fp16
+    /// bytes (9.375 MiB on this tower), so a group of 8 is a 75 MiB program.
+    public static let expertGroupSize: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_QWEN4EXP_ANE_EXPERT_GROUP"],
+            let v = Int(raw), v >= 1
+        else { return 8 }
+        return v
+    }()
+
+    /// `MLX_QWEN4EXP_ANE_EXPERT_CAPACITY`, default 64. The static per-expert
+    /// token capacity `C` of NPUMoE's tier scheme, collapsed to a single tier:
+    /// every grouped program compiles at spatial length `C`. At a 768-token
+    /// prefill with top-10 of 512 the mean expert sees 15 tokens, so 64 covers
+    /// roughly a 4x routing imbalance. Assignments past `C` are not dropped --
+    /// they stay on the GPU path (see the lane's spill handling).
+    public static let expertCapacity: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_QWEN4EXP_ANE_EXPERT_CAPACITY"],
+            let v = Int(raw), v >= 1
+        else { return 64 }
+        return v
+    }()
+
+    /// `MLX_QWEN4EXP_ANE_EXPERT_HOT`, default 8. Hot experts made ANE-resident
+    /// per MoE layer. Rounded DOWN to a multiple of `expertGroupSize`, since a
+    /// program holds exactly one full group.
+    public static let expertHotPerLayer: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_QWEN4EXP_ANE_EXPERT_HOT"],
+            let v = Int(raw), v >= 0
+        else { return 8 }
+        return v
+    }()
+
+    /// `MLX_QWEN4EXP_ANE_EXPERT_MAX_LAYERS`, default 48. Layers allowed to
+    /// build expert programs, in first-armed-call order. The byte and program
+    /// budgets already cut the tower off part way through; this makes the cut
+    /// explicit and reproducible instead of order-dependent.
+    public static let expertMaxLayers: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_QWEN4EXP_ANE_EXPERT_MAX_LAYERS"],
+            let v = Int(raw), v >= 0
+        else { return 48 }
+        return v
+    }()
+
+    /// True when the grouped routed-expert lane may build and run.
+    public static var expertsEnabled: Bool {
+        Qwen4ExpANELane.enabled && !forcedMicroBatchProbe && mode == .experts
+    }
+
+    private static let layerAdmissionLock = NSLock()
+    nonisolated(unsafe) private static var admittedExpertLayers = 0
+
+    /// Admits one more MoE layer to the expert lane, or refuses once
+    /// `expertMaxLayers` layers already hold programs. Called once per layer,
+    /// under the layer's own cache lock.
+    public static func admitExpertLayer() -> Bool {
+        layerAdmissionLock.lock()
+        defer { layerAdmissionLock.unlock() }
+        guard admittedExpertLayers < expertMaxLayers else { return false }
+        admittedExpertLayers += 1
+        return true
+    }
+
+    /// Diagnostic: layers admitted to the expert lane so far.
+    public static func admittedExpertLayerCount() -> Int {
+        layerAdmissionLock.lock()
+        defer { layerAdmissionLock.unlock() }
+        return admittedExpertLayers
+    }
+
     /// True when the legacy micro-batch arm may run.
     public static var microBatchEnabled: Bool { Qwen4ExpANELane.enabled && mode == .microbatch }
 
@@ -184,5 +255,8 @@ public enum Qwen4ExpANEFused {
         defer { budgetLock.unlock() }
         reservedBytesCount = 0
         reservedProgramsCount = 0
+        layerAdmissionLock.lock()
+        admittedExpertLayers = 0
+        layerAdmissionLock.unlock()
     }
 }

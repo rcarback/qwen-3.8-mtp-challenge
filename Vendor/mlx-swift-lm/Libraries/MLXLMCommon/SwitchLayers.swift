@@ -115,10 +115,10 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 // MARK: - SwitchGLU
 
 public class SwitchGLU: Module {
-    @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
-    @ModuleInfo(key: "up_proj") var upProj: SwitchLinear?
-    @ModuleInfo(key: "gate_up_proj") var gateUpProj: SwitchLinear?
-    @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
+    @ModuleInfo(key: "gate_proj") public var gateProj: SwitchLinear?
+    @ModuleInfo(key: "up_proj") public var upProj: SwitchLinear?
+    @ModuleInfo(key: "gate_up_proj") public var gateUpProj: SwitchLinear?
+    @ModuleInfo(key: "down_proj") public var downProj: SwitchLinear
 
     let inputDims: Int
     let hiddenDims: Int
@@ -320,6 +320,16 @@ public class SwitchLinear: Module, Quantizable {
         return result
     }
 
+    /// Expert `index`'s weight as a dense `[outputDims, inputDims]` array.
+    ///
+    /// The stacked gather-GEMM never needs one expert on its own, but an
+    /// offload lane that compiles a fixed-shape program per expert does.
+    /// ``QuantizedSwitchLinear`` overrides this to dequantize; here the stack
+    /// is already dense and the expert is a slice.
+    public func denseExpertWeight(_ index: Int) -> MLXArray {
+        weight[index]
+    }
+
     public func toQuantized(groupSize: Int = 64, bits: Int = 4, mode: QuantizationMode) -> Module {
         QuantizedSwitchLinear(self, groupSize: groupSize, bits: bits, mode: mode)
     }
@@ -375,4 +385,11 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
 
         return result
     }
+
+    override public func denseExpertWeight(_ index: Int) -> MLXArray {
+        MLX.dequantized(
+            weight[index], scales: scales[index], biases: biases?[index],
+            groupSize: groupSize, bits: bits, mode: mode)
+    }
 }
+

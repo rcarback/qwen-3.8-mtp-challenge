@@ -19,6 +19,7 @@ final class Qwen4ExpSparseMoeBlock: Module {
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
     private let aneShared = Qwen4ExpANESharedExpertCache(label: "mlp.shared_expert")
+    private let aneExperts = Qwen4ExpANEExpertLane(label: "mlp.switch_mlp")
 
     init(_ args: Qwen4ExpTextConfiguration) {
         topK = args.numExpertsPerTok
@@ -43,6 +44,15 @@ final class Qwen4ExpSparseMoeBlock: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if Qwen4ExpANEFused.expertsEnabled, Qwen4ExpANEFused.armed(tokens: x.dim(1), batch: x.dim(0)) {
+            do {
+                if let out = try groupedExpertForward(x) { return out }
+            } catch {
+                // Unconditional, like the shared lane's: a repeating run
+                // failure otherwise silently doubles the routed work.
+                fputs("[qwen4exp-ane] grouped expert run failed: \(error); GPU path for this call\n", stderr)
+            }
+        }
         if Qwen4ExpANEFused.sharedEnabled,
             !(sharedExpert.gateProj is QuantizedLinear),
             !(sharedExpert.upProj is QuantizedLinear),
@@ -111,5 +121,89 @@ final class Qwen4ExpSparseMoeBlock: Module {
         }
 
         return out
+    }
+
+    // MARK: - Grouped routed-expert ANE lane
+
+    /// The hot experts' SwiGLU runs on the ANE as `programs` grouped
+    /// fixed-shape programs while the GPU runs the router's gather-GEMM and
+    /// the shared expert. ONE join per layer.
+    ///
+    /// What this does and does not save. The ANE takes real expert arithmetic
+    /// off the critical path, but the GPU's `switchMLP` gather keeps its
+    /// `[B, S, topK]` shape: the assignments the ANE served are neutralised by
+    /// zeroing their combine weight, not by shrinking the gather. Removing
+    /// them from the gather needs a variable-length compaction, whose dynamic
+    /// shapes fragment exactly the fused lazy graph the micro-batch arm was
+    /// measured losing 25% to. So this lane overlaps work; it does not yet
+    /// delete GPU work.
+    func groupedExpertForward(_ x: MLXArray) throws -> MLXArray? {
+        guard let gateProj = switchMLP.gateProj, let upProj = switchMLP.upProj else { return nil }
+        let downProj = switchMLP.downProj
+        let tokens = x.dim(1)
+        let hidden = x.dim(2)
+        let (idx, w) = route(x)
+        let indices2D = idx.reshaped(tokens, topK)
+
+        guard
+            let resolved = aneExperts.resolve(
+                indices: indices2D, numExperts: numExperts,
+                dequantizedExpert: { expert in
+                    (gateProj.denseExpertWeight(expert), upProj.denseExpertWeight(expert),
+                     downProj.denseExpertWeight(expert))
+                })
+        else { return nil }
+
+        let group = resolved.programs[0].groupSize
+        let capacity = resolved.programs[0].capacity
+        let plan = Qwen4ExpANEExpertPlanner.plan(
+            indices: indices2D, slotOf: resolved.slotOf, hotCount: resolved.hotCount,
+            capacity: capacity)
+        let packed = Qwen4ExpANEExpertPlanner.gather(x.reshaped(tokens, hidden), plan: plan)
+
+        // CALLER THREAD. BARRIER 1: staging evals inside `prepare`.
+        var prepared: [ANEDirectDispatch.Prepared] = []
+        prepared.reserveCapacity(resolved.programs.count)
+        for (p, program) in resolved.programs.enumerated() {
+            // [G*C, hidden] expert-major -> [C, G*hidden], the grouped conv's
+            // channel-block layout.
+            let lo = p * group * capacity
+            let hi = lo + group * capacity
+            let slice: MLXArray = packed[lo ..< hi, 0...]
+            let laid: MLXArray = slice.reshaped(group, capacity, hidden).transposed(1, 0, 2)
+                .reshaped(capacity, group * hidden)
+            prepared.append(try program.makeInput(laid))
+        }
+
+        let (_, gpu) = try ConcurrentEngines.run(
+            ane: { () -> Bool in  // BACKGROUND, no MLX
+                for (p, program) in resolved.programs.enumerated() {
+                    try program.predict(prepared[p])
+                }
+                return true
+            },
+            gpu: { () -> (MLXArray, MLXArray) in  // CALLER THREAD
+                let masked = w * (1 - plan.handled.reshaped(w.shape).asType(w.dtype))
+                let y = self.switchMLP(x, idx)
+                let routed = (y * masked.expandedDimensions(axis: -1).asType(y.dtype))
+                    .sum(axis: -2).asType(x.dtype)
+                let shared = sigmoid(self.sharedExpertGate(x)) * self.sharedExpert(x)
+                eval(routed, shared)  // BARRIER 2, mandatory
+                return (routed, shared)
+            })
+
+        // CALLER THREAD: read back, undo the channel-block layout, combine.
+        var blocks: [MLXArray] = []
+        blocks.reserveCapacity(resolved.programs.count)
+        for (p, program) in resolved.programs.enumerated() {
+            let out = program.readOutput(prepared[p])  // [C, G*hidden]
+            blocks.append(
+                out.reshaped(capacity, group, hidden).transposed(1, 0, 2)
+                    .reshaped(group * capacity, hidden))
+        }
+        let packedOut = blocks.count == 1 ? blocks[0] : concatenated(blocks, axis: 0)
+        let aneSum = Qwen4ExpANEExpertPlanner.combine(
+            packedOut, plan: plan, weights: w.reshaped(tokens, topK), tokens: tokens)
+        return gpu.0 + aneSum.asType(x.dtype).reshaped(x.shape) + gpu.1
     }
 }
