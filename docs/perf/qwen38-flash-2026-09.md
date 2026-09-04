@@ -1808,3 +1808,21 @@ This is a visual inspection of six continuations, not a quality measurement. It
 is enough to say that a calibrated selection is the right form and that a
 proper evaluation is the next step, not that the quality is acceptable.
 
+### The recommended configuration, measured
+
+Calibrated pruning to 128 experts combined with top-k 6:
+
+| Arm | Mean tok/s, prompts 2 to 6 | Against plain |
+|---|---:|---:|
+| plain | 296.70 | |
+| Calibrated pool 128 with top-k 6 | 405.82 | **+36.8 percent** |
+
+That equals the naive pool 128 with top-k 6 measured earlier, +36.8 percent,
+and it is the same figure for the same reason: both visit 128 experts and route
+six per token. The difference is the selection, and the continuations here stay
+on the prompt where the naive pairing's did not.
+
+This is the configuration to evaluate properly. It is a third more prefill
+throughput, from two knobs that both default off, and the entire cost sits in
+model quality, which nothing in this document measures.
+
