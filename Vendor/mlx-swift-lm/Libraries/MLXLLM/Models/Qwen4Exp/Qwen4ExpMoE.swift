@@ -85,14 +85,36 @@ final class Qwen4ExpSparseMoeBlock: Module {
     static let routerNative: Bool =
         ProcessInfo.processInfo.environment["MLX_QWEN4EXP_ROUTER_NATIVE"] == "1"
 
+    /// `MLX_QWEN4EXP_POOL`. Restrict routing to the first N experts, leaving
+    /// top-k unchanged. This does not reduce multiply-accumulates at all: the
+    /// same k experts run per token. It only concentrates those rows onto
+    /// fewer distinct experts. It therefore isolates one question the pruning
+    /// and merging literature depends on: does the gather kernel cost follow
+    /// the number of DISTINCT experts touched, or only the number of rows? A
+    /// speed change here is the whole speed case for pruning; no change means
+    /// pruning is a memory argument only. Quality is destroyed, so this is a
+    /// diagnostic, never a shipping mode.
+    static let poolLimit: Int? = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_QWEN4EXP_POOL"],
+            let v = Int(raw), v > 0
+        else { return nil }
+        return v
+    }()
+
     /// Router: float32 logits, top-k by `argPartition`, weights = softmax over the
     /// SELECTED logits (equal to softmax-all followed by renormalisation).
     func route(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
         let logits = Self.routerNative ? gate(x).asType(.float32) : gate(x.asType(.float32))
+        var logitsMasked = logits
+        if let pool = Self.poolLimit, pool < numExperts {
+            // Push everything outside the pool below any real logit.
+            let keep = MLXArray((0 ..< numExperts).map { Float($0 < pool ? 0 : -1e9) })
+            logitsMasked = logits + keep
+        }
         let k = min(Self.topKOverride ?? topK, numExperts)
         let kth = numExperts - k
-        let idx = MLX.argPartition(logits, kth: kth, axis: -1)[.ellipsis, kth...]
-        let w = MLX.softmax(MLX.takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
+        let idx = MLX.argPartition(logitsMasked, kth: kth, axis: -1)[.ellipsis, kth...]
+        let w = MLX.softmax(MLX.takeAlong(logitsMasked, idx, axis: -1), axis: -1, precise: true)
         Self.reportRouteStats(idx, experts: numExperts)
         return (idx, w)
     }

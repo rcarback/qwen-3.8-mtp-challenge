@@ -1682,3 +1682,49 @@ Throughput tracks the multiply-accumulates removed, a little below one for one.
 The routed expert path is therefore close to compute-proportional, and the
 whole gain is a quality-for-speed trade whose quality side is still unmeasured.
 
+### Shrinking the expert pool is fast, and it removes no arithmetic at all
+
+`MLX_QWEN4EXP_POOL` restricts routing to the first N experts while leaving
+top-k at ten. Every token still runs ten experts, so the multiply-accumulate
+count is unchanged. Only the number of DISTINCT experts touched falls.
+
+| Arm | Mean tok/s, prompts 2 to 6 | Against plain |
+|---|---:|---:|
+| plain | 294.60 | |
+| Pool restricted to 64 experts | 368.42 | **+25.1 percent** |
+| top-k=6 together with fused gate+up | 347.66 | +18.0 percent |
+
+This round carries one control rather than two, so read the magnitudes with
+the 0.8 percent drift seen elsewhere in mind. The effects are far larger than
+that.
+
+The pool result is the most informative measurement in this document. It
+removes no arithmetic, and it is worth a quarter of prefill. So the sorted
+gather kernel's cost is driven by how many distinct experts it must visit, not
+by how many rows it multiplies. Every per-expert visit carries a fixed cost:
+its own weight tile fetch, its own dequantisation setup, its own segment
+boundary.
+
+That has three consequences.
+
+Expert pruning and expert merging have a real speed case on this tower, and it
+is a stronger case than the literature's memory argument. Cutting 512 experts
+to 128 would not reduce the work per token at all, and would still be worth
+something close to this measurement.
+
+It also explains the top-k results without needing the compute-proportional
+story offered above. Reducing k lowers the number of distinct experts a layer
+touches, because with fewer draws fewer experts are hit at least once. That is
+the same mechanism as the pool restriction, reached from the other side.
+
+And it re-values the capacity-buffer idea that the routing skew appeared to
+kill. A dense batched form visits every expert exactly once by construction,
+which is the cost this measurement says dominates. The earlier rejection was
+based on padded row counts, and rows now look like the wrong currency. That
+deserves a rerun with a real routing distribution before the idea is filed
+away.
+
+Combining top-k=6 with the fused gate+up measures 18.0 percent, against 19.1
+percent for top-k=6 alone in the previous round. The fusion adds nothing here,
+consistent with it measuring as a wash on its own.
+
