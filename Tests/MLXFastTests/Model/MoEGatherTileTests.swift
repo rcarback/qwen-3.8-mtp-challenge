@@ -116,4 +116,51 @@ final class MoEGatherTileTests: XCTestCase {
             bestSplit, bestFused, 100 * bestFused / bestSplit))
         XCTAssertGreaterThan(bestSplit, 0)
     }
+
+    /// Isolation form of the fused-vs-split question: each arm runs in its OWN
+    /// process and allocates ONLY its own weights, so the 1.68 GB of stacks the
+    /// combined test holds resident cannot confound the result. Select the arm
+    /// with MOE_FUSE_ARM=split or MOE_FUSE_ARM=fused.
+    func testFusedGateUpIsolated() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
+            "needs a real GPU")
+        guard let arm = ProcessInfo.processInfo.environment["MOE_FUSE_ARM"] else {
+            throw XCTSkip("set MOE_FUSE_ARM=split|fused")
+        }
+        let experts = 512, inDim = 2560, outDim = 640, rows = 7000
+        func stack(_ out: Int) -> (MLXArray, MLXArray, MLXArray) {
+            let wf = MLXRandom.normal([experts, out, inDim]).asType(.bfloat16)
+            let q = MLX.quantized(wf, groupSize: 32, bits: 4)
+            let b = q.biases ?? MLXArray.zeros(q.scales.shape, dtype: q.scales.dtype)
+            eval(q.wq, q.scales, b)
+            return (q.wq, q.scales, b)
+        }
+        let x = MLXRandom.normal([rows, 1, inDim]).asType(.bfloat16)
+        var ids = (0 ..< rows).map { Int32(($0 * experts) / rows) }
+        ids.sort()
+        let idx = MLXArray(ids).reshaped(rows)
+        eval(x, idx)
+        func mm(_ w: (MLXArray, MLXArray, MLXArray)) -> MLXArray {
+            MLX.gatherQuantizedMM(
+                x, w.0, scales: w.1, biases: w.2, rhsIndices: idx,
+                transpose: true, groupSize: 32, bits: 4, sortedIndices: true)
+        }
+        var body: () -> Void
+        if arm == "fused" {
+            let f = stack(outDim * 2)
+            body = { let r = mm(f); eval(r) }
+        } else {
+            let g = stack(outDim), u = stack(outDim)
+            body = { let a = mm(g); let b = mm(u); eval(a, b) }
+        }
+        body()
+        var best = Double.infinity
+        for _ in 0 ..< 5 {
+            let t0 = Date()
+            for _ in 0 ..< 20 { body() }
+            best = min(best, Date().timeIntervalSince(t0) / 20 * 1000)
+        }
+        print(String(format: "[fuse-isolated] arm=%@  %7.3f ms", arm, best))
+    }
 }
