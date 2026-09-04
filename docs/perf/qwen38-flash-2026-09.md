@@ -1054,3 +1054,36 @@ The hardware argument is sound and the measurement still says no: the
 mechanism that distributes the work costs more than the second engine returns.
 An MoE ANE lane becomes interesting only if experts can be reached without
 micro-batching the prefill.
+
+### The cost is the restructuring, not the round trips
+
+A natural reading of the MoE lane's slowness is that data round-trips between
+the engines: staged out of MLX, into an IOSurface, through the ANE, and back.
+The three arms above settle it, because one of them contains no ANE at all.
+
+| Arm | Micro-batched | Data crosses engines | tok/s |
+|---|---|---|---|
+| plain | no | no | 293.7 |
+| micro-batched GPU | yes | **no** | 219.1 |
+| micro-batched ANE | yes | yes | 219.5 |
+
+In the middle arm `useANE` is false, so `program` is nil, `aneServes` is false
+for every micro-batch, and every projection goes through
+`layer.gpuProjection`. There is no `makeInput`, no IOSurface, no host copy, and
+nothing leaves the GPU. That arm still pays the entire 25.4 percent. Adding the
+round trips on top of it costs a further 0.2 percent.
+
+So the round trips are real and they are not the reason the lane is slow.
+Cutting one fused lazy graph into `n` segments multiplies the per-layer
+dispatch and barrier count, and that is charged whether or not any data ever
+moves between engines.
+
+This confirms rather than contradicts `docs/perf/ane-zero-transfer-spec.md`,
+which predicted the same thing from static analysis: it found staging was not
+the term that mattered, priced the micro-batching entrance fee at 499 to 986
+milliseconds against a lane ceiling of 2.7 to 8.1 percent of prefill, and
+cancelled the transfer-reduction tasks on that basis. These are the end-to-end
+numbers behind that prediction.
+
+The practical consequence is that transfer-reduction work cannot rescue this
+lane. Only reaching the experts without segmenting the prefill can.
