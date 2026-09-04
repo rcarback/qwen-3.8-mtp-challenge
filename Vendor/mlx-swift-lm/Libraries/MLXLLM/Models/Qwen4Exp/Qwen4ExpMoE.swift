@@ -33,6 +33,36 @@ final class Qwen4ExpSparseMoeBlock: Module {
         super.init()
     }
 
+    /// `MLX_QWEN4EXP_ROUTE_STATS=1`. Diagnostic only: on the first prefill,
+    /// report how unevenly tokens land on experts. The capacity-buffer design
+    /// picks its per-expert capacity C from this number, so it has to be
+    /// measured rather than assumed. Off by default and never on the hot path.
+    static let routeStats: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN4EXP_ROUTE_STATS"] == "1"
+    nonisolated(unsafe) static var routeStatsSeen = 0
+
+    static func reportRouteStats(_ idx: MLXArray, experts: Int) {
+        guard routeStats, routeStatsSeen < 480 else { return }
+        let flat = idx.flattened()
+        guard flat.size >= 512 else { return }  // decode step, not a prefill
+        eval(flat)
+        var counts = [Int](repeating: 0, count: experts)
+        for v in flat.asArray(Int32.self) { counts[Int(v)] += 1 }
+        let total = counts.reduce(0, +)
+        let mean = Double(total) / Double(experts)
+        let maxN = counts.max() ?? 0
+        let zero = counts.filter { $0 == 0 }.count
+        func overflow(_ c: Int) -> Int { counts.reduce(0) { $0 + max(0, $1 - c) } }
+        fputs(String(
+            format: "[route-stats] call=%3d rows=%5d mean=%6.2f max=%3d ratio=%5.2f zero=%3d "
+                + "overflow@16=%5d(%4.1f%%) @24=%5d(%4.1f%%) @32=%5d(%4.1f%%)\n",
+            routeStatsSeen, total, mean, maxN, Double(maxN) / mean, zero,
+            overflow(16), 100.0 * Double(overflow(16)) / Double(total),
+            overflow(24), 100.0 * Double(overflow(24)) / Double(total),
+            overflow(32), 100.0 * Double(overflow(32)) / Double(total)), stderr)
+        routeStatsSeen += 1
+    }
+
     /// Router: float32 logits, top-k by `argPartition`, weights = softmax over the
     /// SELECTED logits (equal to softmax-all followed by renormalisation).
     func route(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
@@ -40,6 +70,7 @@ final class Qwen4ExpSparseMoeBlock: Module {
         let kth = numExperts - topK
         let idx = MLX.argPartition(logits, kth: kth, axis: -1)[.ellipsis, kth...]
         let w = MLX.softmax(MLX.takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
+        Self.reportRouteStats(idx, experts: numExperts)
         return (idx, w)
     }
 

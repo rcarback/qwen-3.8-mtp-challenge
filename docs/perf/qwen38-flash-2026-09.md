@@ -1562,3 +1562,50 @@ The finding is that the method is worth building, and that the first thing to
 measure in that work is the real imbalance ratio, because it decides C and C
 decides everything.
 
+### Correction: real routing is heavily skewed, which invalidates the capacity result
+
+The capacity-buffer benchmark above assumed every expert receives about the
+same number of rows, because its synthetic index array assigned each expert an
+equal contiguous run. The real router does nothing of the kind.
+
+`MLX_QWEN4EXP_ROUTE_STATS=1` reports per-layer routing on a real prefill. On
+752 tokens of ordinary prose, 7520 assignments over 512 experts, mean 14.69
+rows per expert:
+
+| Quantity | Range across the 48 layers |
+|---|---|
+| Busiest expert, rows | 151 to 574 |
+| Imbalance ratio, busiest over mean | 10.3 to 39.1 |
+| Experts receiving zero rows | 147 to 239 of 512 |
+| Rows overflowing a capacity of 16 | 50 to 68 percent |
+| Rows overflowing a capacity of 32 | 25 to 52 percent |
+
+Two consequences, and both are fatal to the method as benchmarked.
+
+A capacity large enough to hold the busiest expert is about 600 rows, so the
+padded buffer would be 512 times 600 against 7520 real rows, a factor of 41 in
+wasted multiply work. A capacity small enough to be efficient, 16 or 32, spills
+between a quarter and two thirds of all rows to a remainder path, which is the
+very gather kernel the design set out to replace.
+
+Separately, between 147 and 239 experts receive no rows at all in any given
+layer. A dense batched form still computes a full capacity tile for each of
+them, so roughly 40 percent of the buffer is spent on experts that were not
+selected. Restricting the batch to active experts only would make the batch
+size data-dependent, which is the dynamic shape the whole design exists to
+avoid.
+
+The measured 1.28 to 1.43 times advantage stands only for uniform routing,
+which this model does not produce. Treat it as a statement about the kernel,
+not about the tower.
+
+The same caveat applies to the top-k table above. Its synthetic indices spread
+rows evenly, so its premise that every expert is touched at any k is false on
+real inputs: at k=10 roughly 300 of 512 experts are active, and reducing k
+would reduce that count and therefore reduce weight traffic. The end-to-end
+serve arms are unaffected, because those ran the real model on real prompts.
+
+The general lesson is worth stating plainly. A microbenchmark of a routed MoE
+kernel is only as good as its routing distribution, and a uniform distribution
+is the one case a trained router never produces.
+
