@@ -1973,3 +1973,26 @@ attacks the wrong term.
 The code stays in the tree, gated off by default. It is the scaffold and the
 baseline for the tiled version, and the arm harness reproduces every number
 above.
+
+### ANE maximum program size: the probe hangs rather than failing (2026-09-04)
+
+The resident-program limit is a count of 126, measured, and bytes do not enter
+into it. Total ANE capacity is therefore `126 x (maximum bytes per program)`,
+and only the 126 has ever been measured. 26 MB is the largest program anyone
+had tried, not a demonstrated ceiling.
+
+A sweep of one program at increasing size (5120, 10240, 20480, 40960, 81920 and
+163840 output channels against 2560 input channels, fp16, sequence length 128,
+so 26 MB to 839 MB) did not answer the question. The process stopped making
+progress and sat at 0.0 percent CPU for 39 minutes, with
+`ANECompilerService` also at 0.0 percent. That is a hang, not a slow compile.
+
+The finding is therefore negative and partial: at some size in this range the
+ANE program load stops returning instead of refusing. A clean refusal is what
+the count probe gets at the 127th program (`0x50004`), so the size path and the
+count path fail differently.
+
+Two things must change before this is retried. The sweep needs a per-size
+timeout so one hang does not consume the whole run, and its output must not be
+piped through a block-buffering filter, which is why no partial result survived
+this attempt.
