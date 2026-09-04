@@ -199,6 +199,7 @@ final class Qwen4ExpAttention: Module {
     @ModuleInfo(key: "indexer") var indexer: Qwen4ExpQSAIndexer
 
     private let aneQProj = Qwen4ExpANEProjectionCache(label: "self_attn.q_proj")
+    private let aneSplitQProj = Qwen4ExpANESplitProjectionCache(label: "self_attn.q_proj")
 
     init(_ args: Qwen4ExpTextConfiguration) {
         nHeads = args.attentionHeads
@@ -216,8 +217,30 @@ final class Qwen4ExpAttention: Module {
         super.init()
     }
 
-    /// GPU `q_proj`: `[B, S, nHeads * 2 * headDim]` (query then gate per head).
-    func qProjection(_ x: MLXArray) -> MLXArray { qProj(x) }
+    /// `q_proj`: `[B, S, nHeads * 2 * headDim]` (query then gate per head).
+    /// With the fused split lane armed the ANE owns output rows `[0, F)` and the
+    /// GPU owns `[F, out)`; the concat restores the row order `finish` reshapes.
+    /// The logical and physical row counts are both `q_proj`'s own `out`.
+    func qProjection(_ x: MLXArray) -> MLXArray {
+        if Qwen4ExpANEFused.splitEnabled,
+            !(qProj is QuantizedLinear),
+            Qwen4ExpANEFused.armed(tokens: x.dim(1), batch: x.dim(0)),
+            let program = aneSplitQProj.program(
+                forTokens: x.dim(1),
+                logicalOut: qProj.weight.dim(0),
+                weight: { self.qProj.weight })
+        {
+            let tokens = x.dim(1)
+            do {
+                return try program(x.reshaped(tokens, -1)).reshaped(1, tokens, -1)
+            } catch {
+                if Qwen4ExpANEFused.log {
+                    fputs("[qwen4exp-ane] split q_proj run failed: \(error); GPU path for this call\n", stderr)
+                }
+            }
+        }
+        return qProj(x)
+    }
 
     func aneQProjection(sequenceLength: Int) -> Qwen4ExpANEProjection? {
         guard Qwen4ExpANELane.enabled else { return nil }

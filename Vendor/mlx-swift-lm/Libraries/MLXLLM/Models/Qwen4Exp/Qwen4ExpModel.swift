@@ -137,11 +137,15 @@ public final class Qwen4ExpTextModel: Module {
             if let forced = Self.forcedMicroBatch, S >= 2 * forced {
                 return forwardMicroBatched(ids, cache: cache, microBatch: forced, useANE: false)
             }
-            if Qwen4ExpANELane.armed(sequenceLength: S) {
+            if Qwen4ExpANEFused.microBatchEnabled, Qwen4ExpANELane.armed(sequenceLength: S) {
                 return forwardMicroBatched(
                     ids, cache: cache, microBatch: Qwen4ExpANELane.microBatch, useANE: true)
             }
         }
+        // Every other mode, including `split`, `shared` and `both`, runs the
+        // plain forward below unchanged. The fused lanes join inside the
+        // modules, so the graph shape here is the same one the pure GPU path
+        // builds.
         var h = tiled(embedTokens(ids), repetitions: [1, 1, args.hcCount])
         let caches: [KVCache?] = cache.map { $0.map { Optional($0) } } ?? Array(repeating: nil, count: layers.count)
         let firstAttn = layers.firstIndex { !$0.isLinear }

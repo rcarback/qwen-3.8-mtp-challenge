@@ -34,6 +34,7 @@ final class Qwen4ExpGatedDeltaNet: Module {
     @ModuleInfo(key: "out_proj") var outProj: Linear
 
     private let aneInProj = Qwen4ExpANEProjectionCache(label: "linear_attn.in_proj")
+    private let aneSplitInProj = Qwen4ExpANESplitProjectionCache(label: "linear_attn.in_proj_qkv")
 
     init(_ args: Qwen4ExpTextConfiguration) {
         numVHeads = args.linearNumValueHeads
@@ -62,9 +63,38 @@ final class Qwen4ExpGatedDeltaNet: Module {
 
     // MARK: phase 1: the fused in-projection
 
-    /// GPU in-projection: `(mixedQKV [B, S, convDim], z [B, S, valueDim])`.
+    /// In-projection: `(mixedQKV [B, S, convDim], z [B, S, valueDim])`.
+    ///
+    /// With the fused split lane armed, the ANE computes `in_proj_qkv` rows
+    /// `[0, F)` while the GPU computes `in_proj_qkv` rows `[F, convDim)` and all
+    /// of `in_proj_z` in the same window. `F` is a share of the LOGICAL
+    /// `convDim + valueDim` phase-1 rows, clamped to `convDim`, so the split
+    /// point stays inside `in_proj_qkv` and the fused
+    /// `[in_proj_qkv; in_proj_z]` weight is never materialized. At the default
+    /// fraction `F = 5120` of the logical 16384 rows. At fraction 0.625 and
+    /// above `F` clamps to `convDim`, the split is degenerate, and the build is
+    /// refused; the layer then stays on the GPU.
     func inProjection(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        (inProjQKV(x), inProjZ(x))
+        if Qwen4ExpANEFused.splitEnabled,
+            !(inProjQKV is QuantizedLinear), !(inProjZ is QuantizedLinear),
+            Qwen4ExpANEFused.armed(tokens: x.dim(1), batch: x.dim(0)),
+            let program = aneSplitInProj.program(
+                forTokens: x.dim(1),
+                logicalOut: convDim + valueDim,
+                weight: { self.inProjQKV.weight })
+        {
+            let tokens = x.dim(1)
+            let x2 = x.reshaped(tokens, -1)
+            do {
+                let (qkv, extra) = try program.run(x2, gpuExtra: { [self.inProjZ($0)] })
+                return (qkv.reshaped(1, tokens, -1), extra[0].reshaped(1, tokens, -1))
+            } catch {
+                if Qwen4ExpANEFused.log {
+                    fputs("[qwen4exp-ane] split in_proj run failed: \(error); GPU path for this call\n", stderr)
+                }
+            }
+        }
+        return (inProjQKV(x), inProjZ(x))
     }
 
     /// The ANE program for the fused `[in_proj_qkv; in_proj_z]` at `sequenceLength`,
