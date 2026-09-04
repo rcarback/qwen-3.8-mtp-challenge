@@ -122,7 +122,7 @@ final class FusedRoutedMoETests: XCTestCase {
     /// resident measures the allocator and residency behaviour rather than the
     /// kernel (see `MoEGatherTileTests.testFusedGateUpIsolated`'s doc comment
     /// for the prior instance of that mistake). Run:
-    ///   for a in control tg64 tg128 tg256 tg512; do
+    ///   for a in control gather tg64 tg128 tg256 tg512; do
     ///     MOE_FUSED_ARM=$a MLXFAST_RUN_MLX_RUNTIME_TESTS=1 \
     ///       swift test --force-resolved-versions --filter testFusedArmTiming
     ///   done
@@ -130,12 +130,20 @@ final class FusedRoutedMoETests: XCTestCase {
     /// Ruling C3 note) loses only its ragged final round, and that loss grows
     /// with threadgroup count G -- so this sweeps DOWN from the shipped
     /// default of 256 rather than up. If tg64 wins, rerun with MOE_FUSED_ARM=tg32.
+    ///
+    /// `gather` is the actual production path the fused kernel replaces --
+    /// NOT `control`'s per-expert Swift loop, which no real code path takes.
+    /// Fix round 1: `control` alone left open which direction a real
+    /// `SwitchGLU` gather-QMM comparison would move the result, so this drives
+    /// a real `SwitchGLU` (gate_up already fused into one stack, matching what
+    /// `Qwen4ExpSparseMoeBlock.fusedRoutedForward` requires before it will even
+    /// try the kernel) over the same fixture.
     func testFusedArmTiming() throws {
         try XCTSkipUnless(
             ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
             "needs a real GPU")
         guard let arm = ProcessInfo.processInfo.environment["MOE_FUSED_ARM"] else {
-            throw XCTSkip("set MOE_FUSED_ARM=control|tg64|tg128|tg256|tg512")
+            throw XCTSkip("set MOE_FUSED_ARM=control|gather|tg64|tg128|tg256|tg512")
         }
 
         // Real per-layer geometry, with the MEASURED skew rather than uniform
@@ -211,6 +219,45 @@ final class FusedRoutedMoETests: XCTestCase {
                 }
                 return MLX.concatenated(out, axis: 0)
             }
+        case "gather":
+            // The real production path the fused kernel displaces: a
+            // `SwitchGLU` whose gate_up stack is already fused into one
+            // `[E, 2*hidden, inDim]` stack -- the same precondition
+            // `Qwen4ExpSparseMoeBlock.fusedRoutedForward` requires before it
+            // will even attempt the fused kernel (see Qwen4ExpMoE.swift) --
+            // driven with the SAME quantized weights as every other arm here,
+            // through `callAsFunction`'s real `gatherSort` -> fused gate_up
+            // `gatherQuantizedMM` -> silu*up -> down `gatherQuantizedMM` ->
+            // `scatterUnsort`, exactly as `SwitchLayers.swift` implements it.
+            let switchGLU = SwitchGLU(
+                inputDims: inDim, hiddenDims: hidden, numExperts: experts, fuseGateUp: true)
+            let gateUpLinear = QuantizedSwitchLinear(
+                inputDims: inDim, outputDims: 2 * hidden, numExperts: experts,
+                weight: gw, scales: gs, biases: gb, bias: nil,
+                groupSize: 32, bits: 4, mode: .affine)
+            let downLinear = QuantizedSwitchLinear(
+                inputDims: hidden, outputDims: inDim, numExperts: experts,
+                weight: dw, scales: ds, biases: db, bias: nil,
+                groupSize: 32, bits: 4, mode: .affine)
+            var children = ModuleChildren()
+            children["gate_up_proj"] = .value(gateUpLinear)
+            children["down_proj"] = .value(downLinear)
+            switchGLU.update(modules: children)
+
+            // One "token" per fixture row, top-1 routing, assigned to the
+            // SAME expert each row already belongs to per `offsets` -- so
+            // `gatherSort`'s per-expert grouping reproduces the identical
+            // per-expert row distribution the other arms measure against,
+            // and `indices.size` (realRows) clears the `doSort` >= 64
+            // threshold `SwitchGLU.callAsFunction` uses on real prompts.
+            var rowExpertIds = [Int32](repeating: 0, count: realRows)
+            for e in 0 ..< experts {
+                let lo = Int(offsets[e]), hi = Int(offsets[e + 1])
+                for r in lo ..< hi { rowExpertIds[r] = Int32(e) }
+            }
+            let xTokens = x.reshaped(1, realRows, inDim)
+            let gatherIdx = MLXArray(rowExpertIds).reshaped(1, realRows, 1)
+            run = { switchGLU(xTokens, gatherIdx) }
         default:
             guard arm.hasPrefix("tg"), let tg = Int(arm.dropFirst(2)) else {
                 throw XCTSkip("unknown arm \(arm); expected control|tg<N> (e.g. tg64, tg128)")

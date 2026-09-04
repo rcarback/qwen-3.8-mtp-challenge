@@ -157,11 +157,19 @@ public enum FusedRoutedMoE {
         rowOffsets: MLXArray, blockOffsets: MLXArray,
         hiddenDim: Int, inDim: Int, numExperts: Int,
         // Task 5, 2026-09-04, real per-layer geometry (512 experts, inDim
-        // 2560, hidden 640, 7000 rows, one 574-row hot expert, 190 idle):
-        // control (naive per-expert quantizedMM loop) 109.3ms; tg32 939.2ms;
-        // tg64 680.5ms (winner); tg128 754.5ms; tg256 920.9ms; tg512 922.3ms.
-        // See .superpowers/sdd/2026-09-04-fused-moe-kernel/task-5-report.md
-        // for the full arm table.
+        // 2560, hidden 640, 7000 rows, one 574-row hot expert, 190 idle).
+        // tg64 is the argmin of the threadgroup sweep in BOTH a back-to-back
+        // round (tg32 939.2ms; tg64 680.5ms; tg128 754.5ms; tg256 920.9ms;
+        // tg512 922.3ms) and a stricter round with a fixed rest between every
+        // arm (tg32 1062.3ms; tg64 1057.3ms; tg128 1114.7ms; tg256 1079.6ms;
+        // tg512 1120.3ms) -- but in the rested round the arms cluster within
+        // ~6% of each other, so this pin should be read as "no worse than the
+        // alternatives measured," not as a confidently large win. The finding
+        // that matters more: EVERY threadgroup count is 30-48x slower than
+        // the real production path (a `SwitchGLU` gather-QMM over the same
+        // fixture, ~21-22ms) at this geometry, which no `threadgroups` value
+        // fixes -- see the redundant-weight-traffic analysis in
+        // .superpowers/sdd/2026-09-04-fused-moe-kernel/task-5-report.md.
         threadgroups: Int = 64
     ) -> MLXArray {
         let rows = xSorted.dim(0)
