@@ -77,10 +77,18 @@ final class Qwen4ExpSparseMoeBlock: Module {
         return v
     }()
 
+    /// `MLX_QWEN4EXP_ROUTER_NATIVE=1`. Run the router GEMM in the activation's
+    /// own dtype and cast only the [tokens, 512] logits to float32, instead of
+    /// casting the [tokens, 2560] activation first. Selection and the weight
+    /// softmax still run in float32. Saves a wide upcast per layer; can change
+    /// which experts win a near-tie, so it is off by default.
+    static let routerNative: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN4EXP_ROUTER_NATIVE"] == "1"
+
     /// Router: float32 logits, top-k by `argPartition`, weights = softmax over the
     /// SELECTED logits (equal to softmax-all followed by renormalisation).
     func route(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
-        let logits = gate(x.asType(.float32))
+        let logits = Self.routerNative ? gate(x).asType(.float32) : gate(x.asType(.float32))
         let k = min(Self.topKOverride ?? topK, numExperts)
         let kth = numExperts - k
         let idx = MLX.argPartition(logits, kth: kth, axis: -1)[.ellipsis, kth...]

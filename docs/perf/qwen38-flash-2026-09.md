@@ -1646,3 +1646,39 @@ the quality side. Before using it, measure perplexity or task accuracy against
 the shipped k=10. The knob defaults to the checkpoint value and changes nothing
 unless it is set.
 
+### Second measurement round: router dtype, wider ANE coverage, top-k=4
+
+Same driver, plain controls on both sides, mean of prompts 2 to 6.
+
+| Arm | Mean tok/s | Against the plain mean |
+|---|---:|---:|
+| plain, first | 298.30 | |
+| plain, second | 295.94 | |
+| plain mean | 297.12 | |
+| Router GEMM in native dtype | 299.60 | +0.83 percent |
+| ANE grouped experts, 16 hot per layer | 275.02 | **-7.4 percent** |
+| top-k=4 | 382.28 | **+28.7 percent** |
+
+The two controls differ by 0.80 percent, so the router result sits exactly on
+the noise floor and is not demonstrated. Its ceiling was always about one
+percent, since the router gate is 1.2 percent of the tower's multiply
+accumulates and only the wide upcast is removed.
+
+Doubling the ANE lane's coverage made it worse, not better: 16 hot experts per
+layer measures -7.4 percent where 8 measured -6.84 percent. Coverage and cost
+move together on this lane, which is what a per-layer join cost predicts and a
+compute win would not. That is the fifth independent ANE measurement on this
+tower and the fifth loss.
+
+The top-k curve continues cleanly:
+
+| k | Against its own plain mean | Share of routed FLOPs removed |
+|---:|---:|---:|
+| 8 | +7.5 percent | 8.8 percent |
+| 6 | +19.1 percent | 17.7 percent |
+| 4 | +28.7 percent | 26.5 percent |
+
+Throughput tracks the multiply-accumulates removed, a little below one for one.
+The routed expert path is therefore close to compute-proportional, and the
+whole gain is a quality-for-speed trade whose quality side is still unmeasured.
+
