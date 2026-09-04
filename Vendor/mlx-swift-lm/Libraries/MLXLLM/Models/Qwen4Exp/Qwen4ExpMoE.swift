@@ -18,6 +18,8 @@ final class Qwen4ExpSparseMoeBlock: Module {
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
+    private let aneShared = Qwen4ExpANESharedExpertCache(label: "mlp.shared_expert")
+
     init(_ args: Qwen4ExpTextConfiguration) {
         topK = args.numExpertsPerTok
         numExperts = args.numExperts
@@ -41,9 +43,55 @@ final class Qwen4ExpSparseMoeBlock: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if Qwen4ExpANEFused.sharedEnabled,
+            !(sharedExpert.gateProj is QuantizedLinear),
+            !(sharedExpert.upProj is QuantizedLinear),
+            !(sharedExpert.downProj is QuantizedLinear),
+            Qwen4ExpANEFused.armed(tokens: x.dim(1), batch: x.dim(0)),
+            let program = aneShared.program(
+                forTokens: x.dim(1),
+                gate: { self.sharedExpert.gateProj.weight },
+                up: { self.sharedExpert.upProj.weight },
+                down: { self.sharedExpert.downProj.weight })
+        {
+            // Hoisted out of the guard chain so a run failure can log. A
+            // `try?` inside an `if let` condition list cannot carry a `catch`.
+            do {
+                return try offloadedForward(x, program: program)
+            } catch {
+                if Qwen4ExpANEFused.log {
+                    fputs("[qwen4exp-ane] shared expert run failed: \(error); GPU path for this call\n", stderr)
+                }
+            }
+        }
         let (idx, w) = route(x)
         let y = switchMLP(x, idx)  // [B, S, k, D]
         let routed = (y * w.expandedDimensions(axis: -1).asType(y.dtype)).sum(axis: -2)
         return routed.asType(x.dtype) + sigmoid(sharedExpertGate(x)) * sharedExpert(x)
+    }
+
+    /// `sharedExpert(x)` does not depend on the routed sum, so it runs on the
+    /// ANE while the GPU runs the router, the routed gather-GEMM and the
+    /// `[B, S, 1]` shared-expert gate. Two barriers per layer (spec 0.4).
+    func offloadedForward(_ x: MLXArray, program: Qwen4ExpANESharedExpert) throws -> MLXArray {
+        let tokens = x.dim(1)
+        // CALLER THREAD. BARRIER 1: staging evals inside.
+        let prepared = try program.makeInput(x.reshaped(tokens, -1))
+        let (_, gpu) = try ConcurrentEngines.run(
+            ane: { try program.predict(prepared) },  // BACKGROUND, no MLX
+            gpu: { () -> (MLXArray, MLXArray) in  // CALLER THREAD
+                let (idx, w) = self.route(x)
+                let y = self.switchMLP(x, idx)
+                let routed = (y * w.expandedDimensions(axis: -1).asType(y.dtype))
+                    .sum(axis: -2).asType(x.dtype)
+                let gate = sigmoid(self.sharedExpertGate(x))  // [B, S, 1]
+                eval(routed, gate)  // BARRIER 2, mandatory
+                return (routed, gate)
+            })
+        // CALLER THREAD: read back, drop padded rows, combine.
+        let shared = program.readOutput(prepared, tokens: tokens)  // [tokens, hidden] fp16
+        let out = gpu.0 + gpu.1 * shared.asType(x.dtype).reshaped(x.shape)
+        if Qwen4ExpANEFused.zeroCopyReadback { eval(out) }  // BARRIER 3, zero-copy only
+        return out
     }
 }
