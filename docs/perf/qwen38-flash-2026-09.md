@@ -2000,3 +2000,42 @@ Nothing is therefore known about the maximum program size beyond the 26 MB that
 the count probe already demonstrated. A retry needs unbuffered output, a
 per-size timeout so one slow size cannot consume the run, and a liveness check
 that samples the worker process.
+
+## N-gram table gather, measured (2026-09-04)
+
+204.854 ms is the best-of-5 gather time at real per-forward geometry: 700
+tokens times 16 heads, 11,200 rows, each row 160 bf16 values converted to
+float16. The gather ran once per forward, since PLE sits at layer 2 only. The
+timed loop touched 392 distinct 16 KiB pages.
+
+The ratio of gather time to that 1.06 s of MoE work is 204.854 ms over
+1,060 ms, about 19.3 percent.
+
+### The fixture bounds conversion cost only
+
+The fixture is 2,500 rows per shard times 8 shards, 20,000 rows of 160
+dimensions at 2 bytes each, 6.4 MB total. That size is cache-resident, and the
+warm call before the timed loop faults every page in. The real table is
+102.4 GB across 128 shards, sparsely touched, and its pages are not resident
+between forwards on the ranked box.
+
+This measurement therefore bounds conversion cost only: the 1.79 million
+scalar bf16-to-f16 conversions and the per-row memcpy that `gather` performs.
+It says nothing about page-fault cost on the real table. Because the fixture
+is fully faulted in before the timed loop starts, 204.854 ms is a floor on
+the real gather, not a ceiling. Page faults against a 102.4 GB memory-mapped
+file on the ranked box add cost this run did not measure. Real-table gather
+time is expected to sit at or above this figure.
+
+### Decision
+
+The measured gather clears 50 ms by a wide margin. That places it in the top
+branch of the decision rule: a gather at or above 50 ms, about 5 percent of
+the forward, justifies Task 3 on speed. Proceed to Task 3, re-measure the
+gather after the rewrite, then decide Task 4 from the re-measured number.
+
+Because the fixture measurement is a floor rather than a ceiling, the
+page-fault gap does not weaken this decision. It only adds cost the fixture
+could not see, so the real gather is at least as expensive as 204.854 ms,
+not less. The under-10-ms "not hot" branch, and the footprint-only carve-out
+that branch requires, do not apply to this result.

@@ -31,4 +31,43 @@ final class Qwen4ExpNGramGatherTests: XCTestCase {
             XCTAssertLessThanOrEqual(s.distinctPages, 32, "at most one page per row")
         }
     }
+
+    /// Real per-forward geometry: 700 tokens x 16 heads = 11,200 rows of 160
+    /// bf16 values. Reports gather wall time so the table's cost can be stated
+    /// as a fraction of a forward pass instead of guessed from its file size.
+    ///
+    /// Baseline for interpretation: one layer's routed MoE measures 22.0 ms at
+    /// real geometry, and there are 48 layers, so a whole forward's MoE work is
+    /// on the order of 1.06 s. The gather runs ONCE per forward (PLE is at
+    /// layer 2 only). Anything under ~10 ms here is under 1 percent of the
+    /// forward and is not worth optimizing further.
+    func testGatherTimingAtRealGeometry() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
+            "needs a real GPU")
+        let rowsPerShard = 2_500_012 / 1000  // scaled fixture, same row width
+        let table = try Qwen4ExpNGramTable.inMemoryFixture(
+            rowsPerShard: rowsPerShard, dim: 160, shards: 8)
+
+        var rng = SystemRandomNumberGenerator()
+        let total = Int64(rowsPerShard * 8)
+        let gids: [[Int64]] = (0 ..< 700).map { _ in
+            (0 ..< 16).map { _ in Int64.random(in: 0 ..< total, using: &rng) }
+        }
+
+        _ = table.gather(gids)  // warm: fault the pages in
+        Qwen4ExpNGramTable.stats.reset()
+        var best = Double.greatestFiniteMagnitude
+        for _ in 0 ..< 5 {
+            let t0 = Date()
+            let out = table.gather(gids)
+            out.eval()
+            best = min(best, Date().timeIntervalSince(t0))
+        }
+        let s = Qwen4ExpNGramTable.stats.snapshot()
+        print(
+            "[ngram] 700 tok x 16 heads = \(s.rows / 5) rows; best \(String(format: "%.3f", best * 1000)) ms; "
+                + "distinct 16KiB pages \(s.distinctPages / 5)")
+        XCTAssertEqual(s.rows / 5, 11_200)
+    }
 }
