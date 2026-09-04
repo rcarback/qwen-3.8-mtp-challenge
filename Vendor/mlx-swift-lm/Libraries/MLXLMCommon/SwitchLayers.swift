@@ -364,6 +364,19 @@ public class SwitchGLU: Module {
         return (both[0 ..< hiddenDims, 0...], both[hiddenDims ..< (2 * hiddenDims), 0...], down)
     }
 
+    /// `MLX_MOE_ACT_SPARSITY`. Intra-expert activation sparsity, training-free
+    /// form: zero the SwiGLU intermediate channels whose magnitude falls below
+    /// this multiple of the row's mean absolute value. The literature reports
+    /// large gains from skipping those channels' work; MLX computes the down
+    /// projection densely, so masking cannot skip anything and only adds a pass.
+    /// This exists to measure that, not to ship.
+    static let actSparsity: Float? = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_MOE_ACT_SPARSITY"],
+            let v = Float(raw), v > 0
+        else { return nil }
+        return v
+    }()
+
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
@@ -410,7 +423,13 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        x = downProj(activated, idx, sortedIndices: doSort)
+        var gated = activated
+        if let f = Self.actSparsity {
+            let mag = MLX.abs(gated)
+            let thr = mag.mean(axis: -1, keepDims: true) * f
+            gated = MLX.where(mag .>= thr, gated, MLXArray(0).asType(gated.dtype))
+        }
+        x = downProj(gated, idx, sortedIndices: doSort)
 
         if doSort {
             x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)

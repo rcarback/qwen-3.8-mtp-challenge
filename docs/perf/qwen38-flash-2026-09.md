@@ -1760,3 +1760,24 @@ popularity or by output similarity and would recover much of what this loses.
 What the curve establishes is that the speed prize is real and large enough to
 justify that work, which was the open question.
 
+### Intra-expert activation sparsity, executed: no speed change, real quality loss
+
+`MLX_MOE_ACT_SPARSITY` zeroes SwiGLU intermediate channels whose magnitude
+falls below a multiple of the row's mean absolute value, the training-free form
+of the technique.
+
+| Arm | Mean tok/s, prompts 2 to 6 | Against plain |
+|---|---:|---:|
+| plain | 296.70 | |
+| Activation sparsity at 1.0x mean | 294.38 | -0.8 percent |
+
+The result is the one the structure predicts. Masking a channel does not let
+MLX skip it: the down projection is a dense quantized GEMM over all 640
+intermediate channels whatever their values, so the mask adds a pass and
+removes no work. The published gains come from kernels that consume a sparsity
+mask and skip the corresponding columns, which this stack has no path to
+express.
+
+Greedy continuations diverged from the plain arm on several prompts, so the
+method costs output quality and returns no time. It is executed and closed.
+
