@@ -1826,3 +1826,38 @@ This is the configuration to evaluate properly. It is a third more prefill
 throughput, from two knobs that both default off, and the entire cost sits in
 model quality, which nothing in this document measures.
 
+### Execution status of every catalogue entry
+
+| Method | Status | Result or reason |
+|---|---|---|
+| Micro-batched ANE lane | executed | -25.2 percent |
+| Shared expert on ANE | executed | -2.8 and -3.3 percent |
+| Projection channel split on ANE | executed | -3.6 percent |
+| Grouped experts on ANE, 8 hot | executed | -6.84 percent |
+| Grouped experts on ANE, 16 hot | executed | -7.4 percent |
+| Fused gate+up gather GEMM | executed | -0.60 percent, within drift |
+| top-k reduction, k = 8, 6, 4 | executed | +7.5, +19.1, +28.7 percent |
+| Naive expert pool, 256, 128, 64 | executed | +10.4, +18.0, +25.1 percent |
+| Calibrated popularity pruning, 128 | executed | +17.7 percent |
+| Pruning combined with top-k | executed | +36.8 percent |
+| Router GEMM in native dtype | executed | +0.83 percent, at the noise floor |
+| Intra-expert activation sparsity | executed | -0.8 percent |
+| Capacity-padded batched GEMM | executed at kernel level | 1.28 to 1.43x on uniform routing, refuted by real skew |
+| Small-M row tile for the gather GEMM | inspected, already present | M4 selects a 16-row tile; the M5 path hardcodes 64 |
+| Expert-major relayout | inspected, no-op | the quantized path passes transpose as a kernel flag |
+| Token rounding to tile multiples | not applicable | rows per expert sit below the tile already |
+| Larger prefill chunk or batching | executed | rate peaks near 1300 tokens then falls |
+| Capacity-factor token dropping | not executed | needs the capacity path, which the skew measurement refuted |
+| Fused router kernel | not executed | custom Metal kernel, and the router is 1.2 percent of the tower |
+| Re-quantize experts smaller | not executed | tower is at 6 percent of bus, traffic does not bind |
+| Expert merging, weight averaging | not executed | requires dequantising, averaging and requantising 24,576 experts |
+| BaseRT single-launch fused MoE kernel | not executed | a from-scratch Metal grouped GEMM, estimated 60 to 120 hours |
+| Expert offload and streaming | not applicable | every expert is resident; there is nothing to stream |
+| Expert prefetching | not applicable | same reason |
+| Expert-parallel sharding | not applicable | one device |
+
+Nineteen configurations covering sixteen distinct methods were measured. Four
+entries are inapplicable to a single-device, fully resident deployment rather
+than skipped. Four were not executed and each is named above with its reason;
+the largest, BaseRT, is a multi-week kernel project.
+
