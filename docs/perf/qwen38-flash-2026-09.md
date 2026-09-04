@@ -1090,6 +1090,10 @@ lane. Only reaching the experts without segmenting the prefill can.
 
 ## MoE tower, fused single-split lanes (2026-09-03)
 
+> The round 1 tables in this section are superseded by "Round 2:
+> interleaved, logged" below. Round 1 ran without worker logs and while the
+> machine may not have been quiet; its `split` figure did not reproduce.
+
 The prior section closed on one path forward: reach the MoE experts without
 segmenting the prefill. This section measures that path. The fused lane keeps
 each piece of work as one independent unit with one join per layer, and does
@@ -1108,7 +1112,7 @@ not micro-batch. Two features were measured together and separately:
 | `MLX_ANE_DIRECT` | enables the ANE-direct path |
 | `MLX_QWEN4EXP_ANE_MODE` | selects `split`, `shared`, or `both` |
 | `MLX_QWEN4EXP_ANE_LOG` | turns on the `[qwen4exp-ane]` build/failure log |
-| `MLX_QWEN4EXP_ANE_SPLIT_FRACTION` | fraction of intermediate channels sent to the ANE prefix in split mode (not swept this run) |
+| `MLX_QWEN4EXP_ANE_SPLIT_FRACTION` | share of the phase-1 projection output rows the ANE prefix computes in split mode, default 0.3125 (not swept) |
 
 ### Program budget from the spec
 
@@ -1168,10 +1172,14 @@ counts as run-to-run drift rather than a code effect.
 The `both` arm is the only one with a surviving build log (188 tagged lines).
 The `split` and `shared` arms wrote no lines to the served log at all,
 including two lines that fire unconditionally regardless of the logging flag,
-so their build and failure counts could not be read from this run. The
-measurement report attributes this to stdio buffering combined with an
-ungraceful process kill, not to the lanes being inert (see the token-head
-differences below).
+so their build and failure counts could not be read from this run. The cause
+was in the parent, not the worker: `WorkerStderrDrain` read the worker's
+stderr pipe with `readData(ofLength: 8192)`, which on a pipe blocks until 8 KB
+have arrived or the pipe closes. A direct probe confirmed the call returned
+only at process exit. A worker that printed under 8 KB before the kill had
+nothing forwarded, and the `both` arm's lines were forwarded in 8 KB blocks,
+which is why they appear after `listening on`. Commit `2fd0f598` reads with
+`availableData` instead, and every round 2 arm below carries its full log.
 
 From the `both` arm's log:
 
@@ -1248,3 +1256,83 @@ arms, and a single pass per arm mean none of these MoE fused-lane numbers
 should be treated as final. A rerun with the stdio-buffering fix from the
 measurement report, and a proper cooldown gate between arms, is needed before
 drawing a conclusion about split or shared on this workload.
+
+### The program limit is a count, not a byte budget
+
+`ANEProgramCountLimitTests` loads fixed-shape programs until the ANE refuses
+one. Both sizes fail at the same place:
+
+| Program | Weight bytes | Loaded before the first `0x50004` |
+|---|---:|---:|
+| 64x64, S=128 | 8 KB | 126 |
+| 5120x2560, S=1024 | 26 MB | 126 |
+
+One process holds at most 126 loaded ANE programs. Bytes do not enter into it.
+This explains every failure this document has recorded: the dense lane held
+64 programs at bucket 512 and lost 10 of the 64 it then wanted at bucket 1024
+(118 fit, 10 did not), and the round 1 `both` arm held 96 at bucket 512 and
+lost most of the 96 it then wanted at bucket 1024. A lane that needs more than
+126 programs across its buckets must unload the previous bucket or share
+programs across layers. The `Qwen4ExpANEFused` byte budget of 4096 MB is not
+the binding constraint and its count limit should be 126 minus what the
+dense lane holds, not 256.
+
+### Round 2: interleaved, logged
+
+Same six prompts, same driver, 60 seconds between arms, plain and shared
+alternating so each shared arm has a plain neighbour on both sides. Every
+lane arm logged 48 programs built at bucket 512 during the serve warm and 48
+at bucket 1024 on the first prompt, with zero build failures and zero run
+failures. Worker binary at `00bb2ca8`. Prompt 1 pays the bucket-1024 compile
+in the lane arms and a cold-start cost in every arm, so the means below are
+prompts 2 to 6.
+
+| Prompt tokens | plain A | shared A | plain B | shared B | split B |
+|---:|---:|---:|---:|---:|---:|
+| 653 | 165.8 | 123.0 | 180.8 | 103.2 | 111.1 |
+| 675 | 275.5 | 267.8 | 267.3 | 256.5 | 247.8 |
+| 692 | 272.3 | 266.8 | 249.8 | 247.5 | 256.4 |
+| 723 | 275.5 | 269.0 | 276.3 | 259.1 | 257.4 |
+| 735 | 282.9 | 274.2 | 276.2 | 267.6 | 264.4 |
+| 765 | 290.7 | 280.6 | 274.2 | 268.2 | 268.8 |
+| mean 2 to 6 | **279.4** | **271.7** | **268.8** | **259.8** | **259.0** |
+
+| Comparison | Effect | Prompts lower |
+|---|---:|---:|
+| shared A against plain A | -2.8 percent | 5 of 5 |
+| shared B against plain B | -3.3 percent | 5 of 5 |
+| split B against plain B | -3.6 percent | 4 of 5 |
+| plain B against plain A (drift) | -3.8 percent | |
+
+The drift between the two plain arms is as large as either lane effect, which
+is why the comparison is against the adjacent plain arm and not against a
+pooled mean. Read that way, both lanes lose about 3 percent on every prompt
+pair. The round 1 `split` loss of 29 percent did not reproduce and is not
+carried forward.
+
+Emitted tokens: plain A and plain B agree on all six prompts. Shared A and
+shared B agree with each other and differ from plain on prompts 675 and 692.
+Split B differs from plain on prompt 692 only. The divergences are
+deterministic across repeats, which is the fp16 representation effect the
+design anticipated, not noise.
+
+### What the fused lanes say
+
+The fused shape removes the micro-batch restructuring and its 25 percent
+cost, exactly as intended, and what remains is a small loss on both features.
+The reason is the size of the concurrency window. The shared expert is one
+expert beside ten routed ones, so its share of layer compute is about 5
+percent and the two barriers per layer cost more than the overlap returns.
+The projection split has the same problem in a different place: the window
+holds only the projection itself, about 29 million multiply-adds per token on
+the GPU beside 13 million on the ANE, and nothing else in the layer can enter
+it because everything downstream depends on the result. On the dense tower
+the same window holds the whole MLP suffix, which is why the same mechanism
+wins there and loses here.
+
+The MoE tower has no independent, fixed-shape piece of work large enough to
+pay for a per-layer join. The routed experts are the only large piece, and
+they cannot be reached from a fixed-shape program. This closes the ANE
+question for this tower: the micro-batch lane loses 25 percent, the fused
+lanes lose about 3 percent, and there is no third shape.
+
