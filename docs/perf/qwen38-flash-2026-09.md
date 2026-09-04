@@ -2076,3 +2076,67 @@ scalar loop such as this gather's inner conversion, that gap can
 be two orders of magnitude. Any test in this codebase that reports
 milliseconds without stating its build configuration should be treated as
 unverified until it is re-run in release.
+
+## N-gram table int8 and int4 variants, measured (2026-09-04)
+
+int8 reconstructs the real table almost exactly, and int4 does not. Both
+variants convert cleanly, and the choice between them rests on how much
+embedding error the model tolerates, which this work did not measure.
+
+The table below reports one real shard, `shard_000`, of the pinned 128-shard
+table. The sample is 100,000 real rows drawn from that shard and read through
+the same `gather` path production uses. A release build produced every number.
+
+| metric | int8 | int4 |
+|---|---|---|
+| size ratio against bf16 | 0.5125 | 0.2625 |
+| whole-table size | 52.5 GB | 26.9 GB |
+| mean absolute error | 3.84e-05 | 6.50e-04 |
+| maximum absolute error | 1.83e-04 | 2.91e-03 |
+| mean relative row-max error | 0.21 percent | 3.31 percent |
+| mean cosine similarity | 0.999982 | 0.994836 |
+| worst-row cosine similarity | 0.999954 | 0.986941 |
+
+### Why this work happened, and what it does not claim
+
+Footprint and residency justify these variants. Speed does not. The bf16 table
+is 102.4 GB and the transformer tower is 87.2 GB, so the pair needs 189.6 GB
+against the 128 GB this machine holds. At int4 the pair needs about 114 GB and
+fits. At int8 it needs about 140 GB and still does not fit.
+
+The gather is not hot. A release build measures it at 1.609 ms for 11,200 rows
+at real per-forward geometry, against roughly 1,060 ms of MoE work. That is
+about 0.15 percent of a forward.
+
+### Page footprint falls with the encoding
+
+392 distinct 16 KiB pages carry the bf16 gather at real geometry. int8 touches
+200 and int4 touches 104. These counts are exact, and they matter more on the
+real table than on any fixture. The real table is sparsely touched and its
+pages do not stay resident, so fewer pages touched means fewer faults taken.
+
+### The timing numbers in this run are contaminated
+
+Do not quote per-variant gather times from this run. The suite executed 11
+tests in one process, which violates the one-arm-per-process rule this
+document applies to every other timing claim. The isolated bf16 measurement of
+1.609 ms stands; the 2.1 to 2.3 ms figures this run printed for all three
+encodings reflect a dirtied process and serve only to show that quantized
+gather stays in the same range as bf16.
+
+### Recommendation
+
+Adopt int8. Its worst-row cosine similarity of 0.999954 leaves no embedding
+meaningfully moved.
+
+Do not adopt int4 on this evidence. A worst-row cosine similarity of 0.986941
+and a mean relative row-max error of 3.31 percent are not noise. This test
+measures reconstruction error in embedding space. It does not measure model
+output, so it answers how far an embedding moves and not whether the model
+cares. The n-gram embeddings feed the PLE path at layer 2, and the network may
+absorb that angular error or may not.
+
+int4 remains the only variant that makes the table and the tower resident
+together, so the footprint case for it is real. Deciding it needs an
+end-to-end logit-divergence check against the bf16 table on real prose. That
+check is separate work.
