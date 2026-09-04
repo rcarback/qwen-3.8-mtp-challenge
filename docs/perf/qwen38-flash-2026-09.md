@@ -2003,39 +2003,76 @@ that samples the worker process.
 
 ## N-gram table gather, measured (2026-09-04)
 
-204.854 ms is the best-of-5 gather time at real per-forward geometry: 700
-tokens times 16 heads, 11,200 rows, each row 160 bf16 values converted to
-float16. The gather ran once per forward, since PLE sits at layer 2 only. The
-timed loop touched 392 distinct 16 KiB pages.
+1.630 ms is the release-build best-of-5 gather time at real per-forward
+geometry: 700 tokens times 16 heads, 11,200 rows. Each row holds 160 bf16
+values converted to float16. The gather ran once per forward, since PLE
+sits at layer 2 only. The timed loop touched 392 distinct 16 KiB pages.
 
-The ratio of gather time to that 1.06 s of MoE work is 204.854 ms over
-1,060 ms, about 19.3 percent.
+A first pass measured the same test under a plain debug build (`swift test`,
+no `-c release`) at 204.854 ms. That is about 125.7 times the release
+number. That debug figure is not a usable bound on the gather's real cost.
+The next section explains why.
 
-### The fixture bounds conversion cost only
+The ratio of the release gather time to the roughly 1.06 s of MoE work in a
+700-token forward is 1.630 ms over 1,060 ms, about 0.15 percent.
 
-The fixture is 2,500 rows per shard times 8 shards, 20,000 rows of 160
-dimensions at 2 bytes each, 6.4 MB total. That size is cache-resident, and the
-warm call before the timed loop faults every page in. The real table is
-102.4 GB across 128 shards, sparsely touched, and its pages are not resident
-between forwards on the ranked box.
+### Two measurement errors, opposite directions
 
-This measurement therefore bounds conversion cost only: the 1.79 million
-scalar bf16-to-f16 conversions and the per-row memcpy that `gather` performs.
-It says nothing about page-fault cost on the real table. Because the fixture
-is fully faulted in before the timed loop starts, 204.854 ms is a floor on
-the real gather, not a ceiling. Page faults against a 102.4 GB memory-mapped
-file on the ranked box add cost this run did not measure. Real-table gather
-time is expected to sit at or above this figure.
+Two separate effects push this measurement away from the real gather's cost,
+in opposite directions. The doc's first pass named only one of them.
+
+**Effect 1: debug build overhead pushes the number UP.** The first pass ran
+under `swift test` with no `-c release` flag, so it built in debug
+configuration. Debug Swift performs no inlining and does not specialize the
+`Float16(Float(bitPattern:))` conversion in the gather's inner loop. It also
+keeps retain and release traffic live on every iteration. On a tight
+per-element scalar loop, that routinely costs 10 to 100+ times a release
+build. The measured 125.7 times ratio here sits inside that range.
+
+**Effect 2: fixture residency pushes the number DOWN, relative to the real
+table.** The fixture is 2,500 rows per shard times 8 shards, 20,000 rows of
+160 dimensions at 2 bytes each, 6.4 MB total. That size is cache-resident,
+and a warm call before the timed loop faults every page in. The real table
+is 102.4 GB across 128 shards, sparsely touched, and its pages are not
+resident between forwards on the ranked box. This measurement bounds
+conversion cost only: the 1.79 million scalar bf16-to-f16 conversions and
+the per-row memcpy that `gather` performs. It says nothing about page-fault
+cost on the real table.
+
+Effect 1 is much larger than effect 2, and it dominates the debug reading.
+That is why 204.854 ms cannot be used to reason about the real gather at
+all. Building in release removes effect 1. It does not remove effect 2.
+Fixture residency is a property of the fixture versus the real checkpoint,
+not of build configuration, and only a real-table run removes it.
+
+The release number, 1.630 ms, is the correct starting point. For the reason
+in effect 2, it remains a floor rather than a ceiling on the real gather's
+cost. It says nothing about how much page-fault cost the real 102.4 GB
+table would add.
 
 ### Decision
 
-The measured gather clears 50 ms by a wide margin. That places it in the top
-branch of the decision rule: a gather at or above 50 ms, about 5 percent of
-the forward, justifies Task 3 on speed. Proceed to Task 3, re-measure the
-gather after the rewrite, then decide Task 4 from the re-measured number.
+1.630 ms is under 10 ms. Per the brief's rule, neither Task 3 nor Task 4 is
+justified on speed by this result alone.
 
-Because the fixture measurement is a floor rather than a ceiling, the
-page-fault gap does not weaken this decision. It only adds cost the fixture
-could not see, so the real gather is at least as expensive as 204.854 ms,
-not less. The under-10-ms "not hot" branch, and the footprint-only carve-out
-that branch requires, do not apply to this result.
+Ruling C3 blocks closing the question on fixture evidence, even at this
+reading. The fixture's page residency removes exactly the term that would
+decide whether the real gather is hot. That term is page-fault cost against
+a 102.4 GB, sparsely touched, memory-mapped table. The conclusion "the
+n-gram gather is not hot" requires a real-table run that this task did not
+perform.
+
+Task 4 may still proceed, but only if the footprint argument in Task 4's
+preamble holds once this page count is known. The fixture touched 392
+distinct 16 KiB pages per forward. Task 3 is not justified on speed by this
+measurement.
+
+### What the debug/release ratio implies elsewhere
+
+The 125.7 times debug/release ratio is itself a datum for this repository.
+Any timing test that runs under plain `swift test`, with no `-c release`,
+measures debug-build cost, not the cost the ranked box pays. For a tight
+scalar loop such as this gather's inner conversion, that gap can
+be two orders of magnitude. Any test in this codebase that reports
+milliseconds without stating its build configuration should be treated as
+unverified until it is re-run in release.
