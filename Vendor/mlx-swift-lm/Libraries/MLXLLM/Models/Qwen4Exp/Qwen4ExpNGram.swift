@@ -94,6 +94,72 @@ final class Qwen4ExpNGramTable {
     let dim: Int
     let bytesPerRow: Int
 
+    /// Counters for one gather window. The n-gram path had no instrumentation
+    /// at all, so its cost was inferred from the table's 102.4 GB size rather
+    /// than measured. Only 3.58 MB is gathered per 700-token forward, and the
+    /// gather runs once (PLE is at layer 2 only, of 48), so the size is a poor
+    /// proxy and this counts the quantities that actually vary.
+    struct Stats {
+        var calls = 0
+        var rows = 0
+        var nanos: UInt64 = 0
+        var distinctPages = 0
+    }
+
+    /// Off unless `MLX_QWEN4EXP_NGRAM_STATS=1`. Page accounting walks a Set per
+    /// gather, which is real work, so it must not run on an unmeasured path.
+    static let statsEnabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN4EXP_NGRAM_STATS"] == "1"
+
+    final class StatsBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = Stats()
+        func reset() { lock.lock(); value = Stats(); lock.unlock() }
+        func snapshot() -> Stats { lock.lock(); defer { lock.unlock() }; return value }
+        func record(rows: Int, nanos: UInt64, pages: Int) {
+            lock.lock()
+            value.calls += 1
+            value.rows += rows
+            value.nanos += nanos
+            value.distinctPages += pages
+            lock.unlock()
+        }
+    }
+    static let stats = StatsBox()
+
+    /// Synthetic table backed by in-memory safetensors blobs, so the gather can
+    /// be tested without the 102.4 GB checkpoint.
+    static func inMemoryFixture(rowsPerShard: Int, dim: Int, shards: Int) throws
+        -> Qwen4ExpNGramTable
+    {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ngram-fixture-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for s in 0 ..< shards {
+            var payload = [UInt16](repeating: 0, count: rowsPerShard * dim)
+            for i in 0 ..< payload.count {
+                // bf16 bit pattern for a small distinct value per position.
+                payload[i] = UInt16(truncatingIfNeeded: 0x3C00 &+ (i % 97))
+            }
+            let body = payload.withUnsafeBufferPointer { Data(buffer: $0) }
+            let header = try JSONSerialization.data(withJSONObject: [
+                "weight": [
+                    "dtype": "BF16", "shape": [rowsPerShard, dim],
+                    "data_offsets": [0, body.count],
+                ]
+            ])
+            var file = Data()
+            withUnsafeBytes(of: UInt64(header.count).littleEndian) { file.append(contentsOf: $0) }
+            file.append(header)
+            file.append(body)
+            try file.write(to: dir.appendingPathComponent(String(format: "shard_%03d.safetensors", s)))
+        }
+        let spec = Qwen4ExpNGramTableSpec(
+            directory: dir.lastPathComponent, shards: shards, rowsPerShard: rowsPerShard,
+            dim: dim, dtype: "bfloat16")
+        return try Qwen4ExpNGramTable(directory: dir, spec: spec)
+    }
+
     init(directory: URL, spec: Qwen4ExpNGramTableSpec) throws {
         precondition(spec.dtype == "bfloat16", "n-gram table must be bfloat16")
         rowsPerShard = spec.rowsPerShard
@@ -124,8 +190,21 @@ final class Qwen4ExpNGramTable {
 
     /// `gids[t]` lists one global row id per head. Returns `[T, heads * dim]` float16.
     func gather(_ gids: [[Int64]]) -> MLXArray {
+        let t0 = DispatchTime.now().uptimeNanoseconds
         let T = gids.count
         let heads = gids.first?.count ?? 0
+        var pages = Set<Int>()
+        if Self.statsEnabled {
+            pages.reserveCapacity(T * heads)
+            for row in gids {
+                for gid in row {
+                    let shard = Int(gid) / rowsPerShard
+                    let r = Int(gid) % rowsPerShard
+                    let start = dataOffsets[shard] + r * bytesPerRow
+                    pages.insert(shard << 40 | (start / 16384))
+                }
+            }
+        }
         var out = [Float16](repeating: 0, count: T * heads * dim)
         out.withUnsafeMutableBufferPointer { dst in
             var cursor = 0
@@ -146,7 +225,12 @@ final class Qwen4ExpNGramTable {
                 }
             }
         }
-        return MLXArray(out, [T, heads * dim])
+        let result = MLXArray(out, [T, heads * dim])
+        Self.stats.record(
+            rows: T * heads,
+            nanos: DispatchTime.now().uptimeNanoseconds - t0,
+            pages: pages.count)
+        return result
     }
 }
 
