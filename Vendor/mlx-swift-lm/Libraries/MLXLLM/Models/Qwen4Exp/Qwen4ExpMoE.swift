@@ -90,8 +90,25 @@ final class Qwen4ExpSparseMoeBlock: Module {
             })
         // CALLER THREAD: read back, drop padded rows, combine.
         let shared = program.readOutput(prepared, tokens: tokens)  // [tokens, hidden] fp16
-        let out = gpu.0 + gpu.1 * shared.asType(x.dtype).reshaped(x.shape)
+        let sharedWide = shared.asType(x.dtype).reshaped(x.shape)
+        let out = gpu.0 + gpu.1 * sharedWide
         if Qwen4ExpANEFused.zeroCopyReadback { eval(out) }  // BARRIER 3, zero-copy only
+
+        if Qwen4ExpANEFused.verify {
+            // MLX_QWEN4EXP_ANE_VERIFY=1 (diagnostic): the pure-GPU shared
+            // expert this call substitutes for, logged as a per-call max-abs
+            // error against the ANE-produced partial. Doubles the shared
+            // expert's work; never use for timing.
+            let ref = sharedExpert(x).asType(.float32)
+            let diff = MLX.abs(sharedWide.asType(.float32) - ref)
+            let maxAbs = diff.max()
+            let maxRef = MLX.abs(ref).max()
+            eval(maxAbs, maxRef)
+            aneLog(String(
+                format: "shared verify T=%d: maxAbs=%.4f max|ref|=%.2f",
+                tokens, maxAbs.item(Float.self), maxRef.item(Float.self)))
+        }
+
         return out
     }
 }

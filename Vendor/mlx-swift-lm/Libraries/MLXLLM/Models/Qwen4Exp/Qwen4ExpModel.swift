@@ -248,9 +248,19 @@ public final class Qwen4ExpTextModel: Module {
                             if let np = nextPrepared, let p = program { try p.predict(np) }
                         },
                         gpu: { () -> MLXArray in
-                            layer.finish(
+                            let o = layer.finish(
                                 hs[i], x: mixes[i].x, inject: mixes[i].inject, projection: projections[i]!,
                                 rope: rope, mask: mask, cache: c)
+                            // BARRIER 2, mandatory: without this eval, `o` stays
+                            // an unevaluated graph and nothing is submitted to
+                            // the GPU while the ANE `predict` runs in the `ane:`
+                            // closure above, so `group.wait()` below just waits
+                            // out the ANE latency with the GPU idle -- no
+                            // overlap at all. Matches the two fused lanes
+                            // (Qwen4ExpANEDenseLane.swift, Qwen4ExpMoE.swift),
+                            // which already eval here for the same reason.
+                            eval(o)
+                            return o
                         })
                     out = o
                 } catch {
@@ -273,9 +283,10 @@ public final class Qwen4ExpTextModel: Module {
                     }
                 }
             }
-            // ONE barrier per layer, not one per micro-batch. The old code ran
-            // eval() inside the gpu closure, forcing 48 x n hard syncs for a
-            // prefill that the plain path evaluates in a single graph.
+            // Each micro-batch's `gpu:` closure already evaluated `hs[i]`
+            // (BARRIER 2 above) so genuine ANE/GPU overlap is possible; this is
+            // a cheap no-op confirming every segment of `hs` is materialized
+            // before the next layer reads it.
             eval(hs)
         }
         let wide = concatenated(hs, axis: 1)

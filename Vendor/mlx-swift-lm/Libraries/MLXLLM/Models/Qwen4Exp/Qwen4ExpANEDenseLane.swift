@@ -128,9 +128,24 @@ final class Qwen4ExpANESplitProjection {
     /// fp16 weight bytes this program holds resident.
     let programBytes: Int
 
-    private let prefix: Qwen4ExpANEProjection
+    /// `nil` under `MLX_QWEN4EXP_ANE_FP16_GPU=1` (ablate): no ANE program is
+    /// built at all and `run` computes the prefix rows as a GPU fp16 matmul.
+    private let prefix: Qwen4ExpANEProjection?
+    /// `weight[0 ..< f, 0...]` cast to fp16, evaluated once at build. Kept
+    /// resident (not just handed to `Qwen4ExpANEProjection`) so the ablation
+    /// matmul and the `MLX_QWEN4EXP_ANE_VERIFY=1` reference both have it.
+    private let prefixWeightFP16: MLXArray
     /// `weight[f ..< out, 0...]`, evaluated once at build.
     private let suffixWeight: MLXArray
+    /// `MLX_QWEN4EXP_ANE_FP16_GPU=1`: run the prefix as a GPU fp16 matmul
+    /// instead of on the ANE. See spec 8.5.
+    private let ablate: Bool
+    /// `MLX_QWEN4EXP_ANE_VERIFY=1`: log the offloaded result against the
+    /// pure-GPU reference it substitutes for.
+    private let verify: Bool
+    /// Only populated under `MLX_QWEN4EXP_ANE_VERIFY=1`: the unsliced,
+    /// original-dtype weight, so `run` can compute that pure-GPU reference.
+    private let referenceWeight: MLXArray?
 
     /// `weight` is the PHYSICAL `[out, in]` dense projection weight, any float
     /// dtype. `logicalOut` is the whole phase-1 output row count the fraction is
@@ -152,11 +167,25 @@ final class Qwen4ExpANESplitProjection {
         // short row that no downstream shape check catches.
         guard f > 0, f < out else { throw Qwen4ExpANESplitError.degenerateSplit(f: f, out: out) }
         programBytes = f * inn * 2
-        prefix = try Qwen4ExpANEProjection(weight: weight[0 ..< f, 0...], sequenceLength: sequenceLength)
+        ablate = Qwen4ExpANEFused.fp16GpuAblate
+        verify = Qwen4ExpANEFused.verify
+
+        let prefixSlice = weight[0 ..< f, 0...].asType(.float16)
+        eval(prefixSlice)
+        prefixWeightFP16 = prefixSlice
+        prefix = ablate ? nil : try Qwen4ExpANEProjection(weight: prefixSlice, sequenceLength: sequenceLength)
+
         let suffix = weight[f ..< out, 0...]
         eval(suffix)
         suffixWeight = suffix
         precondition(suffixWeight.dim(0) == out - f)
+
+        if verify {
+            eval(weight)
+            referenceWeight = weight
+        } else {
+            referenceWeight = nil
+        }
     }
 
     /// `x`: `[T, in]`, `T <= sequenceLength`, any float dtype.
@@ -175,38 +204,77 @@ final class Qwen4ExpANESplitProjection {
             "Qwen4ExpANESplitProjection.run expected x [T, \(inn)], got \(x.shape)")
         precondition(tokens <= sequenceLength, "Qwen4ExpANESplitProjection.run: T=\(tokens) > compiled \(sequenceLength)")
 
-        // CALLER THREAD. Pad the ANE leg only, in the SOURCE dtype. Do not cast
-        // here: `Qwen4ExpANEProjection.makeInput` casts to fp16 and
-        // `ANEDirectDispatch.prepare` casts again. Padding in fp16 would be a
-        // third cast and would materialize a full `[bucket, in]` fp16 temp per
-        // layer per forward. `ANEFusedSplitMLP.padForANE` pads in the source
-        // dtype for the same reason.
-        let padded =
-            tokens == sequenceLength
-            ? x
-            : concatenated([x, MLXArray.zeros([sequenceLength - tokens, inn], dtype: x.dtype)], axis: 0)
+        let y: MLXArray
+        let extraResult: [MLXArray]
 
-        // BARRIER 1: `prepare` calls `eval(xT)` internally, on this thread.
-        let prepared = try prefix.makeInput(padded)
+        if ablate {
+            // GPU-fp16 ablation (MLX_QWEN4EXP_ANE_FP16_GPU=1, diagnostic): the
+            // SAME F prefix rows the ANE would compute, as a plain GPU fp16
+            // matmul. No ANE dispatch, no padding, no private frameworks
+            // touched. A divergence that survives this path is the fp16
+            // REPRESENTATION, not ANE-specific (silu table / radix-4 /
+            // surface padding). See spec 8.5.
+            let x16 = x.asType(.float16)
+            let anePart = matmul(x16, prefixWeightFP16.transposed(1, 0))
+            let suffix = matmul(x, suffixWeight.transposed(1, 0))
+            let extra = try gpuExtra(x)
+            eval([anePart, suffix] + extra)
+            y = concatenated([anePart.asType(suffix.dtype), suffix], axis: -1)
+            extraResult = extra
+        } else {
+            guard let prefix else {
+                preconditionFailure("Qwen4ExpANESplitProjection: ablate=false but no ANE program was built")
+            }
+            // CALLER THREAD. Pad the ANE leg only, in the SOURCE dtype. Do not
+            // cast here: `Qwen4ExpANEProjection.makeInput` casts to fp16 and
+            // `ANEDirectDispatch.prepare` casts again. Padding in fp16 would be
+            // a third cast and would materialize a full `[bucket, in]` fp16
+            // temp per layer per forward. `ANEFusedSplitMLP.padForANE` pads in
+            // the source dtype for the same reason.
+            let padded =
+                tokens == sequenceLength
+                ? x
+                : concatenated([x, MLXArray.zeros([sequenceLength - tokens, inn], dtype: x.dtype)], axis: 0)
 
-        let (_, gpu) = try ConcurrentEngines.run(
-            ane: { try self.prefix.predict(prepared) },  // BACKGROUND, no MLX
-            gpu: { () throws -> (MLXArray, [MLXArray]) in  // CALLER THREAD
-                let suffix = matmul(x, self.suffixWeight.transposed(1, 0))
-                let extra = try gpuExtra(x)
-                eval([suffix] + extra)  // BARRIER 2, mandatory
-                return (suffix, extra)
-            })
+            // BARRIER 1: `prepare` calls `eval(xT)` internally, on this thread.
+            let prepared = try prefix.makeInput(padded)
 
-        // CALLER THREAD. Read the ANE surface back, drop the padded rows, join.
-        // `read` gathers eagerly, so the output surface is free once `prepared`
-        // drops and no third barrier is needed. See spec 0.5.
-        let aneFull = readBack(prepared)  // [sequenceLength, F] fp16
-        let anePart = tokens == sequenceLength ? aneFull : aneFull[0 ..< tokens, 0...]
-        precondition(gpu.0.dim(1) == out - f)
-        let y = concatenated([anePart.asType(gpu.0.dtype), gpu.0], axis: -1)  // [T, out]
-        if Qwen4ExpANEFused.zeroCopyReadback { eval(y) }  // BARRIER 3, zero-copy only
-        return (y, gpu.1)
+            let (_, gpu) = try ConcurrentEngines.run(
+                ane: { try prefix.predict(prepared) },  // BACKGROUND, no MLX
+                gpu: { () throws -> (MLXArray, [MLXArray]) in  // CALLER THREAD
+                    let suffix = matmul(x, self.suffixWeight.transposed(1, 0))
+                    let extra = try gpuExtra(x)
+                    eval([suffix] + extra)  // BARRIER 2, mandatory
+                    return (suffix, extra)
+                })
+
+            // CALLER THREAD. Read the ANE surface back, drop the padded rows,
+            // join. `read` gathers eagerly, so the output surface is free once
+            // `prepared` drops and no third barrier is needed. See spec 0.5.
+            let aneFull = readBack(prepared)  // [sequenceLength, F] fp16
+            let anePart = tokens == sequenceLength ? aneFull : aneFull[0 ..< tokens, 0...]
+            precondition(gpu.0.dim(1) == out - f)
+            y = concatenated([anePart.asType(gpu.0.dtype), gpu.0], axis: -1)  // [T, out]
+            extraResult = gpu.1
+            if Qwen4ExpANEFused.zeroCopyReadback { eval(y) }  // BARRIER 3, zero-copy only
+        }
+
+        if verify, let referenceWeight {
+            // MLX_QWEN4EXP_ANE_VERIFY=1 (diagnostic): the pure-GPU result this
+            // call substitutes for, using the ORIGINAL unsplit weight (not the
+            // fp16 prefix slice), logged as a per-call max-abs error. Doubles
+            // the matmul work of the offloaded piece; never use for timing.
+            let ref = matmul(x, referenceWeight.transposed(1, 0).asType(x.dtype))
+            let diff = MLX.abs(y.asType(.float32) - ref.asType(.float32))
+            let maxAbs = diff.max()
+            let maxRef = MLX.abs(ref.asType(.float32)).max()
+            eval(maxAbs, maxRef)
+            aneLog(String(
+                format: "split verify out=%d F=%d T=%d: maxAbs=%.4f max|ref|=%.2f",
+                out, f, tokens, maxAbs.item(Float.self), maxRef.item(Float.self)))
+        }
+
+        return (y, extraResult)
     }
 
     /// `run` with no extra GPU work. Passes `{ _ in [] }`.
