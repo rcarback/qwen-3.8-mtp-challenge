@@ -63,11 +63,26 @@ final class Qwen4ExpSparseMoeBlock: Module {
         routeStatsSeen += 1
     }
 
+    /// `MLX_QWEN4EXP_TOPK`. Routes to this many experts per token instead of
+    /// the checkpoint's `num_experts_per_tok`. Cutting k is the one way to
+    /// reduce routed-expert work that needs no restructuring of the forward:
+    /// the gather-GEMM keeps its shape, only narrower. The softmax below
+    /// renormalises over whatever is selected, so the weights still sum to
+    /// one. This changes model output and is a speed against accuracy dial,
+    /// not a free win.
+    static let topKOverride: Int? = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_QWEN4EXP_TOPK"],
+            let v = Int(raw), v > 0
+        else { return nil }
+        return v
+    }()
+
     /// Router: float32 logits, top-k by `argPartition`, weights = softmax over the
     /// SELECTED logits (equal to softmax-all followed by renormalisation).
     func route(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
         let logits = gate(x.asType(.float32))
-        let kth = numExperts - topK
+        let k = min(Self.topKOverride ?? topK, numExperts)
+        let kth = numExperts - k
         let idx = MLX.argPartition(logits, kth: kth, axis: -1)[.ellipsis, kth...]
         let w = MLX.softmax(MLX.takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
         Self.reportRouteStats(idx, experts: numExperts)

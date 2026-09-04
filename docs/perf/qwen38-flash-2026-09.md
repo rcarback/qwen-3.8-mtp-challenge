@@ -1609,3 +1609,40 @@ The general lesson is worth stating plainly. A microbenchmark of a routed MoE
 kernel is only as good as its routing distribution, and a uniform distribution
 is the one case a trained router never produces.
 
+### Measured end to end: reducing top-k is the largest win found
+
+`MLX_QWEN4EXP_TOPK` routes each token to that many experts instead of the
+checkpoint's ten. Four arms, six prompts each, plain measured on both sides,
+prefill tokens per second, mean of prompts 2 to 6:
+
+| Arm | Mean tok/s | Against the plain mean |
+|---|---:|---:|
+| plain, first | 298.16 | |
+| plain, second | 298.48 | |
+| plain mean | 298.32 | |
+| k=8 | 320.68 | **+7.5 percent** |
+| k=6 | 355.22 | **+19.1 percent** |
+
+The two controls differ by 0.11 percent, so both effects are far outside the
+noise.
+
+This reverses the microbenchmark reported earlier in this document, and the
+reason is the routing skew measured above. The microbenchmark gave every
+expert an equal share, under which reducing k cannot remove an expert from the
+active set and each expert's rows still fill one tile. Under real routing
+between 147 and 239 experts are already idle, so a smaller k removes more of
+them, and the saving is real.
+
+The scale also makes sense. Routed experts are 44.2 percent of the tower's
+projection multiply-accumulates, so k=6 removes 17.7 percent of them, which
+predicts about 21 percent more throughput if that path were purely
+compute-bound. The measured 19.1 percent is close, so the routed expert path
+is roughly proportional to the work it is given.
+
+**This changes model output and the change is not subtle.** At k=8 and k=6 the
+greedy continuations differ from the plain arm on most prompts, not merely at
+near-ties. Reducing k is a quality-for-speed trade, and nothing here measures
+the quality side. Before using it, measure perplexity or task accuracy against
+the shipped k=10. The knob defaults to the checkpoint value and changes nothing
+unless it is set.
+
