@@ -66,4 +66,54 @@ final class MoEGatherTileTests: XCTestCase {
         }
         XCTAssertGreaterThan(base, 0)
     }
+
+    /// SonicMoE's fused gate+up: does issuing ONE gather GEMM of width 2*640
+    /// beat two of width 640 over the same sorted input? Same total FLOPs, one
+    /// fewer launch and one fewer read of the gathered activations.
+    func testFusedGateUpAgainstSplit() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
+            "needs a real GPU")
+
+        let experts = 512, inDim = 2560, outDim = 640, rows = 7000
+        func stack(_ out: Int) -> (MLXArray, MLXArray, MLXArray) {
+            let wf = MLXRandom.normal([experts, out, inDim]).asType(.bfloat16)
+            let q = MLX.quantized(wf, groupSize: 32, bits: 4)
+            let b = q.biases ?? MLXArray.zeros(q.scales.shape, dtype: q.scales.dtype)
+            eval(q.wq, q.scales, b)
+            return (q.wq, q.scales, b)
+        }
+        let gate = stack(outDim), up = stack(outDim), fused = stack(outDim * 2)
+
+        let x = MLXRandom.normal([rows, 1, inDim]).asType(.bfloat16)
+        var ids = (0 ..< rows).map { Int32(($0 * experts) / rows) }
+        ids.sort()
+        let idx = MLXArray(ids).reshaped(rows)
+        eval(x, idx)
+
+        func mm(_ w: (MLXArray, MLXArray, MLXArray)) -> MLXArray {
+            MLX.gatherQuantizedMM(
+                x, w.0, scales: w.1, biases: w.2, rhsIndices: idx,
+                transpose: true, groupSize: 32, bits: 4, sortedIndices: true)
+        }
+        func timeIt(_ body: () -> MLXArray, reps: Int) -> Double {
+            eval(body())
+            let t0 = Date()
+            for _ in 0 ..< reps { eval(body()) }
+            return Date().timeIntervalSince(t0) / Double(reps) * 1000
+        }
+
+        var bestSplit = Double.infinity, bestFused = Double.infinity
+        for _ in 0 ..< 5 {
+            // No concatenate in the split arm: the real SwitchGLU keeps the two
+            // results separate, and the fused path slices. Adding a concat here
+            // would hand the fused arm a win the shipped code never sees.
+            bestSplit = min(bestSplit, timeIt({ let a = mm(gate); let b = mm(up); eval(a, b); return b }, reps: 20))
+            bestFused = min(bestFused, timeIt({ let f = mm(fused); eval(f); return f }, reps: 20))
+        }
+        print(String(
+            format: "[fused-gateup] split(2x640) %7.3f ms | fused(1x1280) %7.3f ms | fused is %5.1f%% of split",
+            bestSplit, bestFused, 100 * bestFused / bestSplit))
+        XCTAssertGreaterThan(bestSplit, 0)
+    }
 }
