@@ -72,6 +72,14 @@ final class FusedRoutedMoETests: XCTestCase {
         XCTAssertLessThan(maxAbs, 3e-2, "fused quantized output diverged from quantizedMatmul")
     }
 
+    // Both tests below drive `forceFusedRoutedMoE`, which the production
+    // source declares inside `#if DEBUG` (Qwen4ExpMoE.swift). Without this
+    // guard the whole test target fails to COMPILE under `swift test -c
+    // release`, which silently confines every timing test in this target to
+    // an unoptimized build. That cost a wrong measurement once: an n-gram
+    // gather timed at 204.854 ms in debug and 1.630 ms in release, a 125.7x
+    // ratio that inverted the conclusion drawn from it.
+    #if DEBUG
     /// The gate must not change the routed sum. Runs both arms in one process
     /// against the same synthetic block, because this test does not load the
     /// real checkpoint. Uses the `forceFusedRoutedMoE` debug override instead
@@ -167,6 +175,7 @@ final class FusedRoutedMoETests: XCTestCase {
             MLX.all(MLX.isFinite(y.asType(.float32))).item(Bool.self),
             "fallback output must be finite")
     }
+    #endif
 
     /// One arm per process -- a combined test holding several weight stacks
     /// resident measures the allocator and residency behaviour rather than the
