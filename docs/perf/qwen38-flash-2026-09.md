@@ -1449,3 +1449,74 @@ own FLOP and byte arithmetic, worked out from measured tokens-per-second and
 weight sizes, not from running the method. Where the table says "estimated,"
 no code for that specific method exists yet, or no timed run of it was taken
 tonight. Do not read an estimate as a result.
+
+### Kernel-level measurements taken alongside the literature pass
+
+Three questions were answered with microbenchmarks rather than end-to-end
+arms, because each costs minutes instead of an hour. The test is
+`Tests/MLXFastTests/Model/MoEGatherTileTests.swift`.
+
+**Reducing top-k does not speed the routed expert GEMM.** One routed
+projection, 512 experts, 2560 in, 640 out, at the shape the sorted gather path
+receives, minimum of five interleaved passes:
+
+| k | Rows per expert | Time | Against k=10 | Useful FLOPs |
+|---:|---:|---:|---:|---:|
+| 10 | 13.67 | 6.095 ms | 100 percent | 100 percent |
+| 8 | 10.94 | 9.985 ms | 164 percent | 80 percent |
+| 6 | 8.20 | 9.481 ms | 156 percent | 60 percent |
+| 4 | 5.47 | 8.475 ms | 139 percent | 40 percent |
+| 2 | 2.73 | 3.699 ms | 61 percent | 20 percent |
+
+No setting below the shipped k=10 was faster, across two independent runs.
+The magnitudes are not a clean function of k and should be treated as
+indicative. The reason the family fails is structural: at a 700-token prompt
+every one of the 512 experts still receives at least one row at any k, so
+expert weight traffic does not fall, and each expert's rows still occupy one
+whole 16-row tile. Adaptive and dynamic top-k inherit this result.
+
+**Fusing gate and up is a wash, not a win.** Each form timed in its own
+process, allocating only its own weights:
+
+| Arm | Time |
+|---|---:|
+| Split, two 640-wide gather GEMMs | 22.020 ms |
+| Fused, one 1280-wide gather GEMM | 21.936 ms |
+
+An earlier combined test that held all three weight stacks resident, 1.68 GB,
+reported the fused form at 2.2 times slower. That was a residency artifact.
+The same combined test measured the split arm at less than half its isolated
+time, so it was unreliable in both directions. A microbenchmark holding
+several large weight stacks measures the allocator, not the kernel.
+
+**The expert gather GEMM is already tiled for small M on this machine.**
+`SwitchGLU` sorts once the assignment count reaches 64, so `GatherQMM` takes
+the `gather_qmm_rhs` branch. That branch selects tiles by generation:
+
+| Path | Machine | bm | bn | bk | Waste at 13.7 rows per expert |
+|---|---|---:|---:|---:|---:|
+| `gather_qmm_rhs` | M4 Max | 16 | 32 | 32 | 1.17x |
+| `gather_qmm_rhs_nax` | M5 | 64 | 64 | 64 | 4.67x |
+
+So tile quantization costs about 17 percent here, not the several-fold waste a
+64-row tile would imply. The fork's tuned `qmm_row_tile` rule states in its own
+comment that it applies to `qmm` and `qmm_splitk` only and that the gather
+family is untouched. Porting it to the nax gather path is a small change with a
+measured precedent on the dense projections, and it cannot be evaluated on this
+M4 because this M4 does not take that path.
+
+**Prompt length does not raise the prefill rate.** One resident serve, four
+prompts, same session:
+
+| Prompt tokens | Prefill seconds | Prefill tokens per second |
+|---:|---:|---:|
+| 653 | 3.679 | 177.5 |
+| 1294 | 4.353 | 297.3 |
+| 2576 | 9.246 | 278.6 |
+| 5140 | 21.634 | 237.6 |
+
+The first row pays the cold-start cost. Past about 1300 tokens the rate falls,
+because the 12 full-attention layers grow quadratically while the expert path
+improves slowly. Rows per expert do rise with prompt length, but not fast
+enough to pay for the attention growth.
+
