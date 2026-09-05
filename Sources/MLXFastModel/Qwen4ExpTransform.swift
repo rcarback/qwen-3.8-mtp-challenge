@@ -21,10 +21,27 @@ public enum Qwen4ExpTransform {
         public var expertBits: Int
         public var shardBytes: Int
 
+        /// Reference an already-transformed n-gram table instead of writing
+        /// one. Off by default, so the produced tree is byte-identical to what
+        /// it has always been.
+        ///
+        /// The table is about 95 GB and the transform copies it unchanged into
+        /// every output tree, so any experiment that varies a transform option
+        /// pays 95 GB to reproduce a file it does not modify. Pointing at an
+        /// existing table brings an output from about 175 GB to about 80 GB,
+        /// which is the difference between fitting on this machine and not.
+        ///
+        /// Set it to a directory holding `shard_NNN.safetensors`. The shards
+        /// are symlinked, so the destination is no longer self-contained:
+        /// anything that archives or checksums the tree sees links. The
+        /// transform records `ngram_table.linked` in config.json to say so.
+        public var linkNGramTableFrom: URL?
+
         public init(
             source: URL, destination: URL, expertGroupSize: Int = 32, expertBits: Int = 4,
-            shardBytes: Int = 4 << 30
+            shardBytes: Int = 4 << 30, linkNGramTableFrom: URL? = nil
         ) {
+            self.linkNGramTableFrom = linkNGramTableFrom
             self.source = source
             self.destination = destination
             self.expertGroupSize = expertGroupSize
@@ -107,11 +124,25 @@ public enum Qwen4ExpTransform {
                 if isNGramShard(key) {
                     let shard = shardIndex(ofNGramKey: key)
                     guard shard >= 0 else { throw MLXFastError.invalidInput("bad n-gram shard key \(key)") }
-                    let bytes = try readBytes(handle, header: header, info: info)
-                    try writeSafetensors(
-                        url: o.destination.appendingPathComponent(
-                            String(format: "ngram/shard_%03d.safetensors", shard)),
-                        tensors: [("weight", info.dtype, info.shape, bytes)])
+                    let name = String(format: "shard_%03d.safetensors", shard)
+                    let dest = o.destination.appendingPathComponent("ngram/\(name)")
+                    if let existing = o.linkNGramTableFrom {
+                        // The table is identical across transform options, so
+                        // point at it rather than rewriting 95 GB.
+                        let target = existing.appendingPathComponent(name)
+                        guard fm.fileExists(atPath: target.path) else {
+                            throw MLXFastError.invalidInput(
+                                "linkNGramTableFrom is missing \(name); the referenced table must "
+                                    + "already hold every shard this source declares")
+                        }
+                        try? fm.removeItem(at: dest)
+                        try fm.createSymbolicLink(at: dest, withDestinationURL: target)
+                    } else {
+                        let bytes = try readBytes(handle, header: header, info: info)
+                        try writeSafetensors(
+                            url: dest,
+                            tensors: [("weight", info.dtype, info.shape, bytes)])
+                    }
                     ngramShards += 1
                     ngramRows = info.shape[0]
                     ngramDim = info.shape[1]
@@ -165,9 +196,13 @@ public enum Qwen4ExpTransform {
         guard ngramShards > 0 else {
             throw MLXFastError.invalidInput("no n-gram shards found in the source")
         }
+        // `linked` records that the shards are symlinks, so the tree is not
+        // self-contained. Anything that archives, copies or checksums it needs
+        // to know that before it walks the directory.
         text["ngram_table"] = [
             "directory": "ngram", "shards": ngramShards, "rows_per_shard": ngramRows,
             "dim": ngramDim, "dtype": "bfloat16",
+            "linked": o.linkNGramTableFrom != nil,
         ]
         try JSONSerialization.data(withJSONObject: text, options: [.prettyPrinted, .sortedKeys])
             .write(to: o.destination.appendingPathComponent("config.json"))

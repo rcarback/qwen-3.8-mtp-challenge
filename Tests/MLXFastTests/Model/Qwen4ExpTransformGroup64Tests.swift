@@ -102,4 +102,74 @@ final class Qwen4ExpTransformGroup64Tests: XCTestCase {
                     + "\(scaleKeys.count) scale tensors, \(scaleElems) scale elements")
         }
     }
+    /// A linked table must produce the same gather as a copied one, and must
+    /// say so in config.json.
+    ///
+    /// The transform copies the n-gram table unchanged into every output tree.
+    /// At 95 GB that makes any transform-option experiment cost about 175 GB,
+    /// which is what blocks a group-64 build on this machine. Linking brings it
+    /// to about 80 GB. The risk is that a linked tree is no longer
+    /// self-contained, so this pins both the equivalence and the disclosure.
+    func testLinkedNGramTableMatchesACopiedOne() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
+            "needs a GPU")
+
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("qwen4exp-link-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let src = root.appendingPathComponent("source")
+        try Qwen4ExpTransformTests.writeTinySource(to: src)
+
+        // Copied, as today.
+        let copied = root.appendingPathComponent("weights-copied")
+        try Qwen4ExpTransform.run(
+            .init(source: src, destination: copied, expertGroupSize: 32, expertBits: 4,
+                shardBytes: 32 << 10))
+
+        // Linked against the tree just produced.
+        let linked = root.appendingPathComponent("weights-linked")
+        try Qwen4ExpTransform.run(
+            .init(source: src, destination: linked, expertGroupSize: 32, expertBits: 4,
+                shardBytes: 32 << 10,
+                linkNGramTableFrom: copied.appendingPathComponent("ngram")))
+
+        // The shards must be links, not files.
+        let one = linked.appendingPathComponent("ngram/shard_000.safetensors")
+        let attrs = try FileManager.default.attributesOfItem(atPath: one.path)
+        XCTAssertEqual(
+            attrs[.type] as? FileAttributeType, .typeSymbolicLink,
+            "linked mode must symlink the shards, not copy them")
+
+        // config.json must disclose it.
+        func ngramBlock(_ dir: URL) throws -> [String: Any] {
+            let d = try Data(contentsOf: dir.appendingPathComponent("config.json"))
+            let cfg = try JSONSerialization.jsonObject(with: d) as? [String: Any]
+            return cfg?["ngram_table"] as? [String: Any] ?? [:]
+        }
+        XCTAssertEqual(try ngramBlock(linked)["linked"] as? Bool, true)
+        XCTAssertEqual(try ngramBlock(copied)["linked"] as? Bool, false)
+
+        // And the two must gather identically. This is the claim that matters:
+        // a link that resolved to the wrong bytes would still load.
+        let spec = Qwen4ExpNGramTableSpec(
+            directory: "ngram",
+            shards: try ngramBlock(copied)["shards"] as? Int ?? 0,
+            rowsPerShard: try ngramBlock(copied)["rows_per_shard"] as? Int ?? 0,
+            dim: try ngramBlock(copied)["dim"] as? Int ?? 0,
+            dtype: "bfloat16")
+        let a = try Qwen4ExpNGramTable(
+            directory: copied.appendingPathComponent("ngram"), spec: spec)
+        let b = try Qwen4ExpNGramTable(
+            directory: linked.appendingPathComponent("ngram"), spec: spec)
+        let gids: [[Int64]] = [[0, 1, 2, 3]]
+        let ga = a.gather(gids).asType(.float32)
+        let gb = b.gather(gids).asType(.float32)
+        ga.eval(); gb.eval()
+        XCTAssertEqual(
+            MLX.abs(ga - gb).max().item(Float.self), 0,
+            "a linked table must gather byte-identically to a copied one")
+        print("[transform-link] symlinked, disclosed in config, gathers identically")
+    }
+
 }
