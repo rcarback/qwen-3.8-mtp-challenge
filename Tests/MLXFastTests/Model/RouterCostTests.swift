@@ -33,6 +33,22 @@ final class RouterCostTests: XCTestCase {
         // small to fuse. Every stage turned out to be flat in token count, so at
         // decode the router costs nearly the same while the useful work
         // collapses to a single row. 48 layers pay that cost once per token.
+        //
+        // WARM THE WHOLE SWEEP FIRST. Without this the first token count in the
+        // loop absorbs process warmup and reads high: T=1 measured 0.320 ms
+        // chained on one run and 0.158 to 0.226 ms on later ones, which made
+        // T=1 look worse than T=8 and inflated the router's share of a decode
+        // step from about 16 percent to 26 percent.
+        for warm in [1, 8, 700] {
+            let wx = MLXRandom.normal([warm, hidden]).asType(.float16)
+            let wg = MLXRandom.normal([hidden, experts]).asType(.bfloat16)
+            eval(wx, wg)
+            for _ in 0 ..< 10 {
+                let l = matmul(wx.asType(.float32), wg.asType(.float32))
+                eval(MLX.softmax(MLX.top(l, k: topK, axis: -1), axis: -1))
+            }
+        }
+
         for tokens in [1, 2, 4, 8, 128, 700] {
             let x = MLXRandom.normal([tokens, hidden]).asType(.float16)
             // The router gate ships in bf16 per layer; MLX upcasts for the

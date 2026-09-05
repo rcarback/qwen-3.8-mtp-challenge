@@ -8,7 +8,7 @@ import XCTest
 /// Where does a 59.41 ms decode step go?
 ///
 /// `DecodeStepCostTests` measured the whole step; the router accounts for about
-/// 15.4 ms of it and nothing accounted for the rest. This times each major
+/// 8.6 ms of it and nothing accounted for the rest. This times each major
 /// component at DECODE geometry, one row, with the real shapes from
 /// config.json: hidden 2560, 24 query heads over 2 KV heads at head_dim 256,
 /// 512 experts of which 10 route per token, moe_intermediate 640, vocab
@@ -17,7 +17,13 @@ import XCTest
 /// EVERY component is timed CHAINED, one eval() around the whole block, because
 /// timing sub-steps separately forces a GPU submission each and inflates the
 /// result. That mistake put the router at 38.1 ms per token when the in-situ
-/// figure is 15.4 ms.
+/// figure is 8.6 ms.
+///
+/// Run-to-run spread is about 25 percent on the per-instance figures even with
+/// warmup, so the ORDERING is the durable result and the absolute values are
+/// not. Two warmed runs gave routed MoE 0.459 and 0.360 ms, rms_norm 0.233 and
+/// 0.203 ms, and identical ordering. `lm_head`, one large op, is stable at
+/// 0.94 to 0.95 ms.
 ///
 /// These are component floors, not a decomposition: the sum need not equal the
 /// whole, because in situ these blocks share submissions and overlap. Read the
@@ -58,6 +64,26 @@ final class DecodeBreakdownTests: XCTestCase {
 
         let x = MLXRandom.normal([1, hidden]).asType(.float16)
         eval(x)
+
+        // Warm the kernel families this test uses BEFORE timing any of them.
+        // Without this the first component measured absorbs process warmup: in
+        // the router test the same quantity read 0.320 ms as the first arm and
+        // 0.180 ms once warmed, which is a 1.8x error in whichever component
+        // happens to be timed first.
+        do {
+            let ww = MLXRandom.normal([512, hidden]).asType(.float16)
+            eval(ww)
+            let (wq0, s0, b0) = quantized(ww, groupSize: 32, bits: 4)
+            eval(wq0, s0, b0!)
+            let nw = MLXRandom.normal([hidden]).asType(.float16)
+            eval(nw)
+            for _ in 0 ..< 20 {
+                eval(
+                    quantizedMatmul(
+                        x, wq0, scales: s0, biases: b0, transpose: true, groupSize: 32, bits: 4))
+                eval(x * rsqrt((x * x).mean(axis: -1, keepDims: true) + 1e-6) * nw)
+            }
+        }
 
         func qmm(_ t: (MLXArray, MLXArray, MLXArray), _ v: MLXArray) -> MLXArray {
             quantizedMatmul(v, t.0, scales: t.1, biases: t.2, transpose: true,
@@ -147,8 +173,8 @@ final class DecodeBreakdownTests: XCTestCase {
                     + "\(String(format: "%5.1f", total / decodeStepMs * 100))%")
         }
         print(
-            "  router (measured separately)                    =   15.4ms   25.9%")
-        accounted += 15.4
+            "  router (measured separately)                    =    8.6ms   14.5%")
+        accounted += 8.6
         print(
             "  ---- accounted \(String(format: "%.1f", accounted))ms of \(decodeStepMs)ms "
                 + "= \(String(format: "%.0f", accounted / decodeStepMs * 100))%")
