@@ -397,11 +397,24 @@ final class Qwen4ExpNGramEmbedding: Module {
         guard let root = Qwen4ExpRuntime.weightsDirectory else {
             fatalError(Qwen4ExpNGramError.noRoot.description)
         }
+        // Diagnostic override, in the same spirit as MLX_QWEN4EXP_NGRAM_STATS.
+        // The table encoding is self-describing, so pointing at a converted
+        // directory is enough to A/B bf16 against int8 or int4 without
+        // rewriting the checkpoint's own `ngram` directory. Unset in normal
+        // operation, where the config's own directory is used.
+        let dir =
+            ProcessInfo.processInfo.environment["MLX_QWEN4EXP_NGRAM_DIR"].map {
+                URL(fileURLWithPath: $0)
+            } ?? root.appendingPathComponent(spec.directory)
         let t: Qwen4ExpNGramTable
         do {
-            t = try Qwen4ExpNGramTable(directory: root.appendingPathComponent(spec.directory), spec: spec)
+            t = try Qwen4ExpNGramTable(directory: dir, spec: spec)
         } catch {
             fatalError("\(error)")
+        }
+        if let override = ProcessInfo.processInfo.environment["MLX_QWEN4EXP_NGRAM_DIR"] {
+            FileHandle.standardError.write(
+                Data("qwen4exp: n-gram table overridden to \(override)\n".utf8))
         }
         hasher = h
         table = t

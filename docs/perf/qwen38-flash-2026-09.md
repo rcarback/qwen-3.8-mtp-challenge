@@ -2133,33 +2133,61 @@ encodings and told the reader not to quote them. Those figures came from a run
 executing 11 tests in one process, which inflated every arm. The isolated
 numbers above replace them.
 
-### Recommendation
+### Recommendation, superseded below
 
-Adopt int8. Its worst-row cosine similarity of 0.999954 leaves no embedding
-meaningfully moved.
+An earlier revision of this section read "adopt int8, do not adopt int4 on this
+evidence", reasoning from the reconstruction errors above. An end-to-end
+measurement contradicts that reasoning. The section that follows replaces it.
 
-Do not adopt int4 on this evidence. A worst-row cosine similarity of 0.986941
-and a mean relative row-max error of 3.31 percent are not noise. This test
-measures reconstruction error in embedding space. It does not measure model
-output, so it answers how far an embedding moves and not whether the model
-cares. The n-gram embeddings feed the PLE path at layer 2, and the network may
-absorb that angular error or may not.
+## N-gram encoding, measured end to end (2026-09-04)
 
-int4 remains the only variant that makes the table and the tower resident
-together, so the footprint case for it is real. Deciding it needs an
-end-to-end logit-divergence check against the bf16 table on real prose. That
-check is separate work.
+int8 and int4 are indistinguishable in their effect on the model, and both
+change about 5 percent of the model's decisions. Reconstruction error in
+embedding space does not predict end-to-end behaviour here.
 
-### Both variants are reachable from the command line
+One real 512-token prefill through the whole 48-layer tower, per encoding,
+release build, greedy argmax recorded at every position. The prompt holds six
+unrelated passages, so the n-gram lookups spread over many distinct rows.
 
-`mlxfast-swift quantize-ngram-table --source DIR --dest DIR --bits 8|4`
-produces the table. The runtime then opens whatever the directory holds: the
-loader reads shard 0's safetensors header and selects the width from it, so no
-configuration key can disagree with the bytes on disk. A bf16 shard names one
-`BF16` tensor, and a quantized shard names a `U8` `weight` beside `scales` and
-`biases`. Per-shard validation still runs against the detected width, so a
-directory holding a mixture fails.
+| comparison | argmax agreement | flips | mean abs delta top-1 | positions identical |
+|---|---|---|---|---|
+| bf16 against bf16 (control) | 512/512, 100 percent | 0 | 0.0 exactly | 512/512 |
+| bf16 against int8 | 488/512, 95.31 percent | 24 | 0.1246 | 190/512 |
+| bf16 against int4 | 487/512, 95.12 percent | 25 | 0.1434 | 180/512 |
+| int8 against int4 | 485/512, 94.73 percent | 27 | 0.1467 | n/a |
 
-One real shard converts to int4 in 1.1 seconds, 800,003,960 bytes to
-210,001,251 bytes. The whole 128-shard table therefore takes about 2.4 minutes
-and lands at 26.9 GB.
+### The magnitude of the reconstruction error does not carry through
+
+int4 reconstructs the table 16.9 times worse than int8 in embedding space. It
+perturbs the logits 1.15 times more. int8 and int4 also disagree with each
+other more than either disagrees with bf16, and the three flip sets overlap
+only partly: 24 and 25 flips share just 12 positions.
+
+That pattern rules out a magnitude effect. Three encodings perturbing a common
+quantity by very different amounts would produce nested flip sets and
+proportional deltas. Instead each encoding flips a different quarter of the
+128 positions whose top-2 gap sits at or below 0.5625, which is the signature
+of a perturbation whose direction matters and whose size does not.
+
+The control is what makes this readable. A bf16 rerun reproduces the first run
+bit for bit, with a maximum delta of exactly zero, so every difference above
+belongs to the encoding and none of it to run-to-run variation.
+
+### What this means for adoption
+
+Both encodings change the same fraction of decisions, so footprint decides
+between them. int4 is the better choice of the two: it costs no more
+behaviourally, it halves int8's size again, and it is the only variant that
+makes the table and the tower resident together, at about 114 GB against this
+machine's 128 GB where int8 needs about 140 GB.
+
+The prior question is whether to quantize this table at all. Every flip lands
+at a position the model was already unsure about. The maximum bf16 top-2 gap
+among flipped positions is 0.5625, against a median gap of 1.375 across all
+512 positions, so neither encoding overturns a confident prediction. Against
+that, about 5 percent of next-token decisions change, and in free generation
+an early change compounds rather than staying local.
+
+Adopt int4 if the residency gain is worth that. Keep bf16 if it is not.
+Adopting int8 is the one choice the measurements rule out: it carries int4's
+behavioural cost at twice int4's size, and it does not fit in RAM.
