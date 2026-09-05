@@ -28,7 +28,12 @@ final class RouterCostTests: XCTestCase {
         let hidden = 2560, experts = 512, topK = 10
         let moePerLayerMs = 22.0  // measured production baseline
 
-        for tokens in [128, 700] {
+        // DECODE geometry first. An earlier revision of this test measured only
+        // 128 and 700 tokens, both prefill, and concluded the router was too
+        // small to fuse. Every stage turned out to be flat in token count, so at
+        // decode the router costs nearly the same while the useful work
+        // collapses to a single row. 48 layers pay that cost once per token.
+        for tokens in [1, 2, 4, 8, 128, 700] {
             let x = MLXRandom.normal([tokens, hidden]).asType(.float16)
             // The router gate ships in bf16 per layer; MLX upcasts for the
             // softmax, which is one of the costs a fused kernel would remove.
@@ -56,14 +61,31 @@ final class RouterCostTests: XCTestCase {
             eval(sel)
             let softmaxMs = time("softmax") { eval(MLX.softmax(sel, axis: -1)) }
 
+            // The three stages as ONE graph submission. The per-stage numbers
+            // above force three separate submissions, which is not how the
+            // model runs them -- in situ they sit in one graph. The gap
+            // between `chained` and the sum is the submission overhead a fused
+            // kernel could remove, and it is the honest ceiling for fusing.
+            let chainedMs = time("chained") {
+                let l = matmul(x.asType(.float32), gate.asType(.float32))
+                eval(MLX.softmax(MLX.top(l, k: topK, axis: -1), axis: -1))
+            }
+
             let total = gemmMs + topkMs + softmaxMs
             let share = total / moePerLayerMs * 100
+            // What 48 layers pay per forward. At decode that is per TOKEN, and
+            // it is the number that decides whether fusing the router matters.
+            let perForward = total * 48
             print(
                 "[router] tokens=\(tokens): gemm=\(String(format: "%.3f", gemmMs))ms "
                     + "topk=\(String(format: "%.3f", topkMs))ms "
                     + "softmax=\(String(format: "%.3f", softmaxMs))ms "
                     + "total=\(String(format: "%.3f", total))ms "
-                    + "= \(String(format: "%.2f", share))% of the 22.0ms per-layer MoE")
+                    + "= \(String(format: "%.2f", share))% of the 22.0ms per-layer MoE; "
+                    + "x48 = \(String(format: "%.1f", perForward))ms | "
+                    + "chained=\(String(format: "%.3f", chainedMs))ms "
+                    + "x48 = \(String(format: "%.1f", chainedMs * 48))ms "
+                    + "(submission overhead \(String(format: "%.1f", (total - chainedMs) * 48))ms)")
         }
     }
 }
