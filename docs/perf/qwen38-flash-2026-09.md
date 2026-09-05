@@ -2791,8 +2791,9 @@ compiled:
 Compiled from FIRST position beats baseline from second, so the treatment
 overcomes the position advantage rather than depending on it. Pooling every
 pure arm measured -- baseline 65.02, 65.29, 66.06, 66.41, 67.24 against
-compiled 64.01, 64.50, 64.91, 66.04 -- gives medians of 66.06 and 64.91, a gain
-of 2.1 percent, Mann-Whitney U of 18 out of 20, one-sided p about 0.03.
+compiled 64.01, 64.50, 64.91, 66.04 -- gives medians of 66.06 and 64.70, a gain
+of 2.05 percent, Mann-Whitney U of 18 out of 20, one-sided p about 0.03. In
+throughput that is 15.14 tokens per second against 15.46.
 
 Two rules for this box come out of that, and they cost four extra runs to
 learn. Do not pool medians across batches, because the same configuration
