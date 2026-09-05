@@ -29,8 +29,16 @@ final class ExpertSimilarityTests: XCTestCase {
         guard let source = env["MLXFAST_QWEN4EXP_SOURCE"] else {
             throw XCTSkip("set MLXFAST_QWEN4EXP_SOURCE to the bf16 source directory")
         }
+        // Layer 0 alone proves nothing about layer 47, and a merge has to hold
+        // everywhere. These span the tower.
+        for layer in [0, 23, 47] {
+            try measureLayer(source: source, layer: layer)
+        }
+    }
+
+    private func measureLayer(source: String, layer: Int) throws {
         let root = URL(fileURLWithPath: source)
-        let key = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+        let key = "model.language_model.layers.\(layer).mlp.experts.gate_up_proj"
 
         let indexURL = root.appendingPathComponent("model.safetensors.index.json")
         guard
@@ -75,21 +83,31 @@ final class ExpertSimilarityTests: XCTestCase {
         let p50 = sorted[sorted.count / 2]
         let p99 = sorted[Int(Double(sorted.count) * 0.99)]
         let maxOff = sorted[sorted.count - 1]
-        // For a 512 -> 128 merge each expert needs 3 partners it is close to.
-        // Count, per expert, its best partner.
-        var bestPartner = [Float]()
+        // A 512 -> 128 merge needs THREE close partners per expert, not one.
+        // The first, second and third best partner separate "pairs" from
+        // "clusters of four": if the second drops sharply below the first,
+        // only pairing is supported and the method table's 1.35x, which is for
+        // 512 -> 128, does not apply.
+        var best1 = [Float](), best2 = [Float](), best3 = [Float]()
         for i in 0 ..< experts {
-            var best: Float = -1
-            for j in 0 ..< experts where j != i { best = max(best, g[i * experts + j]) }
-            bestPartner.append(best)
+            var row = [Float]()
+            row.reserveCapacity(experts - 1)
+            for j in 0 ..< experts where j != i { row.append(g[i * experts + j]) }
+            row.sort(by: >)
+            best1.append(row[0])
+            best2.append(row.count > 1 ? row[1] : -1)
+            best3.append(row.count > 2 ? row[2] : -1)
         }
-        let meanBest = bestPartner.reduce(0, +) / Float(bestPartner.count)
+        func avg(_ a: [Float]) -> Float { a.reduce(0, +) / Float(a.count) }
+        let m1 = avg(best1), m2 = avg(best2), m3 = avg(best3)
 
         print(
-            "[expert-sim] experts=\(experts) proj=\(projDim): off-diagonal cosine "
+            "[expert-sim] layer=\(layer) experts=\(experts) proj=\(projDim): off-diagonal cosine "
                 + "mean=\(String(format: "%.4f", mean)) p50=\(String(format: "%.4f", p50)) "
                 + "p99=\(String(format: "%.4f", p99)) max=\(String(format: "%.4f", maxOff)); "
-                + "mean best-partner=\(String(format: "%.4f", meanBest))")
+                + "best1=\(String(format: "%.4f", m1)) best2=\(String(format: "%.4f", m2)) "
+                + "best3=\(String(format: "%.4f", m3)) "
+                + "drop1to2=\(String(format: "%.4f", m1 - m2))")
 
         // No assertion on the value: this is a measurement that decides whether
         // to build a merge, not a property the checkpoint must satisfy. It only
