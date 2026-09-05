@@ -35,8 +35,18 @@ final class ExpertGroupSizeTests: XCTestCase {
         guard let source = env["MLXFAST_QWEN4EXP_SOURCE"] else {
             throw XCTSkip("set MLXFAST_QWEN4EXP_SOURCE to the bf16 source directory")
         }
+        // Layer 0 alone proves nothing. Expert similarity turned out to be
+        // wildly layer-dependent - best-partner cosine 0.92 at layer 0 against
+        // 0.47 at layers 23 and 47 - so a group-size result from one layer
+        // cannot be trusted either. These span the tower.
+        for layer in [0, 23, 47] {
+            try measureLayer(source: source, layer: layer)
+        }
+    }
+
+    private func measureLayer(source: String, layer: Int) throws {
         let root = URL(fileURLWithPath: source)
-        let key = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+        let key = "model.language_model.layers.\(layer).mlp.experts.gate_up_proj"
 
         let indexURL = root.appendingPathComponent("model.safetensors.index.json")
         guard
@@ -55,7 +65,7 @@ final class ExpertGroupSizeTests: XCTestCase {
         let signal = sqrt((ref * ref).mean().item(Float.self))
 
         var rel = [Int: Float]()
-        var line = "[expert-gs] gate_up experts=\(expertCount) shape=\(ref.shape) "
+        var line = "[expert-gs] layer=\(layer) gate_up experts=\(expertCount) "
         for gs in [32, 64] {
             let (wq, sc, bi) = quantized(ref, groupSize: gs, bits: 4)
             let back = dequantized(

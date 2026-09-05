@@ -2592,3 +2592,40 @@ these rows do not have them.
 A structured Hadamard transform was never built. It would have the same effect
 on the error and merely be cheaper to apply, so the negative result stands
 without it.
+
+## Expert group-64 holds across the tower (2026-09-05)
+
+Affine group-64 costs 13 to 15 percent more reconstruction error than the
+shipped group-32, consistently at three layers spanning the tower, and halves
+the scale and bias metadata. Measured against the bf16 originals, 32 experts of
+gate_up_proj per layer:
+
+| layer | group-32 rel rms | group-64 rel rms | ratio | metadata |
+|---|---|---|---|---|
+| 0 | 0.0845 | 0.0968 | 1.146x | 12800 to 6400 KiB |
+| 23 | 0.0816 | 0.0920 | 1.127x | 12800 to 6400 KiB |
+| 47 | 0.0824 | 0.0935 | 1.135x | 12800 to 6400 KiB |
+
+The layer sweep was not a formality. Expert similarity, measured the same way
+on the same layers, swung from 0.92 best-partner cosine at layer 0 to 0.47 at
+layers 23 and 47, which killed expert merging after a single-layer result had
+suggested it was viable. Group-size behaviour turns out to be layer-stable
+where similarity is not, so the one-layer figure happened to be safe. The check
+cost 90 seconds and the alternative was trusting it.
+
+Across the routed experts this is about 15.1 GB of metadata down to 7.5 GB, a
+7.6 GB saving with no change in weight bit width. It remains the cheapest
+footprint win in this document.
+
+### Still not adoptable, for a reason this document has established twice
+
+Reconstruction error does not predict behaviour on this model. n-gram encodings
+spanning 16.9x in reconstruction error all moved 23 to 25 of 512 argmaxes, and
+nvfp4 reconstructs better than int4 while changing more decisions on five of
+six prompts. A 1.13x ratio is permission to build, not evidence the model
+tolerates it.
+
+What remains is a transform at `expertGroupSize` 64, which
+`Qwen4ExpTransform.Options` already accepts, followed by a divergence run
+against the group-32 build over several prompts. That costs a pass over the
+362 GB source and about 87 GB of disk.
