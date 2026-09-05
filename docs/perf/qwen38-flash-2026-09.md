@@ -2133,64 +2133,14 @@ encodings and told the reader not to quote them. Those figures came from a run
 executing 11 tests in one process, which inflated every arm. The isolated
 numbers above replace them.
 
-### Recommendation, superseded below
+### Recommendation, superseded
 
-An earlier revision of this section read "adopt int8, do not adopt int4 on this
-evidence", reasoning from the reconstruction errors above. An end-to-end
-measurement contradicts that reasoning. The section that follows replaces it.
-
-## N-gram encoding, measured end to end (2026-09-04)
-
-int8 and int4 are indistinguishable in their effect on the model, and both
-change about 5 percent of the model's decisions. Reconstruction error in
-embedding space does not predict end-to-end behaviour here.
-
-One real 512-token prefill through the whole 48-layer tower, per encoding,
-release build, greedy argmax recorded at every position. The prompt holds six
-unrelated passages, so the n-gram lookups spread over many distinct rows.
-
-| comparison | argmax agreement | flips | mean abs delta top-1 | positions identical |
-|---|---|---|---|---|
-| bf16 against bf16 (control) | 512/512, 100 percent | 0 | 0.0 exactly | 512/512 |
-| bf16 against int8 | 488/512, 95.31 percent | 24 | 0.1246 | 190/512 |
-| bf16 against int4 | 487/512, 95.12 percent | 25 | 0.1434 | 180/512 |
-| int8 against int4 | 485/512, 94.73 percent | 27 | 0.1467 | n/a |
-
-### The magnitude of the reconstruction error does not carry through
-
-int4 reconstructs the table 16.9 times worse than int8 in embedding space. It
-perturbs the logits 1.15 times more. int8 and int4 also disagree with each
-other more than either disagrees with bf16, and the three flip sets overlap
-only partly: 24 and 25 flips share just 12 positions.
-
-That pattern rules out a magnitude effect. Three encodings perturbing a common
-quantity by very different amounts would produce nested flip sets and
-proportional deltas. Instead each encoding flips a different quarter of the
-128 positions whose top-2 gap sits at or below 0.5625, which is the signature
-of a perturbation whose direction matters and whose size does not.
-
-The control is what makes this readable. A bf16 rerun reproduces the first run
-bit for bit, with a maximum delta of exactly zero, so every difference above
-belongs to the encoding and none of it to run-to-run variation.
-
-### What this means for adoption
-
-Both encodings change the same fraction of decisions, so footprint decides
-between them. int4 is the better choice of the two: it costs no more
-behaviourally, it halves int8's size again, and it is the only variant that
-makes the table and the tower resident together, at about 114 GB against this
-machine's 128 GB where int8 needs about 140 GB.
-
-The prior question is whether to quantize this table at all. Every flip lands
-at a position the model was already unsure about. The maximum bf16 top-2 gap
-among flipped positions is 0.5625, against a median gap of 1.375 across all
-512 positions, so neither encoding overturns a confident prediction. Against
-that, about 5 percent of next-token decisions change, and in free generation
-an early change compounds rather than staying local.
-
-Adopt int4 if the residency gain is worth that. Keep bf16 if it is not.
-Adopting int8 is the one choice the measurements rule out: it carries int4's
-behavioural cost at twice int4's size, and it does not fit in RAM.
+Two earlier recommendations in this document are wrong and are replaced by the
+four-encoding section at the end. The first said "adopt int8, do not adopt
+int4", reasoning from reconstruction error. The second said int4 was the only
+variant that fits in RAM. Reconstruction error does not predict behaviour here,
+and the table is memory-mapped and sparsely touched, so it never needed to be
+resident at all. Footprint is a disk argument.
 
 ## N-gram gather on the real table, and the row layout that decides it (2026-09-04)
 
@@ -2239,3 +2189,53 @@ Disk footprint is 102.4 GB, 49 GB and 25 GB. That is a disk argument, not a
 memory one: the table is memory-mapped and sparsely touched, so it never needed
 to be resident, and an earlier section in this document arguing residency for
 int4 was wrong on that premise.
+
+
+## The four n-gram encodings, decided (2026-09-04)
+
+Adopt int4. It is the cheapest on disk, the fastest to gather, and
+behaviourally identical to every other quantized option.
+
+One real 512-token prefill through the whole 48-layer tower per encoding,
+release build, two rounds, real tables:
+
+| encoding | gather | share of forward | disk | argmax flips /512 | worst-row cosine |
+|---|---|---|---|---|---|
+| bf16 | 1014, 1064 ms | 14.0 percent | 102.4 GB | 0 (control) | exact |
+| int8 | 876, 868 ms | 11.6 percent | 49 GB | 24 | 0.999955 |
+| int4 | 856, 856 ms | 11.9 percent | 25 GB | 25 | 0.986543 |
+| nvfp4 | 873, 853 ms | 11.5 percent | 28 GB | 23 | 0.993017 |
+
+### Reconstruction error does not predict behaviour
+
+The three quantized encodings span 16.9 times in reconstruction error and
+produce 23, 24 and 25 flipped decisions out of 512. int8 reconstructs an
+embedding almost exactly, at worst-row cosine 0.999955, and still moves 24
+decisions. nvfp4 roughly halves int4's worst-row cosine error and saves two
+flips, which is inside the spread between the other two.
+
+Every flip lands where the model was already unsure. The largest bf16 top-2
+gap among flipped positions is 0.5625, against a median gap of 1.375 over all
+512 positions, so no confident prediction is overturned. The bf16 control
+reproduces itself bit for bit, zero flips and a maximum delta of exactly zero,
+so all of this belongs to the encoding and none to run-to-run variation.
+
+The practical reading: quantizing this table at all costs about 5 percent of
+next-token decisions, and which quantization you choose does not change that.
+Choose on size and speed.
+
+### nvfp4 does not earn its premium here
+
+NVFP4 spends its four bits as E2M1 floats under a per-16 E4M3 block scale, ten
+block scales a row against int4's one affine scale. On real embeddings that
+buys better average error and a notably better worst row, and costs a worse
+maximum absolute error, because logarithmic levels resolve finely near zero and
+leave a 50 percent gap between 4 and 6 at the top of a block. None of it
+reaches the logits. It also costs 12 percent more disk than int4 and takes
+509 seconds to convert against int4's 297, so int4 remains the choice.
+
+One caution for anyone testing a symmetric format against a synthetic fixture:
+an affine code carries a bias and a float code does not. On the checked-in
+fixture, whose values sit in [0.0078, 0.0137] and never cross zero, nvfp4
+measures 5.7 times worse than int4. That is a fact about the fixture. Real
+embeddings are near zero-centred, which is the case NVFP4 is built for.
