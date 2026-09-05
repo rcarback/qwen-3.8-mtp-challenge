@@ -2477,3 +2477,65 @@ not: the cost left the critical path rather than moving along it.
 
 `MLX_QWEN4EXP_NGRAM_AHEAD=0` disables the head start and keeps the synchronous
 prefetch, which is the arm measured above.
+
+## The decode component breakdown is invalid; it measured a dispatch floor (2026-09-05)
+
+An isolated `eval()` at one row costs about 0.22 ms regardless of what it
+computes. The decode component breakdown timed each block that way, so it
+measured that floor 48 or 96 times over rather than the blocks' in-situ cost.
+Its per-component figures should not be used.
+
+The measurement that shows it, three arms over the same RMS norm at one row:
+
+| arm | per call |
+|---|---|
+| production, `MLXFast.rmsNorm` with the scale recomputed | 0.2263 ms |
+| same, scale precomputed once | 0.2268 ms |
+| hand-written unfused: multiply, mean, rsqrt, multiply | 0.2262 ms |
+
+One fused kernel and five separate ops cost the same. So the number is not the
+work; it is the round trip.
+
+The same floor appears in every component the breakdown timed: expert GEMM at
+one row 0.223 ms, router chained 0.180 ms, linear attention projections
+0.229 ms, full attention projections 0.229 ms, shared expert 0.177 ms. Only
+`lm_head` at 0.938 ms sits meaningfully above it, and it is the only component
+whose figure carried information.
+
+### The arithmetic that should have caught this
+
+A decode step is 59.41 ms across 48 layers, so 1.24 ms per layer. A layer runs
+more than ten operations. At a 0.22 ms floor per operation a layer would cost
+over 2.2 ms and a step over 105 ms. The step is 59.41 ms, so the model does not
+pay that floor per component: it evaluates a layer as one graph and the
+submissions amortise.
+
+The breakdown summed to 109 percent of the step and that was written off as
+blocks sharing submissions in situ. The right reading was that the components
+were not being measured at all.
+
+### What survives
+
+The qualitative conclusion stands and is now better supported: decode is
+dominated by dispatch rather than arithmetic. Five components with different
+arithmetic by two orders of magnitude all cost 0.18 to 0.23 ms in isolation,
+and `lm_head` at 636 MFLOP is the only one whose content shows up.
+
+What does not survive is any claim about how a decode step divides between
+components. rms_norm is not 17 percent, the routed MoE is not 30 percent, and
+the router's 14.5 percent rests on the same floor. Those numbers are withdrawn.
+
+Measuring the split requires timing inside the model, not reconstructing it
+from microbenchmarks: instrument the layer loop, or ablate a component from a
+real forward and difference the step time.
+
+### Two negative results worth keeping
+
+Hoisting the RMS norm scale saves nothing. `Qwen4ExpRMSNorm` recomputes
+`(1.0 + weight).asType()` on every call for a weight that never changes, which
+looked like 288 redundant ops per decode step. It is free: the fused kernel
+dominates and the extra ops disappear into the same round trip.
+
+MLX `compile` on the norm was measured at 32 percent faster earlier. That
+figure was against the hand-written unfused arm, which production does not run.
+Against the real fused norm there is nothing to fuse.
