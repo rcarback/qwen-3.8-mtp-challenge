@@ -2906,3 +2906,182 @@ explanations — launch overhead recovers 1.8 percent, page faults account for
 0.1 percent — without supplying a third. The per-layer instrument added
 earlier remains the only tool that measures inside the real forward, and the
 question of where the 65 ms goes is still open.
+
+## 2026-09-05 — Why decode is slow, and why nothing moved it
+
+Decode costs about 64 ms per token, 15.4 tokens per second. This section
+accounts for all of it, names the policy decision it traces to, and explains
+in the same numbers why every optimisation attempted before this one measured
+close to zero.
+
+### The transform leaves 85 percent of a token's bytes in bf16
+
+Only the routed experts are quantized. Every other tensor is a bf16 byte copy;
+the transform header says so ("dense bf16 byte copies") and the on-disk
+safetensors headers confirm it:
+
+| family | GB on disk | dtype |
+| --- | --- | --- |
+| switch_mlp (routed experts) | 77.07 | 4-bit affine g32 |
+| linear_attn | 4.17 | bf16 |
+| self_attn | 1.34 | bf16 |
+| hyper_connection | 1.32 | bf16 |
+| lm_head | 1.27 | bf16 |
+| embed_tokens | 1.27 | bf16 |
+| shared_expert | 0.48 | bf16 |
+| mlp.gate (router) | 0.13 | bf16 |
+
+The experts are 88 percent of the disk and 15 percent of what a token reads: a
+token touches 10 of 512 experts, 1.51 GB. The dense tensors are touched in
+full on every token: 8.78 GB. So 85 percent of the bytes behind a decode step
+are unquantized.
+
+Upstream's `quant_predicate` for this architecture (mlx-lm PR 1788) quantizes
+everything except the router. This fork's transform diverged from that policy.
+That divergence is what happened. There is no off-the-shelf comparison to
+run -- upstream `main` has no `qwen4_exp` and the PR is unmerged -- but the
+policy difference alone predicts a 2 to 3x gap in per-token bytes.
+
+### Measured, not inferred
+
+The bf16 gemv is not the problem in itself. At the in-projection shape,
+`[1, 2560] x [2560, 10240]`, over 36 distinct weight matrices under one eval:
+
+| kernel | achieved | per 52 MB layer |
+| --- | --- | --- |
+| bf16 gemv | 441.5 GB/s | 0.119 ms |
+| q4 g32 qmv | 300.8 GB/s | 0.054 ms |
+| q4 g64 qmv | 162.5 GB/s | 0.091 ms |
+| q8 g32 qmv | 368.7 GB/s | 0.080 ms |
+
+bf16 runs near the machine's peak. The cost is the byte count, not the
+kernel. (q4 g64 is slower than g32 in wall time, which corroborates the
+group-64 rejection from a second direction.)
+
+The decisive test quantizes the dense Linears at load, from the same tree,
+through the same code, behind `DARKBLOOM_DENSE_QUANT_BITS` -- one variable.
+Counterbalanced:
+
+| position | dense | ms per token | tokens/s |
+| --- | --- | --- | --- |
+| 1 | q4 | 42.46 | 23.6 |
+| 2 | bf16 | 63.80 | 15.7 |
+| 3 | bf16 | 65.71 | 15.2 |
+| 4 | q4 | 42.57 | 23.5 |
+
+64 to 42.5 ms, 33 percent, ten times the run-to-run noise, from either
+position. q8 lands at 57.1 ms, 11.5 percent.
+
+The saving exceeds its byte prediction. At 441 GB/s the dense bf16 costs about
+20 ms and q4 at 301 GB/s about 8, a predicted 12 ms; measured 21. The q4 arms'
+p10 to p90 also tightened from 8 ms to 2.6. On a 128 GB box holding an 87 GB
+tower and a 102 GB n-gram table, 6 GB less resident dense weight is less
+pressure on everything else, and the measurement says that pressure was
+costing about as much again as the bytes.
+
+### The other half is launch cost, and it is structural
+
+`DecodeLayerCostTests` chains one real layer through its own output 64 times
+under a single eval. Its weights stay hot, so what it measures is the op chain:
+
+| dense | linear-attention layer | full-attention layer | 48 layers |
+| --- | --- | --- | --- |
+| bf16 | 0.675 ms | 0.729 ms | 33.0 ms |
+| q4 | 0.614 ms | 0.626 ms | 29.6 ms |
+
+Quantizing dense saves 3.4 ms in the chain and 21 ms in the real step. The
+chain re-reads one layer's 187 MB, which stays cached; the step streams 48
+layers' 10.3 GB. Subtracting gives the decomposition:
+
+| term | about | what moves it |
+| --- | --- | --- |
+| weight streaming, 85 percent bf16 dense | 31 ms | dense quantization: 21 ms measured |
+| op-chain launch cost, 0.69 ms per layer | 33 ms | whole-layer compile |
+
+A chain of dependent elementwise ops at the hidden width prices one launch at
+5 to 12 us on this box, so 0.69 ms per layer is roughly 60 to 100 ops. That is
+eager-dispatch cost and it does not shrink with bytes. Block-level compile
+recovered 2 percent because it fused about 15 of those ops; whole-layer compile
+is what recovers the term, and the earlier section records why it is blocked:
+the layer-2 n-gram gather is host code, so a traced graph would bake one
+token's embedding in as a constant. Making that gather a graph op, or
+compiling around layer 2, is worth about 25 of the 42.5 ms that remain after
+dense quantization.
+
+### Why nothing we tried worked
+
+Every attempted optimisation now has a denominator.
+
+The fused MoE kernel, group-64 experts, the ANE expert split, expert merging,
+capacity-factor dropping and router fusion all acted on the 1.51 GB of expert
+bytes inside a 31 ms streaming term that 8.78 GB of dense bf16 dominates. The
+best possible outcome for any of them was a few percent of the step, and the
+measured outcomes were a few percent or a refusal.
+
+Compile acted on the 33 ms launch term but could reach only the ops inside two
+blocks, about 15 percent of a layer's chain, for 2 percent of the step.
+
+Prefill work -- the n-gram gather, the ANE lanes -- does not touch the decode
+step at all.
+
+None of these was wrong to try. Each was measured against a step whose
+composition nobody had established, and each was judged against the wrong
+denominator as a result. The two instruments in this section, one with hot
+weights and one with cold, are what it took to establish it.
+
+### Fidelity
+
+Greedy self-feeding decode against the bf16-dense stream, three prompts,
+first divergence:
+
+| prompt | q4 step (gap) | q8 step (gap) |
+| --- | --- | --- |
+| law | 1 (1.25) | 18 (0.125) |
+| biology | 3 (0.375) | 25 (0.25) |
+| music | 10 (0.0, exact tie) | 6 (0.0, exact tie) |
+
+q8 diverges late and on near-ties. q4 diverges early, once at a decisive gap. A
+divergence index says the streams differ; it cannot say which is better, and
+upstream's own 4-bit tree would diverge from bf16 dense too. The quality
+question is settled below by teacher-forced next-token loss, which is
+position-independent and comparable across arms.
+
+### Quality: Teacher-forced next-token loss
+
+Six prompts of unrelated prose (law, biology, music, geology, cooking,
+logistics), 512 positions each, mean negative log-likelihood of the true next
+token under each arm. The bf16 arm is the tree as shipped. `DensePerplexityTests`
+runs this with `MLXFAST_PPL_PROMPTS=<dir of .txt>`.
+
+| dense arm | mean NLL | perplexity | change vs bf16 |
+| --- | --- | --- | --- |
+| bf16 | 1.4679 | 4.340 | -- |
+| q8 g32 | 1.4648 | 4.327 | -0.3 percent |
+| q4 g32 | 1.6179 | 5.043 | +16.2 percent |
+
+The per-prompt spread tells the same story. q8 moves every prompt by less than
+0.01 nats in either direction, which is noise. q4 raises every prompt by 0.12
+to 0.18 nats, and the worst prompt (geology) by 0.17.
+
+**Decision: q8 dense is the default. q4 dense is not.** q8 keeps the model and
+buys 11.5 percent of the step (64 to 57.1 ms). q4 buys 33 percent (to 42.5
+ms) and costs 16 percent perplexity, which on this model is a different model.
+The preceding fidelity table already showed it: q4 diverged at step 1 on a
+decisive 1.25-logit gap, which is not a near tie.
+
+What this changes about the plan:
+
+- The offline tree gets `denseBits: 8`. That is the transform option in this
+  branch, and the per-layer `quantization` entries it writes are what the
+  loader already reads for mixed precision. Building it needs about 81 GB free
+  and this machine has 69 GB. The old `weights-g64` tree in the Trash is 74 GB.
+- The remaining 15 to 20 ms between q8 and q4 is not free to take. A mixed
+  policy (q8 attention and lm_head, q4 shared expert, and the dense layer-0
+  MLP) might keep most of the speed at a fraction of the loss, but that is
+  a new experiment with its own perplexity arm, not a setting to ship.
+- Whole-layer compile is the other lever, orthogonal to bytes: about
+  25 ms of the q8 step is launch cost, and the layer-2 host n-gram gather is
+  what keeps `compile` off the whole layer.
+- The ANE prefill lanes decline `QuantizedLinear` weights, so a q8 dense tree
+  turns them off. They never touched the decode step, so this costs prefill
+  only, a trade the decode numbers justify.
