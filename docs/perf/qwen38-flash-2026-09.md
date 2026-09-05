@@ -3041,12 +3041,12 @@ first divergence:
 | music | 10 (0.0, exact tie) | 6 (0.0, exact tie) |
 
 q8 diverges late and on near-ties. q4 diverges early, once at a decisive gap. A
-divergence index says the streams differ; it cannot say which is better, and
-upstream's own 4-bit tree would diverge from bf16 dense too. The quality
-question is settled below by teacher-forced next-token loss, which is
-position-independent and comparable across arms.
+divergence index says the streams differ. It cannot say which is better, and
+upstream's own 4-bit tree would diverge from bf16 dense too. Teacher-forced
+next-token loss, which is position-independent and comparable across arms,
+settles the quality question in the next section.
 
-### Quality: Teacher-forced next-token loss
+### Quality by teacher-forced next-token loss
 
 Six prompts of unrelated prose (law, biology, music, geology, cooking,
 logistics), 512 positions each, mean negative log-likelihood of the true next
