@@ -2718,3 +2718,144 @@ plan should be retired.
 7.6 GB of metadata against 8.95 percent of decisions. For comparison, n-gram
 int4 saves 77 GB of disk for about 5 percent. Group-64 is a worse trade on both
 sides of the ledger.
+
+## 2026-09-05 — Compiled decode and the fused router tail
+
+Two beads, `2u9` (compile the decode path) and `2t6` (fused router kernel),
+executed together because both are launch-overhead arguments and both are
+answered by the same instrument.
+
+### The instrument had to be built first
+
+`DecodeStepCostTests` sweeps rows in one process and reports 2200 ms at its
+first arm and 19.8 ms per token at its last. That spread is not a property of
+row count. An 87 GB model faults in from disk during the first arm, so the
+sweep charges the whole cold start to whichever shape happens to run first.
+Every decode number taken from it is therefore a residency measurement wearing
+a row-count label.
+
+`DecodeCompileRealTests` replaces it for A/B work: it warms residency out of
+the measurement, then times 200 single-token steps and reports the median with
+the warm-up curve printed alongside, so the flattening is visible rather than
+assumed. One arm per process, selected by environment. The curve for a cold
+process reads 2154, 2188, 974, 68, 68 — three bands of paging before the
+steady state.
+
+### Compile buys 1.8 percent, and the projection it replaces was a floor
+
+MLX `compile` now wraps two blocks, each behind its own switch and each
+restricted to the decode regime:
+
+- the hyper-connection read gate, `Qwen4ExpGatedResidual.mix` — a zero-centred
+  RMS norm, two low-rank projections, a silu, two sigmoids, a broadcast product
+  and a mean, called 96 times per decode step
+- the gated shared expert, `sigmoid(gate(x)) * shared(x)`
+
+Neither uses `shapeless: true`. Both bodies read their input shape to build
+reshape targets, so a symbolic trace would bake whatever the first call
+carried; tracing per shape instead means prefill, whose length varies call to
+call, would retrace repeatedly. Prefill is compute-bound and stays eager.
+
+Six runs, one arm per process:
+
+| configuration | median ms per token |
+| --- | --- |
+| baseline | 66.06, 65.29, 65.02 |
+| compiled | 64.41, 64.50, 64.01 |
+
+The groups do not overlap. The gain is 1.8 percent.
+
+The bead projected 8.4 percent as a lower bound, from isolated blocks. That
+projection was reading the dispatch floor. Its compiled `rms_norm` arm measured
+0.223 ms, and the isolated-eval floor on this machine is about 0.22 ms: the
+block had been compiled down to the cost of the round trip, so the measurement
+described the round trip. This is the third time on this model that an isolated
+microbenchmark has reported that floor as though it were a component.
+
+The real model does preserve the ordering the synthetic suggested, which is
+worth keeping: the elementwise-heavy read gate gains about 1.5 percent, the
+matmul-heavy shared expert about 0.6 percent. `compile` fuses glue and cannot
+fuse inside a tuned quantized matmul.
+
+### Whole-step compiled decode is unavailable, and the cache types were not the blocker
+
+The bead's feasibility note found `CompiledDecode.eligible()` returning false
+because `Qwen4ExpModel.newCache` returns `Qwen4ExpAttnCache`, `ArraysCache` and
+`MambaCache` rather than the `Compilable*` types, and scoped the remaining work
+as writing three compilable cache variants.
+
+Those are necessary and not sufficient. `Qwen4ExpNGram.swift:555` reads the
+current token back to the host with `ids.asType(.int64).asArray(Int64.self)`,
+gathers rows out of a 102 GB memory map with `memcpy`, and wraps the result in
+a fresh `MLXArray`. `compile(inputs:outputs:)` runs Swift code once, at trace
+time. A compiled decode step would bake one token's n-gram embedding in as a
+constant and replay it forever: not a crash, but wrong logits from layer 2
+onward on every subsequent step.
+
+So the sufficient condition is out of reach while the n-gram table lives in a
+mapping the GPU cannot address. Writing the three cache types would produce a
+graph that is fast and wrong.
+
+### Decode is not stalled on the n-gram table
+
+The same host gather suggested its own hypothesis: with a 102 GB table and an
+87 GB model against 128 GB of RAM the table cannot be resident, so each decode
+step should take about sixteen cold faults with almost no readahead cover.
+
+Measured, it is 0.063 ms per step, 0.1 percent of the step. The hypothesis is
+refuted.
+
+One limitation, stated because it bounds the claim: the timing loop cycles
+token ids through a small range, so the same sixteen rows are requested
+repeatedly and stay resident. 0.1 percent is the best case. A varied-token
+version would be needed before saying the gather is cheap on real text.
+
+### The fused router kernel is correct and still loses
+
+`FusedRouterSelect` collapses the router's selection tail — `argPartition`, the
+slice, `takeAlong` and the precise float32 softmax — into one Metal kernel, one
+threadgroup per row, logits resident in registers across ten masked-argmax
+rounds. The gate GEMM is deliberately left on the tuned `matmul`: this
+repository's one prior hand-written replacement for a tuned kernel,
+`FusedRoutedMoE`, ran 48 times slower than the library path.
+
+The trap the bead names is the wrong risk and, separately, an absent one.
+
+It is the wrong risk because `argPartition`'s order among equal values is not
+observable here. The caller gathers the selected experts and reduces them with
+`(y * w).sum(axis: -2)`, which is order-independent up to float associativity.
+Only the selected SET has to match, and reproducing a set is the easy half.
+
+It is absent because the set can differ only on an exact float32 tie astride
+the k-boundary. Over 20000 rows of router-shaped logits there were 0 such ties,
+smallest boundary gap 2.98e-06. Set equality and weights were verified against
+the eager tail at 1, 7, 64 and 1024 rows.
+
+What refuses it is speed:
+
+| rows | eager | fused | delta |
+| --- | --- | --- | --- |
+| 1 | 0.190 ms | 0.192 ms | +1.0% |
+| 512 | 0.292 ms | 0.226 ms | -22.8% |
+| 7000 | 0.457 ms | 0.516 ms | +12.9% |
+
+At one row both sides sit at 0.19 ms, the same dispatch floor as above, so
+nothing is resolved there. At 7000 rows, the measured real prefill width, the
+kernel is 12.9 percent slower: one threadgroup per row makes each row serialise
+ten reduction rounds behind eighty barriers, while the library partitions the
+whole tensor in parallel. The gain at 512 rows is real and falls between the
+two widths the model runs at.
+
+Kept, off by default behind `MLX_QWEN4EXP_FUSED_ROUTER=1`, with the same status
+as `FusedRoutedMoE`: a correct implementation carrying its own refusal. A
+row-parallel rewrite is the only version that could win at 7000 rows, and the
+ceiling for the whole method remains the 1 to 3 percent of prefill the bead's
+design section bounds it at.
+
+### What this does not explain
+
+Decode costs about 65 ms per token. This work rules out two candidate
+explanations — launch overhead recovers 1.8 percent, page faults account for
+0.1 percent — without supplying a third. The per-layer instrument added
+earlier remains the only tool that measures inside the real forward, and the
+question of where the 65 ms goes is still open.
