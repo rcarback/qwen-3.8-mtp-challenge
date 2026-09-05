@@ -1,7 +1,7 @@
 import Foundation
 import MLX
 import MLXHuggingFace
-import MLXLLM
+@testable import MLXLLM
 import MLXLMCommon
 import Testing
 import Tokenizers  // required for #huggingFaceTokenizerLoader() macro expansion
@@ -70,9 +70,31 @@ struct Qwen4ExpNGramEncodingDivergenceTests {
         let tokens = MLXArray(ids.map { Int32($0) }).reshaped([1, 512])
 
         let cache = context.model.newCache(parameters: nil)
+        Qwen4ExpNGramTable.stats.reset()
+        let t0 = DispatchTime.now().uptimeNanoseconds
         let out = context.model(LMInput.Text(tokens: tokens), cache: cache, state: nil)
         let logits = out.logits.asType(.float32)
         eval(logits)
+        let forwardMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+        // The gather runs once per forward (PLE sits at layer 2 only), so these
+        // stats describe the whole prefill's n-gram cost. On the REAL table the
+        // pages are not resident, so this is the page-fault term the 6.4 MB
+        // fixture measurements could not see.
+        let g = Qwen4ExpNGramTable.stats.snapshot()
+        let gatherMs = Double(g.nanos) / 1e6
+        // Built in pieces: one long interpolation defeats the type checker.
+        let tableName: String = env["MLX_QWEN4EXP_NGRAM_DIR"] ?? "bf16-default"
+        let fwd: String = String(format: "%.1f", forwardMs)
+        let gat: String = String(format: "%.2f", gatherMs)
+        let share: String = String(format: "%.2f", gatherMs / forwardMs * 100)
+        var line = "[ngram-cost] table=" + tableName
+        line += " forward=" + fwd + "ms"
+        line += " gather=" + gat + "ms"
+        line += " gather_share=" + share + "%"
+        line += " rows=" + String(g.rows)
+        line += " pages=" + String(g.distinctPages)
+        line += " calls=" + String(g.calls)
+        print(line)
 
         // Per position: the argmax, its value, and the runner-up. That is
         // enough to compare two arms on decision agreement AND to say whether

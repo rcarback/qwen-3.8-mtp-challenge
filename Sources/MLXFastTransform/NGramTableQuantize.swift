@@ -15,6 +15,15 @@ import Foundation
 /// per-row scaling preserves each embedding's own dynamic range at a cost of 4
 /// metadata bytes against 320 payload bytes. The table is 320,001,536 rows, so
 /// this converts 102.4 GB to 52.5 GB (int8) or 26.9 GB (int4).
+///
+/// The row's scale, bias and payload are stored CONTIGUOUSLY, as one record of
+/// `4 + dim*bits/8` bytes, rather than in three separate tensors. That layout
+/// is what makes a quantized table cheaper to read than the bf16 one. The
+/// production gather touches thousands of rows scattered across 320 million,
+/// so no two rows share a 16 KiB page and each row costs its own page fault.
+/// Splitting a row across a weight region, a scale region and a bias region
+/// therefore costs THREE faults per row and measured 2.3x slower than bf16
+/// despite moving a quarter of the bytes. One record is one fault.
 public enum NGramTableQuantize {
     public enum Failure: Error, CustomStringConvertible {
         case badShard(String)
@@ -54,11 +63,11 @@ public enum NGramTableQuantize {
         else { throw Failure.badShard(source.path) }
         let rows = shape[0], dim = shape[1]
         let base = 8 + headerLength + range[0]
-        let perRow = bits == 8 ? dim : dim / 2
+        let codes = bits == 8 ? dim : dim / 2
+        // [scale: f16][bias: f16][codes...] per row, contiguous.
+        let perRow = 4 + codes
 
         var payload = Data(count: rows * perRow)
-        var scales = [UInt16](repeating: 0, count: rows)
-        var biases = [UInt16](repeating: 0, count: rows)
 
         data.withUnsafeBytes { src in
             payload.withUnsafeMutableBytes { dst in
@@ -76,52 +85,40 @@ public enum NGramTableQuantize {
                     let levels = Float(bits == 8 ? 255 : 15)
                     let scale = (hi - lo) / levels
                     let safeScale = scale == 0 ? 1 : scale
-                    scales[r] = Float16(scale).bitPattern
-                    biases[r] = Float16(lo).bitPattern
                     let rowOut = d.advanced(by: r * perRow)
+                    rowOut.storeBytes(
+                        of: Float16(scale).bitPattern.littleEndian, toByteOffset: 0, as: UInt16.self)
+                    rowOut.storeBytes(
+                        of: Float16(lo).bitPattern.littleEndian, toByteOffset: 2, as: UInt16.self)
                     if bits == 8 {
                         for c in 0 ..< dim {
                             let q = ((values[c] - lo) / safeScale).rounded()
                             rowOut.storeBytes(
-                                of: UInt8(max(0, min(Float(255), q))), toByteOffset: c, as: UInt8.self)
+                                of: UInt8(max(0, min(Float(255), q))), toByteOffset: 4 + c,
+                                as: UInt8.self)
                         }
                     } else {
                         for c in stride(from: 0, to: dim, by: 2) {
                             let q0 = UInt8(max(0, min(Float(15), ((values[c] - lo) / safeScale).rounded())))
                             let q1 = UInt8(
                                 max(0, min(Float(15), ((values[c + 1] - lo) / safeScale).rounded())))
-                            rowOut.storeBytes(of: q0 | (q1 << 4), toByteOffset: c / 2, as: UInt8.self)
+                            rowOut.storeBytes(of: q0 | (q1 << 4), toByteOffset: 4 + c / 2, as: UInt8.self)
                         }
                     }
                 }
             }
         }
 
-        let scaleBytes = scales.withUnsafeBufferPointer { Data(buffer: $0) }
-        let biasBytes = biases.withUnsafeBufferPointer { Data(buffer: $0) }
         let outHeader = try JSONSerialization.data(withJSONObject: [
             "weight": [
                 "dtype": "U8", "shape": [rows, perRow],
                 "data_offsets": [0, payload.count],
-            ],
-            "scales": [
-                "dtype": "F16", "shape": [rows],
-                "data_offsets": [payload.count, payload.count + scaleBytes.count],
-            ],
-            "biases": [
-                "dtype": "F16", "shape": [rows],
-                "data_offsets": [
-                    payload.count + scaleBytes.count,
-                    payload.count + scaleBytes.count + biasBytes.count,
-                ],
-            ],
+            ]
         ])
         var file = Data()
         withUnsafeBytes(of: UInt64(outHeader.count).littleEndian) { file.append(contentsOf: $0) }
         file.append(outHeader)
         file.append(payload)
-        file.append(scaleBytes)
-        file.append(biasBytes)
         try file.write(to: dest)
     }
 }

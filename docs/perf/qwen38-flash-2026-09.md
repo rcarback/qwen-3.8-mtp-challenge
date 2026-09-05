@@ -2191,3 +2191,51 @@ an early change compounds rather than staying local.
 Adopt int4 if the residency gain is worth that. Keep bf16 if it is not.
 Adopting int8 is the one choice the measurements rule out: it carries int4's
 behavioural cost at twice int4's size, and it does not fit in RAM.
+
+## N-gram gather on the real table, and the row layout that decides it (2026-09-04)
+
+The n-gram gather costs 1027 ms of a 7113 ms forward on the real bf16 table,
+about 14 percent. An earlier section in this document put it at 0.15 percent.
+That figure came from a 6.4 MB fixture that was fully faulted in before timing,
+which deleted the page-fault term. The real term is 631 times the term the
+fixture measured, 1027 ms against 1.609 ms. Treat every fixture gather number
+in this document as conversion cost only.
+
+### Page count is row-bound, not byte-bound
+
+The gather reads 8192 rows scattered across 320,001,536. No two rows share a
+16 KiB page, so the cost is one cold page fault per row: 7860 distinct pages to
+read about 2.6 MB of useful data. Shrinking a row does not change that. int8
+touches 7856 pages and int4 touches 7847, against bf16's 7860.
+
+### One row must be one record
+
+A quantized row carries a scale, a bias and its codes. Storing those in three
+separate tensors costs three page faults per row, because the three regions sit
+far apart in the shard. Measured that way, quantization made the table smaller
+and 2.3 times slower:
+
+| encoding | gather, split layout | gather, one record per row |
+|---|---|---|
+| bf16 | 1011, 1023 ms | 1027, 1018 ms |
+| int8 | 2395, 2382 ms | 879, 877 ms |
+| int4 | 2362, 2367 ms | 865, 868 ms |
+
+The fix moves no bytes and changes no arithmetic. Each row is now a contiguous
+`[scale f16][bias f16][codes]` record, 164 bytes for int8 and 84 for int4, so
+one row is one read and one fault. bf16 is unchanged because its layout never
+moved, which is the control for this comparison.
+
+### Result
+
+int4 gathers about 15 percent faster than bf16 and int8 about 14 percent
+faster, consistently across rounds. Whole-forward time does not separate the
+three: the measured forwards range from 7113 ms to 7742 ms with no ordering by
+encoding, so the roughly 150 ms the gather saves sits inside run-to-run
+variance at two rounds per arm. Claim the gather improvement, not an
+end-to-end one, until more rounds say otherwise.
+
+Disk footprint is 102.4 GB, 49 GB and 25 GB. That is a disk argument, not a
+memory one: the table is memory-mapped and sparsely touched, so it never needed
+to be resident, and an earlier section in this document arguing residency for
+int4 was wrong on that premise.

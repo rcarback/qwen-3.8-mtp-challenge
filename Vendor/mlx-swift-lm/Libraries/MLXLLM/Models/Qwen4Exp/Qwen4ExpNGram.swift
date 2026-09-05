@@ -128,11 +128,10 @@ final class Qwen4ExpNGramTable {
     static let stats = StatsBox()
 
     /// Bits per element: 16 (bf16, the on-disk default), 8, or 4 (offline
-    /// per-row affine codes from `NGramTableQuantize`). Quantized shards carry
-    /// `scales`/`biases` alongside `weight`; these offsets are empty at bits==16.
+    /// per-row affine codes from `NGramTableQuantize`). A quantized row is one
+    /// `[scale f16][bias f16][codes]` record, so `bytesPerRow` describes every
+    /// encoding and no separate scale or bias regions exist.
     private let bits: Int
-    private let scaleOffsets: [Int]
-    private let biasOffsets: [Int]
 
     /// Writes a synthetic bf16 shard set and returns its directory, so a table
     /// can be opened over it directly or re-encoded by `NGramTableQuantize`.
@@ -204,16 +203,17 @@ final class Qwen4ExpNGramTable {
             let shape = info["shape"] as? [Int], shape.count == 2
         else { throw Qwen4ExpNGramError.badShard(url.path) }
         if dtype == "BF16" { return 16 }
-        guard dtype == "U8", header?["scales"] != nil, header?["biases"] != nil
-        else { throw Qwen4ExpNGramError.badShard(url.path) }
-        if shape[1] == spec.dim { return 8 }
-        if shape[1] == spec.dim / 2 { return 4 }
+        guard dtype == "U8" else { throw Qwen4ExpNGramError.badShard(url.path) }
+        // A quantized record is [scale f16][bias f16][codes], so the row width
+        // alone names the width: 4 + dim for int8, 4 + dim/2 for int4.
+        if shape[1] == 4 + spec.dim { return 8 }
+        if shape[1] == 4 + spec.dim / 2 { return 4 }
         throw Qwen4ExpNGramError.badShard(url.path)
     }
 
     /// `bits` selects the on-disk row encoding: 16 reads the checkpoint's bf16
-    /// shards directly (`weight` only); 8 and 4 read `NGramTableQuantize`
-    /// output (`weight` as packed `U8` plus per-row `scales`/`biases`, both F16).
+    /// shards directly; 8 and 4 read `NGramTableQuantize` output, one `U8`
+    /// tensor whose rows are `[scale f16][bias f16][codes]` records.
     init(directory: URL, spec: Qwen4ExpNGramTableSpec, bits: Int) throws {
         precondition(bits == 16 || bits == 8 || bits == 4, "n-gram table bits must be 16, 8, or 4")
         precondition(
@@ -221,11 +221,11 @@ final class Qwen4ExpNGramTable {
         self.bits = bits
         rowsPerShard = spec.rowsPerShard
         dim = spec.dim
-        bytesPerRow = bits == 16 ? dim * 2 : 0
+        // One contiguous record per row in every encoding, so one stride and
+        // one page fault per row rather than three.
+        bytesPerRow = bits == 16 ? dim * 2 : 4 + (bits == 8 ? dim : dim / 2)
         var maps = [Data]()
         var offsets = [Int]()
-        var scaleOffsets = [Int]()
-        var biasOffsets = [Int]()
         for s in 0 ..< spec.shards {
             let url = directory.appendingPathComponent(String(format: "shard_%03d.safetensors", s))
             let data = try Data(contentsOf: url, options: [.alwaysMapped])
@@ -244,23 +244,14 @@ final class Qwen4ExpNGramTable {
                 guard dtype == "BF16", shape == [spec.rowsPerShard, spec.dim]
                 else { throw Qwen4ExpNGramError.badShard(url.path) }
             } else {
-                let perRow = bits == 8 ? spec.dim : spec.dim / 2
-                guard dtype == "U8", shape == [spec.rowsPerShard, perRow],
-                    let scaleInfo = header?["scales"] as? [String: Any],
-                    let scaleRange = scaleInfo["data_offsets"] as? [Int], scaleRange.count == 2,
-                    let biasInfo = header?["biases"] as? [String: Any],
-                    let biasRange = biasInfo["data_offsets"] as? [Int], biasRange.count == 2
+                guard dtype == "U8", shape == [spec.rowsPerShard, bytesPerRow]
                 else { throw Qwen4ExpNGramError.badShard(url.path) }
-                scaleOffsets.append(8 + headerLength + scaleRange[0])
-                biasOffsets.append(8 + headerLength + biasRange[0])
             }
             maps.append(data)
             offsets.append(8 + headerLength + range[0])
         }
         self.maps = maps
         self.dataOffsets = offsets
-        self.scaleOffsets = scaleOffsets
-        self.biasOffsets = biasOffsets
     }
 
     /// `gids[t]` lists one global row id per head. Returns `[T, heads * dim]` float16.
@@ -275,11 +266,11 @@ final class Qwen4ExpNGramTable {
                 for gid in row {
                     let shard = Int(gid) / rowsPerShard
                     let r = Int(gid) % rowsPerShard
-                    // Quantized rows have no fixed `bytesPerRow`; the page a row
-                    // starts on is still a useful locality signal, so approximate
-                    // it with the weight-tensor's own per-row stride.
-                    let stride = bits == 16 ? bytesPerRow : (bits == 8 ? dim : dim / 2)
-                    let start = dataOffsets[shard] + r * stride
+                    // Exact for every encoding now: one record per row means
+                    // one start offset. The previous split layout counted only
+                    // the weight page and undercounted the quantized paths by
+                    // about 3x, which hid why they were slower than bf16.
+                    let start = dataOffsets[shard] + r * bytesPerRow
                     pages.insert(shard << 40 | (start / 16384))
                 }
             }
@@ -315,7 +306,6 @@ final class Qwen4ExpNGramTable {
             // the CPU into f16 directly. There is no MLX dtype for a per-row
             // affine code with this layout, so the GPU cast trick above does
             // not apply here.
-            let perRow = bits == 8 ? dim : dim / 2
             out.withUnsafeMutableBufferPointer { dstBuf in
                 var cursor = 0
                 for row in gids {
@@ -324,15 +314,19 @@ final class Qwen4ExpNGramTable {
                         let r = Int(gid) % rowsPerShard
                         maps[shard].withUnsafeBytes { src in
                             let s = src.baseAddress!
+                            // One record: scale, bias, then the codes.
+                            let rec = dataOffsets[shard] + r * bytesPerRow
                             let scale = Float(
                                 Float16(
-                                    bitPattern: s.loadUnaligned(
-                                        fromByteOffset: scaleOffsets[shard] + r * 2, as: UInt16.self)))
+                                    bitPattern: UInt16(
+                                        littleEndian: s.loadUnaligned(
+                                            fromByteOffset: rec, as: UInt16.self))))
                             let bias = Float(
                                 Float16(
-                                    bitPattern: s.loadUnaligned(
-                                        fromByteOffset: biasOffsets[shard] + r * 2, as: UInt16.self)))
-                            let rowStart = dataOffsets[shard] + r * perRow
+                                    bitPattern: UInt16(
+                                        littleEndian: s.loadUnaligned(
+                                            fromByteOffset: rec + 2, as: UInt16.self))))
+                            let rowStart = rec + 4
                             if bits == 8 {
                                 for c in 0 ..< dim {
                                     let q = s.loadUnaligned(fromByteOffset: rowStart + c, as: UInt8.self)
