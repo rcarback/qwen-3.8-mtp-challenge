@@ -2555,3 +2555,40 @@ dominates and the extra ops disappear into the same round trip.
 MLX `compile` on the norm was measured at 32 percent faster earlier. That
 figure was against the hand-written unfused arm, which production does not run.
 Against the real fused norm there is nothing to fuse.
+
+## Rotation before int4 does not help this table (2026-09-05)
+
+Rotating a row before quantizing it makes the n-gram table's error slightly
+worse, not better. 20,000 real rows of shard_000, dim 160, per-row affine int4,
+against a fixed random orthogonal rotation verified orthogonal to 1e-3:
+
+| | relative rms | relative row-max |
+|---|---|---|
+| as shipped | 0.10223 | 0.06138 |
+| rotated first | 0.10282 | 0.10440 |
+
+Rotation costs 0.6 percent on rms and 70 percent on row-max error.
+
+### Why the literature's result does not transfer
+
+Rotation helps when a group's range is set by an outlier that wastes the scale
+for everything else. That is the situation at group-16 in a weight matrix,
+where the papers measure it, and it is why Hadamard rotation lets INT4 surpass
+NVFP4 there.
+
+These rows are n-gram embeddings, and their values are already near-Gaussian
+across the 160 dimensions with no dominant outlier. A rotation of a Gaussian
+vector is another Gaussian vector, so there is no outlier to spread and nothing
+to gain. The row-max column shows the cost: rotation mixes every channel into
+every other, so the reconstruction error that was concentrated on a few large
+values is now spread across all of them, which raises the per-row maximum.
+
+The expectation recorded when this was filed was that rotation would help MORE
+here than in the literature, because per-row affine at 160 values is ten times
+coarser than group-16. That reasoning was wrong. Granularity is not the
+variable that decides whether rotation helps; the presence of outliers is, and
+these rows do not have them.
+
+A structured Hadamard transform was never built. It would have the same effect
+on the error and merely be cheaper to apply, so the negative result stands
+without it.
