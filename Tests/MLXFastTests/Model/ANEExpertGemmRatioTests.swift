@@ -96,10 +96,34 @@ struct ANEExpertGemmRatioTests {
     @Test("expert-shaped GEMM: ANE vs GPU throughput ratio", .enabled(if: enabled))
     func expertGemmRatio() async throws {
         try #require(ANERuntime.available())
+        // Warm both engines before timing anything. The router sweep taught
+        // this the expensive way: its first-measured shape absorbed process
+        // warmup and read 1.8x high, which inverted a conclusion.
+        do {
+            let w = MLXRandom.normal([640, 2560]).asType(.float16)
+            let v = MLXRandom.normal([64, 2560]).asType(.float16)
+            eval(w, v)
+            for _ in 0 ..< 20 { eval(matmul(v, w.transposed(1, 0))) }
+            let spec = buildConvMatmul(K: 2560, F: 640, S: 64, weight: f16Bytes(w))
+            let asset = try MLModelAsset(specification: spec)
+            let cfg = MLModelConfiguration()
+            cfg.computeUnits = .cpuAndNeuralEngine
+            let m = try await MLModel.load(asset: asset, configuration: cfg)
+            let va = try mlxToMultiArray_1C1S(v)
+            let inp = try MLDictionaryFeatureProvider(
+                dictionary: ["a": MLFeatureValue(multiArray: va)])
+            let box = MLBox(m, inp)
+            for _ in 0 ..< 10 {
+                try autoreleasepool { _ = try box.model.prediction(from: box.input) }
+            }
+        }
+
         // gate/up: 2560 -> 640.  down: 640 -> 2560.
-        // S sweeps the rows-per-expert regime: production sees about 14 rows
-        // per expert at 700 tokens, and a dense lane would see many more.
-        for S in [16, 128, 1024] {
+        // S=1 IS DECODE and yvk never measured it. Decode runs one row per
+        // token by construction, which is the launch-bound regime where the
+        // GPU is slowest and the ANE looked competitive. S=16 and above are
+        // prefill widths where batching is available.
+        for S in [1, 2, 4, 16, 128, 1024] {
             try await measure(K: 2560, F: 640, S: S, label: "gate_up")
             try await measure(K: 640, F: 2560, S: S, label: "down   ")
         }
