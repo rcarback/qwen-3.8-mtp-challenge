@@ -145,3 +145,15 @@ final class Qwen4ExpGatedResidual: Module {
         return hyper + written.reshaped(lead + [hc * d])
     }
 }
+
+/// `MLX_QWEN4EXP_COMPILE_PROJ=1`. Wrap the attention and gated-delta
+/// in-projections in `compile`. Off by default: both blocks are mostly
+/// quantized matmul, which is already one tuned kernel that `compile` cannot
+/// fuse inside, and the isolated measurement predicted a loss on both. Kept as
+/// a switch so the prediction is checked on the real model rather than assumed
+/// -- inference from block composition is exactly the reasoning that has failed
+/// repeatedly on this model.
+enum Qwen4ExpProjectionCompile {
+    static let enabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN4EXP_COMPILE_PROJ"] == "1"
+}

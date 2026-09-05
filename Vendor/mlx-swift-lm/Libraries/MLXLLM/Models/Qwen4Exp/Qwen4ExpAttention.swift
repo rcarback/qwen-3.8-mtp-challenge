@@ -247,6 +247,40 @@ final class Qwen4ExpAttention: Module {
         return aneQProj.program(weight: { qProj.weight }, sequenceLength: sequenceLength)
     }
 
+    /// The cache-free head of `finish`: split the fused q/gate projection, run
+    /// `k_proj` and `v_proj`, apply the two head norms, and lay all four out for
+    /// attention. Two quantized matmuls and two norms, no cache and no RoPE, so
+    /// it is the largest fixed-shape region of a full-attention layer that
+    /// `compile` can see at once.
+    private func projectionBlock(_ x: MLXArray, qgFlat: MLXArray, B: Int, S: Int)
+        -> (q: MLXArray, k: MLXArray, v: MLXArray, gate: MLXArray)
+    {
+        func body(_ x: MLXArray, _ qgFlat: MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+            let qg = MLX.split(qgFlat.reshaped(B, S, nHeads, 2 * headDim), parts: 2, axis: -1)
+            return (
+                qNorm(qg[0]).transposed(0, 2, 1, 3),
+                kNorm(kProj(x).reshaped(B, S, nKVHeads, headDim)).transposed(0, 2, 1, 3),
+                vProj(x).reshaped(B, S, nKVHeads, headDim).transposed(0, 2, 1, 3),
+                qg[1].reshaped(B, S, nHeads * headDim)
+            )
+        }
+        guard Qwen4ExpProjectionCompile.enabled,
+            B * S <= Qwen4ExpGatedResidual.compileMaxRows
+        else { return body(x, qgFlat) }
+        // `B` and `S` are captured by the trace, so a shape change would reuse a
+        // trace built for the old one. Keyed on the row count, which is what the
+        // guard above already restricts.
+        if compiledProjection == nil || compiledProjectionRows != B * S {
+            compiledProjectionRows = B * S
+            compiledProjection = compile { [self] a, b in body(a, b) }
+        }
+        return compiledProjection!(x, qgFlat)
+    }
+
+    private var compiledProjection:
+        (@Sendable (MLXArray, MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray))?
+    private var compiledProjectionRows = -1
+
     func finish(
         _ x: MLXArray, qg qgFlat: MLXArray, rope: Qwen4ExpRotary,
         mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: Qwen4ExpAttnCache?
@@ -256,11 +290,11 @@ final class Qwen4ExpAttention: Module {
         let offset = cache?.offset ?? 0
         let sparse = indexer.keepMask(x, rope: rope, cache: cache, offset: offset)
 
-        let qg = MLX.split(qgFlat.reshaped(B, S, nHeads, 2 * headDim), parts: 2, axis: -1)
-        let gate = qg[1].reshaped(B, S, nHeads * headDim)
-        var q = qNorm(qg[0]).transposed(0, 2, 1, 3)
-        var k = kNorm(kProj(x).reshaped(B, S, nKVHeads, headDim)).transposed(0, 2, 1, 3)
-        let v = vProj(x).reshaped(B, S, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        let qkvg = projectionBlock(x, qgFlat: qgFlat, B: B, S: S)
+        let gate = qkvg.gate
+        var q = qkvg.q
+        var k = qkvg.k
+        let v = qkvg.v
 
         let (c, s) = rope.cosSin(positions: qwen4ExpPositions(offset: offset, count: S))
         q = qwen4ExpApplyPartialRope(q, cos: c.expandedDimensions(axis: 1), sin: s.expandedDimensions(axis: 1))

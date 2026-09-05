@@ -2763,19 +2763,42 @@ Six runs, one arm per process:
 | baseline | 66.06, 65.29, 65.02 |
 | compiled | 64.41, 64.50, 64.01 |
 
-The groups do not overlap. The gain is 1.8 percent.
+A first reading of that table said the two groups do not overlap, and called
+the gain 1.8 percent. Both halves of that needed work.
 
-The bead projected 8.4 percent as a lower bound, from isolated blocks. That
-projection was reading the dispatch floor. Its compiled `rms_norm` arm measured
-0.223 ms, and the isolated-eval floor on this machine is about 0.22 ms: the
-block had been compiled down to the cost of the round trip, so the measurement
-described the round trip. This is the third time on this model that an isolated
-microbenchmark has reported that floor as though it were a component.
+The first problem is drift. A later control arm in the compiled configuration,
+same binary and same switches, measured 66.05 ms, so the same configuration
+spans 64.01 to 66.05 across batches -- a 1.5 ms spread as large as the effect.
+Separation in the table above is partly an artefact of the order the arms ran
+in.
 
-The real model does preserve the ordering the synthetic suggested, which is
-worth keeping: the elementwise-heavy read gate gains about 1.5 percent, the
-matmul-heavy shared expert about 0.6 percent. `compile` fuses glue and cannot
-fuse inside a tuned quantized matmul.
+The second problem is worse, and a later experiment surfaced it. Every
+comparison behind the figure ran the baseline first and the compiled arm
+second. A pair of projection runs then showed the arm in second position
+winning twice regardless of which treatment it carried, which would make the
+whole result a position effect.
+
+Settled by counterbalancing -- compiled first, then baseline, baseline,
+compiled:
+
+| position | configuration | ms per token |
+| --- | --- | --- |
+| 1 | compiled | 64.91 |
+| 2 | baseline | 67.24 |
+| 3 | baseline | 66.41 |
+| 4 | compiled | 66.04 |
+
+Compiled from FIRST position beats baseline from second, so the treatment
+overcomes the position advantage rather than depending on it. Pooling every
+pure arm measured -- baseline 65.02, 65.29, 66.06, 66.41, 67.24 against
+compiled 64.01, 64.50, 64.91, 66.04 -- gives medians of 66.06 and 64.91, a gain
+of 2.1 percent, Mann-Whitney U of 18 out of 20, one-sided p about 0.03.
+
+Two rules for this box come out of that, and they cost four extra runs to
+learn. Do not pool medians across batches, because the same configuration
+drifts 1.5 ms between them. Do not read a single A/B pair, because position
+inside a batch moves the result by about as much as a real effect; counterbalance
+the order instead.
 
 ### Whole-step compiled decode is unavailable, and the cache types were not the blocker
 
@@ -2851,6 +2874,29 @@ as `FusedRoutedMoE`: a correct implementation carrying its own refusal. A
 row-parallel rewrite is the only version that could win at 7000 rows, and the
 ceiling for the whole method remains the 1 to 3 percent of prefill the bead's
 design section bounds it at.
+
+### Compiling the projections does nothing, in either direction
+
+The bead's step 1 also names the attention projections. The isolated benchmark
+predicted a clear loss there -- 14.6 percent slower for the full-attention
+projections, 3.4 percent for the gated-delta in-projection -- on the theory
+that a quantized matmul is already one tuned kernel and `compile` can only add
+tracing around it.
+
+Measured on the real model, behind `MLX_QWEN4EXP_COMPILE_PROJ`, over two pairs:
+
+| pair | ran first | ran second |
+| --- | --- | --- |
+| 1 | proj off, 66.05 | proj on, 65.37 |
+| 2 | proj on, 66.57 | proj off, 65.55 |
+
+The sign flips with run order and the arm in second position wins both times.
+There is no effect to measure. Neither the predicted loss nor the apparent gain
+survives, and the switch stays off.
+
+This pair of runs is also what caught the position confound described above, so
+an experiment that found nothing about its own subject fixed the experiment
+before it.
 
 ### What this does not explain
 

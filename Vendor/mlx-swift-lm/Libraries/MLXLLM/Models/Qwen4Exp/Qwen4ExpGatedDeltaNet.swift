@@ -94,8 +94,18 @@ final class Qwen4ExpGatedDeltaNet: Module {
                 }
             }
         }
+        if Qwen4ExpProjectionCompile.enabled,
+            x.shape.dropLast().reduce(1, *) <= Qwen4ExpGatedResidual.compileMaxRows
+        {
+            if compiledInProj == nil {
+                compiledInProj = compile { [self] v in (inProjQKV(v), inProjZ(v)) }
+            }
+            return compiledInProj!(x)
+        }
         return (inProjQKV(x), inProjZ(x))
     }
+
+    private var compiledInProj: (@Sendable (MLXArray) -> (MLXArray, MLXArray))?
 
     /// The ANE program for the fused `[in_proj_qkv; in_proj_z]` at `sequenceLength`,
     /// or nil when the lane is off or the program failed to build.
