@@ -2370,3 +2370,69 @@ decodes E2M1 and E4M3 through CPU lookup tables and receives none of it.
 Keep int4. nvfp4 costs 12 percent more disk, 509 seconds against 297 to
 convert, changes more decisions on five of six prompts, and its reason for
 existing is hardware this machine does not have.
+
+## Decode-geometry audit of the method table (2026-09-05)
+
+Every estimate in the consolidated method table is stated in prefill terms, and
+prefill shares do not transfer to decode. This audit marks each row's regime
+and re-estimates the rows the decode measurements change.
+
+The two facts driving every re-estimate:
+
+- A decode step is 59.41 ms and is launch-bound. `lm_head`, the largest GEMM in
+  the step at 636 MFLOP, costs 1.6 percent because it is one dispatch. Two RMS
+  norms per layer cost 17 percent because they are 96.
+- Component cost is FLAT in row count across the decode range. The router
+  measures 0.180 ms chained at one row and 0.176 ms at eight. An expert-shaped
+  GEMM measures 0.223 ms at one row, 0.225 at two, 0.226 at four.
+
+### The row that changes most: speculative decode depth
+
+The table lists "push MTP draft depth toward the trusted maximum" as the
+largest untouched lever and does not quantify it. The flatness above quantifies
+it, and the number is large.
+
+A decode forward costs about the same whether it carries one row or eight. So a
+block of K speculative rows costs approximately one forward, not K forwards.
+Every accepted token beyond the first is nearly free, and the ceiling is the
+acceptance rate rather than any per-token compute.
+
+That reframes the shipped depth-2 schedule as leaving most of the available
+throughput unused, and it makes acceptance rate, not compute, the thing worth
+optimising. Anything that raises acceptance buys close to its full value.
+
+### Rows that are prefill-only and do not apply at decode
+
+| row | why it does not apply |
+|---|---|
+| Static-capacity dense batched MoE | Replaces a 512-way gather with one batched GEMM. Decode has one row per token, so there is no batch to build. |
+| Retune the gather_qmm tile for small row counts | The prefill case is about 14 rows per expert against a tile sized for more. At decode it is one row, and the measurement says the cost is dispatch rather than tile efficiency: an expert GEMM takes 0.22 ms while doing 3.3 MFLOP. |
+| Token rounding to the tile multiple | Depends on the tile retune above, which is itself moot at decode. |
+| Increase the prefill chunk or batch several prompts | Prefill by construction. |
+| Micro-batched ANE prefill | Measured -25.2 percent and prefill by name. |
+
+### Rows worth MORE at decode than the table says
+
+| row | prefill estimate | decode reading |
+|---|---|---|
+| Fuse gate_proj and up_proj into one gather GEMM | 2 to 5 percent of prefill | Removes one dispatch per layer, 48 per token, in a regime where dispatch is the cost. Re-measure at one row before building. |
+| Fuse router GEMM, top-k and softmax | 1 to 3 percent of prefill | The router is 8.6 ms of a 59.41 ms decode step, about 14.5 percent, and at one row nearly all of it is overhead on 2.6 MFLOP of arithmetic. |
+| Remove the float32 router upcast | 1 to 3 percent of prefill | The traffic argument disappears at one row, but the upcast is still a separate dispatch, and dispatches are what cost. Fold it into the router fusion rather than treating it separately. |
+
+### Rows the decode data confirms as dead
+
+The three measured ANE lanes and the whole ANE/GPU split family stay closed,
+and the decode measurement closes them for the regime their original refutation
+did not cover. At one row the GPU runs an expert GEMM in 0.223 ms and the ANE
+in 0.209 ms, both at 0.01 to 0.02 TF/s against the GPU's 8.06 TF/s at 1024
+rows. The ratio is near 1 because both engines are idle, not because both are
+fast. Splitting work between two idle engines adds a join barrier and saves
+nothing.
+
+### The baseline this table is stated against needs a decode twin
+
+Every speed claim in this document is stated against the production MoE at
+22.0 ms per layer, measured at 7000 rows. There is no decode equivalent, and
+without one no row's decode estimate can be stated as a percentage. Establishing
+that number is the prerequisite for re-estimating the rest of the table
+properly.
