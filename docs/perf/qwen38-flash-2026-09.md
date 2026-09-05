@@ -2287,3 +2287,34 @@ After that, quantizing this table is a disk argument only. int4 turns 102.4 GB
 into 25 GB and costs about 5 percent of next-token decisions. Keep bf16 unless
 disk is the binding constraint; take int4 when it is, and prefer int4 over int8
 and nvfp4, which cost the same decisions for more space.
+
+
+## Sorting the n-gram read loop into fault order buys nothing (2026-09-05)
+
+The gather reads about 7850 distinct pages and the prefetch issues its madvise
+runs in ascending file order, so the read loop was walking those pages in gid
+order behind a readahead that streams forward. Aligning the two changes
+nothing:
+
+| read order | median gather, three rounds |
+|---|---|
+| gid order | 858.5 ms |
+| ascending file order | 862.0 ms |
+
+Implemented, verified against the existing value-equality tests, measured, and
+reverted. The prefetch already extracts whatever the ordering is worth, so the
+sort added an 8192-entry allocation and a sort per gather for no gain.
+
+### What the remaining cost implies
+
+858 ms over about 7850 faults is roughly 109 microseconds per fault. Random
+16 KiB reads on this storage sit near that figure UNOVERLAPPED, which suggests
+the madvise batch is not achieving much concurrency: it removes the serial
+stall per fault that a naive loop pays, and the earlier measurement shows it
+saves 13.7 percent, but the residue still looks close to serial.
+
+That points the remaining work at overlap with useful compute rather than at
+ordering. The gids are known at layer 0 and the PLE does not run until layer 2,
+so issuing the readahead on a background thread would let the faults resolve
+during two layers of unrelated work. That needs a hook in the model's layer
+loop and is the next thing to try.
