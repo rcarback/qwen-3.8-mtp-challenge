@@ -109,9 +109,15 @@ private enum MLXFastCLI {
             throw MLXFastError.invalidInput(
                 "quantize-ngram-table needs --source <dir> and --dest <dir>")
         }
-        guard let bits = Int(options.value(for: "--bits", default: "")), bits == 8 || bits == 4
-        else {
-            throw MLXFastError.invalidInput("quantize-ngram-table needs --bits 8 or --bits 4")
+        let bitsRaw = options.value(for: "--bits", default: "")
+        let bits: Int
+        switch bitsRaw {
+        case "8": bits = 8
+        case "4": bits = 4
+        case "nvfp4": bits = NGramTableQuantize.nvfp4Bits
+        default:
+            throw MLXFastError.invalidInput(
+                "quantize-ngram-table needs --bits 8, 4 or nvfp4")
         }
         let sourceURL = URL(fileURLWithPath: source)
         let destURL = URL(fileURLWithPath: dest)
@@ -122,7 +128,9 @@ private enum MLXFastCLI {
         try NGramTableQuantize.convert(sourceDir: sourceURL, destDir: destURL, bits: bits)
         let elapsed = Date().timeIntervalSince(started)
         print(
-            "quantize-ngram-table: wrote int\(bits) shards to \(dest) in "
+            "quantize-ngram-table: wrote "
+                + (bits == NGramTableQuantize.nvfp4Bits ? "nvfp4" : "int\(bits)")
+                + " shards to \(dest) in "
                 + String(format: "%.1f s", elapsed))
     }
 
@@ -2872,7 +2880,7 @@ private enum MLXFastCLI {
               mlxfast-swift analyze-ngram-similarity --golden PATH [--case NAME] [--orders 1,2,3] [--max-hit-rate RATE]
               mlxfast-swift generate-gpqa-answers --gpqa PATH [--weights PATH] [--tokenizer PATH] --output PATH [--case-count N] [--max-new-tokens N]
               mlxfast-swift checkpoint-shards --index PATH
-              mlxfast-swift quantize-ngram-table --source DIR --dest DIR --bits 8|4
+              mlxfast-swift quantize-ngram-table --source DIR --dest DIR --bits 8|4|nvfp4
               mlxfast-swift dflash-benchmark --drafter PATH --golden PATH [--weights PATH] [--block-size N] [--tokens N] [--schedule-seed N] [--output PATH]
               mlxfast-swift dflash-probe --drafter PATH --golden PATH [--weights PATH] [--tokens N] [--schedule-seed N] [--output PATH]
               mlxfast-swift dflash-reference --drafter PATH --emitted PATH --output PATH [--weights PATH]

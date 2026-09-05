@@ -71,6 +71,22 @@ struct Qwen4ExpNGramHasher {
     }
 }
 
+/// E2M1 magnitudes by 3-bit magnitude code, with a sign bit above them.
+/// Duplicated from `NGramTableQuantize`: the converter lives in
+/// MLXFastTransform and this in MLXLLM, and a constant table is cheaper to
+/// mirror than a module dependency.
+let qwen4ExpE2M1: [Float] = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
+
+/// Decodes one OCP FP8 E4M3 byte: bias 7, no infinities, 0x7F and 0xFF NaN.
+func qwen4ExpE4M3ToFloat(_ b: UInt8) -> Float {
+    let sign: Float = (b & 0x80) != 0 ? -1 : 1
+    let exp = Int((b >> 3) & 0x0F)
+    let man = Int(b & 0x07)
+    if exp == 0 { return sign * Float(man) * 0.001953125 }
+    if exp == 15 && man == 7 { return .nan }
+    return sign * (1 + Float(man) / 8) * exp2(Float(exp - 7))
+}
+
 enum Qwen4ExpNGramError: Error, CustomStringConvertible {
     case badShard(String)
     case noRoot
@@ -132,6 +148,10 @@ final class Qwen4ExpNGramTable {
     /// `[scale f16][bias f16][codes]` record, so `bytesPerRow` describes every
     /// encoding and no separate scale or bias regions exist.
     private let bits: Int
+
+    /// Sentinel width for NVFP4: four bits per value like int4, but spent as
+    /// E2M1 floats under a per-16 E4M3 block scale.
+    static let nvfp4Bits = 40
 
     /// Writes a synthetic bf16 shard set and returns its directory, so a table
     /// can be opened over it directly or re-encoded by `NGramTableQuantize`.
@@ -208,6 +228,8 @@ final class Qwen4ExpNGramTable {
         // alone names the width: 4 + dim for int8, 4 + dim/2 for int4.
         if shape[1] == 4 + spec.dim { return 8 }
         if shape[1] == 4 + spec.dim / 2 { return 4 }
+        // NVFP4 adds one E4M3 byte per 16-value block ahead of the codes.
+        if shape[1] == 4 + spec.dim / 16 + spec.dim / 2 { return nvfp4Bits }
         throw Qwen4ExpNGramError.badShard(url.path)
     }
 
@@ -215,7 +237,9 @@ final class Qwen4ExpNGramTable {
     /// shards directly; 8 and 4 read `NGramTableQuantize` output, one `U8`
     /// tensor whose rows are `[scale f16][bias f16][codes]` records.
     init(directory: URL, spec: Qwen4ExpNGramTableSpec, bits: Int) throws {
-        precondition(bits == 16 || bits == 8 || bits == 4, "n-gram table bits must be 16, 8, or 4")
+        precondition(
+            bits == 16 || bits == 8 || bits == 4 || bits == Self.nvfp4Bits,
+            "n-gram table bits must be 16, 8, 4 or nvfp4")
         precondition(
             bits != 16 || spec.dtype == "bfloat16", "bf16 n-gram table must declare dtype bfloat16")
         self.bits = bits
@@ -223,7 +247,11 @@ final class Qwen4ExpNGramTable {
         dim = spec.dim
         // One contiguous record per row in every encoding, so one stride and
         // one page fault per row rather than three.
-        bytesPerRow = bits == 16 ? dim * 2 : 4 + (bits == 8 ? dim : dim / 2)
+        bytesPerRow =
+            bits == 16
+            ? dim * 2
+            : (bits == Self.nvfp4Bits
+                ? 4 + dim / 16 + dim / 2 : 4 + (bits == 8 ? dim : dim / 2))
         var maps = [Data]()
         var offsets = [Int]()
         for s in 0 ..< spec.shards {
@@ -327,7 +355,23 @@ final class Qwen4ExpNGramTable {
                                         littleEndian: s.loadUnaligned(
                                             fromByteOffset: rec + 2, as: UInt16.self))))
                             let rowStart = rec + 4
-                            if bits == 8 {
+                            if bits == Self.nvfp4Bits {
+                                let blocks = dim / 16
+                                let codeBase = rec + 4 + blocks
+                                for b in 0 ..< blocks {
+                                    let bcode = s.loadUnaligned(
+                                        fromByteOffset: rec + 4 + b, as: UInt8.self)
+                                    let step = qwen4ExpE4M3ToFloat(bcode) * scale
+                                    for c in b * 16 ..< (b + 1) * 16 {
+                                        let byte = s.loadUnaligned(
+                                            fromByteOffset: codeBase + c / 2, as: UInt8.self)
+                                        let nib = c % 2 == 0 ? (byte & 0xF) : (byte >> 4)
+                                        let mag = qwen4ExpE2M1[Int(nib & 0x7)]
+                                        let v = (nib & 0x8) != 0 ? -mag : mag
+                                        dstBuf[cursor + c] = Float16(v * step)
+                                    }
+                                }
+                            } else if bits == 8 {
                                 for c in 0 ..< dim {
                                     let q = s.loadUnaligned(fromByteOffset: rowStart + c, as: UInt8.self)
                                     dstBuf[cursor + c] = Float16(Float(q) * scale + bias)

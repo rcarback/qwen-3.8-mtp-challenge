@@ -114,9 +114,10 @@ final class Qwen4ExpNGramQuantizeTests: XCTestCase {
         let a = original.gather(gids).asType(.float32)
         a.eval()
 
-        for bits in [8, 4] {
+        for bits in [8, 4, NGramTableQuantize.nvfp4Bits] {
             let dst = URL(fileURLWithPath: NSTemporaryDirectory())
                 .appendingPathComponent("ngram-real1-q\(bits)-\(UUID().uuidString)")
+            let label = bits == NGramTableQuantize.nvfp4Bits ? "nvfp4" : "int\(bits)"
             defer { try? FileManager.default.removeItem(at: dst) }
             try NGramTableQuantize.convert(sourceDir: srcDir, destDir: dst, bits: bits)
 
@@ -130,10 +131,13 @@ final class Qwen4ExpNGramQuantizeTests: XCTestCase {
                     atPath: dst.appendingPathComponent("shard_000.safetensors").path)[.size] as? Int) ?? 0
             let ratio = Double(destBytes) / Double(sourceBytes)
             print(
-                "[ngram-quantize] bits=\(bits) shard_000: source=\(sourceBytes)B dest=\(destBytes)B "
+                "[ngram-quantize] bits=\(label) shard_000: source=\(sourceBytes)B dest=\(destBytes)B "
                     + "ratio=\(String(format: "%.4f", ratio))")
 
             let quantized = try Qwen4ExpNGramTable(directory: dst, spec: spec, bits: bits)
+            XCTAssertEqual(
+                try Qwen4ExpNGramTable.detectBits(directory: dst, spec: spec), bits,
+                "\(label) shards must be self-describing on disk")
 
             let b = quantized.gather(gids).asType(.float32)
             b.eval()
@@ -194,7 +198,7 @@ final class Qwen4ExpNGramQuantizeTests: XCTestCase {
             (0 ..< 16).map { _ in Int64.random(in: 0 ..< total, using: &rng) }
         }
 
-        for bits in [8, 4] {
+        for bits in [8, 4, NGramTableQuantize.nvfp4Bits] {
             let dst = URL(fileURLWithPath: NSTemporaryDirectory())
                 .appendingPathComponent("ngram-fixture-q\(bits)-\(UUID().uuidString)")
             defer { try? FileManager.default.removeItem(at: dst) }
@@ -233,7 +237,7 @@ final class Qwen4ExpNGramQuantizeTests: XCTestCase {
         XCTAssertEqual(try Qwen4ExpNGramTable.detectBits(directory: src, spec: spec), 16)
 
         let gids: [[Int64]] = [[0, 1, 255, 256, 300, 511, 7, 9, 11, 13, 17, 19, 23, 29, 31, 37]]
-        for bits in [8, 4] {
+        for bits in [8, 4, NGramTableQuantize.nvfp4Bits] {
             let dst = URL(fileURLWithPath: NSTemporaryDirectory())
                 .appendingPathComponent("ngram-detect-\(bits)-\(UUID().uuidString)")
             defer { try? FileManager.default.removeItem(at: dst) }
@@ -253,6 +257,50 @@ final class Qwen4ExpNGramQuantizeTests: XCTestCase {
                 MLX.abs(a - b).max().item(Float.self), 0,
                 "detected open disagreed with explicit bits: \(bits)")
         }
+    }
+
+    /// NVFP4 must round-trip through its own codec and be detected on disk.
+    /// It spends four bits per value like int4, but as E2M1 floats under a
+    /// per-16 E4M3 block scale, so its row is 92 bytes against int4's 84.
+    /// The tolerance is the E2M1 step at the block's own magnitude, not a
+    /// fixed epsilon: E2M1 levels are logarithmic (0, .5, 1, 1.5, 2, 3, 4, 6),
+    /// so the worst relative step is between 4 and 6, that is one third.
+    func testNVFP4RoundTripAndDetection() throws {
+        let src = try Qwen4ExpNGramTable.fixtureDirectory(rowsPerShard: 256, dim: 160, shards: 2)
+        let dst = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ngram-nvfp4-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dst) }
+        try NGramTableQuantize.convert(
+            sourceDir: src, destDir: dst, bits: NGramTableQuantize.nvfp4Bits)
+
+        let spec = Qwen4ExpNGramTableSpec(
+            directory: dst.lastPathComponent, shards: 2, rowsPerShard: 256, dim: 160,
+            dtype: "bfloat16")
+        XCTAssertEqual(
+            try Qwen4ExpNGramTable.detectBits(directory: dst, spec: spec),
+            Qwen4ExpNGramTable.nvfp4Bits, "a 92-byte row must be detected as nvfp4")
+
+        let gids: [[Int64]] = [[0, 1, 255, 256, 300, 511, 7, 9, 11, 13, 17, 19, 23, 29, 31, 37]]
+        let original = try Qwen4ExpNGramTable(directory: src, spec: spec)
+        let quantized = try Qwen4ExpNGramTable(directory: dst, spec: spec)  // detected
+        let a = original.gather(gids).asType(.float32)
+        let b = quantized.gather(gids).asType(.float32)
+        a.eval(); b.eval()
+
+        let lo = a.min().item(Float.self), hi = a.max().item(Float.self)
+        let tolerance = (hi - lo) / 3 + 1e-3
+        let maxErr = MLX.abs(a - b).max().item(Float.self)
+        XCTAssertLessThan(maxErr, tolerance, "nvfp4 error \(maxErr) exceeded one step \(tolerance)")
+        // This fixture is ADVERSE to nvfp4 and deliberately does not assert
+        // that nvfp4 beats int4 here. Its values sit in [0.0078, 0.0137]: a
+        // narrow band that never crosses zero. An affine code carries a bias,
+        // so it puts that offset in the bias and spends all 15 levels on the
+        // spread. NVFP4 is sign-and-magnitude with no offset, so its levels
+        // fan out from zero and only three of them land in that band. Measured
+        // on this fixture nvfp4 is about 5.7x worse than int4, which is a fact
+        // about the fixture rather than about the format. Real embeddings are
+        // near zero-centred, which is the case NVFP4 is built for; the
+        // real-shard test above is where the two are actually compared.
     }
 
 }

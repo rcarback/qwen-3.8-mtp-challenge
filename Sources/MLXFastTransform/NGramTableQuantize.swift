@@ -24,6 +24,47 @@ import Foundation
 /// Splitting a row across a weight region, a scale region and a bias region
 /// therefore costs THREE faults per row and measured 2.3x slower than bf16
 /// despite moving a quarter of the bytes. One record is one fault.
+/// E2M1 magnitudes by 3-bit magnitude code; a sign bit sits above these.
+/// Exponent 0 is subnormal (0, 0.5); exponents 1 to 3 scale 1, 2 and 4 by
+/// 1 + mantissa/2.
+let e2m1Magnitude: [Float] = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
+
+/// Decodes one OCP FP8 E4M3 byte: bias 7, no infinities, 0x7F and 0xFF NaN.
+func e4m3ToFloat(_ b: UInt8) -> Float {
+    let sign: Float = (b & 0x80) != 0 ? -1 : 1
+    let exp = Int((b >> 3) & 0x0F)
+    let man = Int(b & 0x07)
+    if exp == 0 { return sign * Float(man) * 0.001953125 }
+    if exp == 15 && man == 7 { return .nan }
+    return sign * (1 + Float(man) / 8) * exp2(Float(exp - 7))
+}
+
+/// The 128 finite non-negative E4M3 values, ascending, with their byte codes.
+/// Encoding a positive scale is a binary search over this rather than bit
+/// surgery, which keeps the mapping obviously correct at 25 million encodes
+/// per shard.
+let e4m3PositiveLadder: [(value: Float, code: UInt8)] = {
+    var out: [(Float, UInt8)] = []
+    for b in UInt8(0) ... UInt8(126) {
+        let v = e4m3ToFloat(b)
+        if v.isFinite { out.append((v, b)) }
+    }
+    return out.sorted { $0.0 < $1.0 }
+}()
+
+/// Nearest E4M3 code for a non-negative value, saturating at the ladder ends.
+func floatToE4M3(_ x: Float) -> UInt8 {
+    let ladder = e4m3PositiveLadder
+    if !(x > 0) { return 0 }
+    if x >= ladder[ladder.count - 1].value { return ladder[ladder.count - 1].code }
+    var lo = 0, hi = ladder.count - 1
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2
+        if ladder[mid].value <= x { lo = mid } else { hi = mid }
+    }
+    return (x - ladder[lo].value) <= (ladder[hi].value - x) ? ladder[lo].code : ladder[hi].code
+}
+
 public enum NGramTableQuantize {
     public enum Failure: Error, CustomStringConvertible {
         case badShard(String)
@@ -31,13 +72,20 @@ public enum NGramTableQuantize {
         public var description: String {
             switch self {
             case .badShard(let p): return "n-gram shard is not a single BF16 [rows, dim] 'weight': \(p)"
-            case .badBits(let b): return "n-gram quantization supports bits 4 or 8, got \(b)"
+            case .badBits(let b):
+                return "n-gram quantization supports bits 8, 4 or 40 (nvfp4), got \(b)"
             }
         }
     }
 
+    /// `bits` is 8, 4, or `nvfp4Bits` for NVFP4. NVFP4 packs the same four
+    /// bits per value as int4 but spends them as E2M1 floats under a per-16
+    /// E4M3 block scale, so a row carries ten block scales instead of one
+    /// affine scale. That is 92 bytes a row against int4's 84.
+    public static let nvfp4Bits = 40
+
     public static func convert(sourceDir: URL, destDir: URL, bits: Int) throws {
-        guard bits == 4 || bits == 8 else { throw Failure.badBits(bits) }
+        guard bits == 4 || bits == 8 || bits == nvfp4Bits else { throw Failure.badBits(bits) }
         try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
         let shards = try FileManager.default.contentsOfDirectory(atPath: sourceDir.path)
             .filter { $0.hasPrefix("shard_") && $0.hasSuffix(".safetensors") }
@@ -63,9 +111,12 @@ public enum NGramTableQuantize {
         else { throw Failure.badShard(source.path) }
         let rows = shape[0], dim = shape[1]
         let base = 8 + headerLength + range[0]
+        let isNVFP4 = bits == nvfp4Bits
+        let blocks = dim / 16
         let codes = bits == 8 ? dim : dim / 2
-        // [scale: f16][bias: f16][codes...] per row, contiguous.
-        let perRow = 4 + codes
+        // Contiguous per row. Affine: [scale f16][bias f16][codes].
+        // NVFP4:  [rowScale f16][pad 2][blocks x E4M3][codes].
+        let perRow = isNVFP4 ? 4 + blocks + codes : 4 + codes
 
         var payload = Data(count: rows * perRow)
 
@@ -82,10 +133,53 @@ public enum NGramTableQuantize {
                         values[c] = v
                         lo = min(lo, v); hi = max(hi, v)
                     }
+                    let rowOut = d.advanced(by: r * perRow)
+                    if isNVFP4 {
+                        // Per-row global scale brings block scales into E4M3
+                        // range. Strict NVFP4 makes this per tensor; per row is
+                        // the analogue in a table whose rows are independent
+                        // embeddings, and it is strictly the more accurate of
+                        // the two. E2M1 tops out at 6 and E4M3 at 448.
+                        let amax = max(abs(lo), abs(hi))
+                        let rowScale = amax > 0 ? amax / (6 * 448) : 1
+                        rowOut.storeBytes(
+                            of: Float16(rowScale).bitPattern.littleEndian, toByteOffset: 0,
+                            as: UInt16.self)
+                        rowOut.storeBytes(of: UInt16(0), toByteOffset: 2, as: UInt16.self)
+                        let rs = Float(Float16(rowScale))
+                        for b in 0 ..< blocks {
+                            var bmax: Float = 0
+                            for c in b * 16 ..< (b + 1) * 16 { bmax = max(bmax, abs(values[c])) }
+                            let blockScale = bmax > 0 ? bmax / 6 / rs : 0
+                            let bcode = floatToE4M3(blockScale)
+                            rowOut.storeBytes(of: bcode, toByteOffset: 4 + b, as: UInt8.self)
+                            let step = e4m3ToFloat(bcode) * rs
+                            for c in b * 16 ..< (b + 1) * 16 {
+                                let t = step > 0 ? values[c] / step : 0
+                                let sign: UInt8 = t < 0 ? 8 : 0
+                                let m = abs(t)
+                                var best = 0
+                                var bestErr = Float.greatestFiniteMagnitude
+                                for k in 0 ..< 8 {
+                                    let e = abs(e2m1Magnitude[k] - m)
+                                    if e < bestErr { bestErr = e; best = k }
+                                }
+                                let nib = sign | UInt8(best)
+                                let off = 4 + blocks + c / 2
+                                if c % 2 == 0 {
+                                    rowOut.storeBytes(of: nib, toByteOffset: off, as: UInt8.self)
+                                } else {
+                                    let prev = rowOut.load(fromByteOffset: off, as: UInt8.self)
+                                    rowOut.storeBytes(
+                                        of: prev | (nib << 4), toByteOffset: off, as: UInt8.self)
+                                }
+                            }
+                        }
+                        continue
+                    }
                     let levels = Float(bits == 8 ? 255 : 15)
                     let scale = (hi - lo) / levels
                     let safeScale = scale == 0 ? 1 : scale
-                    let rowOut = d.advanced(by: r * perRow)
                     rowOut.storeBytes(
                         of: Float16(scale).bitPattern.littleEndian, toByteOffset: 0, as: UInt16.self)
                     rowOut.storeBytes(
