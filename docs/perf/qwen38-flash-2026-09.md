@@ -2318,3 +2318,55 @@ ordering. The gids are known at layer 0 and the PLE does not run until layer 2,
 so issuing the readahead on a background thread would let the faults resolve
 during two layers of unrelated work. That needs a hook in the model's layer
 loop and is the next thing to try.
+
+## nvfp4 loses to int4 across six prompts (2026-09-05)
+
+int4 changes fewer of the model's decisions than nvfp4 on five of six prompts.
+One prompt cannot separate these encodings, and the earlier single-prompt
+result that put them at 23 against 25 flips was noise.
+
+Six prompts, each 512 tokens assembled from four unrelated technical domains so
+the hashed 3-grams reach largely disjoint regions of the table. Each measured
+against a bf16 control that reproduces itself bit for bit.
+
+| prompt | int4 flips | nvfp4 flips | shared / union |
+|---|---|---|---|
+| law | 24 | 30 | 15/39 |
+| biology | 27 | 32 | 16/43 |
+| music | 29 | 31 | 18/42 |
+| geology | 25 | 30 | 11/44 |
+| cooking | 25 | 26 | 12/39 |
+| logistics | 16 | 11 | 5/22 |
+| median | 25.0 | 30.0 | |
+| total | 146 | 160 | of 3072 positions |
+
+### The overlap is the more interesting column
+
+The two encodings share only about a third of the positions they flip: 15 of 39
+on law, 11 of 44 on geology. Each disagrees with bf16 at largely different
+places. That is a perturbation whose direction matters and whose size does not,
+and it is the same pattern the earlier int8-against-int4 comparison showed.
+
+### This agrees with the published work, including the mechanism
+
+Measured here on real embedding rows, nvfp4 beats int4 on mean error
+(5.28e-04 against 6.50e-04) and loses on maximum absolute error (6.16e-03
+against 2.76e-03) and on mean relative row-max error (6.54 against 3.31
+percent). Row-max error is error on the largest values in a block, which is
+where E2M1 leaves a 50 percent gap between its levels 4 and 6.
+
+The literature reports exactly this. "Four Over Six: More Accurate NVFP4
+Quantization with Adaptive Block Scaling" (arXiv 2512.02010) is named for that
+gap, calls it a dead zone, and finds NVFP4 degraded against INT4 near block
+maxima at matched block size. Red Hat's analysis reports the two formats at
+comparable accuracy for weight-only quantization generally.
+
+NVFP4's throughput case rests on Blackwell tensor cores executing it without a
+dequantization step. There is no FP4 datapath on Apple Silicon, so this fork
+decodes E2M1 and E4M3 through CPU lookup tables and receives none of it.
+
+### Verdict
+
+Keep int4. nvfp4 costs 12 percent more disk, 509 seconds against 297 to
+convert, changes more decisions on five of six prompts, and its reason for
+existing is hardware this machine does not have.
