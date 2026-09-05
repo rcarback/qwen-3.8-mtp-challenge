@@ -37,11 +37,28 @@ public enum Qwen4ExpTransform {
         /// transform records `ngram_table.linked` in config.json to say so.
         public var linkNGramTableFrom: URL?
 
+        /// Quantize the dense Linear weights too, at this bit width. Off by
+        /// default, which reproduces the tree as it has always been: experts
+        /// quantized, everything else a bf16 byte copy.
+        ///
+        /// That default is where the decode time went. A token touches 1.51 GB
+        /// of routed experts and 8.78 GB of dense bf16 -- 85 percent of its
+        /// bytes -- and quantizing the dense weights at load measured 64 -> 42.5
+        /// ms per token. Upstream's quant_predicate (mlx-lm PR 1788) quantizes
+        /// everything except the router; this option matches it. The router,
+        /// the one-column shared-expert gate, the embedding (one row read per
+        /// token), the conv1d, every norm and the MTP head stay in bf16.
+        public var denseBits: Int?
+        public var denseGroupSize: Int
+
         public init(
             source: URL, destination: URL, expertGroupSize: Int = 32, expertBits: Int = 4,
-            shardBytes: Int = 4 << 30, linkNGramTableFrom: URL? = nil
+            shardBytes: Int = 4 << 30, linkNGramTableFrom: URL? = nil,
+            denseBits: Int? = nil, denseGroupSize: Int = 32
         ) {
             self.linkNGramTableFrom = linkNGramTableFrom
+            self.denseBits = denseBits
+            self.denseGroupSize = denseGroupSize
             self.source = source
             self.destination = destination
             self.expertGroupSize = expertGroupSize
@@ -69,6 +86,18 @@ public enum Qwen4ExpTransform {
 
     static func isExpertStack(_ key: String) -> Bool {
         key.hasSuffix(".mlp.experts.gate_up_proj") || key.hasSuffix(".mlp.experts.down_proj")
+    }
+
+    /// A runtime key whose module is a dense `Linear` the loader will turn into
+    /// a `QuantizedLinear` when `.scales` is present. Mirrors upstream's
+    /// quant_predicate, minus the embedding: decode reads one row of it.
+    static func isDenseLinear(runtimeKey rk: String, shape: [Int], groupSize: Int) -> Bool {
+        guard shape.count == 2, rk.hasSuffix(".weight"), shape[1] % groupSize == 0 else { return false }
+        if rk.hasPrefix("mtp.") { return false }
+        for skip in ["embed_tokens", "conv1d", "norm", "mlp.gate.weight", "shared_expert_gate", "ple_embedding"] {
+            if rk.contains(skip) { return false }
+        }
+        return true
     }
 
     static func shardIndex(ofNGramKey key: String) -> Int {
@@ -109,6 +138,7 @@ public enum Qwen4ExpTransform {
         var ngramDim = 0
         var outputMap = [String: String]()
         var totalBytes = 0
+        var denseQuantizedPaths = [String]()
         let writer = ShardWriter(directory: o.destination, shardBytes: o.shardBytes)
 
         for (file, keys) in bySourceFile.sorted(by: { $0.key < $1.key }) {
@@ -117,6 +147,7 @@ public enum Qwen4ExpTransform {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
             var expertsToQuantize = [String]()
+            var denseToQuantize = [(String, String)]()
             for key in keys {
                 guard let info = header.tensors[key] else {
                     throw MLXFastError.invalidInput("\(key) missing from \(file) header")
@@ -153,6 +184,10 @@ public enum Qwen4ExpTransform {
                     expertsToQuantize.append(key)
                     continue
                 }
+                if o.denseBits != nil, isDenseLinear(runtimeKey: rk, shape: info.shape, groupSize: o.denseGroupSize) {
+                    denseToQuantize.append((key, rk))
+                    continue
+                }
                 let bytes = try readBytes(handle, header: header, info: info)
                 var shape = info.shape
                 // torch (C,1,K) -> mlx (C,K,1): same bytes, new shape
@@ -162,8 +197,23 @@ public enum Qwen4ExpTransform {
                 try writer.append(name: rk, dtype: info.dtype, shape: shape, bytes: bytes)
                 totalBytes += bytes.count
             }
-            if !expertsToQuantize.isEmpty {
+            if !expertsToQuantize.isEmpty || !denseToQuantize.isEmpty {
                 let arrays = try MLX.loadArrays(url: url)
+                if let denseBits = o.denseBits {
+                    for (key, rk) in denseToQuantize {
+                        guard let w = arrays[key] else { continue }
+                        let q = MLX.quantized(w, groupSize: o.denseGroupSize, bits: denseBits)
+                        guard let biases = q.biases else {
+                            throw MLXFastError.invalidInput("affine quantization returned no biases for \(rk)")
+                        }
+                        eval(q.wq, q.scales, biases)
+                        let base = String(rk.dropLast(".weight".count))
+                        totalBytes += try writer.append(array: q.wq, name: base + ".weight")
+                        totalBytes += try writer.append(array: q.scales, name: base + ".scales")
+                        totalBytes += try writer.append(array: biases, name: base + ".biases")
+                        denseQuantizedPaths.append(base)
+                    }
+                }
                 for key in expertsToQuantize {
                     guard let rk = runtimeKey(key), let w = arrays[key] else { continue }
                     let suffix = key.hasSuffix("gate_up_proj") ? "experts.gate_up_proj" : "experts.down_proj"
@@ -199,6 +249,19 @@ public enum Qwen4ExpTransform {
         // `linked` records that the shards are symlinks, so the tree is not
         // self-contained. Anything that archives, copies or checksums it needs
         // to know that before it walks the directory.
+        if let denseBits = o.denseBits,
+            denseBits != o.expertBits || o.denseGroupSize != o.expertGroupSize
+        {
+            // Mixed precision: the loader keys per-layer overrides by module
+            // path, interleaved in the same block as the global parameters
+            // (BaseConfiguration.QuantizationContainer). Matching parameters
+            // need no entries; the global block already covers the dense paths.
+            var quantization = text["quantization"] as? [String: Any] ?? [:]
+            for path in denseQuantizedPaths {
+                quantization[path] = ["group_size": o.denseGroupSize, "bits": denseBits]
+            }
+            text["quantization"] = quantization
+        }
         text["ngram_table"] = [
             "directory": "ngram", "shards": ngramShards, "rows_per_shard": ngramRows,
             "dim": ngramDim, "dtype": "bfloat16",

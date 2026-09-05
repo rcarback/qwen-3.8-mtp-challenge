@@ -313,6 +313,33 @@ public func loadWeights(
     try model.update(parameters: parameters, verify: [.all])
     mark("update params")
 
+    // DARKBLOOM_DENSE_QUANT_BITS=<4|8> (group DARKBLOOM_DENSE_QUANT_GROUP, default
+    // 32): quantize every dense Linear the tree left in bf16, at load, from the
+    // loaded weights. Off unless set.
+    //
+    // Exists as a single-variable experiment. On disk only the routed experts
+    // are quantized and every dense tensor is bf16, which makes the dense
+    // tensors 85 percent of the bytes one decode token touches (8.78 GB of
+    // 10.29). Upstream's quant_predicate (mlx-lm PR 1788) quantizes everything
+    // but the router. Doing it here, on the same tree and the same code path,
+    // isolates the byte count from every other difference an offline tree
+    // would carry. The router and the one-column shared-expert gate stay in
+    // full precision, matching upstream; embeddings are skipped because decode
+    // reads one row of them and quantizing buys nothing there.
+    if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DENSE_QUANT_BITS"],
+        let denseBits = Int(raw), denseBits == 4 || denseBits == 8
+    {
+        let group = Int(ProcessInfo.processInfo.environment["DARKBLOOM_DENSE_QUANT_GROUP"] ?? "") ?? 32
+        var count = 0
+        quantize(model: model, groupSize: group, bits: denseBits) { path, module in
+            guard module is Linear, !(module is Quantized) else { return false }
+            if path.hasSuffix("mlp.gate") || path.hasSuffix("shared_expert_gate") { return false }
+            count += 1
+            return true
+        }
+        mark("dense quantize q\(denseBits) g\(group): \(count) layers")
+    }
+
     // Drop the staging dictionary before dtype conversion so we don't keep
     // two copies of safetensor arrays alive during the bf16 pass.
     weights.removeAll(keepingCapacity: false)
