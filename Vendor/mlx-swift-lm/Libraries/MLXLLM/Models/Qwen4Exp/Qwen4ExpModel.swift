@@ -158,6 +158,12 @@ public final class Qwen4ExpTextModel: Module {
             let (context, next) = nextPrevContext(ids: ids, pleCache: pc, prev: nil)
             prevContext = context
             pc?[3] = next
+            // Start the n-gram readahead now, on a background thread, so the
+            // faults resolve during layers 0 and 1 instead of stalling the PLE
+            // at layer 2. The gather reads about 7850 cold pages at prefill
+            // widths and costs about 858 ms; two layers is roughly 296 ms of
+            // cover. MLX_QWEN4EXP_NGRAM_AHEAD=0 disables it.
+            layers[pleIdx].ple?.embedding.prefetchAhead(ids: ids, prevContext: context)
         }
         for (i, layer) in layers.enumerated() {
             h = layer(

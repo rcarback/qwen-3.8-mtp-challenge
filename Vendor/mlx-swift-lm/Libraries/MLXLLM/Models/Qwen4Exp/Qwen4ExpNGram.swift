@@ -158,6 +158,27 @@ final class Qwen4ExpNGramTable {
     static let prefetchEnabled: Bool =
         ProcessInfo.processInfo.environment["MLX_QWEN4EXP_NGRAM_PREFETCH"] != "0"
 
+    /// Issue the readahead two layers early, on a background thread, rather
+    /// than at the top of the gather. Set MLX_QWEN4EXP_NGRAM_AHEAD=0 to
+    /// measure without it.
+    static let aheadEnabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN4EXP_NGRAM_AHEAD"] != "0"
+
+    /// Issues the readahead on a background thread and returns at once.
+    ///
+    /// The synchronous `prefetch` runs at the top of the gather, so the read
+    /// loop still waits on the first faults. The gids are known before layer 0
+    /// and the PLE does not run until layer 2, so issuing there gives the
+    /// faults two layers of unrelated compute to resolve under. At prefill
+    /// widths a layer is roughly 148 ms of a 7100 ms forward, so two layers is
+    /// about 296 ms of cover against a gather that costs about 858 ms.
+    func prefetchAhead(_ gids: [[Int64]]) {
+        guard Self.prefetchEnabled, Self.aheadEnabled else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.prefetch(gids)
+        }
+    }
+
     /// Tells the kernel which pages the gather is about to read, in ascending
     /// file order, before reading any of them.
     ///
@@ -507,6 +528,23 @@ final class Qwen4ExpNGramEmbedding: Module {
         hasher = h
         table = t
         return (h, t)
+    }
+
+    /// Computes this forward's gids and starts their readahead, without
+    /// gathering. Called before layer 0 so the faults resolve during layers 0
+    /// and 1 rather than stalling the PLE at layer 2.
+    func prefetchAhead(ids: MLXArray, prevContext: MLXArray) {
+        guard Qwen4ExpNGramTable.prefetchEnabled, Qwen4ExpNGramTable.aheadEnabled else { return }
+        let (h, t) = resolve()
+        let B = ids.dim(0), S = ids.dim(1)
+        let idRows = ids.asType(.int64).asArray(Int64.self)
+        let ctxRows = prevContext.asType(.int64).asArray(Int64.self)
+        let ctx = args.ngramSize - 1
+        for b in 0 ..< B {
+            let history =
+                Array(ctxRows[(b * ctx) ..< ((b + 1) * ctx)]) + Array(idRows[(b * S) ..< ((b + 1) * S)])
+            t.prefetchAhead(h.gids(history: history))
+        }
     }
 
     /// `ids` `[B, S]`, `prevContext` `[B, ngramSize-1]` -> `[B, S, pleEmbedDim]` float16.

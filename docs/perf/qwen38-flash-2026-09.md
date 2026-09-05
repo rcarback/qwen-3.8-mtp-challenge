@@ -2436,3 +2436,44 @@ Every speed claim in this document is stated against the production MoE at
 without one no row's decode estimate can be stated as a percentage. Establishing
 that number is the prerequisite for re-estimating the rest of the table
 properly.
+
+## Issuing the n-gram readahead two layers early halves the gather (2026-09-05)
+
+Starting the readahead before layer 0, on a background thread, cuts the gather
+by 47 percent and a prefill forward by 6.5 percent. Three rounds, real bf16
+table, release, synchronous prefetch on in both arms so the head start is the
+only variable.
+
+| | gather median | forward median |
+|---|---|---|
+| readahead at the gather | 851.8 ms | 9865.5 ms |
+| readahead two layers early | 448.4 ms | 9228.3 ms |
+| delta | -403.4 ms, -47.4 percent | -637.2 ms, -6.5 percent |
+
+No round crossed over: gather read 851.8, 845.1 and 853.8 ms without the head
+start and 473.1, 445.3 and 448.4 ms with it.
+
+### Why this worked where the other two levers did not
+
+The gather reads about 7850 cold pages and its residue works out to roughly
+109 microseconds per fault, which is close to what an unoverlapped random
+16 KiB read costs on this storage. That said the faults were not achieving much
+concurrency with each other, so the remaining opportunity had to come from
+somewhere other than fault scheduling.
+
+Sorting the read loop into fault order did nothing, because madvise had already
+extracted whatever ordering was worth. The synchronous madvise batch made the
+faults overlap each other, worth 13.7 percent. This lever overlaps them with
+UNRELATED COMPUTE instead: the gids are known before layer 0, the PLE runs at
+layer 2, and two layers of a prefill forward is roughly 296 ms of cover.
+
+### Both metrics moved, which is what makes it real
+
+Gather time alone would have been the wrong measure here. The timer starts when
+`gather()` is entered, so pages already resident by then make gather look
+cheaper whether or not the work disappeared. The work could simply have
+relocated into layers 0 and 1. The forward median falling 637 ms says it did
+not: the cost left the critical path rather than moving along it.
+
+`MLX_QWEN4EXP_NGRAM_AHEAD=0` disables the head start and keeps the synchronous
+prefetch, which is the arm measured above.
