@@ -82,7 +82,53 @@ final class Qwen4ExpGatedResidual: Module {
         super.init()
     }
 
+    /// `MLX_QWEN4EXP_COMPILE_GLUE=0` disables. The read gate is the launch-bound
+    /// shape compile was built for: a zero-centred RMS norm, two low-rank
+    /// projections, a silu, two sigmoids, a broadcast product and a mean, all
+    /// over 2560 elements, run twice per layer and so 96 times per decode step.
+    /// Arithmetic does not predict decode cost on this model -- `lm_head` is the
+    /// largest GEMM in the step and costs 1.6 percent because it is ONE launch --
+    /// so fusing this chain removes launches, not flops.
+    static let compileGlue: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN4EXP_COMPILE_GLUE"] != "0"
+
+    /// Rows per forward at or below which the compiled trace is used.
+    ///
+    /// Ruling: NOT `shapeless: true`. The body reads `hyper.shape` to build its
+    /// reshape targets, and a symbolic trace would bake whatever the first call
+    /// happened to carry. Tracing per shape instead means prefill -- whose
+    /// sequence length varies call to call -- would retrace repeatedly, so the
+    /// compiled path is restricted to the decode regime it was measured in.
+    /// Prefill is compute-bound and is left on the eager path unchanged.
+    static let compileMaxRows = 8
+
+    private var compiledGated: (@Sendable (MLXArray) -> (MLXArray, MLXArray))?
+    private var compiledPlain: (@Sendable (MLXArray) -> MLXArray)?
+
     func mix(_ hyper: MLXArray) -> (mixed: MLXArray, inject: MLXArray?) {
+        guard Self.compileGlue,
+            hyper.shape.dropLast().reduce(1, *) <= Self.compileMaxRows
+        else { return mixBody(hyper) }
+        // Built on first use, never at init: the trace bakes the weights in as
+        // constants, and at init they are still the zero-filled placeholders
+        // `Module` allocates rather than the loaded checkpoint.
+        if inject != nil {
+            if compiledGated == nil {
+                compiledGated = compile { [self] h in
+                    let r = mixBody(h)
+                    return (r.mixed, r.inject!)
+                }
+            }
+            let (mixed, gate) = compiledGated!(hyper)
+            return (mixed, gate)
+        }
+        if compiledPlain == nil {
+            compiledPlain = compile { [self] h in mixBody(h).mixed }
+        }
+        return (compiledPlain!(hyper), nil)
+    }
+
+    private func mixBody(_ hyper: MLXArray) -> (mixed: MLXArray, inject: MLXArray?) {
         let normed = hcNorm(hyper)
         let lead = Array(hyper.shape.dropLast())
         var w = silu(mixDown(normed) / Float(hc))

@@ -186,6 +186,43 @@ final class Qwen4ExpSparseMoeBlock: Module {
             stderr)
     }
 
+    /// `MLX_QWEN4EXP_COMPILE_SHARED=0` disables. The shared expert is
+    /// `sigmoid(gate(x)) * down(silu(gate_proj(x)) * up(x))`: four matmuls with
+    /// a silu, a sigmoid and two products threaded between them, once per layer.
+    /// A quantized matmul is already one tuned kernel and compile cannot fuse
+    /// inside it, so whatever this wins comes from the elementwise glue only --
+    /// which is why it is a separate switch from the read gate and is measured
+    /// on its own.
+    static let compileShared: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN4EXP_COMPILE_SHARED"] != "0"
+
+    private var compiledShared: (@Sendable (MLXArray) -> MLXArray)?
+
+    /// The gated shared expert. Same restriction to the decode regime, and for
+    /// the same reason, as `Qwen4ExpGatedResidual.mix`.
+    func sharedBranch(_ x: MLXArray) -> MLXArray {
+        guard Self.compileShared,
+            x.shape.dropLast().reduce(1, *) <= Qwen4ExpGatedResidual.compileMaxRows
+        else { return sharedBody(x) }
+        if compiledShared == nil {
+            compiledShared = compile { [self] v in sharedBody(v) }
+        }
+        return compiledShared!(x)
+    }
+
+    private func sharedBody(_ x: MLXArray) -> MLXArray {
+        sigmoid(sharedExpertGate(x)) * sharedExpert(x)
+    }
+
+    /// `MLX_QWEN4EXP_FUSED_ROUTER=1`. Replace the router's selection tail --
+    /// `argPartition`, the slice, `takeAlong` and the precise softmax -- with the
+    /// single `FusedRouterSelect` kernel. Off by default: it is a hand-written
+    /// kernel standing in for library primitives, and it breaks an exact logit
+    /// tie toward the lower expert index where MLX promises nothing, so it has
+    /// to earn its way on before it is on.
+    static let fusedRouterSelect: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN4EXP_FUSED_ROUTER"] == "1"
+
     /// Router: float32 logits, top-k by `argPartition`, weights = softmax over the
     /// SELECTED logits (equal to softmax-all followed by renormalisation).
     func route(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
@@ -203,6 +240,14 @@ final class Qwen4ExpSparseMoeBlock: Module {
             logitsMasked = logits + keep
         }
         let k = min(Self.topKOverride ?? topK, numExperts)
+        if Self.fusedRouterSelect {
+            let lead = Array(logitsMasked.shape.dropLast())
+            let (i, w) = FusedRouterSelect.forward(
+                logits: logitsMasked.reshaped([-1, numExperts]), topK: k, numExperts: numExperts)
+            let idx = i.reshaped(lead + [k])
+            Self.reportRouteStats(idx, experts: numExperts)
+            return (idx, w.reshaped(lead + [k]))
+        }
         let kth = numExperts - k
         let idx = MLX.argPartition(logitsMasked, kth: kth, axis: -1)[.ellipsis, kth...]
         let w = MLX.softmax(MLX.takeAlong(logitsMasked, idx, axis: -1), axis: -1, precise: true)
@@ -307,7 +352,7 @@ final class Qwen4ExpSparseMoeBlock: Module {
 
         let y = scatterUnsort(x: ySorted, invOrder: invOrder, shape: idx.shape)
         let routed = (y * w.expandedDimensions(axis: -1).asType(y.dtype)).sum(axis: -2)
-        return routed.asType(x.dtype) + sigmoid(sharedExpertGate(x)) * sharedExpert(x)
+        return routed.asType(x.dtype) + sharedBranch(x)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -346,7 +391,7 @@ final class Qwen4ExpSparseMoeBlock: Module {
         let (idx, w) = route(x)
         let y = switchMLP(x, idx)  // [B, S, k, D]
         let routed = (y * w.expandedDimensions(axis: -1).asType(y.dtype)).sum(axis: -2)
-        return routed.asType(x.dtype) + sigmoid(sharedExpertGate(x)) * sharedExpert(x)
+        return routed.asType(x.dtype) + sharedBranch(x)
     }
 
     /// `sharedExpert(x)` does not depend on the routed sum, so it runs on the
