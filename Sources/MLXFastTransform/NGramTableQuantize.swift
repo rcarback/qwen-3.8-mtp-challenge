@@ -1,15 +1,23 @@
 import Foundation
 
 /// Offline re-encoding of the Qwen3.8-Flash-Next n-gram embedding table from
-/// bf16 to a per-row affine int8 or int4 code.
+/// bf16 to a per-row affine int8 or int4 code, or to NVFP4.
 ///
-/// This exists for footprint and residency, not speed. The bf16 table is
-/// 102.4 GB and the transformer tower is about 87.2 GB, for a combined 189.6
-/// GB that does not fit in the 128 GB this machine has. At int4 the table is
-/// 26.9 GB, for a combined total near 114 GB, which fits. Measured gather cost
-/// at real per-forward geometry is 1.630 ms in a release build against about
-/// 1,060 ms of MoE work per forward -- about 0.15 percent -- so nothing here
-/// is justified as a speedup; see `docs/perf/qwen38-flash-2026-09.md`.
+/// This buys disk footprint AND read speed. On the real table a quantized
+/// gather measures about 856 ms against bf16's 1014 ms for one 512-token
+/// prefill, roughly 15 percent faster, and the table goes from 102.4 GB to
+/// 49 GB (int8), 28 GB (nvfp4) or 25 GB (int4). int4 is the adopted encoding;
+/// `docs/perf/qwen38-flash-2026-09.md` has the four-way comparison.
+///
+/// Two earlier claims in this comment were wrong and are recorded here so they
+/// are not reintroduced. It said the re-encoding existed for RESIDENCY, on the
+/// grounds that the table plus the tower exceed this machine's memory. The
+/// table is memory-mapped and sparsely touched, so it never needed to be
+/// resident and footprint is a disk argument. It also said the gather costs
+/// 0.15 percent of a forward and that no speedup was available. That figure
+/// came from a 6.4 MB fixture that was fully faulted in, which deleted the
+/// page-fault term; on the real table the gather is about 14 percent of a
+/// forward.
 ///
 /// One scale and one bias per 160-value row. A row is one n-gram embedding, so
 /// per-row scaling preserves each embedding's own dynamic range at a cost of 4
