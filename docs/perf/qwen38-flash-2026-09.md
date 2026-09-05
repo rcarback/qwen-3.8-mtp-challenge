@@ -2239,3 +2239,51 @@ an affine code carries a bias and a float code does not. On the checked-in
 fixture, whose values sit in [0.0078, 0.0137] and never cross zero, nvfp4
 measures 5.7 times worse than int4. That is a fact about the fixture. Real
 embeddings are near zero-centred, which is the case NVFP4 is built for.
+
+## Batched readahead, and what it does to the encoding choice (2026-09-04)
+
+Telling the kernel which pages the gather needs, before reading any of them,
+cuts the bf16 gather by 13.7 percent and erases the reason to quantize for
+speed.
+
+The gather reads about 8192 rows scattered across 320 million. No two rows
+share a 16 KiB page, so a plain read takes one cold fault per row and each
+fault stalls until storage answers. Every row id is known before the first
+read, so those faults never had to be serial. The gather now sorts the offsets
+per shard, coalesces runs that fall on the same or the next page, and issues
+one `madvise(MADV_WILLNEED)` per run. Same total input and output, overlapped
+instead of queued. `MLX_QWEN4EXP_NGRAM_PREFETCH=0` turns it off.
+
+Median gather over three rounds, real tables, release, one 512-token prefill:
+
+| encoding | prefetch off | prefetch on | change |
+|---|---|---|---|
+| bf16 | 1007.3 ms | 869.8 ms | 13.7 percent faster |
+| int4 | 852.1 ms | 860.8 ms | no change, inside noise |
+
+### The earlier speed win for quantization was page-cache residency
+
+Prefetch helps bf16 and does nothing for int4. Both touch about 7850 pages, so
+if both were equally cold the two would improve together. They do not, because
+int4 is 25 GB and coexists with the 87 GB tower in this machine's 128 GB, while
+bf16 at 102.4 GB cannot. int4's faults were mostly already satisfied from page
+cache; bf16's were reaching storage.
+
+So the 15 percent that quantization appeared to win was a property of this
+machine's memory, not of the codec. Once the read stops being latency-bound the
+two encodings measure the same: 869.8 ms against 860.8 ms, a 1 percent gap with
+overlapping ranges.
+
+Prefetch costs int4 about 1 percent, which is the syscalls doing no useful work
+on pages that are already resident. That is inside the noise here and not worth
+gating on table size.
+
+### Revised recommendation
+
+Take the prefetch unconditionally. It improves the shipped bf16 default by 13.7
+percent, changes no output, and needs no format change.
+
+After that, quantizing this table is a disk argument only. int4 turns 102.4 GB
+into 25 GB and costs about 5 percent of next-token decisions. Keep bf16 unless
+disk is the binding constraint; take int4 when it is, and prefer int4 over int8
+and nvfp4, which cost the same decisions for more space.

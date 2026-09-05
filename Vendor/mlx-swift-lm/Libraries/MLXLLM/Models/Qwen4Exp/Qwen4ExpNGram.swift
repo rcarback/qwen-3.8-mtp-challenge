@@ -153,6 +153,55 @@ final class Qwen4ExpNGramTable {
     /// E2M1 floats under a per-16 E4M3 block scale.
     static let nvfp4Bits = 40
 
+    /// Batched readahead before the gather reads anything. On by default;
+    /// set MLX_QWEN4EXP_NGRAM_PREFETCH=0 to measure without it.
+    static let prefetchEnabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN4EXP_NGRAM_PREFETCH"] != "0"
+
+    /// Tells the kernel which pages the gather is about to read, in ascending
+    /// file order, before reading any of them.
+    ///
+    /// The gather reads thousands of rows scattered across 320 million. No two
+    /// rows share a 16 KiB page, so a naive read takes one cold fault per row
+    /// and each fault stalls the thread until the storage returns. Every gid is
+    /// known before the first read, so the faults do not have to be serial:
+    /// one madvise(MADV_WILLNEED) per coalesced run lets the kernel issue the
+    /// reads together and the loop then walks pages that are already arriving.
+    private func prefetch(_ gids: [[Int64]]) {
+        guard Self.prefetchEnabled, !gids.isEmpty else { return }
+        let pageSize = 16384
+        var perShard = [Int: [Int]]()
+        for row in gids {
+            for gid in row {
+                let shard = Int(gid) / rowsPerShard
+                let r = Int(gid) % rowsPerShard
+                perShard[shard, default: []].append(dataOffsets[shard] + r * bytesPerRow)
+            }
+        }
+        for (shard, offsets) in perShard {
+            let sorted = offsets.sorted()
+            maps[shard].withUnsafeBytes { src in
+                guard let base = src.baseAddress else { return }
+                var i = 0
+                while i < sorted.count {
+                    let lo = (sorted[i] / pageSize) * pageSize
+                    var hi = ((sorted[i] + bytesPerRow + pageSize - 1) / pageSize) * pageSize
+                    var j = i + 1
+                    // Merge runs that already touch the same or the next page,
+                    // so one syscall covers a cluster instead of a row.
+                    while j < sorted.count, (sorted[j] / pageSize) * pageSize <= hi {
+                        hi = max(hi, ((sorted[j] + bytesPerRow + pageSize - 1) / pageSize) * pageSize)
+                        j += 1
+                    }
+                    madvise(
+                        UnsafeMutableRawPointer(mutating: base.advanced(by: lo)), hi - lo,
+                        MADV_WILLNEED)
+                    i = j
+                }
+            }
+        }
+    }
+
     /// Writes a synthetic bf16 shard set and returns its directory, so a table
     /// can be opened over it directly or re-encoded by `NGramTableQuantize`.
     static func fixtureDirectory(rowsPerShard: Int, dim: Int, shards: Int) throws -> URL {
@@ -303,6 +352,7 @@ final class Qwen4ExpNGramTable {
                 }
             }
         }
+        prefetch(gids)
         var out = [Float16](repeating: 0, count: T * heads * dim)
         if bits == 16 {
             out.withUnsafeMutableBufferPointer { dst in
