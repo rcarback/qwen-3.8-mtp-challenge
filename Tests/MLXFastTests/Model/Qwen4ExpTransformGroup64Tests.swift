@@ -172,4 +172,42 @@ final class Qwen4ExpTransformGroup64Tests: XCTestCase {
         print("[transform-link] symlinked, disclosed in config, gathers identically")
     }
 
+    /// Produces a real group-64 weights tree, linking the n-gram table.
+    ///
+    /// This is bead 2x7 step 2. It reads the 362 GB bf16 source and writes
+    /// about 80 GB, which fits only because `linkNGramTableFrom` stops the
+    /// transform copying the unchanged 95 GB table. Opt-in and slow, so it is
+    /// gated on its own variable rather than the general runtime flag.
+    ///
+    ///     MLXFAST_RUN_MLX_RUNTIME_TESTS=1 MLXFAST_RUN_G64_TRANSFORM=1 \
+    ///     MLXFAST_QWEN4EXP_SOURCE=<source> MLXFAST_QWEN4EXP_WEIGHTS=<weights> \
+    ///     MLXFAST_G64_OUT=<dest> swift test -c release \
+    ///       --force-resolved-versions --filter buildGroup64Tree
+    func testBuildGroup64Tree() throws {
+        let env = ProcessInfo.processInfo.environment
+        try XCTSkipUnless(env["MLXFAST_RUN_G64_TRANSFORM"] == "1", "opt in with MLXFAST_RUN_G64_TRANSFORM=1")
+        guard let source = env["MLXFAST_QWEN4EXP_SOURCE"],
+            let weights = env["MLXFAST_QWEN4EXP_WEIGHTS"],
+            let out = env["MLXFAST_G64_OUT"]
+        else { throw XCTSkip("needs MLXFAST_QWEN4EXP_SOURCE, _WEIGHTS and MLXFAST_G64_OUT") }
+
+        let t0 = Date()
+        try Qwen4ExpTransform.run(
+            .init(
+                source: URL(fileURLWithPath: source),
+                destination: URL(fileURLWithPath: out),
+                expertGroupSize: 64, expertBits: 4,
+                linkNGramTableFrom: URL(fileURLWithPath: weights).appendingPathComponent("ngram")))
+        let secs = Date().timeIntervalSince(t0)
+
+        let cfgData = try Data(contentsOf: URL(fileURLWithPath: out).appendingPathComponent("config.json"))
+        let cfg = try JSONSerialization.jsonObject(with: cfgData) as? [String: Any]
+        let quant = cfg?["quantization"] as? [String: Any]
+        XCTAssertEqual(quant?["group_size"] as? Int, 64, "the tree must record group_size 64")
+        XCTAssertEqual(quant?["bits"] as? Int, 4, "bit width must be unchanged")
+        let ng = cfg?["ngram_table"] as? [String: Any]
+        XCTAssertEqual(ng?["linked"] as? Bool, true, "the n-gram table must be linked, not copied")
+        print("[g64-transform] wrote \(out) in \(String(format: "%.0f", secs))s")
+    }
+
 }

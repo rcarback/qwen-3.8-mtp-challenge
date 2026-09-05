@@ -2672,3 +2672,49 @@ which reintroduces the round-trip floor at smaller scale and distorts more than
 it reveals. Layer granularity is the finest cut where the distortion stays
 bounded and interpretable, and the 1.96x figure is the correction factor any
 finer estimate has to carry.
+
+## Expert group-64 changes 9 percent of decisions; do not adopt (2026-09-05)
+
+Group-64 halves the routed experts' scale and bias metadata for 7.6 GB, at a
+reconstruction penalty of 1.127x to 1.146x. Measured end to end it changes 8.95
+percent of the model's next-token decisions, which is too much for that saving.
+
+A real group-64 tree, transformed from the bf16 source, against the shipped
+group-32 build over six prompts of 512 positions each. The n-gram table is
+symlinked and identical in both arms, so expert group size is the only variable.
+
+| prompt | flips / 512 | mean abs delta top-1 |
+|---|---|---|
+| law | 40 | 0.308 |
+| biology | 51 | 0.382 |
+| music | 57 | 0.404 |
+| geology | 43 | 0.324 |
+| cooking | 44 | 0.296 |
+| logistics | 40 | 0.296 |
+| median | 43.5 | |
+| total | 275 of 3072 | agreement 91.05 percent |
+
+### Reconstruction error understated this by a wide margin
+
+Group-64's reconstruction penalty is 1.13x, which passed the plan's 1.5x gate
+comfortably and looked like the cheapest footprint win in this document. End to
+end it moves 43.5 decisions per 512 against the n-gram int4 encoding's 25, on
+the same harness and the same prompts.
+
+That is the third time on this model that reconstruction error has failed to
+predict behaviour, and this time it failed in the dangerous direction. The
+n-gram encodings spanned 16.9x in reconstruction error and all landed at 23 to
+25 flips. nvfp4 reconstructs better than int4 and changes more decisions.
+Group-64 reconstructs only 13 percent worse than group-32 and changes 74
+percent more decisions than a much coarser change to a different tensor.
+
+The rule this establishes: on this model, a reconstruction ratio is not
+evidence about behaviour in either direction, and the gate should be an
+end-to-end run rather than an error bound. The 1.5x reconstruction gate in the
+plan should be retired.
+
+### What it costs and what it buys
+
+7.6 GB of metadata against 8.95 percent of decisions. For comparison, n-gram
+int4 saves 77 GB of disk for about 5 percent. Group-64 is a worse trade on both
+sides of the ledger.
