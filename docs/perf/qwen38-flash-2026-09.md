@@ -2388,18 +2388,34 @@ The two facts driving every re-estimate:
 
 ### The row that changes most: speculative decode depth
 
-The table lists "push MTP draft depth toward the trusted maximum" as the
-largest untouched lever and does not quantify it. The flatness above quantifies
-it, and the number is large.
+CORRECTED 2026-09-05. An earlier revision of this section said a decode forward
+costs about the same carrying one row or eight, so a K-row block costs one
+forward. That came from microbenchmarks which turned out to measure an
+isolated-eval floor. Measured on the real model the picture is different, and
+the conclusion is weaker but still large.
 
-A decode forward costs about the same whether it carries one row or eight. So a
-block of K speculative rows costs approximately one forward, not K forwards.
-Every accepted token beyond the first is nearly free, and the ceiling is the
-acceptance rate rather than any per-token compute.
+| rows carried | forward | against one row | per token |
+|---|---|---|---|
+| 1 | 56.67 ms | 1.00x | 56.67 ms |
+| 2 | 120.86 ms | 2.13x | 60.43 ms |
+| 4 | 139.71 ms | 2.47x | 34.93 ms |
+| 8 | 161.39 ms | 2.85x | 20.17 ms |
 
-That reframes the shipped depth-2 schedule as leaving most of the available
-throughput unused, and it makes acceptance rate, not compute, the thing worth
-optimising. Anything that raises acceptance buys close to its full value.
+Cost is NOT flat in rows. Going from one row to two costs 2.13x, slightly worse
+than linear, so the first extra row is not free at all. From two rows to eight
+the cost grows 1.34x for four times the work, and per-token cost falls from
+60.43 ms to 20.17 ms.
+
+So the shape is a large fixed cost per forward plus a small marginal cost per
+row, with the step from one to two paying an extra penalty. Depth 8 is 2.81x
+the throughput of depth 1 if every draft is accepted, and the shipped depth-2
+schedule sits at the worst point on this curve: it pays the one-to-two penalty
+without reaching the region where the marginal row is cheap.
+
+That still makes draft depth the largest lever in the table, and it makes
+acceptance rate at HIGHER depths the thing to measure. The 2.81x ceiling
+degrades with acceptance: at depth 8 with 75 percent acceptance the realised
+gain is closer to 2x.
 
 ### Rows that are prefill-only and do not apply at decode
 

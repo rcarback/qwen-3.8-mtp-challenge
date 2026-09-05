@@ -60,30 +60,45 @@ struct DecodeStepCostTests {
             state: nil)
         eval(prefill.logits)
 
+        // Sweep rows per forward on the REAL model. The microbenchmarks that
+        // suggested component cost is flat in row count turned out to be
+        // measuring an isolated-eval floor of about 0.22 ms, so the
+        // speculative-decode conclusion drawn from them needs the real model
+        // to stand. If a forward carrying K rows costs about what one row
+        // costs, a K-row speculative block costs roughly one forward and every
+        // accepted token past the first is nearly free.
         var next = Int32(42)
-        // Warm: the first decode step after a prefill pays one-off costs.
-        for _ in 0 ..< 3 {
-            let o = context.model(
-                LMInput.Text(tokens: MLXArray([next]).reshaped([1, 1])), cache: cache, state: nil)
-            eval(o.logits)
-        }
-
-        var best = Double.greatestFiniteMagnitude
-        var total = 0.0
-        let steps = 32
-        for _ in 0 ..< 3 {
-            let t0 = DispatchTime.now().uptimeNanoseconds
-            for _ in 0 ..< steps {
-                let o = context.model(
-                    LMInput.Text(tokens: MLXArray([next]).reshaped([1, 1])), cache: cache,
-                    state: nil)
+        var perRows = [(Int, Double)]()
+        for rows in [1, 2, 4, 8] {
+            let tok = MLXArray((0 ..< rows).map { Int32(next) + Int32($0) })
+                .reshaped([1, rows])
+            // Warm this shape before timing it.
+            for _ in 0 ..< 3 {
+                let o = context.model(LMInput.Text(tokens: tok), cache: cache, state: nil)
                 eval(o.logits)
             }
-            let dt = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6 / Double(steps)
-            best = min(best, dt)
-            total += dt
-            next = (next + 1) % 1000
+            var best = Double.greatestFiniteMagnitude
+            for _ in 0 ..< 3 {
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                for _ in 0 ..< 8 {
+                    let o = context.model(LMInput.Text(tokens: tok), cache: cache, state: nil)
+                    eval(o.logits)
+                }
+                best = min(best, Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6 / 8)
+            }
+            perRows.append((rows, best))
+            next = (next + Int32(rows)) % 1000
         }
+        let one = perRows[0].1
+        print("[decode-rows] forward cost against rows carried, real model")
+        for (rows, ms) in perRows {
+            print(
+                "  rows=\(rows)  \(String(format: "%7.2f", ms))ms  "
+                    + "\(String(format: "%5.2f", ms / one))x of one row  "
+                    + "per token \(String(format: "%6.2f", ms / Double(rows)))ms")
+        }
+        let best = one
+        var total = one * 3
         let routerPerToken = 35.0  // 0.729 ms x 48 layers, measured separately
         print(
             "[decode] best=\(String(format: "%.2f", best))ms/token "
