@@ -2,6 +2,8 @@ import Foundation
 import MLX
 import XCTest
 
+@testable import MLXFastCore
+@testable import MLXFastTransform
 @testable import MLXLLM
 
 final class Qwen4ExpNGramGatherTests: XCTestCase {
@@ -70,4 +72,106 @@ final class Qwen4ExpNGramGatherTests: XCTestCase {
                 + "distinct 16KiB pages \(s.distinctPages / 5)")
         XCTAssertEqual(s.rows / 5, 11_200)
     }
+    /// The page counter must equal an independently computed page set, for
+    /// every encoding.
+    ///
+    /// This exists because the counter was wrong in a way that hid a real
+    /// performance bug. It computed `dataOffsets[shard] + r * stride` using the
+    /// weight-tensor stride alone. Under the old split layout a quantized row
+    /// also read a scale and a bias from two far-away regions, so the true
+    /// fault count was about 3x what the counter reported. The three encodings
+    /// therefore reported near-identical page counts, which read as "locality
+    /// is the same" when quantized rows were in fact faulting three pages each
+    /// and measuring 2.3x slower than bf16.
+    ///
+    /// The row is one contiguous record now, so the counter is exact. This test
+    /// pins that: it recomputes the expected `(shard, page)` set from the gids
+    /// in the test itself, rather than trusting the implementation's own
+    /// arithmetic.
+    func testDistinctPagesMatchesAnIndependentCount() throws {
+        guard Qwen4ExpNGramTable.statsEnabled else {
+            throw XCTSkip("needs MLX_QWEN4EXP_NGRAM_STATS=1")
+        }
+        let rowsPerShard = 512, dim = 160, shards = 3
+        let src = try Qwen4ExpNGramTable.fixtureDirectory(
+            rowsPerShard: rowsPerShard, dim: dim, shards: shards)
+        let spec = Qwen4ExpNGramTableSpec(
+            directory: src.lastPathComponent, shards: shards, rowsPerShard: rowsPerShard,
+            dim: dim, dtype: "bfloat16")
+
+        // Spread the gids over all three shards and across each shard's rows,
+        // so pages are genuinely distinct rather than clustered in one block.
+        let gids: [[Int64]] = (0 ..< 12).map { t in
+            (0 ..< 8).map { h in Int64((t * 8 + h) * 37 % (rowsPerShard * shards)) }
+        }
+
+        for (label, dir) in try encodings(from: src) {
+            let table = try Qwen4ExpNGramTable(directory: dir, spec: spec)
+            let bytesPerRow = try rowWidth(of: dir, spec: spec)
+            Qwen4ExpNGramTable.stats.reset()
+            _ = table.gather(gids)
+            let got = Qwen4ExpNGramTable.stats.snapshot().distinctPages
+
+            // Independent recomputation: one record per row, so a row occupies
+            // the page its start offset falls in.
+            let base = try weightOffset(of: dir)
+            var expected = Set<Int>()
+            for row in gids {
+                for gid in row {
+                    let shard = Int(gid) / rowsPerShard
+                    let r = Int(gid) % rowsPerShard
+                    expected.insert(shard << 40 | ((base + r * bytesPerRow) / 16384))
+                }
+            }
+            XCTAssertEqual(
+                got, expected.count,
+                "\(label): counter said \(got) pages, independent count says \(expected.count)")
+            XCTAssertGreaterThan(expected.count, 1, "\(label): fixture must span several pages")
+        }
+    }
+
+    /// bf16 source plus one converted directory per quantized encoding.
+    private func encodings(from src: URL) throws -> [(String, URL)] {
+        var out: [(String, URL)] = [("bf16", src)]
+        for (label, bits) in [
+            ("int8", 8), ("int4", 4), ("nvfp4", NGramTableQuantize.nvfp4Bits),
+        ] {
+            let dst = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("ngram-pages-\(label)-\(UUID().uuidString)")
+            try NGramTableQuantize.convert(sourceDir: src, destDir: dst, bits: bits)
+            out.append((label, dst))
+        }
+        return out
+    }
+
+    /// Reads `weight`'s row width straight from shard 0's header.
+    private func rowWidth(of dir: URL, spec: Qwen4ExpNGramTableSpec) throws -> Int {
+        let (header, _) = try shardHeader(of: dir)
+        guard let info = header["weight"] as? [String: Any],
+            let shape = info["shape"] as? [Int], shape.count == 2
+        else { throw MLXFastError.invalidInput("bad fixture header") }
+        // bf16 rows are dim values of 2 bytes; quantized rows are byte-shaped.
+        return (info["dtype"] as? String) == "BF16" ? shape[1] * 2 : shape[1]
+    }
+
+    /// Byte offset of `weight`'s payload within shard 0.
+    private func weightOffset(of dir: URL) throws -> Int {
+        let (header, headerLength) = try shardHeader(of: dir)
+        guard let info = header["weight"] as? [String: Any],
+            let range = info["data_offsets"] as? [Int], range.count == 2
+        else { throw MLXFastError.invalidInput("bad fixture header") }
+        return 8 + headerLength + range[0]
+    }
+
+    private func shardHeader(of dir: URL) throws -> ([String: Any], Int) {
+        let data = try Data(contentsOf: dir.appendingPathComponent("shard_000.safetensors"))
+        let headerLength = Int(
+            data.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian })
+        guard
+            let header = try JSONSerialization.jsonObject(
+                with: data.subdata(in: 8 ..< (8 + headerLength))) as? [String: Any]
+        else { throw MLXFastError.invalidInput("bad fixture header") }
+        return (header, headerLength)
+    }
+
 }
