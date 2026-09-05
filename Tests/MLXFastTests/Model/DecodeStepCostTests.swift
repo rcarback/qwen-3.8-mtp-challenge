@@ -8,6 +8,7 @@ import Tokenizers  // required for #huggingFaceTokenizerLoader() macro expansion
 
 @testable import MLXFastCore
 @testable import MLXFastModel
+@testable import MLXLLM
 
 /// How long is one decode step, so per-token overheads have a denominator?
 ///
@@ -97,13 +98,32 @@ struct DecodeStepCostTests {
                     + "\(String(format: "%5.2f", ms / one))x of one row  "
                     + "per token \(String(format: "%6.2f", ms / Double(rows)))ms")
         }
-        let best = one
-        var total = one * 3
-        let routerPerToken = 35.0  // 0.729 ms x 48 layers, measured separately
-        print(
-            "[decode] best=\(String(format: "%.2f", best))ms/token "
-                + "mean=\(String(format: "%.2f", total / 3))ms/token; "
-                + "router 35.0ms/token = \(String(format: "%.1f", routerPerToken / best * 100))% "
-                + "of the best step")
+
+        // Per-layer split from INSIDE the forward. This forces an eval per
+        // layer, serialising what the graph pipelines, so the total overstates
+        // the unmeasured step. The gap between them is how much the graph
+        // amortises, and it is the number a microbenchmark cannot reach.
+        if Qwen4ExpLayerTiming.enabled {
+            Qwen4ExpLayerTiming.reset()
+            let tok = MLXArray([Int32(7)]).reshaped([1, 1])
+            let o = context.model(LMInput.Text(tokens: tok), cache: cache, state: nil)
+            eval(o.logits)
+            let m = Qwen4ExpLayerTiming.snapshotMs()
+            let c = Qwen4ExpLayerTiming.counts()
+            let sum = m.full + m.linear + m.tail
+            print(
+                "[decode-layers] serialised, one row\n"
+                    + "  full attention   \(c.full) layers  "
+                    + "\(String(format: "%7.2f", m.full))ms  "
+                    + "\(String(format: "%.3f", m.full / Double(max(c.full, 1))))ms each\n"
+                    + "  linear attention \(c.linear) layers  "
+                    + "\(String(format: "%7.2f", m.linear))ms  "
+                    + "\(String(format: "%.3f", m.linear / Double(max(c.linear, 1))))ms each\n"
+                    + "  tail (mixer)                 "
+                    + "\(String(format: "%7.2f", m.tail))ms\n"
+                    + "  serialised total             \(String(format: "%7.2f", sum))ms  "
+                    + "against \(String(format: "%.2f", one))ms pipelined  "
+                    + "= \(String(format: "%.2f", sum / one))x")
+        }
     }
 }

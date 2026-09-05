@@ -2629,3 +2629,46 @@ What remains is a transform at `expertGroupSize` 64, which
 `Qwen4ExpTransform.Options` already accepts, followed by a divergence run
 against the group-32 build over several prompts. That costs a pass over the
 362 GB source and about 87 GB of disk.
+
+## Where a decode step goes, measured from inside the forward (2026-09-05)
+
+Per-layer timing taken inside the real forward, one row, opt-in via
+`MLX_QWEN4EXP_LAYER_TIMING`. This replaces the microbenchmark breakdown, whose
+figures were withdrawn after they turned out to measure an isolated-eval floor.
+
+| | layers | serialised total | per layer |
+|---|---|---|---|
+| full attention | 12 | 28.82 ms | 2.402 ms |
+| linear attention (gated delta) | 36 | 90.53 ms | 2.515 ms |
+| tail, hyper-connection mixer | 1 | 0.71 ms | 0.71 ms |
+| serialised total | | 120.06 ms | |
+| pipelined forward | | 61.19 ms | |
+
+### The graph amortises about half the work
+
+Forcing an eval per layer serialises what the lazy graph would pipeline, so the
+120.06 ms total overstates the real 61.19 ms step by 1.96x. That factor is the
+result, not an artifact: it says roughly half of a decode step's nominal layer
+work overlaps with other layer work, and it bounds any component decomposition
+from above. A breakdown that sums serialised parts will overstate by about 2x
+unless it accounts for this.
+
+### The two attention families cost the same per layer
+
+Full attention runs 2.402 ms per layer and gated-delta linear attention runs
+2.515 ms, despite being entirely different code paths with different state
+shapes. Linear attention dominates only by count: 36 layers against 12, so 75
+percent of layer time. Any optimisation aimed at one family and not the other
+addresses at most a quarter or three quarters of the tower accordingly.
+
+That similarity is itself worth noting. Gated-delta linear attention is meant to
+be the cheaper mechanism, and at one row it is not cheaper at all.
+
+### What this does not resolve
+
+The split within a layer, between attention, the routed MoE, the shared expert
+and the norms, is still unmeasured. Going finer means an eval per component,
+which reintroduces the round-trip floor at smaller scale and distorts more than
+it reveals. Layer granularity is the finest cut where the distortion stays
+bounded and interpretable, and the 1.96x figure is the correction factor any
+finer estimate has to carry.

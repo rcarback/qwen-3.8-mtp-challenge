@@ -92,6 +92,52 @@ final class Qwen4ExpDecoderLayer: Module {
     }
 }
 
+/// Per-layer timing for the real forward, opt-in via MLX_QWEN4EXP_LAYER_TIMING.
+///
+/// Exists because a component breakdown assembled from microbenchmarks measured
+/// an isolated-eval floor of about 0.22 ms rather than the components it named:
+/// a fused kernel and five separate ops time identically in isolation. The only
+/// way to decompose a graph-evaluated forward is from inside it.
+public enum Qwen4ExpLayerTiming {
+    public static let enabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN4EXP_LAYER_TIMING"] == "1"
+
+    nonisolated(unsafe) private static var full = [UInt64]()
+    nonisolated(unsafe) private static var linear = [UInt64]()
+    nonisolated(unsafe) private static var tail: UInt64 = 0
+    private static let lock = NSLock()
+
+    static func record(layer: Int, isLinear: Bool, nanos: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        if isLinear { linear.append(nanos) } else { full.append(nanos) }
+    }
+
+    static func recordTail(nanos: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        tail = nanos
+    }
+
+    public static func reset() {
+        lock.lock(); defer { lock.unlock() }
+        full.removeAll(); linear.removeAll(); tail = 0
+    }
+
+    /// Milliseconds: (full-attention total, linear-attention total, tail).
+    public static func snapshotMs() -> (full: Double, linear: Double, tail: Double) {
+        lock.lock(); defer { lock.unlock() }
+        return (
+            Double(full.reduce(0, +)) / 1e6,
+            Double(linear.reduce(0, +)) / 1e6,
+            Double(tail) / 1e6
+        )
+    }
+
+    public static func counts() -> (full: Int, linear: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (full.count, linear.count)
+    }
+}
+
 public final class Qwen4ExpTextModel: Module {
     let args: Qwen4ExpTextConfiguration
     let rope: Qwen4ExpRotary
@@ -164,6 +210,32 @@ public final class Qwen4ExpTextModel: Module {
             // widths and costs about 858 ms; two layers is roughly 296 ms of
             // cover. MLX_QWEN4EXP_NGRAM_AHEAD=0 disables it.
             layers[pleIdx].ple?.embedding.prefetchAhead(ids: ids, prevContext: context)
+        }
+        if Qwen4ExpLayerTiming.enabled {
+            // Per-layer cost inside the REAL forward. This forces an eval per
+            // layer, which SERIALISES what the lazy graph would otherwise
+            // pipeline, so the sum overstates the unmeasured forward. That gap
+            // is itself the result: it is how much the graph amortises.
+            //
+            // Microbenchmarks cannot answer this. Timing a component in
+            // isolation measures a GPU round trip of about 0.22 ms whatever it
+            // computes, so a breakdown assembled that way reports that floor
+            // rather than the component.
+            for (i, layer) in layers.enumerated() {
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                h = layer(
+                    h, rope: rope, mask: mask, ssmMask: nil, cache: caches[i], ids: ids,
+                    prevContext: prevContext)
+                eval(h)
+                Qwen4ExpLayerTiming.record(
+                    layer: i, isLinear: layer.isLinear,
+                    nanos: DispatchTime.now().uptimeNanoseconds - t0)
+            }
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            let out = mixer.mix(h).mixed
+            eval(out)
+            Qwen4ExpLayerTiming.recordTail(nanos: DispatchTime.now().uptimeNanoseconds - t1)
+            return (out, h)
         }
         for (i, layer) in layers.enumerated() {
             h = layer(
