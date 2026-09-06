@@ -3238,13 +3238,14 @@ six prompts, 128 completion tokens):
 | cost model, measured price, margin clamp off | 21.03 | 17.71 | 0.23 to 1.00 |
 
 The measured price alone made the schedule safe (never below serial) and
-conservative: the ranked tower's top-2 margin clamp held position-1
+conservative. The ranked tower's top-2 margin clamp held position-1
 confidence under the 0.51 threshold on four prompts where the head is right
 79 percent of the time. With the clamp off for this tower the per-position
-EMAs price the round on their own: depth 1 on five prompts (18.7 to 23.7
-tok/s), and a back-off to 0.23 drafts per round on music, where it lands at
-serial (17.71) instead of forced depth 1's 20.4. That is the shipped policy:
-17.6 percent over serial at the median and never below serial on any prompt.
+EMAs price the round on their own. The result is depth 1 on five prompts
+(18.7 to 23.7 tok/s) and 0.23 drafts per round on music, which decodes at
+serial speed (17.71) instead of forced depth 1's 20.4. That is the shipped
+policy. It is 17.6 percent over serial at the median and never below serial
+on any prompt.
 
 Prompt lookup drafting adds 0.4 tok/s on open prose, as expected. Grounded
 tasks are where it pays, and it cannot repair a depth choice.
