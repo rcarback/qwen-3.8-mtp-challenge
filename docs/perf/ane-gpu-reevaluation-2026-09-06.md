@@ -715,15 +715,16 @@ numbers are the fused-lane sweep above.
 
 Against the control repeat the split lane is 23.0 percent above and the
 shared lane 13.6 above. Two readings. First, the MoE tower loses far more to
-the load than the dense tower: 47 to 58 percent of its cool prefill and 25
-percent of its decode, against 16 to 27 and 10 to 15 on the dense tower. A
-reading, not a measurement: the MoE prefill is hundreds of short kernels
-(the expert gathers, the gated-delta kernels, the n-gram gather) and each
-one waits behind a load dispatch, where the dense tower's big matmuls hold
-the GPU for longer per dispatch. Second, the lanes hold their cool standing
+the load than the dense tower. It gives up 47 to 58 percent of its cool
+prefill and 25 percent of its decode, where the dense tower gave up 16 to 27
+and 10 to 15. The likely cause, which this run does not measure, is dispatch
+count. The MoE prefill is hundreds of short kernels for the expert gathers
+and the gated-delta state, and each one waits behind a load dispatch, where
+the dense tower's big matmuls hold the GPU for longer per dispatch. Second, the lanes hold their cool standing
 under load, at the control's level and inside a control envelope 20 percent
-wide: split int8 at 0.9 percent below when cool and 1.1 below the first
-loaded control, shared int8 at 2.3 below cool and 8.7 below loaded. The
+wide. Split int8 sits 0.9 percent below the control when cool and 1.1 below
+the first loaded control. Shared int8 sits 2.3 below when cool and 8.7 below
+loaded. The
 per-prompt pairs spread 0.51 to 1.27 for the controls alone, so no MoE lane
 can be ranked against the control under this load without more repeats,
 and the last-prompt column carries no pattern here (the control repeat
