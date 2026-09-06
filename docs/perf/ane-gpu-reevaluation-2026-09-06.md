@@ -276,3 +276,98 @@ had been holding about 700 GB of purgeable snapshot space, which it released
 on its own once the volume filled, so the free-space reading during the
 incident understated what the box had. `tools/ane-probes/cleanup-run.sh`
 now runs after every phase of the measurement queue.
+
+### MoE shared-expert lane, perplexity
+
+The shared expert as one fused ANE program per layer, weights re-quantized
+from the q8 tree, 3072 teacher-forced positions:
+
+| arm | perplexity | vs control |
+| --- | --- | --- |
+| gpu (control) | 4.327 | |
+| shared expert, fp16 | 4.338 | +0.25 percent |
+| shared expert, int8 | 4.336 | +0.2 percent |
+| shared expert, int4 | 4.760 | +10.0 percent |
+
+The fp16 and int8 forms sit at the fp16-compute floor. The int4 form is not
+usable here: one codebook per tensor over a `[640 x 2560]` projection that
+every token passes through costs 10 percent of perplexity, against 3.7
+percent for a third of the dense tower's MLP. Any int4 on the shared expert
+needs the per-row codebooks of the bank form.
+
+### MoE split lanes, perplexity
+
+The gated-delta `in_proj_qkv` and the attention `q_proj` with the first
+0.3125 of their output channels on the ANE and the rest on the GPU, the two
+partials concatenated, 3072 positions:
+
+| arm | perplexity | vs control |
+| --- | --- | --- |
+| gpu (control) | 4.327 | |
+| split, int8 | 4.315 | -0.3 percent, within noise |
+| split, int4 | 4.551 | +5.2 percent |
+
+int8 is lossless on both MoE lanes. The per-tensor int4 costs 5 percent on
+the split projections and 10 percent on the shared expert. On this tower
+the int4 question is settled against the per-tensor codebook; only the
+per-row form remains a candidate.
+
+
+### MoE tower speed, the fused lanes on the q8 tree
+
+Six prompts, resident serve, draft depth 0, the box gated on temperature
+and on background quiescence, every lane arm building its programs (48 to
+49 shared-expert programs per bucket, 36 `in_proj` plus 13 `q_proj` splits
+per bucket before the count wall). Wall time per request is now recorded
+beside the model's timers; a first pass of this sweep was discarded because
+a backup and the photo analyser had made each request take minutes.
+
+| arm | prefill tok/s, prompts 2 to 6 | vs control | paired range | decode tok/s | wall per request |
+| --- | --- | --- | --- | --- | --- |
+| gpu (control) | 274.2 | | | 18.31 | 7.7 s |
+| shared expert, fp16 | 267.0 | -2.6 percent | 0.969 to 0.978 | 18.47 | 8.2 s |
+| shared expert, int8 | 267.9 | -2.3 percent | 0.972 to 0.984 | 18.34 | 8.3 s |
+| shared expert, int4 | 265.9 | -3.0 percent | 0.963 to 0.975 | 18.25 | 8.7 s |
+| split projections, int8 | 271.8 | -0.9 percent | 0.979 to 0.999 | 18.10 | 8.1 s |
+| split projections, int4 | 270.1 | -1.5 percent | 0.978 to 0.992 | 18.11 | 8.4 s |
+| gpu2 (control repeat) | 270.7 | -1.3 percent | 0.983 to 0.990 | 18.18 | 7.9 s |
+
+The shared-expert lanes lose 2 to 3 percent in every form. The fp16 lane
+measured the same loss on 2026-09-03, because the window holds one expert
+beside ten and the two barriers per layer cost more than the overlap
+returns. The split lanes at int8 sit inside the control's own drift, so on
+this tower the compressed forms turn the dense-projection lane from a small
+loss into parity, and no further. Decode is untouched everywhere.
+
+**MoE verdict.** The fused dense lanes do not pay on this tower in any
+weight form, because the ANE has no piece of work large enough between
+graph boundaries. int8 is lossless in quality and free in speed; that is
+the ceiling of this design, not a reason to ship it. Bead `wok` closes on
+this table, and the open bead `e2l` with it.
+
+## An external reference point, mlx-serve
+
+While this record was being written, an X post reported `ddalcu/mlx-serve`
+pull request 363 on an M5 Max: 8-bit dense with 4-bit experts, the KV cache
+at 8 bits, a cold context ladder to 512K, about 1140 tokens per second of
+prefill and 47.9 of generation there. The pull request's own table and the
+project's release notes put numbers on our hardware class beside ours, on
+the same weight configuration:
+
+| runtime, M4 Max | prefill tok/s | serial decode tok/s | with speculation |
+| --- | --- | --- | --- |
+| this tree, q8 dense and q4 experts, 650-token prompts | 274 | 18.3 | 13.8 at depth 2 |
+| mlx-serve v26.8.11, 4-bit pack, short context | | 60 | 78 |
+| mlx-serve v26.9.1, 32k prompt | 699 | 69 | |
+| mlx-serve v26.9.1, 256k prompt | 551 | | |
+
+That is a 3.5x decode gap and a 2 to 5x prefill gap against an open
+runtime on the same silicon, and it dwarfs every ANE lever measured this
+week. The same release notes report a Neural Engine prefill offload
+that makes a 16k-token prompt 19 to 35 percent faster, which is bead `60w`'s
+premise measured by someone else. Bead `qex` reproduces their
+protocol on this box and runs ours on the same ladder. It then reads their
+source to attribute the gap across the decode step, the gated-delta kernel,
+the MoE dispatch, the n-gram table path, the 8-bit KV cache, and the ANE
+offload.
+
