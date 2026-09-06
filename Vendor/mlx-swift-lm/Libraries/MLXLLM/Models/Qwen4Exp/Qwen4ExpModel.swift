@@ -75,10 +75,96 @@ final class Qwen4ExpDecoderLayer: Module {
         return mlpHC.combine(h1, branch: mlp(x2), inject: inject2!)
     }
 
+    // MARK: - compiled whole-layer step (linear layers, decode widths)
+
+    /// `MLX_QWEN4EXP_COMPILE_LAYER=0` disables. Whole-layer compile for the 36
+    /// gated-delta layers at decode widths: the hyper-connection mixes, the
+    /// in-projection, the short conv, the delta-rule update, the MoE block
+    /// with its router and shared expert, and both combines, traced as ONE
+    /// compiled function per input shape. The recurrent state travels as
+    /// explicit inputs and outputs, so no cache array is mutated in place and
+    /// the MTP session's snapshot and rollback see ordinary assignments.
+    ///
+    /// Layer 2 carries the PLE; its host-gathered n-gram embedding is an input
+    /// to the trace, which is what keeps the trace from baking one token's
+    /// rows in as a constant. Full-attention layers are not compiled: their
+    /// KV cache and sparse keep mask change shape every step.
+    static let compileLayer: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN4EXP_COMPILE_LAYER"] != "0"
+
+    /// Rows per forward at or below which the compiled trace is used. The
+    /// MTP verify block is at most 1 + 8 rows.
+    static let compileLayerMaxRows = 9
+
+    private var compiledStep: (@Sendable ([MLXArray]) -> [MLXArray])?
+
+    /// Inputs: `[h, convState, recurrentState]` plus `[pleConvState, pleEmbedding]`
+    /// on the PLE layer. Outputs: `[hOut, convState, recurrentState]` plus
+    /// `[pleConvState]`.
+    private func functionalStep(_ args: [MLXArray]) -> [MLXArray] {
+        guard let linearAttn else { fatalError("functionalStep is for linear layers") }
+        var h = args[0]
+        var pleOut: MLXArray? = nil
+        if let ple {
+            let (pleValue, pleState) = ple.forwardFunctional(
+                hidden: h, embedding: args[4], convState: args[3])
+            h = h + pleValue
+            pleOut = pleState
+        }
+        let (x, inject) = attnHC.mix(h)
+        let (mixedQKV, z) = linearAttn.inProjection(x)
+        let (branch, newConv, newState) = linearAttn.finishFunctional(
+            x, mixedQKV: mixedQKV, z: z, mask: nil, convState: args[1], state: args[2])
+        let h1 = attnHC.combine(h, branch: branch, inject: inject!)
+        let (x2, inject2) = mlpHC.mix(h1)
+        let out = mlpHC.combine(h1, branch: mlp(x2), inject: inject2!)
+        var results = [out, newConv, newState]
+        if let pleOut { results.append(pleOut) }
+        return results
+    }
+
+    /// True when this layer can take the compiled path for `rows` rows.
+    func canCompile(rows: Int, cache: KVCache?) -> Bool {
+        Self.compileLayer && isLinear && rows <= Self.compileLayerMaxRows && cache is ArraysCache
+    }
+
+    /// The compiled step. `ids` and `prevContext` are only read on the PLE
+    /// layer, on the host, before the trace runs.
+    func compiledCall(_ hIn: MLXArray, cache: ArraysCache, ids: MLXArray, prevContext: MLXArray?)
+        -> MLXArray
+    {
+        guard let linearAttn else { fatalError("compiledCall is for linear layers") }
+        let B = hIn.dim(0)
+        let S = hIn.dim(1)
+        var args: [MLXArray] = [
+            hIn,
+            cache[0] ?? MLXArray.zeros([B, linearAttn.convKernelSize - 1, linearAttn.convDim], dtype: hIn.dtype),
+            cache[1] ?? MLXArray.zeros(
+                [B, linearAttn.numVHeads, linearAttn.headVDim, linearAttn.headKDim], dtype: .float32),
+        ]
+        if let ple, let prevContext {
+            args.append(
+                cache[2] ?? MLXArray.zeros([B, ple.convStateLength, hIn.dim(-1)], dtype: hIn.dtype))
+            args.append(ple.gatheredEmbedding(ids: ids, prevContext: prevContext, dtype: hIn.dtype))
+        }
+        if compiledStep == nil {
+            compiledStep = compile(shapeless: false) { [unowned self] in self.functionalStep($0) }
+        }
+        let out = compiledStep!(args)
+        cache[0] = out[1]
+        cache[1] = out[2]
+        cache.offset += S
+        if ple != nil, out.count > 3 { cache[2] = out[3] }
+        return out[0]
+    }
+
     func callAsFunction(
         _ hIn: MLXArray, rope: Qwen4ExpRotary, mask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?, cache: KVCache?, ids: MLXArray, prevContext: MLXArray?
     ) -> MLXArray {
+        if ssmMask == nil, let arrays = cache as? ArraysCache, canCompile(rows: hIn.dim(1), cache: cache) {
+            return compiledCall(hIn, cache: arrays, ids: ids, prevContext: prevContext)
+        }
         let (h, x, inject) = preMix(hIn, ids: ids, prevContext: prevContext, cache: cache)
         let branch: MLXArray
         if let linearAttn {

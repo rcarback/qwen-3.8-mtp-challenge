@@ -127,20 +127,38 @@ final class Qwen4ExpGatedDeltaNet: Module {
         -> MLXArray
     {
         let B = x.dim(0)
+        let (out, newConv, newState) = finishFunctional(
+            x, mixedQKV: mixedIn, z: zFlat, mask: mask,
+            convState: cache?[0] ?? MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: x.dtype),
+            state: cache?[1])
+        if let cache {
+            cache[0] = newConv
+            cache[1] = newState
+            cache.offset += x.dim(1)
+        }
+        return out
+    }
+
+    /// The layer body with its recurrent state as explicit values: nothing is
+    /// read from or written to a cache, so a compiled trace can take the state
+    /// as inputs and hand the new state back as outputs. Same arithmetic as the
+    /// cache-based `finish`, which is a thin wrapper over this.
+    func finishFunctional(
+        _ x: MLXArray, mixedQKV mixedIn: MLXArray, z zFlat: MLXArray, mask: MLXArray?,
+        convState: MLXArray, state: MLXArray?
+    ) -> (out: MLXArray, convState: MLXArray, state: MLXArray) {
+        let B = x.dim(0)
         let S = x.dim(1)
         var mixedQKV = mixedIn
         let z = zFlat.reshaped(B, S, numVHeads, headVDim)
         let b = inProjB(x)
         let a = inProjA(x)
 
-        let convState = cache?[0] ?? MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: x.dtype)
         if let mask {
             mixedQKV = MLX.where(mask.expandedDimensions(axis: -1), mixedQKV, MLXArray.zeros(like: mixedQKV))
         }
         let convInput = concatenated([convState, mixedQKV], axis: 1)
-        if let cache {
-            cache[0] = convInput[0..., (convInput.dim(1) - (convKernelSize - 1))..., 0...]
-        }
+        let newConv = convInput[0..., (convInput.dim(1) - (convKernelSize - 1))..., 0...]
         let convOut = silu(conv1d(convInput))
         let parts = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
         var q = parts[0].reshaped(B, S, numKHeads, headKDim)
@@ -152,12 +170,8 @@ final class Qwen4ExpGatedDeltaNet: Module {
         k = MLXArray(invScale).asType(x.dtype) * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         let (out, newState) = gatedDeltaUpdate(
-            q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias, state: cache?[1], mask: mask)
-        if let cache {
-            cache[1] = newState
-            cache.offset += S
-        }
-        return outProj(norm(out, gate: z).reshaped(B, S, valueDim))
+            q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias, state: state, mask: mask)
+        return (outProj(norm(out, gate: z).reshaped(B, S, valueDim)), newConv, newState)
     }
 
     func callAsFunction(_ x: MLXArray, mask: MLXArray?, cache: ArraysCache?) -> MLXArray {

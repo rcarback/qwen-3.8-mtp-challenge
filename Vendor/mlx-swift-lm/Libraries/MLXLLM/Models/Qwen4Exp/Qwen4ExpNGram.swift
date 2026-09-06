@@ -603,22 +603,49 @@ final class Qwen4ExpPLELayer: Module {
     private func shortConv(_ x: MLXArray, cache: ArraysCache?) -> MLXArray {
         let B = x.dim(0)
         let state = cache?[2] ?? MLXArray.zeros([B, stateLen, x.dim(-1)], dtype: x.dtype)
-        let full = concatenated([state, x], axis: 1)
-        if let cache { cache[2] = full[0..., (full.dim(1) - stateLen)..., 0...] }
-        return silu(conv1d(full))
+        let (out, newState) = shortConvFunctional(x, state: state)
+        if let cache { cache[2] = newState }
+        return out
     }
 
-    func callAsFunction(hidden: MLXArray, ids: MLXArray, prevContext: MLXArray, cache: ArraysCache?)
-        -> MLXArray
+    private func shortConvFunctional(_ x: MLXArray, state: MLXArray) -> (MLXArray, MLXArray) {
+        let full = concatenated([state, x], axis: 1)
+        return (silu(conv1d(full)), full[0..., (full.dim(1) - stateLen)..., 0...])
+    }
+
+    /// The n-gram embedding for this call, gathered on the host. Exposed so a
+    /// compiled layer can take it as an input instead of tracing through the
+    /// host readback.
+    func gatheredEmbedding(ids: MLXArray, prevContext: MLXArray, dtype: DType) -> MLXArray {
+        embedding(ids: ids, prevContext: prevContext).asType(dtype)
+    }
+
+    /// The PLE with its gathered embedding and conv state as explicit values.
+    func forwardFunctional(hidden: MLXArray, embedding emb: MLXArray, convState: MLXArray)
+        -> (out: MLXArray, convState: MLXArray)
     {
-        let emb = embedding(ids: ids, prevContext: prevContext).asType(hidden.dtype)
+        let gated = gatedValue(hidden: hidden, embedding: emb)
+        let (conv, newState) = shortConvFunctional(normConv(gated), state: convState)
+        return (gated + conv, newState)
+    }
+
+    var convStateLength: Int { stateLen }
+
+    private func gatedValue(hidden: MLXArray, embedding emb: MLXArray) -> MLXArray {
         let lead = Array(hidden.shape.dropLast())
         let key = normKey(keyProj(emb)).reshaped(lead + [hc, d])
         let value = valueProj(emb)
         let query = normQuery(hidden).reshaped(lead + [hc, d])
         var gate = (key * query).sum(axis: -1, keepDims: true) / Float(d).squareRoot()
         gate = sqrt(maximum(abs(gate), 1e-6)) * sign(gate)
-        let gated = (sigmoid(gate) * value.expandedDimensions(axis: -2)).reshaped(lead + [hc * d])
+        return (sigmoid(gate) * value.expandedDimensions(axis: -2)).reshaped(lead + [hc * d])
+    }
+
+    func callAsFunction(hidden: MLXArray, ids: MLXArray, prevContext: MLXArray, cache: ArraysCache?)
+        -> MLXArray
+    {
+        let emb = embedding(ids: ids, prevContext: prevContext).asType(hidden.dtype)
+        let gated = gatedValue(hidden: hidden, embedding: emb)
         return gated + shortConv(normConv(gated), cache: cache)
     }
 }
