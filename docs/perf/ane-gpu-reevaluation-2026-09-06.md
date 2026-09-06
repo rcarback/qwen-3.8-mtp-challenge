@@ -394,8 +394,8 @@ the GPU control. A cell that says pending is a queued arm, not an estimate.
 | ANE int4, fraction 0.3125 | 132.5 (+7.1 percent) | 12.44 | 5.772 | 2 of 6 |
 | ANE int8, fraction 0.5 | 130.8, throttles late | 12.40 | 5.571 | 2 of 6 |
 | ANE int4, fraction 0.5 | 115.7, throttles late | 12.82 | 5.923 | |
-| ANE bank, per-row int4, all 64 layers | pending | pending | pending | pending |
-| GPU plus ANE: int8 0.3125 with depth-2 drafting | pending | pending | | |
+| ANE bank, per-row int4, all 64 layers, Core ML path | 63.3 (-49 percent) | 11.87 | 5.565 | 0 of 6 |
+| GPU plus ANE: int8 0.3125 with depth-2 drafting, cool gap | 140.4 (+15.5 percent over the depth-2 control's 121.5) | 22.40 (control 21.94) | | |
 
 The dense tower's per-operation split at prefill: the MLP is three of its
 four dense projections by weight bytes, and the ANE prefix holds 0.3125 of
@@ -417,7 +417,7 @@ because the lane arms only at 128 tokens and above.
 | ANE shared expert, fp16 | 267.0 (-2.6 percent) | 18.47 | 4.338 | 0 of 6 |
 | ANE shared expert, int8 | 267.9 (-2.3 percent) | 18.34 | 4.336 | 3 of 6 |
 | ANE shared expert, int4 | 265.9 (-3.0 percent) | 18.25 | 4.760 | 0 of 6 |
-| GPU plus ANE: split int8 with depth-2 drafting | pending | pending | | |
+| GPU plus ANE: split int8 with depth-2 drafting | not run: the q8 tree's depth-2 serve hung at load for 18 minutes (the 2026-09-03 depth-2 MoE lost 17 percent on the bf16 tree in any case) | | | |
 | reference, mlx-serve on an M4 Max: 4-bit pack, short context | | 60 to 69 | | |
 | reference, mlx-serve on an M4 Max: 32k prompt | 699 | | | |
 
