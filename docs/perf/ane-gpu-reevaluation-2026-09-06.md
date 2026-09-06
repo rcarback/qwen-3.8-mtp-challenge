@@ -520,3 +520,22 @@ the full-attention layers' KV residency are solved. The design does not
 pay, and bead `i6v` closes. The line that matters is the last one. An open
 GPU runtime does the whole layer in 0.33 ms, a quarter of ours, so the
 launch-cost problem this design tried to route around has a GPU answer.
+
+## mlx-serve, the source half of bead `qex`
+
+A workflow of 97 read-only agents read mlx-serve per subsystem, compared
+each with our path, proposed levers, and put every lever through a skeptic.
+Six levers survived, summing to about 1.7 ms of our 61 ms step; 74 were
+refuted, most of them the ports of mlx-serve's own fused kernels, on the
+ground that our compile pass measured only 2 percent for the elementwise
+glue those kernels also absorb. The digest, with the ranked table, the
+narrative and every refutation, is `docs/perf/mlx-serve-attribution-2026-09-06.md`.
+
+The reading's mechanism claim stands whatever the lever count: their layer
+is a handful of hand-written Metal kernels (hyper-connection read and
+write, gated-delta prework and norm-gate, fused expert gate-up and
+down-reduce) and ours is 60 to 100 MLX operations, so the 45 ms difference
+is dispatch structure, not bytes. The skeptics could not size those kernels
+from the source, and mlx-serve ships each one behind a kill switch, so the
+empirical half of the bead attributes them on this box by switching them
+off one at a time in their own binary.
