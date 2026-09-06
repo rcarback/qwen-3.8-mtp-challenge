@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXNN
 import MLXRandom
 import XCTest
 
@@ -79,6 +80,49 @@ final class DecodeBandwidthTests: XCTestCase {
                     return {
                         quantizedMatmul(
                             xh, wq, scales: s, biases: b!, transpose: true, groupSize: gs, bits: bits)
+                    }
+                }
+            }
+        }
+
+        // B4: the routed-expert gather at one row, real geometry. 10 of 512
+        // experts, gate [E,640,2560] and up [E,640,2560] then down [E,2560,640],
+        // q4 g32, unsorted indices (decode never sorts: 10 < 64). 12 distinct
+        // layers cycled three times: 12 x 1.26 GB defeats every cache.
+        do {
+            let experts = 512, inter = 640, topK = 10, distinct = 12
+            let gs = 32, bits = 4
+            let wBytes = Double(topK) * Double(inter * hidden * 3) * Double(bits) / 8
+            let sBytes = Double(topK) * Double(inter * hidden * 3 / gs) * 4
+            bench("q4 g32 gather_qmm 10-of-512 gate,up,down", bytesPerLayer: wBytes + sBytes) {
+                var stacks = [(MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)]()
+                for _ in 0 ..< distinct {
+                    func q(_ o: Int, _ i: Int) -> (MLXArray, MLXArray, MLXArray) {
+                        let w = MLXRandom.normal([experts, o, i]).asType(.float16)
+                        let (wq, s, b) = quantized(w, groupSize: gs, bits: bits)
+                        eval(wq, s, b!)
+                        return (wq, s, b!)
+                    }
+                    let g = q(inter, hidden), u = q(inter, hidden), d = q(hidden, inter)
+                    stacks.append((g.0, g.1, g.2, u.0, u.1, u.2, d.0, d.1, d.2))
+                }
+                let xh = x.asType(.float16).reshaped([1, 1, 1, 1, hidden])
+                return (0 ..< layers).map { i in
+                    let st = stacks[i % distinct]
+                    let idx = MLXArray((0 ..< topK).map { _ in Int32.random(in: 0 ..< Int32(experts)) })
+                        .reshaped([1, 1, topK])
+                    eval(idx)
+                    return {
+                        let gate = gatherQuantizedMM(
+                            xh, st.0, scales: st.1, biases: st.2, rhsIndices: idx,
+                            transpose: true, groupSize: gs, bits: bits)
+                        let up = gatherQuantizedMM(
+                            xh, st.3, scales: st.4, biases: st.5, rhsIndices: idx,
+                            transpose: true, groupSize: gs, bits: bits)
+                        let h = MLXNN.silu(gate) * up
+                        return gatherQuantizedMM(
+                            h, st.6, scales: st.7, biases: st.8, rhsIndices: idx,
+                            transpose: true, groupSize: gs, bits: bits)
                     }
                 }
             }
