@@ -614,15 +614,16 @@ and the output read.
 
 At S=1024 the fp16 program runs 5.0 TF/s and the int4 program 11.4. The
 compressed forms are 1.8 to 2.3 times faster than fp16 at the bucket the
-lane uses, and the reason is not DRAM bandwidth, which would cost 1.6 ms for
-167 MB. The engine re-streams its weights per spatial tile, and the per-row cost
-shows it. For fp16 that cost rises from 0.025 ms at S=128 to 0.033 at
-S=1024; for int4 it falls from 0.020 to 0.015. The palette's bandwidth win, absent at one small conv,
-is real on the fused program at real shape. That is why the cool sweep put int4 at +14.8 percent and int8 at fraction
-0.5 at +16.6 percent. fp16 sat at +4.8 percent. The Core ML path's fp16 conv times agree with these within a few
-percent once scaled by output width. The earlier suspicion that Core ML
-itself was slow is withdrawn. The bank was slow because its program ran on
-the GPU.
+lane uses. DRAM bandwidth is not the reason, since 167 MB costs 1.6 ms. The
+engine re-streams its weights per spatial tile, and the per-row cost shows
+it. For fp16 that cost rises from 0.025 ms at S=128 to 0.033 at S=1024. For
+int4 it falls from 0.020 to 0.015. The palette's bandwidth win is absent at
+one small conv and real on the fused program at real shape. That is why the
+cool sweep put int4 at +14.8 percent and int8 at fraction 0.5 at +16.6
+percent. fp16 reached 4.8 percent. The Core ML path's fp16 conv times
+agree with these within 5 percent once scaled by output width. The
+earlier suspicion that Core ML itself was slow is withdrawn. The bank was
+slow because its program ran on the GPU.
 
 The balance point follows. At int4 the whole MLP would cost the ANE about
 48 ms at S=1024 against the GPU's about 45. The split that finishes both
