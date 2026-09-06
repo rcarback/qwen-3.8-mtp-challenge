@@ -1,84 +1,105 @@
-# int4 weight programs (blockwise, grouped)
+# int4 weight programs (palette, and the rejected blockwise form)
 
-**Status: exact format known; in-memory compile is an open item.** The
-architecture paper establishes that the ANE dequantizes int4 to fp16 at the
-multiplier input, and that the int4 palette form streams natively at about
-2.37x the bandwidth of fp16. The MIL op, blob layout and nibble packing below
-are byte-identical to what a real int4 model emits. But the in-memory ANE
-compiler (`_ANEInMemoryModel`, `compileWithQoS`) returns `InvalidMILProgram`
-for it, while accepting the int8 affine op from the same code path. The
-distinguishing fact is that `constexpr_blockwise_shift_scale` is an iOS18-only
-op and `constexpr_affine_dequantize` is iOS16; the working hypothesis is that
-the in-memory compile path predates the op and the `.mlpackage` compile path
-(`MLModel.compileModel`, which handles the multifunction descriptor) is
-needed. That is the next experiment; do not report int4 as working until it
-runs.
+**Confirmed in hardware, via the palette form.** `ANEQuantizedWeightProbeTests`
+int4-lut arm: the ANE compiled, loaded and ran a 4-bit palettized weight
+(`constexpr_lut_to_dense`) through the in-memory path at 15.9 percent
+relative error, which is the expected error of a per-tensor uniform 16-level
+palette on a random weight, not a dispatch fault. The architecture paper
+establishes this palette form is the one that streams natively at about 2.37x
+fp16 bandwidth. So int4 storage on the ANE is real; what remains is accuracy,
+which is a quantizer choice, not a hardware question.
 
-## Two int4 forms, and which gives the bandwidth win
+## The two int4 forms and their status
 
-| form | MIL op | what the paper measured |
-| --- | --- | --- |
-| int4 affine / blockwise (group scale) | `constexpr_blockwise_shift_scale` | accepted; affine forms "fold to dense fp16 in conversion" |
-| int4 palette (lookup table) | `constexpr_lut_to_dense` (16-entry LUT) | streams natively at ~2.37x bandwidth, ~2.37x faster than fp16 |
+| form | MIL op | vintage | in-memory ANE compile | bandwidth (paper) |
+| --- | --- | --- | --- | --- |
+| palette (lookup table) | `constexpr_lut_to_dense` | iOS16 | **confirmed** | streams natively, ~2.37x fp16 |
+| blockwise affine (group scale) | `constexpr_blockwise_shift_scale` | iOS18 | **rejected**, `InvalidMILProgram`, with a byte-identical blob | affine forms fold to fp16 |
 
-The GPU's MLX 4-bit is affine group-64, so blockwise is the form that shares
-the GPU's representation. The 2.37x streaming win is specific to the palette
-form, which is a different quantization (a 16-value codebook per group). Since
-this model is not the ranked target, palettizing the dense projections is an
-open option; NVFP4's E2M1 codebook is exactly 16 values and can be expressed
-as a grouped 4-bit palette, so an NVFP4 weight maps onto the ANE's LUT form
-(not a native mode).
+The pattern behind the split: the in-memory ANE compiler accepts the iOS16
+constexpr ops (`affine_dequantize`, `lut_to_dense`) and rejects the iOS18 one,
+even though coremltools emits it and Core ML compiles it. Use the palette op.
+It is also the form with the measured bandwidth win, so this is the right
+answer, not a fallback.
 
-## The MIL text (byte-exact, blockwise)
+## The MIL text (byte-exact, iOS16 conventions, from `buildConvMILTextInt4LUT`)
 
-Unlike the affine op, blockwise puts `data` and `scale` in the argument list
-and only `name` in the attribute bracket. Both are BLOBFILE references (a
-two-chunk blob). An inline rank-4 scale also fails through the in-memory path.
+The palette op is iOS16, and a byte-exact match means using the iOS16 text
+conventions throughout the program: `program(1.0)`, `func main<ios16>`,
+strings as `tensor<string, []>("...")`, scalars as `tensor<int32, []>(1)`
+(NOT the bare `string(...)` / `int32` forms the ios18 programs use). All op
+parameters sit inline in the attribute bracket with an empty argument list.
 
 ```text
-func main<ios18>(tensor<fp16, [1, IN, 1, S]> x) {
-  tensor<fp16, [OUT, IN, 1, 1]> w = constexpr_blockwise_shift_scale(data = tensor<int4, [OUT, IN, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(DATA_OFF))), scale = tensor<fp16, [OUT, IN/G, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(SCALE_OFF))))[name = string("wdeq")];
-  ... pt/st/pd/dl/gr consts and conv with weight=w ...
-} -> (y);
+program(1.0)
+[buildInfo = dict<tensor<string, []>, tensor<string, []>>({{"coremlc-component-MIL", "3520.4.1"}, {"coremlc-version", "3520.5.1"}, {"mlxfast-program-tag", "<unique-tag>"}})]
+{
+    func main<ios16>(tensor<fp16, [1, IN, 1, S]> x) {
+        tensor<fp16, [OUT, IN, 1, 1]> w = constexpr_lut_to_dense()[indices = tensor<uint8, [OUT*IN/2]>(BLOBFILE(path = tensor<string, []>("@model_path/weights/weight.bin"), offset = tensor<uint64, []>(IDX_OFF))), lut = tensor<fp16, [16]>(BLOBFILE(path = tensor<string, []>("@model_path/weights/weight.bin"), offset = tensor<uint64, []>(LUT_OFF))), name = tensor<string, []>("wdeq"), shape = tensor<uint32, [4]>([OUT, IN, 1, 1])];
+        tensor<int32, [2]> st = const()[name = tensor<string, []>("st"), val = tensor<int32, [2]>([1, 1])];
+        tensor<string, []> pt = const()[name = tensor<string, []>("pt"), val = tensor<string, []>("valid")];
+        tensor<int32, [2]> dl = const()[name = tensor<string, []>("dl"), val = tensor<int32, [2]>([1, 1])];
+        tensor<int32, []> gr = const()[name = tensor<string, []>("gr"), val = tensor<int32, []>(1)];
+        tensor<int32, [4]> pd = const()[name = tensor<string, []>("pd"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+        tensor<fp16, [1, OUT, 1, S]> y = conv(dilations = dl, groups = gr, pad = pd, pad_type = pt, strides = st, weight = w, x = x)[name = tensor<string, []>("conv")];
+    } -> (y);
+}
 ```
 
-- The block size is inferred from the scale shape: `data [OUT, IN, 1, 1]`
-  with `scale [OUT, IN/G, 1, 1]` means blocks of `G` along the input axis.
-  `output = scale[block] * (data - offset[block])`; omit `offset` for
-  symmetric.
-- `data` may be int4, uint4, int8 or uint8. Using int8 data with int4-range
-  values compiles and gives int4 values at int8 storage (no byte saving).
+- `indices` is typed as the PACKED byte count, `uint8 [OUT*IN/2]`, not the
+  element count.
+- `lut` is 16 fp16 centroids for 4 bits (the op supports 2, 4, 16, 64 or 256
+  entries: 1, 2, 4, 6, 8 bits).
+- `shape` is the dense output shape, inline.
 
-## The int4 blob (two chunks, `buildMultiWeightBlob(chunks:chunkTypes:)`)
+## The blob (two chunks, `buildMultiWeightBlob(chunks:chunkTypes:)`)
 
-- Chunk 0 is the packed int4 data: **two signed nibbles per byte, low nibble
-  first**, over the row-major `[OUT, IN]` flattened weight. `byte[i/2] =
-  (q[i] & 0xF) | ((q[i+1] & 0xF) << 4)`, two's complement in the nibble
-  (`-8 = 0x8`, `-1 = 0xF`, `7 = 0x7`). This packing was verified identical to
-  a real int4 model's payload byte for byte.
-- Chunk 0's header type field (byte +4) is **8**, not 1. A real int4 model's
-  `weight.bin` carries `08 00 00 00` there; fp16 and int8 carry `01`. Pass
-  `chunkTypes: [8, 1]`.
-- Chunk 0's byte count is `OUT*IN/2`, payload at header+64.
-- Chunk 1 is the fp16 scale, `[OUT, IN/G]` row-major, type 1.
-- The blob-level header at offset 0 is `chunks.count` (u32) then `2` (u32).
+- Chunk 0: packed indices, **two 4-bit codes per byte, low nibble first**,
+  over the row-major `[OUT, IN]` weight. Verified identical to a real
+  palettized model's payload byte for byte. Its header type field (byte +4)
+  is **3** (uint8); pass `chunkTypes: [3, 1]`.
+- Chunk 1: the 16 fp16 LUT entries, type 1.
+- For reference, the blob type codes seen so far: fp16 and int8 payloads `1`,
+  uint8 packed indices `3`, packed int4 (blockwise data) `8`.
 
-## Quantizing the weight
+## Quantizing to a palette
 
-Blockwise symmetric int4, group `G` along the input axis:
+Per-tensor uniform, the form the probe confirmed:
 
 ```text
-for each output row o, group g:
-  scale[o,g] = max_{j<G} |w[o, g*G+j]| / 7
-  q[o, g*G+j] = clamp(round(w / scale[o,g]), -8, 7)
+s       = max|w| / 8
+lut[i]  = (i - 8) * s              i in 0..15   (values -8s .. 7s)
+code    = clamp(round(w / s) + 8, 0, 15)
 ```
 
-## Confirming it
+This is int4 uniform quantization expressed as a LUT, at one scale for the
+whole tensor, which is why the error is 15.9 percent on a random weight. It
+proves the hardware path; it is too coarse for a production projection.
 
-Run `ANEQuantizedWeightProbeTests` int4 arm. It builds the two-chunk blob
-with the exact packing above and currently records the compile failure. The
-next step is to route the same program through `MLModel.compileModel` on a
-`.mlpackage` (the path `ANEMultiFunctionProbeTests` already uses) and check
-whether the iOS18 op compiles there. If it does, the direct zero-copy dispatch
-of an int4 program goes through the multifunction `.mlpackage`, which is also
-how the program-count limit is relieved; see `program-limit.md`.
+## Getting production accuracy
+
+The palette op decouples the codebook from uniform spacing, so accuracy
+improves without leaving the confirmed op:
+
+1. **Non-uniform centroids.** Fit the 16 entries to the weight distribution
+   (k-means, or quantiles) instead of uniform steps. Same op, same blob,
+   better error on the heavy-tailed weights a projection has.
+2. **Per-channel scale plus a shared codebook.** Keep one 16-entry LUT and
+   apply a per-output-channel fp16 scale afterward with a `mul` against a
+   `[OUT, 1, 1, 1]` const; the `mul` is a confirmed accurate ANE op. This
+   gives per-channel range at 4-bit storage.
+3. **Grouped LUTs.** The iOS18 `constexpr_lut_to_dense` carries a per-group
+   LUT shape; its in-memory compile is untested and, given the blockwise
+   result, likely rejected. Try it only after 1 and 2.
+
+Match the GPU's group-64 affine int4 exactly is not possible through the
+palette op (a palette is a codebook, an affine group is a scale); the GPU and
+ANE will hold the same tensor at different 4-bit representations. Since this
+is not the ranked model, that is acceptable; measure the end-to-end
+divergence, not byte identity.
+
+## NVFP4 on the ANE
+
+Not native. NVFP4's E2M1 codebook is exactly 16 values, so it is
+representable as this 4-bit palette (centroids = the FP4 values, per-block
+scales through option 2 above). Representation, not a native mode.

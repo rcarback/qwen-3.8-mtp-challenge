@@ -33,7 +33,7 @@ below follows from that.
 | --- | --- | --- |
 | `constexpr_affine_dequantize` | **confirmed** | int8 (or uint8) data, scalar or vector scale, scalar zero-point, `axis`. Params inline in the `[...]` attribute bracket. 0.8 percent relative error at int8. `int8.md`. |
 | `constexpr_blockwise_shift_scale` | **rejected (in-memory path)** | int4/uint4/int8/uint8 data with a per-block scale (group along an axis) and optional offset. iOS18 op. coremltools emits it and Core ML compiles it; the in-memory ANE compiler returns `InvalidMILProgram`. Open: try the `.mlpackage` compile path. `int4.md`. |
-| `constexpr_lut_to_dense` | source | Palettized weights: `uint8` packed indices plus a LUT of 2, 4, 16, 64 or 256 entries (1, 2, 4, 6, 8 bits). The int4 palette form is what the architecture paper measured at about 2.37x fp16 bandwidth. Not yet probed here. |
+| `constexpr_lut_to_dense` | **confirmed** | Palettized weights: `uint8` packed indices plus a LUT of 2, 4, 16, 64 or 256 entries (1, 2, 4, 6, 8 bits). The int4 palette form the architecture paper measured at about 2.37x fp16 bandwidth. Ran on the ANE through the in-memory path at 15.9 percent error for a per-tensor uniform 16-level LUT (the quantizer's error, not the op's). iOS16 vintage; params inline in the `[...]` bracket; indices chunk type 3. `int4.md`. |
 | `constexpr_lut_to_sparse`, `constexpr_sparse_to_dense`, `constexpr_sparse_blockwise_shift_scale` | source | Structured sparsity. The paper measured a weight with at least half zeros at 1.55 to 1.64x faster at 0.43x the bytes (a one-bit keep-mask plus packed fp16 nonzeros). Not probed here. |
 | `constexpr_cast` | unprobed | |
 | `quantize`, `dequantize` (runtime, on activations) | unprobed | Activation int8 compute is advertised for A17 Pro / M4 class; unmeasured here. |
@@ -83,7 +83,8 @@ below follows from that.
 | fp16 activations and weights | **confirmed** — the native compute type. |
 | fp32 program | **rejected** — `ANECCompile FAILED: CompilationFailure`. The ANE is fp16-native. An fp16-in, fp32-out cast compiles but the cast is after the conv; it does not change accumulation. |
 | int8 weights (affine) | **confirmed** — dequantized to fp16 on-chip. |
-| int4 weights (blockwise, palette) | source / open — see `int4.md`. |
+| int4 weights, palette (`constexpr_lut_to_dense`) | **confirmed** — dequantized to fp16 on-chip; the 2.37x-bandwidth form. |
+| int4 weights, blockwise affine (`constexpr_blockwise_shift_scale`) | **rejected** by the in-memory compiler (iOS18 op); see `int4.md`. |
 | int8 activations (A17 Pro / M4 class int8-int8 compute) | source, unmeasured here. |
 | fp4 / MXFP4 / NVFP4 | **not native** — these are Metal 4.1 and MLX GPU formats. NVFP4's 16-value E2M1 codebook can be re-expressed as a grouped 4-bit palette (`constexpr_lut_to_dense`), which is representation, not a native mode. |
 

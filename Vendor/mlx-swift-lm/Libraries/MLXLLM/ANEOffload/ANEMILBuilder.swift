@@ -386,6 +386,41 @@ public func buildConvMILTextInt4Blockwise(
     """
 }
 
+/// A 1x1-conv program whose weight is stored as a 4-bit PALETTE and expanded
+/// to fp16 on the ANE via `constexpr_lut_to_dense`: 4-bit indices into a
+/// 16-entry fp16 lookup table. This is the int4 form the ANE architecture
+/// paper measured streaming natively at about 2.37x fp16 bandwidth, and it is
+/// an iOS16-vintage op, so the in-memory ANE compiler accepts it where the
+/// iOS18 `constexpr_blockwise_shift_scale` does not. Matches the byte-exact
+/// iOS16 MIL a real palettized model emits: `program(1.0)`, `func
+/// main<ios16>`, `tensor<string, []>` / `tensor<int32, []>` scalar forms, all
+/// op parameters inline in the attribute bracket. `indices` is the packed
+/// `[outputDim*inputDim/2]` uint8 chunk (two 4-bit codes per byte, low first),
+/// `lut` the 16 fp16 centroids; both are BLOBFILE chunks of `weights/weight.bin`
+/// at the given header offsets (indices chunk type 3, lut chunk type 1).
+public func buildConvMILTextInt4LUT(
+    inputDim: Int, outputDim: Int, sequenceLength: Int,
+    indicesOffset: UInt64, lutOffset: UInt64,
+    programTag: String = UUID().uuidString
+) -> String {
+    let packed = outputDim * inputDim / 2
+    return """
+    program(1.0)
+    [buildInfo = dict<tensor<string, []>, tensor<string, []>>({{"coremlc-component-MIL", "3520.4.1"}, {"coremlc-version", "3520.5.1"}, {"mlxfast-program-tag", "\(programTag)"}})]
+    {
+        func main<ios16>(tensor<fp16, [1, \(inputDim), 1, \(sequenceLength)]> x) {
+            tensor<fp16, [\(outputDim), \(inputDim), 1, 1]> w = constexpr_lut_to_dense()[indices = tensor<uint8, [\(packed)]>(BLOBFILE(path = tensor<string, []>("@model_path/weights/weight.bin"), offset = tensor<uint64, []>(\(indicesOffset)))), lut = tensor<fp16, [16]>(BLOBFILE(path = tensor<string, []>("@model_path/weights/weight.bin"), offset = tensor<uint64, []>(\(lutOffset)))), name = tensor<string, []>("wdeq"), shape = tensor<uint32, [4]>([\(outputDim), \(inputDim), 1, 1])];
+            tensor<int32, [2]> st = const()[name = tensor<string, []>("st"), val = tensor<int32, [2]>([1, 1])];
+            tensor<string, []> pt = const()[name = tensor<string, []>("pt"), val = tensor<string, []>("valid")];
+            tensor<int32, [2]> dl = const()[name = tensor<string, []>("dl"), val = tensor<int32, [2]>([1, 1])];
+            tensor<int32, []> gr = const()[name = tensor<string, []>("gr"), val = tensor<int32, []>(1)];
+            tensor<int32, [4]> pd = const()[name = tensor<string, []>("pd"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<fp16, [1, \(outputDim), 1, \(sequenceLength)]> y = conv(dilations = dl, groups = gr, pad = pd, pad_type = pt, strides = st, weight = w, x = x)[name = tensor<string, []>("conv")];
+        } -> (y);
+    }
+    """
+}
+
 // MARK: - MIL text (procedure bank: many convs, ONE loaded program)
 
 /// One conv procedure in a `buildBankMILText` bank: an `[out, in]` 1x1 conv at

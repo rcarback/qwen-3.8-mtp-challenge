@@ -81,6 +81,26 @@ struct ANEQuantizedWeightProbeTests {
         return d.item(Float.self)
     }
 
+    /// Per-tensor uniform 4-bit palette: 16 fp16 centroids `(i-8)*s`, `s =
+    /// max|w| / 8`, codes `clamp(round(w/s) + 8, 0, 15)`, packed two per byte
+    /// low first over the row-major [O,K] weight.
+    private func quantInt4LUT(_ w: [Float], O: Int, K: Int) -> (indices: Data, lut: [Float]) {
+        var m: Float = 1e-8
+        for v in w { m = max(m, abs(v)) }
+        let s = m / 8
+        let lut = (0 ..< 16).map { Float($0 - 8) * s }
+        var codes = [Int](repeating: 0, count: O * K)
+        for i in 0 ..< (O * K) {
+            codes[i] = max(0, min(15, Int((w[i] / s).rounded()) + 8))
+        }
+        var bytes = [UInt8](repeating: 0, count: (O * K + 1) / 2)
+        for i in 0 ..< (O * K) {
+            let n = UInt8(codes[i] & 0xF)
+            if i % 2 == 0 { bytes[i / 2] = n } else { bytes[i / 2] |= (n << 4) }
+        }
+        return (Data(bytes), lut)
+    }
+
     @Test("ANE accepts int8 and int4 weight storage", .enabled(if: enabled))
     func quantizedWeights() throws {
         try #require(ANERuntime.available())
@@ -132,8 +152,31 @@ struct ANEQuantizedWeightProbeTests {
             print("[q-probe] int4: OK maxAbs=\(String(format: "%.4f", e)) rel=\(String(format: "%.4f", e / scale))")
             #expect(e / scale < 0.25, "int4 ANE result diverged from reference by rel \(e / scale) — not a quant-level error")
         } catch {
-            print("[q-probe] int4: FAILED \(error)")
-            Issue.record("int4 weight storage not accepted: \(error)")
+            // The iOS18 blockwise op is rejected by the in-memory ANE compiler;
+            // recorded, not asserted. The palette arm below is the int4 path.
+            print("[q-probe] int4-blockwise (iOS18 op): FAILED \(error)")
+        }
+
+        // int4 PALETTE (constexpr_lut_to_dense, iOS16): per-tensor 16-entry
+        // LUT, 4-bit packed indices. The ANE-native compressed form (the
+        // paper's 2.37x-bandwidth int4), and an iOS16 op the in-memory
+        // compiler should accept like affine_dequantize.
+        do {
+            let (idx4, lut4) = quantInt4LUT(wf, O: O, K: K)
+            let lutBytes = f16Bytes(MLXArray(lut4).asType(.float16))
+            // indices chunk type 3 (uint8 packed), lut chunk type 1 (fp16).
+            let (blob, offsets) = buildMultiWeightBlob(chunks: [idx4, lutBytes], chunkTypes: [3, 1])
+            let y = try runANE(
+                text: buildConvMILTextInt4LUT(
+                    inputDim: K, outputDim: O, sequenceLength: S,
+                    indicesOffset: offsets[0], lutOffset: offsets[1], programTag: "q-int4lut-\(UUID().uuidString)"),
+                blob: blob, weightFileName: "weight.bin", inputDim: K, outputDim: O, sequenceLength: S, x: x)
+            let e = maxAbs(y, ref)
+            print("[q-probe] int4-lut: OK maxAbs=\(String(format: "%.4f", e)) rel=\(String(format: "%.4f", e / scale))")
+            #expect(e / scale < 0.25, "int4 palette ANE result diverged from reference by rel \(e / scale) — not a quant-level error")
+        } catch {
+            print("[q-probe] int4-lut: FAILED \(error)")
+            Issue.record("int4 palette weight storage not accepted: \(error)")
         }
     }
 }

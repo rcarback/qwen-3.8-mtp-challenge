@@ -16,8 +16,8 @@ cost, the program budget, and whether int8 activation compute exists.
 | ANE fp16 compute | 12 TFLOP/s (paper) | | | |
 | per-dispatch floor | ~190 us, ~98 percent software/firmware; `ANE_ProgramSendRequest` ~163 us (paper) | ~119 us fixed plus bytes/78 GB/s (field guide); ~95 us XPC+IOKit (Orion) | **0.30 ms per program including surface staging** | |
 | int8 weight storage, dequantized to fp16 on-chip | yes (paper: "folds to dense fp16") | | **confirmed, 0.8 percent error** | yes |
-| int4 palette (LUT) weights | yes, ~2.37x fp16 bandwidth and speed (paper, M1) | | not yet probed | yes |
-| int4 blockwise (affine group) weights | accepted (paper) | | in-memory compile rejects the iOS18 op; open | yes (Core ML int4) |
+| int4 palette (LUT) weights | yes, ~2.37x fp16 bandwidth and speed (paper, M1) | | **confirmed**, in-memory compile, 15.9 percent error at a per-tensor uniform palette | yes |
+| int4 blockwise (affine group) weights | accepted (paper) | | **rejected**, the in-memory compiler refuses the iOS18 op with a byte-identical blob | yes (Core ML int4) |
 | structured sparsity (>= 50 percent zeros) | 1.55 to 1.64x at 0.43x bytes (paper) | | not probed | |
 | int8 activation compute (int8 x int8) | no evidence | no evidence | not measured here | **advertised**: "increased throughput for int8-int8 compute on Neural Engine" on A17 Pro and M4 |
 | fp32 compute | no, fp16-native (paper) | no | **rejected by compiler** | no |
