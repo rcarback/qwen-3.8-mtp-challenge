@@ -2208,6 +2208,38 @@ public final class Qwen36MTPBlockSession {
 
     /// Built once. A computed property here would allocate two arrays on
     /// every round, inside the timed path.
+    /// Qwen4Exp (Qwen3.8-Flash-Next) measured price, 2026-09-05. Serve sweep,
+    /// dense q8, six cold prompts of 603-665 tokens, 128 completion tokens:
+    /// round cost over the serial step T(d)/V = 1.51, 2.26, 2.89, 3.39 for
+    /// forced depths 1..4 (serial 57.7 ms; rounds 87, 130, 167, 196 ms). A
+    /// verify row on this MoE tower costs 0.5-0.75 of a serial step, not the
+    /// 0.18 the ranked tower's flat price assumes, and under the flat price
+    /// the schedule chose depth ~2.8 and lost 13 percent to serial while
+    /// forced depth 1 gained 18.5 percent. Positions past 4 are extrapolated
+    /// at 0.5. `DARKBLOOM_QWEN_MTP_DEPTH_PRICE="m1,m2,..."` overrides the
+    /// marginals for a re-measurement without a rebuild.
+    internal static func makeQwen4ExpMeasuredDepthPrice() -> DepthPrice {
+        var marginal: [Double] = [0.51, 0.75, 0.63, 0.50]
+        if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN_MTP_DEPTH_PRICE"] {
+            let parsed = raw.split(separator: ",").compactMap { Double($0) }
+            if !parsed.isEmpty { marginal = parsed }
+        }
+        while marginal.count < Qwen36MTPLimits.maxDepth {
+            marginal.append(marginal.last ?? 0.5)
+        }
+        marginal = Array(marginal.prefix(Qwen36MTPLimits.maxDepth))
+        var cumulative = [1.0]
+        for m in marginal { cumulative.append(cumulative.last! + m) }
+        return DepthPrice(marginal: marginal, cumulative: cumulative)
+    }
+
+    /// The price this session prices rounds with: the tower's measured table
+    /// for Qwen4Exp, the shipped arm for everything else.
+    private lazy var useMarginConfidence: Bool = !(model is Qwen4ExpModel)
+
+    private lazy var activeDepthPrice: DepthPrice =
+        model is Qwen4ExpModel ? Self.makeQwen4ExpMeasuredDepthPrice() : Self.depthPrice
+
     internal static let depthPrice: DepthPrice = {
         switch depthPriceArm {
         case .ship: return makeUniformDepthPrice()
@@ -2446,17 +2478,24 @@ public final class Qwen36MTPBlockSession {
         guard cap > 0 else { return 0 }
         // A block drafter pays one forward for the whole block, so the depth
         // it can afford is set by a different price shape entirely.
-        let price = blockDrafter == nil ? Self.depthPrice : Self.blockDepthPrice
+        let price = blockDrafter == nil ? activeDepthPrice : Self.blockDepthPrice
         var reach = 1.0
         var expected = 0.0
         var depth = 0
         while depth < cap {
             var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
+            // The top-2 margin clamp was fitted on the ranked tower. On
+            // Qwen4Exp it held position-1 confidence under the measured 0.51
+            // threshold on prose where the head is right 79 percent of the
+            // time: the re-priced schedule drafted 0.07-0.45 per round on
+            // four of six prompts and scored 18.7 tok/s where a fixed depth
+            // of 1 scored 20.6 (serial 17.9). The per-position EMAs alone
+            // price those rounds correctly, so the clamp is off there.
+            if useMarginConfidence, depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
                 let margin = tail.1[0] - tail.1[1]
                 let conf = 1.0 / (1.0 + exp(-margin / 2.0))
                 p = Swift.min(p, conf)
-            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
+            } else if useMarginConfidence, depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
                 let margin = tail.1[0] - tail.1[1]
                 let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
                 p = Swift.min(p, conf2)

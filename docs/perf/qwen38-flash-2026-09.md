@@ -3085,3 +3085,241 @@ What this changes about the plan:
 - The ANE prefill lanes decline `QuantizedLinear` weights, so a q8 dense tree
   turns them off. They never touched the decode step, so this costs prefill
   only, a trade the decode numbers justify.
+
+## 2026-09-05 — Every decode method, implemented or evaluated, with the Neural Engine question closed
+
+The catalogue in `decode-methods-2026-09.md` became twenty beads. This section
+records what each one measured. Every number is post-load: steady-state decode
+over 200 warm steps, or a cold first request against a resident serve process.
+Load and compile time are excluded throughout. Dense weights are q8 at load
+(`DARKBLOOM_DENSE_QUANT_BITS=8`) unless a row says otherwise.
+
+### Where a decode step waits
+
+`DecodeSyncCensusTests` splits a step into graph build (the forward returned)
+and eval (submit, then drain):
+
+| term | ms | share |
+| --- | --- | --- |
+| build, graph only | 5.37 | 9.0 percent |
+| eval, submit then drain | 54.47 | 91.0 percent |
+| step | 59.84 | |
+| n-gram gather inside build | 0.024 | |
+
+The step has two host readbacks (the n-gram row ids, read before layer 0, then again at
+layer 2) and one blocking eval. Both readbacks depend only on token ids, so
+they force two-node graphs and never wait on earlier layers. Their cost at eager
+decode is nil. What they do is break a compile trace, so the
+compiled-layer work below takes the gathered embedding as an input instead of
+tracing through the gather.
+
+The launch term is GPU-side: per-kernel encode and the gaps between
+dependent kernels, inside eval. Anything that only removes CPU work (indirect
+command buffers, a zero-allocation loop) is bounded by 5.4 ms. Anything that
+removes kernels attacks the 54 ms.
+
+### The expert gather at one row
+
+`DecodeBandwidthTests`, 36 layers under one eval, same run for every row:
+
+| arm at one row | ms per layer | GB/s |
+| --- | --- | --- |
+| bf16 gemv [2560 → 10240] | 0.158 | 332.3 |
+| q4 g32 qmv, same shape | 0.071 | 230.0 |
+| q8 g32 qmv, same shape | 0.125 | 236.0 |
+| q4 g32 gather_qmm, 10 of 512, gate/up/down | 0.111 | 276.6 |
+| memcpy-class copy | 0.352 | 298.2 |
+
+The routed-expert gather streams at least as well as the dense GEMV. Expert
+bytes cost about 5.3 ms of the step (48 layers). A fused MoE kernel at one row
+can save launches, not bytes.
+
+### Fused gate and up projections at decode
+
+`MLX_SWITCH_FUSE_GATE_UP` was built for prefill and never measured at one
+row. Counterbalanced, 200 warm steps:
+
+| arm | position 1 | position 2 |
+| --- | --- | --- |
+| fused | 58.89 ms | 58.75 ms |
+| separate | 59.47 ms | 59.34 ms |
+
+A saving of 0.6 ms, 1.0 percent, in both positions. The fusion is now on by default and
+the loader builds the fused stack at load, so the concatenation is not charged
+to the first request.
+
+### The quantized matrix-vector mapping is not the lever
+
+`QmvVariantSweepTests` rewrites the stock `qmv_fast` arithmetic with rows
+per simdgroup, simdgroups per threadgroup, and packs per lane as template
+parameters, checks every variant against `quantizedMM`, and times chains over
+distinct weights.
+
+At the per-layer shape [2560 → 10240] every variant is 0 to 36 percent slower
+than stock. At the `lm_head` shape [2560 → 248320] the first run showed stock
+at 114 GB/s against 404 for a variant, and a later run in the same process
+order showed stock at 231 GB/s against 214 for the variant. The first reading
+was a first-arm artifact: the stock arm ran right after 1.3 GB of weights were
+generated. The N sweep from 32k to 248k rows shows stock and variant within 20
+percent of each other with no consistent winner. The mapping is not the reason
+q4 streams at 55 to 75 percent of peak. Closing that gap needs a different
+kernel design, not a retune.
+
+### Neural Engine against GPU at one row, not close
+
+`ANEGemmBench` with the decode shapes, release worker, 20 repeats. The ANE
+number is one fp16 program per call including staging and readback. The GPU
+number is one isolated `quantizedMM` eval, which sits on the 0.27 ms
+isolated-eval floor.
+
+| m × k × n | ANE ms | GPU ms, isolated | ANE / GPU |
+| --- | --- | --- | --- |
+| 1 × 64 × 64, null program | 0.299 | 0.268 | 0.90 |
+| 1 × 2560 × 2560 | 0.406 | 0.275 | 0.68 |
+| 1 × 2560 × 10240, in_proj_qkv | 0.799 | 0.329 | 0.41 |
+| 1 × 10240 × 2560, out_proj | 0.939 | 0.345 | 0.37 |
+| 1 × 2560 × 640, shared expert gate/up | 0.371 | 0.323 | 0.87 |
+| 1 × 640 × 2560, shared expert down | 0.323 | 0.293 | 0.91 |
+| 1 × 2560 × 5120 | 0.554 | 0.321 | 0.58 |
+| 1 × 2560 × 248320, lm_head | 10.94 | 1.654 | 0.15 |
+| 8 × 2560 × 10240, verify rows | 1.051 | 0.621 | 0.59 |
+| 8 × 2560 × 2560 | 0.462 | 0.395 | 0.85 |
+| 8 × 2560 × 640 | 0.327 | 0.274 | 0.84 |
+
+The ANE floor is 0.30 ms per program. The rows that look close, the 640-wide
+shared-expert shapes at 0.84 to 0.91, are floor against floor: inside a graph
+the same q4 GEMV costs 0.03 to 0.07 ms (the preceding bandwidth table), so the
+honest ratio is 5 to 10 against the ANE before the engine sync each call
+adds. `lm_head` on the ANE reads its 1.27 GB of fp16 at 116 GB/s. No decode
+shape splits between the engines, and none is worth moving. The ANE question
+is closed for decode on this tower.
+
+### The draft schedule loses to a fixed depth of one
+
+Serve sweep on the resident process, dense q8, six cold prompts of 603 to
+665 tokens, 128 completion tokens each, median decode tokens per second over
+the six prompts. Prefill is reported on its own. Cold prompts prefill at 235 to
+285 tokens per second, and the first request of a session at 156.
+
+| schedule | decode tok/s | tokens per round | round ms | round / serial | position-1 accept |
+| --- | --- | --- | --- | --- | --- |
+| serial, depth 0 | 17.34 | 1.00 | 57.7 | 1.00 | |
+| forced depth 1 | 20.55 | 1.79 | 87.1 | 1.51 | 0.79 |
+| forced depth 2 | 17.00 | 2.21 | 130.5 | 2.26 | |
+| forced depth 3 | 15.38 | 2.56 | 166.8 | 2.89 | |
+| forced depth 4 | 13.90 | 2.78 | 195.6 | 3.39 | |
+| shipped cost-model schedule, offer 8 | 15.03 | 2.51 | 164.2 | 2.85 | |
+| cost-model schedule plus prompt lookup | 15.40 | 2.46 | 160.8 | 2.79 | |
+
+Forced depth 1 wins on every prompt (20.3 to 23.2 tok/s) and is 18.5 percent
+over serial. Depth 2 already loses. The shipped schedule chooses a depth
+near 2.8 and lands 13 percent below serial.
+
+The schedule's shape is sound. Its price table comes from the ranked tower, where
+a verify row costs 0.18 of a serial step. On this MoE tower the measured
+round costs are 1.51, 2.26, 2.89 and 3.39 serial steps for depths 1 to 4, so
+a row costs 0.5 to 0.75 of a step. `Qwen36MTPBlockSession` now prices
+Qwen4Exp rounds with that measured table
+(`makeQwen4ExpMeasuredDepthPrice`, with `DARKBLOOM_QWEN_MTP_DEPTH_PRICE` as
+the override). Under it the greedy marginal rule stops at
+depth 1 unless position-2 acceptance climbs past about 0.75. The ranked
+tower's price is untouched.
+
+With the compiled linear layers on, the same sweep re-run (median over the
+six prompts, 128 completion tokens):
+
+| schedule, compiled layers on | decode tok/s | worst prompt | effective depth |
+| --- | --- | --- | --- |
+| serial | 17.88 | 17.69 | 0 |
+| serial, compiled layers off | 17.56 | 17.38 | 0 |
+| forced depth 1 | 20.59 | 18.87 | 1.00 |
+| forced depth 1, compiled layers off | 20.45 | 18.16 | 1.00 |
+| cost model, measured price, margin clamp on | 18.72 | 17.45 | 0.07 to 1.00 |
+| cost model, measured price, margin clamp off | 21.03 | 17.71 | 0.23 to 1.00 |
+
+The measured price alone made the schedule safe (never below serial) and
+conservative: the ranked tower's top-2 margin clamp held position-1
+confidence under the 0.51 threshold on four prompts where the head is right
+79 percent of the time. With the clamp off for this tower the per-position
+EMAs price the round on their own: depth 1 on five prompts (18.7 to 23.7
+tok/s), and a back-off to 0.23 drafts per round on music, where it lands at
+serial (17.71) instead of forced depth 1's 20.4. That is the shipped policy:
+17.6 percent over serial at the median and never below serial on any prompt.
+
+Prompt lookup drafting adds 0.4 tok/s on open prose, as expected. Grounded
+tasks are where it pays, and it cannot repair a depth choice.
+
+What this says about the head. With the measured round costs, a
+FastMTP-level head at 0.85 per-position acceptance projects to 21.2 tok/s at
+depth 1 (1.22 times serial) and 19.4 at depth 3. At 0.90 it projects to 21.8
+and 20.9. A better head buys 3 to 6 percent over fixed depth 1 and never
+makes depth 3 or 4 beat depth 1 or 2 here. The row cost binds, not the head.
+Draft trees, lookahead and layer-skip drafts spend more rows per step and
+close on the same arithmetic.
+
+### Compiled linear layers: 2 percent, and what the number means
+
+The 36 gated-delta layers now run as one compiled MLX function each at decode
+widths, with the recurrent state as explicit inputs and outputs and the
+layer-2 n-gram embedding gathered on the host and passed in. Counterbalanced,
+dense q8, 200 warm steps:
+
+| arm | position 1 | position 4 |
+| --- | --- | --- |
+| compiled linear layers | 55.60 ms | 55.47 ms |
+| eager | 56.72 ms | 56.80 ms |
+
+-1.2 ms per step in both positions, bit-identical over 256 greedy steps on
+two prompts, and the p10 to p90 spread tightens from 2.0 to 1.8 ms. It ships
+on (`MLX_QWEN4EXP_COMPILE_LAYER=0` disables).
+
+The number is smaller than the launch term promised, and the reason is the
+finding. Compile fuses the elementwise chains, but every quantized GEMV, every
+expert gather and the delta-rule kernel still launch as separate kernels, and
+the step barely moved. The 33 ms launch term is the gaps between
+matmul launches on the GPU, not the glue around them. That is a kernel-design
+problem (fewer matmul launches per layer) and closes the fused-MoE, shared
+expert and elementwise-fusion beads at a bounded 1 to 2 ms each.
+
+### Mixed q8 and q4 dense policies all lose quality
+
+`DARKBLOOM_DENSE_QUANT_Q8_PATHS` keeps listed module paths at 8 bits while
+the rest take 4. Teacher-forced perplexity over six prompts of 512 positions:
+
+| dense policy | perplexity | change vs bf16 |
+| --- | --- | --- |
+| bf16 | 4.340 | |
+| q8 everywhere | 4.327 | -0.3 percent |
+| q8 on lm_head only, q4 rest | 4.990 | +15 percent |
+| q8 on attention, lm_head and shared expert, q4 rest | 4.675 | +7.7 percent |
+| q4 everywhere | 5.043 | +16 percent |
+
+The gated-delta projections and hyper-connection mixes at q4 cost 7.7
+percent on their own. No mixed policy is within 1 percent of bf16. q8
+everywhere stays the default. The 15 ms between q8 and q4 is not available
+at this model's quality.
+
+### The twenty beads, closed
+
+| bead | outcome | number |
+| --- | --- | --- |
+| B3 quantized GEMV mapping | measured, no win | variants within 20 percent of stock, no consistent winner |
+| L8 sync census | measured | build 5.4 ms, eval 54.5 ms, 2 token-id readbacks, 1 eval |
+| B2 mixed q8/q4 | measured, rejected | +7.7 to +15 percent perplexity |
+| L2 n-gram gather out of the trace | done | embedding passed as a compiled input |
+| L1 whole-layer compile | shipped | -1.2 ms per step, bit-identical |
+| S2 adaptive depth | re-priced, clamp off | 21.03 tok/s, +17.6 percent over serial, never below it |
+| B4 expert gather at one row | measured | 277 GB/s, at least the dense rate |
+| L9 fused gate and up at decode | shipped | -0.6 ms per step |
+| S1 self-distilled head | projected, not trained | +3 to 6 percent ceiling over depth 1 |
+| ANE against GPU | measured, closed | 0.30 ms floor per program, 5 to 10 times slower in-graph |
+| M2 shared expert as expert 11 | evaluated | needs q4 requant, bounded 1 to 2 ms |
+| L6 elementwise fusion | superseded by L1 | residue about 0.3 ms |
+| M1 fused MoE at one row | evaluated | launches only, bounded 1 to 2 ms |
+| S4 prompt lookup | already present, measured | +0.4 tok/s on prose |
+| S3 draft trees | closed | rows cost 0.5 to 0.75 serial each |
+| S6 lookahead | closed | same arithmetic |
+| L4 indirect command buffers | evaluated | CPU term is 5.4 ms, ceiling below it |
+| B7 int4 KV cache | evaluated | 0.2 percent of the step at 1k context |
+| S5 layer-skip drafting | closed | same row arithmetic as S3 |
+| L3 megakernel | evaluated | right term, not buildable on Metal here |
