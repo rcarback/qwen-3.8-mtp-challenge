@@ -330,14 +330,44 @@ public func loadWeights(
         let denseBits = Int(raw), denseBits == 4 || denseBits == 8
     {
         let group = Int(ProcessInfo.processInfo.environment["DARKBLOOM_DENSE_QUANT_GROUP"] ?? "") ?? 32
-        var count = 0
-        quantize(model: model, groupSize: group, bits: denseBits) { path, module in
+        // DARKBLOOM_DENSE_QUANT_Q8_PATHS="self_attn,lm_head": modules whose
+        // path contains one of these keep 8 bits while the rest take
+        // DARKBLOOM_DENSE_QUANT_BITS. Mixed policy for the B2 perplexity arms.
+        let q8Paths = (ProcessInfo.processInfo.environment["DARKBLOOM_DENSE_QUANT_Q8_PATHS"] ?? "")
+            .split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        func eligible(_ path: String, _ module: Module) -> Bool {
             guard module is Linear, !(module is Quantized) else { return false }
             if path.hasSuffix("mlp.gate") || path.hasSuffix("shared_expert_gate") { return false }
+            return true
+        }
+        var count8 = 0
+        if !q8Paths.isEmpty, denseBits != 8 {
+            quantize(model: model, groupSize: group, bits: 8) { path, module in
+                guard eligible(path, module), q8Paths.contains(where: { path.contains($0) }) else {
+                    return false
+                }
+                count8 += 1
+                return true
+            }
+        }
+        var count = 0
+        quantize(model: model, groupSize: group, bits: denseBits) { path, module in
+            guard eligible(path, module) else { return false }
             count += 1
             return true
         }
-        mark("dense quantize q\(denseBits) g\(group): \(count) layers")
+        mark("dense quantize q\(denseBits) g\(group): \(count) layers" + (count8 > 0 ? ", q8 kept on \(count8)" : ""))
+    }
+
+    // Build every SwitchGLU's fused gate_up stack now, at load, so the
+    // concatenation (and the release of the two unfused stacks) is untimed
+    // instead of landing inside the first forward.
+    if SwitchGLUFusion.fuseGateUp {
+        var fused = 0
+        for (_, module) in model.namedModules() {
+            if let glu = module as? SwitchGLU, glu.fusedGateUp() != nil { fused += 1 }
+        }
+        if fused > 0 { mark("fused gate_up stacks: \(fused)") }
     }
 
     // Drop the staging dictionary before dtype conversion so we don't keep
