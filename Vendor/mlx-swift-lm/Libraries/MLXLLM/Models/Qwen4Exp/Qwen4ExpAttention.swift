@@ -223,12 +223,11 @@ final class Qwen4ExpAttention: Module {
     /// The logical and physical row counts are both `q_proj`'s own `out`.
     func qProjection(_ x: MLXArray) -> MLXArray {
         if Qwen4ExpANEFused.splitEnabled,
-            !(qProj is QuantizedLinear),
             Qwen4ExpANEFused.armed(tokens: x.dim(1), batch: x.dim(0)),
             let program = aneSplitQProj.program(
                 forTokens: x.dim(1),
                 logicalOut: qProj.weight.dim(0),
-                weight: { self.qProj.weight })
+                weight: { Qwen4ExpANELane.denseWeight(self.qProj) ?? self.qProj.weight })
         {
             let tokens = x.dim(1)
             do {

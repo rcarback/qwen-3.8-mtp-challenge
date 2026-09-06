@@ -366,16 +366,16 @@ final class Qwen4ExpSparseMoeBlock: Module {
                 fputs("[qwen4exp-ane] grouped expert run failed: \(error); GPU path for this call\n", stderr)
             }
         }
+        // A QuantizedLinear's `.weight` is the packed form; the lane builds
+        // from the dequantized tensor in the configured storage form
+        // (`Qwen4ExpANELane.denseWeight`), so the q8 tree engages too.
         if Qwen4ExpANEFused.sharedEnabled,
-            !(sharedExpert.gateProj is QuantizedLinear),
-            !(sharedExpert.upProj is QuantizedLinear),
-            !(sharedExpert.downProj is QuantizedLinear),
             Qwen4ExpANEFused.armed(tokens: x.dim(1), batch: x.dim(0)),
             let program = aneShared.program(
                 forTokens: x.dim(1),
-                gate: { self.sharedExpert.gateProj.weight },
-                up: { self.sharedExpert.upProj.weight },
-                down: { self.sharedExpert.downProj.weight })
+                gate: { Qwen4ExpANELane.denseWeight(self.sharedExpert.gateProj) ?? self.sharedExpert.gateProj.weight },
+                up: { Qwen4ExpANELane.denseWeight(self.sharedExpert.upProj) ?? self.sharedExpert.upProj.weight },
+                down: { Qwen4ExpANELane.denseWeight(self.sharedExpert.downProj) ?? self.sharedExpert.downProj.weight })
         {
             // Hoisted out of the guard chain so a run failure can log. A
             // `try?` inside an `if let` condition list cannot carry a `catch`.

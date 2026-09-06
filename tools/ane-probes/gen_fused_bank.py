@@ -88,11 +88,17 @@ for n in layers:
     t0 = time.time(); p = "language_model.model.layers.%d.mlp." % n
     inter = tensor(p + "gate_proj.scales").shape[0]; hidden = tensor(p + "gate_proj.weight").shape[1] * 8
     F = int(round(FRAC * inter / 64)) * 64
+    pkg = os.path.join(tmp, "layer%d.mlpackage" % n)
+    if os.path.isdir(os.path.join(pkg, "Data")):
+        # Resume: a per-layer package from an earlier run of this bucket is reused as is.
+        desc.add_function(pkg, src_function_name="main", target_function_name="layer%d" % n)
+        meta["layers"].append({"layer": n, "F": F, "hidden": hidden, "resumed": True})
+        print("layer %d reused" % n, flush=True); continue
     g = dequant(p + "gate_proj", rows=F); u = dequant(p + "up_proj", rows=F); d = dequant(p + "down_proj", cols=F)
     gc, gl = row_codebooks(g); uc, ul = row_codebooks(u); dc, dl = row_codebooks(d)
     err = lambda w, c, l: float(np.abs(np.take_along_axis(l.astype(np.float32), c.astype(np.int64), 1) - w).mean() / np.abs(w).mean())
     m = ct.convert(layer_program(hidden, F, gc, gl, uc, ul, dc, dl), minimum_deployment_target=ct.target.iOS18, compute_units=ct.ComputeUnit.CPU_AND_NE)
-    pkg = os.path.join(tmp, "layer%d.mlpackage" % n); m.save(pkg)
+    m.save(pkg)
     desc.add_function(pkg, src_function_name="main", target_function_name="layer%d" % n)
     meta["layers"].append({"layer": n, "F": F, "hidden": hidden, "rel_err_gate": err(g, gc, gl), "rel_err_down": err(d, dc, dl)})
     print("layer %d F=%d gate relerr %.4f down relerr %.4f  %.1fs" % (n, F, meta["layers"][-1]["rel_err_gate"], meta["layers"][-1]["rel_err_down"], time.time() - t0), flush=True)

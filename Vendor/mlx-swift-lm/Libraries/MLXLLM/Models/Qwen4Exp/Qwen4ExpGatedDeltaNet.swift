@@ -76,12 +76,11 @@ final class Qwen4ExpGatedDeltaNet: Module {
     /// refused; the layer then stays on the GPU.
     func inProjection(_ x: MLXArray) -> (MLXArray, MLXArray) {
         if Qwen4ExpANEFused.splitEnabled,
-            !(inProjQKV is QuantizedLinear), !(inProjZ is QuantizedLinear),
             Qwen4ExpANEFused.armed(tokens: x.dim(1), batch: x.dim(0)),
             let program = aneSplitInProj.program(
                 forTokens: x.dim(1),
                 logicalOut: convDim + valueDim,
-                weight: { self.inProjQKV.weight })
+                weight: { Qwen4ExpANELane.denseWeight(self.inProjQKV) ?? self.inProjQKV.weight })
         {
             let tokens = x.dim(1)
             let x2 = x.reshaped(tokens, -1)

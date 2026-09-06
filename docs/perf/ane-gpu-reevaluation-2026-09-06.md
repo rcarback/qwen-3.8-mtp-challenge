@@ -239,3 +239,40 @@ measured: prefill 7.5 percent over the GPU control on every prompt, decode
 untouched, perplexity unchanged, and completions that differ from the GPU
 only at near-tie tokens. It replaces the fp16 lane, which paid 2.5 points of
 speed for the same quality.
+
+## MoE tower, the fused lanes had never run on the q8 tree
+
+The first MoE perplexity arms came back identical to the control to three
+decimals. They were the control. The shared-expert lane and both split lanes
+still carried the guard that refuses a `QuantizedLinear`, which was added on
+2026-09-05 after the packed q8 weight crashed the fp16 builder, and only the
+plain micro-batch lane had been given the dequantize path this morning. On
+the q8 tree, the tree every MoE measurement now uses, the fused lanes
+reached the GPU path every time and built zero programs. The three call sites now dequantize through MLX like the
+plain lane does, and every MoE arm below reports its program build count.
+
+The MoE control itself: teacher-forced perplexity 4.327 over 3072 positions,
+131 seconds for the arm including the 78 GB load, swap peaking at 5 GB.
+
+## Cleanup sweep (2026-09-06)
+
+The disk reached 155 MB free during the perplexity arms. A read-only audit
+(four area agents, then one skeptic per dead claim, 36 agents in all)
+classified every large consumer. The owner then chose what to remove.
+
+| removed | size | why |
+| --- | --- | --- |
+| Flash-Next bf16 source download | 388 GB | re-downloadable; no transform planned |
+| `Qwen3.8-27B` bf16 base | 111 GB | lineage only; the bf16-prefix ANE arm is superseded by int8 |
+| Flash-Next `weights/` model shards (bf16 dense) | 87 GB | superseded by the q8 tree; `ngram`, `ngram-int4` and the tokenizer stay, so the q8 tree's links resolve |
+| n-gram int8 and nvfp4 tables | 83 GB | the encoding decision kept int4 |
+| Qwen3.5 source checkpoints, DFlash2 drafter trees, stray head downloads | 17 GB | unreferenced or concluded |
+| app, Xcode and SwiftPM caches, simulator devices | 14 GB | rebuilt on demand |
+| session temp (compiled probe models, ANE staging directories, the pipeline cache, activation captures, a venv, logs) | 19 GB | regenerable |
+
+Two things the sweep found that matter beyond disk. First, the fused MoE
+lanes had never engaged on the q8 tree (the section above). Second, macOS
+had been holding about 700 GB of purgeable snapshot space, which it released
+on its own once the volume filled, so the free-space reading during the
+incident understated what the box had. `tools/ane-probes/cleanup-run.sh`
+now runs after every phase of the measurement queue.
