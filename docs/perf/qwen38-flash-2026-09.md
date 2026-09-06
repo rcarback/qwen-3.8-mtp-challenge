@@ -3324,3 +3324,52 @@ at this model's quality.
 | B7 int4 KV cache | evaluated | 0.2 percent of the step at 1k context |
 | S5 layer-skip drafting | closed | same row arithmetic as S3 |
 | L3 megakernel | evaluated | right term, not buildable on Metal here |
+
+### The memory throughput the GPU leaves on the table is not reachable by another engine
+
+`MemoryHeadroomTests` streams a multi-GB working set on each engine for a
+4 s window, alone and in every combination, and reports each engine's GB/s
+inside the window:
+
+| engines | GPU | ANE | CPU | sum |
+| --- | --- | --- | --- | --- |
+| GPU alone | 212.3 | | | 212.3 |
+| ANE alone | | 110.0 | | 110.0 |
+| CPU alone, 4 threads | | | 120.8 | 120.8 |
+| GPU + ANE | 153.8 | 66.1 | | 219.9 |
+| GPU + CPU | 121.7 | | 26.8 | 148.6 |
+| ANE + CPU | | 84.9 | 62.8 | 147.7 |
+| all three | 90.3 | 31.1 | 24.7 | 146.1 |
+| GPU alone, repeat | 188.1 | | | 188.1 |
+
+The sum never exceeds the GPU alone. What the ANE streams beside the
+GPU is what the GPU gives up. The CPU is worse than zero-sum. Its streaming
+threads starve the host thread that encodes the GPU's launches on a
+launch-bound step, and 27 GB/s of CPU cost the GPU 90. This chain reads
+the GPU at 190 to 210 GB/s because it carries a reduction per weight, below
+the pure GEMV instrument's 330 to 440, so the absolute figures are
+harness-specific. The concurrency conclusion is within-harness and it
+closes the row-split idea for `lm_head` on either engine.
+
+### The offline q8 tree
+
+`qwen4exp-transform --dense-bits 8 --link-ngram-from <old>/ngram` builds the
+dense-q8 tree in 101 s: 78 GB against the 87 GB bf16-dense tree, 677
+per-layer quantization entries over the global q4 expert block, the n-gram
+table linked rather than rewritten. Perplexity 4.327, identical to the
+load-time quantization.
+
+Its first measurement, minutes after the write, read 58.2 ms with a p90 of
+74 and 16.1 tok/s in serve. The file cache held 4.6 GB at the time and the
+78 GB write-back was still running. A counterbalanced batch later in the
+session, with the n-gram gather at 0.03 ms on every arm:
+
+| arm | position 1 | position 4 |
+| --- | --- | --- |
+| offline q8 tree | 58.48 ms | 56.78 ms |
+| old tree, q8 at load | 63.62 ms | 58.60 ms |
+
+The offline tree is at least as fast, and the batch as a whole ran noisier
+than the afternoon's 55.5 ms readings, which is machine state after a 78 GB
+write and a Trash purge, not the tree. The working tree from here is this one.
+The load-time hook stays for trees without the entries.
