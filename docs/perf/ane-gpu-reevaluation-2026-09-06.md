@@ -371,3 +371,68 @@ source to attribute the gap across the decode step, the gated-delta kernel,
 the MoE dispatch, the n-gram table path, the 8-bit KV cache, and the ANE
 offload.
 
+
+## Summary tables
+
+Each table walks the same four stages, from the tree before this fork's
+GPU work to GPU plus ANE together. Speed is tokens per
+second on the six real prompts (603 to 665 tokens) unless a row says
+otherwise; earlier rows come from the 2026-09-03 throughput matrix on a
+732-token prompt and are marked. Fidelity is teacher-forced perplexity over
+3072 positions and the count of greedy 96-token completions identical to
+the GPU control. A cell that says pending is a queued arm, not an estimate.
+
+### Dense tower, `Qwen3.8-27B`, q4 group-64
+
+| stage | prefill tok/s | decode tok/s | perplexity | identical completions |
+| --- | --- | --- | --- | --- |
+| before GPU work, depth 0, 732-token prompt (2026-09-03) | 135.5 | 13.03 | | golden, exact |
+| after GPU work, depth-2 drafting, 732-token prompt (2026-09-03) | 130.5 | 18.65 | | golden, exact |
+| after GPU work, depth 0, control for the rows below | 123.8 | 12.37 | 5.566 | 6 of 6 (repeat) |
+| ANE fp16, fraction 0.3125 | 129.8 (+4.8 percent) | 12.69 | 5.565 | 2 of 6 |
+| ANE int8, fraction 0.3125 | 133.1 (+7.5 percent) | 12.59 | 5.563 | 3 of 6 |
+| ANE int4, fraction 0.3125 | 132.5 (+7.1 percent) | 12.44 | 5.772 | 2 of 6 |
+| ANE int8, fraction 0.5 | 130.8, throttles late | 12.40 | 5.571 | 2 of 6 |
+| ANE int4, fraction 0.5 | 115.7, throttles late | 12.82 | 5.923 | |
+| ANE bank, per-row int4, all 64 layers | pending | pending | pending | pending |
+| GPU plus ANE: int8 0.3125 with depth-2 drafting | pending | pending | | |
+
+The dense tower's per-operation split at prefill: the MLP is three of its
+four dense projections by weight bytes, and the ANE prefix holds 0.3125 of
+its intermediate channels, so the lane moves about a quarter of the MLP's
+bytes and about a fifth of the layer's. The +7.5 percent is that share's
+overlap with the GPU's remainder. Decode is untouched by every ANE row
+because the lane arms only at 128 tokens and above.
+
+### MoE tower, Qwen3.8-Flash-Next
+
+| stage | prefill tok/s | decode tok/s | perplexity | identical completions |
+| --- | --- | --- | --- | --- |
+| before GPU work: bf16 dense, q4 experts, 732-token prompt (2026-09-03) | 307.3 | 16.50 | | |
+| before GPU work with the fp16 ANE micro-batch lane (2026-09-03) | 274.3 (-11 percent) | 16.48 | | 3 of 4 |
+| after GPU work: q8 dense, compiled blocks, n-gram readahead; depth 0, control | 274.2 | 18.31 | 4.327 | 6 of 6 (repeat) |
+| after GPU work, depth-2 drafting, 732-token prompt (2026-09-03) | 357.4 | 13.77 | | |
+| ANE split projections, int8 | 271.8 (-0.9 percent) | 18.10 | 4.315 | 1 of 6 |
+| ANE split projections, int4 | 270.1 (-1.5 percent) | 18.11 | 4.551 | 0 of 6 |
+| ANE shared expert, fp16 | 267.0 (-2.6 percent) | 18.47 | 4.338 | 0 of 6 |
+| ANE shared expert, int8 | 267.9 (-2.3 percent) | 18.34 | 4.336 | 3 of 6 |
+| ANE shared expert, int4 | 265.9 (-3.0 percent) | 18.25 | 4.760 | 0 of 6 |
+| GPU plus ANE: split int8 with depth-2 drafting | pending | pending | | |
+| reference, mlx-serve on an M4 Max: 4-bit pack, short context | | 60 to 69 | | |
+| reference, mlx-serve on an M4 Max: 32k prompt | 699 | | | |
+
+On the MoE the routing amplifies small activation differences, so the
+completion-agreement column is a weaker instrument than on the dense tower:
+the int8 arms are lossless in perplexity and still diverge on most prompts.
+
+### Per-operation breakdown, where it is measured
+
+| operation | GPU | ANE | note |
+| --- | --- | --- | --- |
+| MoE decode step, pipelined | 61.2 ms per token | not applicable | 2026-09-05, one row |
+| MoE decode, full-attention layer, serialised | 2.40 ms x 12 layers | | the graph amortises about half of the serialised total |
+| MoE decode, gated-delta layer, serialised | 2.52 ms x 36 layers | | 75 percent of layer time by count |
+| MoE `in_proj_qkv` `[10240, 2560]` at S=128 | 0.684 ms, q4 group-64 | 0.632 ms, fp16, zero-copy output | 0.92x, the compute win the lanes cannot bank |
+| dense fused MLP prefix, 0.3125 of the channels, bucket 1024 | | 167 MB fp16, 83 int8, 42 int4 per layer | compute-bound at this bucket, so the form buys about 2.5 points |
+| expert `gate_up` `[1280, 2560]` and `down` `[2560, 640]` | production q4 group-32 gather | fp16 and int4 palette | the `r` table below, bead `xi7` |
+| whole gated-delta layer at S=1 as one ANE program | 1.27 ms per layer on the GPU (pipelined) | pending | bead `i6v` |
