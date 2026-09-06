@@ -125,11 +125,11 @@ time, GPU control first and last so drift is visible.
   once, cold, at draft depth 0. The row records prompt tokens, seed prefill
   seconds, prefill tokens per second and decode tokens per second. The first
   prompt of an ANE arm pays that bucket's program compile and is reported but
-  excluded from the mean. Script: `serve-sweep.sh`.
+  excluded from the mean. Script: `tools/ane-probes/serve-sweep.sh`.
 - **Agreement.** The greedy 96-token completion of every arm is diffed
   against the GPU control's: the first differing character and the identical
   prefix fraction. A divergence says the arms differ, not which is better.
-  Script: `agree.py`.
+  Script: `tools/ane-probes/agree.py`.
 - **Perplexity.** `DensePerplexityTests` scores the mean negative
   log-likelihood of the true next token over 512 teacher-forced positions per
   prompt, one process per arm, with the ANE lane engaged by the 512-token
@@ -177,7 +177,7 @@ cool-down gate runs only between arms, so an arm that puts more work on the
 ANE heats it through the six prompts. Read this as thermal throttling under
 the heavier ANE share, and as evidence that the balance point sits above
 0.3125 when the engine is cool. A per-prompt cool gap is needed to measure
-it, and `serve-sweep.sh` now has one (`PROMPT_GAP`).
+it, and `tools/ane-probes/serve-sweep.sh` now has one (`PROMPT_GAP`).
 
 Programs: every ANE arm built 117 programs and refused 11 at the second
 bucket, the 126-count wall; the Core ML bank (bead `8xv`) is what lifts it.
