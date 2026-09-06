@@ -326,6 +326,66 @@ public func buildConvMILText(
     """
 }
 
+// MARK: - MIL text with COMPRESSED weights (int8 / int4), dequantized on-ANE
+
+/// A 1x1-conv program whose weight is stored INT8 and dequantized to fp16 on
+/// the ANE via `constexpr_affine_dequantize` (per-output-channel symmetric
+/// scale, zero-point 0). Confirms the ANE consumes int8 weight storage rather
+/// than requiring dense fp16. `scales` is one fp16 value per output channel
+/// (length `outputDim`); the int8 weight bytes are the BLOBFILE payload.
+public func buildConvMILTextInt8(
+    inputDim: Int, outputDim: Int, sequenceLength: Int, scales: [Float],
+    programTag: String = UUID().uuidString
+) -> String {
+    precondition(scales.count == outputDim, "int8 per-channel scales must be [outputDim]")
+    let scaleList = scales.map { String(format: "%.8g", $0) }.joined(separator: ", ")
+    return """
+    program(1.3)
+    [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}, {"mlxfast-program-tag", "\(programTag)"}})]
+    {
+      func main<ios18>(tensor<fp16, [1, \(inputDim), 1, \(sequenceLength)]> x) {
+        tensor<fp16, [\(outputDim), \(inputDim), 1, 1]> w = constexpr_affine_dequantize()[axis = int32(0), name = string("wdeq"), quantized_data = tensor<int8, [\(outputDim), \(inputDim), 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight_data.bin"), offset = uint64(64))), scale = tensor<fp16, [\(outputDim)]>([\(scaleList)]), zero_point = int8(0)];
+        string pt = const()[name=string("pt"), val=string("valid")];
+        tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+        tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+        tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+        int32 gr = const()[name=string("gr"), val=int32(1)];
+        tensor<fp16, [1, \(outputDim), 1, \(sequenceLength)]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=w, x=x)[name=string("conv")];
+      } -> (y);
+    }
+    """
+}
+
+/// A 1x1-conv program whose weight is stored INT4 and dequantized to fp16 on
+/// the ANE via `constexpr_blockwise_shift_scale` (iOS18), the op that matches
+/// MLX-style affine group quantization: a per-block scale along the input
+/// dimension, block size `groupSize`, symmetric (offset 0). `scales` is
+/// row-major `[outputDim, inputDim / groupSize]` fp16; the int4 weight is the
+/// BLOBFILE payload, two signed nibbles per byte (low nibble first).
+public func buildConvMILTextInt4Blockwise(
+    inputDim: Int, outputDim: Int, sequenceLength: Int, groupSize: Int,
+    dataOffset: UInt64, scaleOffset: UInt64,
+    programTag: String = UUID().uuidString
+) -> String {
+    precondition(inputDim % groupSize == 0, "inputDim must be a multiple of groupSize")
+    let groups = inputDim / groupSize
+    return """
+    program(1.3)
+    [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}, {"mlxfast-program-tag", "\(programTag)"}})]
+    {
+      func main<ios18>(tensor<fp16, [1, \(inputDim), 1, \(sequenceLength)]> x) {
+        tensor<fp16, [\(outputDim), \(inputDim), 1, 1]> w = constexpr_blockwise_shift_scale(data = tensor<int4, [\(outputDim), \(inputDim), 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(\(dataOffset)))), scale = tensor<fp16, [\(outputDim), \(groups), 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(\(scaleOffset)))))[name = string("wdeq")];
+        string pt = const()[name=string("pt"), val=string("valid")];
+        tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+        tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+        tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+        int32 gr = const()[name=string("gr"), val=int32(1)];
+        tensor<fp16, [1, \(outputDim), 1, \(sequenceLength)]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=w, x=x)[name=string("conv")];
+      } -> (y);
+    }
+    """
+}
+
 // MARK: - MIL text (procedure bank: many convs, ONE loaded program)
 
 /// One conv procedure in a `buildBankMILText` bank: an `[out, in]` 1x1 conv at
@@ -533,10 +593,17 @@ public func buildSwiGLUDownMILText(
 /// `BLOBFILE(offset=...)` reference expects, matching
 /// `buildConvWeightBlob`'s single-chunk convention (offset 64 = the header,
 /// not the payload at 128).
-public func buildMultiWeightBlob(chunks: [Data]) -> (blob: Data, offsets: [UInt64]) {
+/// `chunkTypes`, when given, sets each chunk header's data-type field (byte
+/// +4 of the chunk header) instead of the default `1`. The ANE blob format
+/// encodes the payload width here: `1` for byte-and-wider payloads (fp16,
+/// int8), `8` for packed int4. A weight.bin dumped from a coremltools int4
+/// model has `8` there; fp16/int8 use `1`. Pass one entry per chunk, or omit
+/// for all-`1`.
+public func buildMultiWeightBlob(chunks: [Data], chunkTypes: [UInt32]? = nil) -> (blob: Data, offsets: [UInt64]) {
+    if let chunkTypes { precondition(chunkTypes.count == chunks.count, "chunkTypes must match chunks") }
     var blob = Data(count: 64)
     var offsets: [UInt64] = []
-    for chunk in chunks {
+    for (idx, chunk) in chunks.enumerated() {
         let aligned = ((blob.count + 63) / 64) * 64
         if aligned > blob.count {
             blob.append(Data(count: aligned - blob.count))
@@ -547,7 +614,7 @@ public func buildMultiWeightBlob(chunks: [Data]) -> (blob: Data, offsets: [UInt6
         header[1] = 0xBE
         header[2] = 0xAD
         header[3] = 0xDE
-        withUnsafeBytes(of: UInt32(1).littleEndian) { raw in
+        withUnsafeBytes(of: (chunkTypes?[idx] ?? 1).littleEndian) { raw in
             for i in 0 ..< 4 { header[4 + i] = raw[i] }
         }
         withUnsafeBytes(of: UInt64(chunk.count).littleEndian) { raw in
