@@ -1,5 +1,6 @@
 import CoreML
 import Foundation
+import IOSurface
 import MLX
 import MLXRandom
 import Testing
@@ -320,6 +321,104 @@ struct ANEMultiFunctionProbeTests {
             print("[p84] _ANEClient loadModel FAILED: \(errU?.takeUnretainedValue().localizedDescription ?? "unknown")")
         }
         readProcedures("post-load")
+    }
+
+    private func makeSurface(bytes: Int) -> IOSurface {
+        let alloc = max(65536, (bytes + 65535) & ~65535)
+        let props: NSDictionary = [
+            kIOSurfaceWidth: alloc, kIOSurfaceHeight: 1, kIOSurfaceBytesPerElement: 1,
+            kIOSurfaceBytesPerRow: alloc, kIOSurfaceAllocSize: alloc, kIOSurfacePixelFormat: 0,
+        ]
+        return IOSurfaceCreate(props as CFDictionary)!
+    }
+
+    /// The corrected e2l/p84 measurement: the multifunction bank dispatched
+    /// through `MLModel.prediction` with ZERO-COPY-ish I/O -- a persistent
+    /// IOSurface-backed input MLMultiArray and `MLPredictionOptions.outputBackings`
+    /// writing into a surface-backed output wrapped straight into MLX. This
+    /// tests whether the ANE compute win (0.598 ms vs 0.689 ms quantized GPU)
+    /// survives once the copying `mlxToMultiArray_1C1S` helper is removed. The
+    /// round trip is split into stage (MLX activation -> input surface),
+    /// predict, and read (output surface -> MLX), each timed, versus the
+    /// quantized GPU matmul that reads the MLX buffer with no staging.
+    @Test("zero-copy surface-backed multifunction dispatch vs GPU", .enabled(if: enabled))
+    func realShapeDispatchCostSurface() throws {
+        try #require(ANERuntime.available())
+        guard #available(macOS 15.0, *) else { return }
+        let inn = 2560, out = 10240, seq = 128
+        let w0 = randomWeight(out, inn, seed: 1)
+        let w1 = randomWeight(out, inn, seed: 2)
+        let x = { () -> MLXArray in MLXRandom.seed(9); let v = MLXRandom.normal([seq, inn]).asType(.float16); eval(v); return v }()
+        let spec = buildMultiFunctionConvSpec(procs: [
+            ANEMultiFunctionProc(name: "main", inputDim: inn, outputDim: out, sequenceLength: seq, weight: f16Bytes(w0)),
+            ANEMultiFunctionProc(name: "proc1", inputDim: inn, outputDim: out, sequenceLength: seq, weight: f16Bytes(w1)),
+        ])
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mf-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let pkg = try writeMLPackage(spec: spec, dir: tmp)
+        let model = try loadFromPackage(pkg, functionName: "proc1")
+
+        // Persistent surface-backed input [1,inn,1,seq] and output [1,out,1,seq],
+        // contiguous fp16 (CoreML handles the ANE's internal padding on this path).
+        let inSurf = makeSurface(bytes: inn * seq * 2)
+        let outSurf = makeSurface(bytes: out * seq * 2)
+        let inMA = try MLMultiArray(
+            dataPointer: inSurf.baseAddress, shape: [1, inn, 1, seq].map { NSNumber(value: $0) },
+            dataType: .float16, strides: [inn * seq, seq, seq, 1].map { NSNumber(value: $0) })
+        let outMA = try MLMultiArray(
+            dataPointer: outSurf.baseAddress, shape: [1, out, 1, seq].map { NSNumber(value: $0) },
+            dataType: .float16, strides: [out * seq, seq, seq, 1].map { NSNumber(value: $0) })
+        let provider = try MLDictionaryFeatureProvider(dictionary: ["a": MLFeatureValue(multiArray: inMA)])
+        let opts = MLPredictionOptions()
+        opts.outputBackings = ["y": outMA]
+
+        // stage: MLX activation [seq,inn] -> [inn,seq] fp16 bytes into the input surface.
+        func stage() {
+            let xt = contiguous(x.transposed(1, 0).asType(.float16))
+            eval(xt)
+            let d = xt.asData().data
+            inSurf.lock(options: [], seed: nil)
+            d.withUnsafeBytes { _ = memcpy(inSurf.baseAddress, $0.baseAddress!, inn * seq * 2) }
+            inSurf.unlock(options: [], seed: nil)
+        }
+        // read: output surface -> MLX [seq,out].
+        func readOut() -> MLXArray {
+            let m = MLXArray(rawPointer: outSurf.baseAddress, [out, seq], dtype: .float16, finalizer: { [outSurf] in _ = outSurf })
+            return contiguous(m.transposed(1, 0))
+        }
+
+        // Correctness: stage, predict, read; compare to x @ w1.T.
+        stage()
+        _ = try model.prediction(from: provider, options: opts)
+        let y = readOut()
+        let e1 = maxAbsError(y, x: x, w: w1)
+        print("[mf-zc] correctness maxAbs vs w1 = \(String(format: "%.4f", e1))")
+
+        func med(_ f: () -> Void, _ n: Int = 50) -> Double {
+            for _ in 0 ..< 10 { f() }
+            var t: [Double] = []
+            for _ in 0 ..< n { let s = DispatchTime.now().uptimeNanoseconds; f(); t.append(Double(DispatchTime.now().uptimeNanoseconds - s) / 1e6) }
+            t.sort(); return t[n / 2]
+        }
+        // Attribute the stage cost: the GPU transpose+sync that produces the
+        // ANE's [inn,seq] input, versus the memcpy into the surface. The
+        // transpose+eval is the GPU->ANE handoff proper; the memcpy is small.
+        let transposeEvalMs = med { let xt = contiguous(x.transposed(1, 0).asType(.float16)); eval(xt) }
+        let asDataMs = med { let xt = contiguous(x.transposed(1, 0).asType(.float16)); eval(xt); _ = xt.asData().data }
+        let stageMs = med { stage() }
+        let predictMs = med { _ = try? model.prediction(from: provider, options: opts) }
+        let readMs = med { _ = readOut() }
+        let e2eMs = med { stage(); _ = try? model.prediction(from: provider, options: opts); _ = readOut() }
+
+        // GPU q4 baseline, reads the MLX buffer directly (no staging).
+        let (wq, sc, bi) = quantized(w1, groupSize: 64, bits: 4)
+        eval(wq, sc, bi)
+        let qMs = med { let r = quantizedMatmul(x, wq, scales: sc, biases: bi, transpose: true, groupSize: 64, bits: 4); eval(r) }
+
+        print(String(format: "[mf-zc] stage %.3f (transpose+eval %.3f, +asData %.3f) | predict %.3f | read %.3f | end-to-end %.3f ms",
+                     stageMs, transposeEvalMs, asDataMs, predictMs, readMs, e2eMs))
+        print(String(format: "[mf-zc] GPU q4 %.3f ms | end-to-end ANE / q4 = %.2f | predict-only / q4 = %.2f", qMs, e2eMs / qMs, predictMs / qMs))
     }
 
     /// The pivotal measurement for beads e2l and p84: warm per-function

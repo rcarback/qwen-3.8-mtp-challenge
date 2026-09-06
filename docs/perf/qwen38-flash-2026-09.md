@@ -3445,7 +3445,7 @@ amortizes over a compute-bound prefill and does not help decode, so the bank
 is a prefill tool, and only if the multifunction program is loaded through a
 `.mlpackage`.
 
-### The banked dense-lane prefill does not ship, and why
+### The banked dense-lane prefill: zero-copy works, the on-model test is owed
 
 Beads e2l and p84 asked whether the multifunction bank turns the count-relieved
 dense lane into a prefill win. Measured on the M4 Max, the answer is no, for a
@@ -3469,24 +3469,44 @@ per bucket, 12 full-attention `q_proj` plus 36 linear `in_proj_qkv`, so one or
 two prefill buckets already fit under the cap on the zero-copy path. The bank
 is only needed for a third bucket and beyond.
 
-But the bank forfeits the zero-copy dispatch. A multifunction program runs only
-through `MLModel.prediction`, whose input copy alone (0.177 ms) makes the ANE a
-net loss: (ANE plus input copy) over the quantized GPU is 1.13x, before the
-output copy and before ANE and GPU contend for memory bandwidth.
+A correction to an earlier draft of this section, which claimed the
+multifunction bank forfeits zero-copy dispatch and therefore loses. That was
+wrong on the mechanism, and the corrected measurement shows why. The
+`procedureIndex` is only a selector for which packed function runs. It does not
+change the buffer handoff, so the bank does not preclude zero-copy. The 0.177 ms
+"input copy" in the table was an artifact of the marshalling helper
+`mlxToMultiArray_1C1S` (a fresh MLMultiArray plus a memcpy), not a property of
+the prediction path.
 
-The zero-copy path that could dispatch a banked program by procedure index does
-not compose with the multifunction compile. `_ANEModel` plus `_ANEClient`
-expose `procedureInfoForProcedureIndex:` and a program handle, but their loader
-reads the old Espresso `model.espresso.net`, while `MLModel.compileModel` of an
-ML Program writes `model.mil` (the compiled `.mlmodelc` holds `model.mil`,
-`coremldata.bin` and `analytics`, no Espresso network and no pre-built ANE
-program). So the multifunction registration lives only in the copy-based
-prediction path, and the zero-copy handle path sees one procedure.
+Rerun through `MLModel.prediction` with an IOSurface-backed input MLMultiArray
+and `MLPredictionOptions.outputBackings` writing into a surface the result is
+read straight into MLX (`realShapeDispatchCostSurface`, same shape, warm):
 
-The bank is a real answer to the 126-program count in the abstract, proven
-earlier. It does not yield a net-positive banked prefill here, because
-relieving the count costs the zero-copy dispatch that made the ANE win, and the
-zero-copy path already covers the dense lane at the one or two buckets that fit.
-A future bridge would need either a multifunction Espresso `NetworkDescription`
-that `_ANEModel` can load, or an ML-Program-aware raw ANE load path; both are
-deep private-framework work and are recorded on bead p84.
+| step | ms |
+| --- | --- |
+| stage, MLX activation to input surface | 0.220 |
+| of which transpose plus eval | 0.226 |
+| of which plus the GPU-to-CPU copy | 0.223 |
+| predict | 0.632 |
+| read, output surface to MLX | 0.005 |
+| end to end | 0.849 |
+| GPU 4-bit group-64 | 0.684 |
+
+Three facts fall out. The output side is genuinely zero-copy: 0.005 ms, because
+`outputBackings` writes the ANE result into the surface and MLX wraps it with no
+copy. The predict still wins on compute, 0.92x the quantized GPU. And the whole
+"stage" cost is a standalone GPU op: the transpose plus its `eval` is the entire
+0.22 ms, and adding the actual GPU-to-CPU data move brings it to 0.223 ms, so
+the data handoff itself adds nothing measurable. A 655 KB transpose is
+microseconds of real bandwidth, so 0.22 ms is the per-op GPU launch and sync
+floor, measured here on a tiny op in isolation.
+
+So the end-to-end 1.24x is a probe artifact. In a real forward the activation is
+already materialized and the transpose is part of the pipelined graph, not a
+separate launch, and the ANE work is meant to overlap the GPU on the next
+layer. What the primitive measurement establishes is narrower and favorable: the
+ANE compute beats the quantized GPU (0.92x), the output is zero-copy, and the
+input data handoff is cheap. Whether that nets positive across a real prefill is
+the on-model A/B that bead e2l now covers. The `_ANEModel` / `_ANEClient`
+Espresso loader that an earlier draft chased was never required; surface-backed
+`MLMultiArray` I/O through `MLModel.prediction` is the zero-copy path.
