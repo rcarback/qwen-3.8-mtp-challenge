@@ -682,8 +682,8 @@ cool prefill and 10 to 15 percent of its decode, and the control moves 12
 percent between its two runs, which is wider than the gap between any arm
 and either control. The per-prompt pairs spread from 0.70 to 1.57 for the
 same reason. A verdict finer than "at the control's level" needs more
-repeats. Second, the two ANE arms sit at that level, +0.5 and -5.6 percent
-on the first control and +13.7 and +6.8 on the repeat, and both hold the
+repeats. Second, the two ANE arms sit at that level, 0.5 percent above and 5.6 below
+on the first control and 13.7 and 6.8 percent above the repeat, and both hold the
 last prompt at 106 to 110 tok/s where both controls fell to 64 to 70. That
 last column is the resilience the owner's rule describes: the arm that
 shares the GPU degrades through the arm, the arm with an ANE share does
