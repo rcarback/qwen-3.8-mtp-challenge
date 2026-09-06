@@ -132,8 +132,12 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 /// steady-state expert-weight footprint is unchanged; the transient peak during
 /// the build is one layer's `gate + up`.
 public enum SwitchGLUFusion {
+    /// Default ON since 2026-09-05: at one decode row it measured -0.6 ms per
+    /// step (-1.0 percent, counterbalanced) on the Qwen4Exp tower, and the
+    /// loader builds the stack eagerly so the concat is not charged to the
+    /// first request. `MLX_SWITCH_FUSE_GATE_UP=0` disables it.
     public static let fuseGateUp: Bool =
-        ProcessInfo.processInfo.environment["MLX_SWITCH_FUSE_GATE_UP"] == "1"
+        ProcessInfo.processInfo.environment["MLX_SWITCH_FUSE_GATE_UP"] != "0"
 }
 
 /// Holds the lazily built fused `gate_up` stack for one ``SwitchGLU``.
