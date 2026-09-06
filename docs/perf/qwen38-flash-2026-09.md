@@ -3510,3 +3510,38 @@ input data handoff is cheap. Whether that nets positive across a real prefill is
 the on-model A/B that bead e2l now covers. The `_ANEModel` / `_ANEClient`
 Espresso loader that an earlier draft chased was never required; surface-backed
 `MLMultiArray` I/O through `MLModel.prediction` is the zero-copy path.
+
+### On-model attempt: the ANE fp16 lane needs dense weights, so the q8 tree cannot host it
+
+The e2l on-model A/B was attempted on the q8 tree and produced a clean GPU-only
+baseline plus a blocker. GPU-only prefill (depth 0, q8 tree, 603 to 665-token
+prompts, warm, `seed_prefill_seconds`):
+
+| prompt | tokens | prefill s | tok/s |
+| --- | --- | --- | --- |
+| biology (first, warmup) | 620 | 3.92 | 158 |
+| cooking | 649 | 3.21 | 202 |
+| geology | 637 | 2.25 | 283 |
+| law | 665 | 2.40 | 278 |
+| logistics | 660 | 2.44 | 271 |
+| music | 603 | 2.25 | 268 |
+
+The ANE-on arm crashed. The worker built the first ANE program
+(`linear_attn.in_proj [16384x640]`) and then hit a Swift precondition failure at
+`ANEDirectDispatch.swift:112`, the input-shape check. The cause is the weight
+representation: on the q8 tree the dense projections are `QuantizedLinear`, whose
+`.weight` is the packed q8 representation with `dim(1) = in / 4 = 640` rather
+than the dense `2560`. The plain micro-batch ANE path
+(`aneInProjection` / `aneQProjection`) handed that packed weight to the fp16
+program builder, so the program was built at inputDim 640 and the real
+`[256, 2560]` activation then failed the shape check. The split path already
+guards on `!(is QuantizedLinear)` and stays on the GPU; the plain path did not,
+which is a pre-existing crash fixed here by adding the same guard.
+
+The deeper consequence stands: the ANE fp16 lane needs dense (bf16) projections.
+It cannot consume 4-bit or 8-bit packed weights, so it does not run on the
+production q8 or q4 tree at all. Measuring the ANE dense-lane prefill needs a
+bf16-projection configuration, a different memory regime whose GPU baseline is
+also bf16 rather than the q4 production matmul. That setup is the remaining work
+for the e2l on-model number; the primitive result above (ANE compute 0.92x the
+quantized GPU, output zero-copy) is what stands without it.

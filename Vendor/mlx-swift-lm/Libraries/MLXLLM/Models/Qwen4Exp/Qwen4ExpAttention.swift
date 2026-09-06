@@ -244,6 +244,12 @@ final class Qwen4ExpAttention: Module {
 
     func aneQProjection(sequenceLength: Int) -> Qwen4ExpANEProjection? {
         guard Qwen4ExpANELane.enabled else { return nil }
+        // The ANE fp16 lane needs a dense weight. A QuantizedLinear's `.weight`
+        // is the packed representation (for q8, dim(1) = in/4), so handing it to
+        // the fp16 program builder makes a program at the wrong inputDim and the
+        // real activation then trips ANEDirectDispatch's shape precondition. The
+        // split path guards on this too; match it and stay on the GPU.
+        guard !(qProj is QuantizedLinear) else { return nil }
         return aneQProj.program(weight: { qProj.weight }, sequenceLength: sequenceLength)
     }
 
