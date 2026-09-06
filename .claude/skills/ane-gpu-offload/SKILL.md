@@ -104,3 +104,26 @@ opaque and reports only `InvalidMILProgram`. Treat its output as a syntax
 sample to match, never as a statement about ANE behavior. Confirm every op and
 format in hardware with the probes:
 `MLXFAST_RUN_MLX_RUNTIME_TESTS=1 MLXFAST_NO_SANDBOX=1 swift test -c release`.
+
+## Housekeeping: clean up after every run
+
+Every ANE run leaves large generated data behind, and this box runs with a
+few gigabytes of free disk, so a run that does not clean up starves the next
+one (2026-09-06: a full disk made program staging fail silently and four
+perplexity arms ran on the GPU while reporting as ANE arms). Run
+`tools/ane-probes/cleanup-run.sh` at the end of every probe, sweep or serve
+run and before any timed arm. It removes, from the user temp directory only:
+
+| what a run leaves | where | size seen |
+| --- | --- | --- |
+| compiled Core ML models (`*.mlmodelc`, `mf-*`, `bank_*`) | `$(getconf DARWIN_USER_TEMP_DIR)` | 85 MB to 812 MB each |
+| in-memory ANE staging dirs a crashed arm leaves (`<hex>_<hex>_<hex>`) | same | up to 167 MB each, 192 seen |
+| the ANE Metal pipeline cache | same, `ane-metal-pipeline-cache` | 6.7 GB |
+
+Pass paths for the run's own generated sets once they are consumed: the r
+probe's packages (`rpkgs`, 4.9 GB), the compute-plan packages (`anepkgs`),
+a bank generator's `tmp-S<bucket>` directory, activation captures. Model
+trees are never touched. Also read the program build counts every ANE arm
+logs (`built ... failed ...`); an arm that reports failures is not an ANE
+arm and its numbers are void.
+

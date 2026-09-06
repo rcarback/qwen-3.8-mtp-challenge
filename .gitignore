@@ -70,3 +70,4 @@ score.baseline-*.json
 # Only the reduced CSV is meant to be committed.
 docs/perf/accept-runs/*.json
 docs/perf/accept-runs/work-*
+__pycache__/

@@ -209,3 +209,33 @@ diverging completion stays on topic and well formed. The control repeat
 reproduces itself exactly, so the divergences belong to the ANE arms and not
 to run-to-run noise. Which arm is closer to the model is the perplexity
 column, reported below as those arms finish.
+
+### Perplexity
+
+Teacher-forced next-token perplexity over 3072 positions (six prompts, 512
+each), one process per arm, every arm with all 64 programs built. An earlier
+pass of these arms ran with the disk full, so most programs failed to stage
+and those layers silently ran on the GPU; those numbers were discarded, and
+the harness now reports its program build counts beside every result.
+
+| arm | perplexity | vs control |
+| --- | --- | --- |
+| gpu (control) | 5.566 | |
+| fp16, fraction 0.3125 | 5.565 | 0.0 percent |
+| int8, fraction 0.3125 | 5.563 | 0.0 percent |
+| int4, fraction 0.3125 | 5.772 | +3.7 percent |
+| int8, fraction 0.5 | 5.571 | +0.1 percent |
+| int4, fraction 0.5 | 5.923 | +6.4 percent |
+
+int8 is lossless at this resolution, at a third of the MLP and at half of
+it. The int4 form with one codebook per tensor costs 3.7 percent of
+perplexity at a third and 6.4 percent at half, in proportion to its share,
+which is the second quantization compounding with the GPU's first. The
+per-row codebooks of the Core ML bank are the int4 that has a chance of
+closing that gap, and they are measured below when the bank arms run.
+
+**Dense tower verdict so far.** int8 at fraction 0.3125 is the best point
+measured: prefill 7.5 percent over the GPU control on every prompt, decode
+untouched, perplexity unchanged, and completions that differ from the GPU
+only at near-tie tokens. It replaces the fp16 lane, which paid 2.5 points of
+speed for the same quality.
