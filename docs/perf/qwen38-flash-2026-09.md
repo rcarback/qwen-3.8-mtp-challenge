@@ -3373,3 +3373,40 @@ The offline tree is at least as fast, and the batch as a whole ran noisier
 than the afternoon's 55.5 ms readings, which is machine state after a 78 GB
 write and a Trash purge, not the tree. The working tree from here is this one.
 The load-time hook stays for trees without the entries.
+
+### The 126-program limit is per-program, and a procedure bank relieves it
+
+The ANE daemon fails the 127th loaded program in a process with
+`Program load failure (0x50004)`, whatever each program's size. The
+`ANEProcedureBankProbeTests` suite asked whether that count is on programs or
+on functions, and whether many functions can share one program.
+
+A procedure bank packs many fixed-shape convs as separate functions inside one
+MIL `program(1.3){}` block. `buildBankMILText` builds it, one function per
+shape, each reading its own weight offset. The results on the M4 Max, macOS
+26.5.2:
+
+| probe | result |
+| --- | --- |
+| compile and load a 2-function program | passes, no load error |
+| dispatch `procedureIndex` 0 (`main`) | correct, fp16 floor 0.0078 |
+| dispatch `procedureIndex` 1 and higher | `Program Inference error` (0x2/0x9) |
+| 64 banks of 8 functions | 512 functions resident in 64 programs, no failure |
+
+The count limit is on programs, not functions. A bank of 8 is one program, so
+512 functions held 64 of the 126 slots. Packing N functions per program
+multiplies the effective function ceiling by N, bounded only by the
+per-program byte ceiling.
+
+The dispatch half is not solved through the bare in-memory path. A
+multi-function program compiles and loads, but only `main` runs; every other
+function inference-errors under all six naming schemes tried. The extra
+functions are compiled but not registered as runnable procedures by
+`_ANEInMemoryModel`. Reaching them needs the Core ML multifunction model
+description, a `functions` list compiled through `MLModel`, which this path
+does not populate. Until that path exists, the bank relieves the count but
+only its `main` function is usable.
+
+This does not change the decode verdict. The ANE loses at one row by 5 to 10
+times, and the bank helps only prefill, where the ANE is compute-bound and the
+126-program count is a real constraint across 48 layers and their buckets.

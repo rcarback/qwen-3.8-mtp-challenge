@@ -250,6 +250,71 @@ public func buildConvMILText(
     """
 }
 
+// MARK: - MIL text (procedure bank: many convs, ONE loaded program)
+
+/// One conv procedure in a `buildBankMILText` bank: an `[out, in]` 1x1 conv at
+/// a fixed `sequenceLength`, reading its fp16 weight from `weightOffset` (a
+/// `buildMultiWeightBlob` header offset into `weights/weight.bin`).
+public struct ANEBankProcedure {
+    public let inputDim: Int
+    public let outputDim: Int
+    public let sequenceLength: Int
+    public let weightOffset: UInt64
+    public init(inputDim: Int, outputDim: Int, sequenceLength: Int, weightOffset: UInt64) {
+        self.inputDim = inputDim
+        self.outputDim = outputDim
+        self.sequenceLength = sequenceLength
+        self.weightOffset = weightOffset
+    }
+}
+
+/// A procedure BANK: `procedures.count` independent 1x1-conv functions inside a
+/// SINGLE MIL `program(1.3){}` block, so the ANE daemon loads them as ONE
+/// program that holds ONE of the ~126 per-process program slots, yet exposes
+/// each function to `evaluate` via its own `procedureIndex`. This is the
+/// workaround for the 126-program count limit measured in
+/// `ANEProgramCountLimitTests`: N fixed shapes cost 1 slot, not N.
+///
+/// The first function is named `main` (a program must define it); the rest are
+/// `proc1`, `proc2`, ... in declaration order. The mapping from the numeric
+/// `procedureIndex` passed at dispatch to these functions is NOT documented by
+/// Apple and is resolved empirically by `ANEProcedureBankProbeTests` (it is
+/// either declaration order, with `main` = 0, or alphabetical by function
+/// name). Each function has its own input `x` and output `y`; all op and
+/// const names are suffixed with the function index so nothing collides across
+/// the shared program. Weight bytes are referenced from the shared
+/// `weights/weight.bin` blob that `buildMultiWeightBlob` produces, at the
+/// per-procedure `weightOffset`.
+public func buildBankMILText(
+    procedures: [ANEBankProcedure],
+    functionName: (Int) -> String = { $0 == 0 ? "main" : "proc\($0)" },
+    programTag: String = UUID().uuidString
+) -> String {
+    precondition(!procedures.isEmpty, "buildBankMILText needs at least one procedure")
+    func function(_ i: Int, _ p: ANEBankProcedure) -> String {
+        let name = functionName(i)
+        return """
+          func \(name)<ios18>(tensor<fp16, [1, \(p.inputDim), 1, \(p.sequenceLength)]> x\(i)) {
+            tensor<fp16, [\(p.outputDim), \(p.inputDim), 1, 1]> w\(i) = const()[name=string("w\(i)"), val=tensor<fp16, [\(p.outputDim), \(p.inputDim), 1, 1]>(BLOBFILE(path=string("@model_path/weights/weight.bin"), offset=uint64(\(p.weightOffset))))];
+            string pt\(i) = const()[name=string("pt\(i)"), val=string("valid")];
+            tensor<int32, [2]> st\(i) = const()[name=string("st\(i)"), val=tensor<int32, [2]>([1,1])];
+            tensor<int32, [4]> pd\(i) = const()[name=string("pd\(i)"), val=tensor<int32, [4]>([0,0,0,0])];
+            tensor<int32, [2]> dl\(i) = const()[name=string("dl\(i)"), val=tensor<int32, [2]>([1,1])];
+            int32 gr\(i) = const()[name=string("gr\(i)"), val=int32(1)];
+            tensor<fp16, [1, \(p.outputDim), 1, \(p.sequenceLength)]> y\(i) = conv(dilations=dl\(i), groups=gr\(i), pad=pd\(i), pad_type=pt\(i), strides=st\(i), weight=w\(i), x=x\(i))[name=string("conv\(i)")];
+          } -> (y\(i));
+        """
+    }
+    let functions = procedures.enumerated().map { function($0.offset, $0.element) }.joined(separator: "\n")
+    return """
+    program(1.3)
+    [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}, {"mlxfast-program-tag", "\(programTag)"}})]
+    {
+    \(functions)
+    }
+    """
+}
+
 /// The on-disk weight blob `buildConvMILText`'s `BLOBFILE(offset=uint64(64))`
 /// reference reads. `BLOBFILE` does not read a raw tensor payload directly
 /// at that offset -- it reads oMLX's `make_blob` chunk-descriptor structure,

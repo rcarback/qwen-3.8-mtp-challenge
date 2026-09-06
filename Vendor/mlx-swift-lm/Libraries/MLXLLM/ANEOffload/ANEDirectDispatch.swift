@@ -108,7 +108,11 @@ public enum ANEDirectDispatch {
     /// transpose + eval + `asData`), wraps both surfaces, and builds the
     /// `_ANERequest`. Returns a `Prepared` that `evaluate` and `read`
     /// consume -- only `evaluate` may run off this thread.
-    public static func prepare(model: ANEInMemoryModel, x: MLXArray, inputDim: Int, outputDim: Int, sequenceLength: Int) throws -> Prepared {
+    /// `procedureIndex` selects which function of a multi-function
+    /// (`buildBankMILText`) program this request runs; the default `0` is the
+    /// sole function (`main`) of every single-conv program and is unchanged
+    /// behaviour for those callers.
+    public static func prepare(model: ANEInMemoryModel, x: MLXArray, inputDim: Int, outputDim: Int, sequenceLength: Int, procedureIndex: Int = 0) throws -> Prepared {
         precondition(x.ndim == 2 && x.shape[0] == sequenceLength && x.shape[1] == inputDim,
                      "ANEDirectDispatch.prepare expected x shape [\(sequenceLength), \(inputDim)], got \(x.shape)")
 
@@ -182,7 +186,7 @@ public enum ANEDirectDispatch {
             requestClass, requestSel,
             [inputObject] as NSArray, [0] as NSArray,
             [outputObject] as NSArray, [0] as NSArray,
-            nil, nil, NSNumber(value: 0)
+            nil, nil, NSNumber(value: procedureIndex)
         ) else {
             throw ANEDispatchError.requestFailed
         }
