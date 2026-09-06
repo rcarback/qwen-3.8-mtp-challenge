@@ -118,3 +118,17 @@ output. Measure the end-to-end divergence, not byte identity.
 Not native. NVFP4's E2M1 codebook is exactly 16 values, so it is
 representable as this 4-bit palette (centroids = the FP4 values, per-block
 scales through option 2 above). Representation, not a native mode.
+
+## Measured at real shape, direct path (2026-09-06)
+
+The dense tower's fused MLP prefix (hidden 5120, F=5440) through the
+in-memory dispatch: fp16 33.9 ms, int8 18.9, int4 15.0 per call at S=1024;
+at S=128 fp16 3.25, int8 2.33, int4 2.59. The compressed forms are 1.8 to
+2.3x faster at the bucket the lane uses because the engine re-streams its
+weights per spatial tile (fp16's per-row cost rises with S, int4's falls).
+End to end, cool, int4 at fraction 0.3125 prefilled +14.8 percent over the
+GPU and int8 at 0.5 +16.6, against fp16's +4.8. Per-row codebooks are
+lossless in perplexity (5.565 vs 5.566) but a per-row LUT program falls off
+the ANE in Core ML's compute plan (every op `preferred=gpu`); one codebook
+per 64 rows stays on it.
+

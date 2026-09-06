@@ -83,6 +83,14 @@ GPU time over ANE time, fp16 ANE weights, by S=16/128/256/512/1024: expert
 `gate_up` 1.59/2.90/2.18/1.14/1.08; expert `down` 2.31/2.36/1.84/1.79/0.77;
 MoE `in_proj_qkv` 0.82/1.56/1.01/0.73/0.93; dense MLP `gate` half
 0.94/0.99/0.41/0.47/0.70; dense MLP `down` half 0.31/0.61/0.16/0.17/0.23.
+With int4 palette weights (output-side scale) the same table reads: expert
+`gate_up` 1.67/3.00/3.29/0.98/0.88; expert `down` 2.01/2.25/2.64/2.19/0.87;
+`in_proj_qkv` 0.77/1.09/0.99/0.93/0.80; dense `gate` half
+0.66/1.15/0.99/1.07/1.03; dense `down` half 0.57/0.64/0.57/0.54/0.99. The
+palette doubles the ANE's rate on the large shapes (dense gate 13.0 TF/s at
+S=1024 against 5.5 in fp16) because the engine re-streams weights per
+spatial tile, so at int4 the ANE matches the GPU's q4 matmul on the dense
+MLP at bucket 1024 and the split balance point is near fraction 0.5.
 Three things this settles. The ANE beats an ISOLATED GPU matmul on expert
 shapes at prefill widths, but production runs the batched gather at 0.31
 microseconds per token-expert pair against 1.5 for the ANE's best rate, so

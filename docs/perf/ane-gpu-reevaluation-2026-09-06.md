@@ -585,3 +585,75 @@ in the in-memory program, whose compiler accepted the per-tensor palette and
 rejected the blockwise op; if it takes the grouped LUT, int4 at the direct
 path's speed and the bank's quality is one build away.
 
+### Why the bank was slow
+
+The bank package's own compute plan, read after the arms: every op of its
+fused program, the three convs and the SiLU chain, is `preferred=gpu`. The
+per-row palette (`lut` shaped `[5440, 1, 1, 1, 16, 1]`) falls off the ANE
+where the per-64-row palette of the compute-plan probe stayed on it. The
+bank arm ran its ANE prefix on the GPU through Core ML, beside MLX, and
+lost half the prefill for it. The 49 percent loss says nothing about the
+Core ML dispatch path or the per-row quantizer; it says the ANE compiler has
+a limit on palette groups that a per-row codebook exceeds. The bank is
+regenerated with one codebook per 64 rows, plan-checked before it runs, and
+its perplexity is measured again against the per-row 5.565.
+
+
+## The fused prefix at real shape on the direct path
+
+`ANEFusedRealShapeProbeTests`: the dense tower's fused MLP prefix (hidden
+5120, F=5440, the shipped fraction) through the production in-memory
+dispatch, random weights, median of 12 calls including the input staging
+and the output read.
+
+| form | S=128 | S=256 | S=512 | S=1024 | ms per row at 1024 |
+| --- | --- | --- | --- | --- | --- |
+| fp16 | 3.25 ms | 10.03 | 17.98 | 33.89 | 0.033 |
+| int8 | 2.33 | 5.77 | 10.20 | 18.92 | 0.018 |
+| int4 | 2.59 | 4.55 | 7.88 | 14.96 | 0.015 |
+
+At S=1024 the fp16 program runs 5.0 TF/s and the int4 program 11.4. The
+compressed forms are 1.8 to 2.3 times faster than fp16 at the bucket the
+lane uses, and the reason is not DRAM bandwidth, which would cost 1.6 ms for
+167 MB. The engine re-streams its weights per spatial tile, and the per-row cost
+shows it. For fp16 that cost rises from 0.025 ms at S=128 to 0.033 at
+S=1024; for int4 it falls from 0.020 to 0.015. The palette's bandwidth win, absent at one small conv,
+is real on the fused program at real shape. That is why the cool sweep put int4 at +14.8 percent and int8 at fraction
+0.5 at +16.6 percent. fp16 sat at +4.8 percent. The Core ML path's fp16 conv times agree with these within a few
+percent once scaled by output width. The earlier suspicion that Core ML
+itself was slow is withdrawn. The bank was slow because its program ran on
+the GPU.
+
+The balance point follows. At int4 the whole MLP would cost the ANE about
+48 ms at S=1024 against the GPU's about 45. The split that finishes both
+legs together is near fraction 0.5, and 0.625 is the first fraction past
+it. Both are queued cool.
+
+One accounting gap stays open. With the fp16 leg at 34 ms per layer at
+bucket 1024, the fp16 lane should lose to the GPU's 27 ms MLP. It measured
++4.8 percent. The serve's prefill may run the lane at a smaller bucket than
+the probe assumes, although the program logs say bucket 1024 for the
+613-token chunk. The discrepancy is recorded rather than explained.
+
+### `r` for int4, rerun in the output-side form
+
+The int4 palette with the per-channel scale on the conv output, Core ML
+path, GPU at production quantization. `r` is GPU time over ANE time.
+
+| shape | S=16 | S=128 | S=256 | S=512 | S=1024 |
+| --- | --- | --- | --- | --- | --- |
+| expert `gate_up` | 1.67 | 3.00 | 3.29 | 0.98 | 0.88 |
+| expert `down` | 2.01 | 2.25 | 2.64 | 2.19 | 0.87 |
+| MoE `in_proj_qkv` | 0.77 | 1.09 | 0.99 | 0.93 | 0.80 |
+| dense MLP `gate` half | 0.66 | 1.15 | 0.99 | 1.07 | 1.03 |
+| dense MLP `down` half | 0.57 | 0.64 | 0.57 | 0.54 | 0.99 |
+
+The dense gate at S=1024 runs 13.0 TF/s on the ANE against 5.5 in fp16, and
+the down 7.4 against 1.9. With palette weights the ANE matches the GPU's
+production q4 matmul on both dense shapes at the bucket the lane uses,
+where fp16 sat at 0.2 to 0.7. That is the same weight re-streaming effect
+seen on the direct path, and it is the number behind the balance point at
+fraction 0.5. The output-side scale costs nothing measurable. The void rows of the first
+run had the scale on the weight and were 100 to 3000 times slower on the
+same packages.
+

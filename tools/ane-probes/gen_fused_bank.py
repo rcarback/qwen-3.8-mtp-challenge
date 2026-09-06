@@ -18,6 +18,10 @@ from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
 
 W, OUT, FRAC, S = sys.argv[1], sys.argv[2], float(sys.argv[3]), int(sys.argv[4])
 spec = sys.argv[5] if len(sys.argv) > 5 else "0-63"
+# Rows per codebook. 1 = one codebook per row (lossless, but the ANE compiler
+# rejects the program and Core ML runs it on the GPU); 64 = one per 64 rows
+# (ANE-eligible in the compute plan). Set ROWS_PER_LUT in the environment.
+ROWS_PER_LUT = int(os.environ.get("ROWS_PER_LUT", "1"))
 layers = list(range(int(spec.split("-")[0]), int(spec.split("-")[1]) + 1)) if "-" in spec else [int(x) for x in spec.split(",")]
 os.makedirs(OUT, exist_ok=True)
 idx = json.load(open(os.path.join(W, "model.safetensors.index.json")))["weight_map"]
@@ -48,7 +52,17 @@ def dequant(prefix, rows=None, cols=None):
     return g * q + bb
 
 def row_codebooks(w, iters=8, chunk=256):
-    """Per-row 16-level Lloyd quantizer. Returns codes uint8 [O,K] and lut fp16 [O,16]."""
+    """Per-row-block 16-level Lloyd quantizer (ROWS_PER_LUT rows share a codebook).
+    Returns codes uint8 [O,K] and lut fp16 [O/ROWS_PER_LUT,16]."""
+    if ROWS_PER_LUT > 1:
+        O, K = w.shape
+        assert O % ROWS_PER_LUT == 0
+        wb = w.reshape(O // ROWS_PER_LUT, ROWS_PER_LUT * K)
+        codes_b, luts_b = row_codebooks_rows(wb, iters, chunk)
+        return codes_b.reshape(O, K), luts_b
+    return row_codebooks_rows(w, iters, chunk)
+
+def row_codebooks_rows(w, iters=8, chunk=256):
     O, K = w.shape
     codes = np.empty((O, K), dtype=np.uint8); luts = np.empty((O, 16), dtype=np.float16)
     qs = (np.arange(16) + 0.5) / 16.0
@@ -71,9 +85,9 @@ def row_codebooks(w, iters=8, chunk=256):
 def layer_program(hidden, F, gc, gl, uc, ul, dc, dl):
     @mb.program(input_specs=[mb.TensorSpec(shape=(1, hidden, 1, S), dtype=T.fp16)], opset_version=ct.target.iOS18)
     def prog(x):
-        gw = mb.constexpr_lut_to_dense(indices=gc.astype(T.np_uint4_dtype).reshape(F, hidden, 1, 1), lut=gl.reshape(F, 1, 1, 1, 16, 1))
-        uw = mb.constexpr_lut_to_dense(indices=uc.astype(T.np_uint4_dtype).reshape(F, hidden, 1, 1), lut=ul.reshape(F, 1, 1, 1, 16, 1))
-        dw = mb.constexpr_lut_to_dense(indices=dc.astype(T.np_uint4_dtype).reshape(hidden, F, 1, 1), lut=dl.reshape(hidden, 1, 1, 1, 16, 1))
+        gw = mb.constexpr_lut_to_dense(indices=gc.astype(T.np_uint4_dtype).reshape(F, hidden, 1, 1), lut=gl.reshape(F // ROWS_PER_LUT, 1, 1, 1, 16, 1))
+        uw = mb.constexpr_lut_to_dense(indices=uc.astype(T.np_uint4_dtype).reshape(F, hidden, 1, 1), lut=ul.reshape(F // ROWS_PER_LUT, 1, 1, 1, 16, 1))
+        dw = mb.constexpr_lut_to_dense(indices=dc.astype(T.np_uint4_dtype).reshape(hidden, F, 1, 1), lut=dl.reshape(hidden // ROWS_PER_LUT, 1, 1, 1, 16, 1))
         gate = mb.conv(x=x, weight=gw, strides=[1, 1], pad_type="valid", dilations=[1, 1], groups=1, name="gate")
         up = mb.conv(x=x, weight=uw, strides=[1, 1], pad_type="valid", dilations=[1, 1], groups=1, name="up")
         # SiLU spelled as x / (1 + exp(-x)): the ANE's silu op is a coarse table.
@@ -83,7 +97,7 @@ def layer_program(hidden, F, gc, gl, uc, ul, dc, dl):
     return prog
 
 tmp = os.path.join(OUT, "tmp-S%d" % S); os.makedirs(tmp, exist_ok=True)
-desc = MultiFunctionDescriptor(); meta = {"fraction": FRAC, "bucket": S, "layers": [], "form": "int4-lut-per-row"}
+desc = MultiFunctionDescriptor(); meta = {"fraction": FRAC, "bucket": S, "layers": [], "form": "int4-lut-per-%d-rows" % ROWS_PER_LUT}
 for n in layers:
     t0 = time.time(); p = "language_model.model.layers.%d.mlp." % n
     inter = tensor(p + "gate_proj.scales").shape[0]; hidden = tensor(p + "gate_proj.weight").shape[1] * 8
@@ -96,7 +110,9 @@ for n in layers:
         print("layer %d reused" % n, flush=True); continue
     g = dequant(p + "gate_proj", rows=F); u = dequant(p + "up_proj", rows=F); d = dequant(p + "down_proj", cols=F)
     gc, gl = row_codebooks(g); uc, ul = row_codebooks(u); dc, dl = row_codebooks(d)
-    err = lambda w, c, l: float(np.abs(np.take_along_axis(l.astype(np.float32), c.astype(np.int64), 1) - w).mean() / np.abs(w).mean())
+    def err(w, c, l):
+        lut_rows = np.repeat(l.astype(np.float32), ROWS_PER_LUT, axis=0)   # [O,16]
+        return float(np.abs(np.take_along_axis(lut_rows, c.astype(np.int64), 1) - w).mean() / np.abs(w).mean())
     m = ct.convert(layer_program(hidden, F, gc, gl, uc, ul, dc, dl), minimum_deployment_target=ct.target.iOS18, compute_units=ct.ComputeUnit.CPU_AND_NE)
     m.save(pkg)
     desc.add_function(pkg, src_function_name="main", target_function_name="layer%d" % n)
