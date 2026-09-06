@@ -199,6 +199,82 @@ public func buildConvMatmul(K: Int, F: Int, S: Int, weight: Data) -> Data {
     return buildSpec(inputs: io.ins, outputs: io.outs, ops: ops)
 }
 
+/// One conv procedure of a MULTIFUNCTION Core ML `Model` proto: an `[F,K]`
+/// 1x1 conv at a fixed `S`, its fp16 weight bytes baked in as a const. The
+/// bare-MIL-text procedure bank (`buildBankMILText`) compiles and loads N
+/// functions but only `main` is dispatchable, because the in-memory
+/// descriptor carries no model description and so registers one procedure.
+/// `buildMultiFunctionConvSpec` supplies that missing description.
+public struct ANEMultiFunctionProc {
+    public let name: String
+    public let inputDim: Int
+    public let outputDim: Int
+    public let sequenceLength: Int
+    public let weight: Data  // fp16, row-major [out, in]
+    public init(name: String, inputDim: Int, outputDim: Int, sequenceLength: Int, weight: Data) {
+        self.name = name
+        self.inputDim = inputDim
+        self.outputDim = outputDim
+        self.sequenceLength = sequenceLength
+        self.weight = weight
+    }
+}
+
+/// A MULTIFUNCTION Core ML `Model` proto: `procs.count` independent 1x1-conv
+/// functions, each declared BOTH in the MIL program's `functions` map AND in
+/// the model description's `functions` list (`ModelDescription.functions`,
+/// field 20; iOS18/macOS15 multifunction models). The paired declaration is
+/// what makes every function a runnable procedure -- the missing half of the
+/// bare-text bank. Load through `MLModelAsset(specification:)` +
+/// `MLModel.load(asset:configuration:)` with `MLModelConfiguration.functionName`
+/// set to a proc name, then `prediction` runs that function on the ANE. Every
+/// function takes an input feature `a` and produces an output feature `y`
+/// (each function is its own MIL scope, so the names do not collide). The
+/// first proc's name is also the `defaultFunctionName` (field 21).
+public func buildMultiFunctionConvSpec(procs: [ANEMultiFunctionProc], includeTopLevelIO: Bool = false, opset: String = "CoreML9") -> Data {
+    precondition(!procs.isEmpty, "buildMultiFunctionConvSpec needs at least one proc")
+
+    // Program submessage: Program{version=1, functions=2(map name->Function)}.
+    // `opset` gates which MIL ops are legal and which model features are
+    // enabled: multifunction is iOS18 = `CoreML9` (the single-conv proto path
+    // hardcodes the iOS17 `CoreML8`, which predates multifunction and makes
+    // Core ML reject the description).
+    var programFns = Data()
+    for p in procs {
+        let ops = convOps(K: p.inputDim, F: p.outputDim, S: p.sequenceLength, weight: p.weight)
+        var block = Data()
+        block += strF(2, "y")  // Block.outputs
+        block += ops
+        let fnInputs = lenF(1, namedValue("a", .fp16, [1, p.inputDim, 1, p.sequenceLength]))
+        let fn = fnInputs + strF(2, opset) + mapEntry(3, key: opset, value: block)
+        programFns += mapEntry(2, key: p.name, value: fn)
+    }
+    let program = varF(1, 1) + programFns
+
+    // ModelDescription: one FunctionDescription per proc (field 20) plus the
+    // default function name (field 21). FunctionDescription{name=1, input=2,
+    // output=3} carrying FeatureDescriptions.
+    var desc = Data()
+    // Optional top-level default-function I/O (ModelDescription.input=1,
+    // output=10), mirroring the first proc. Some Core ML validators expect
+    // the default function's signature at the top level even for a
+    // multifunction model; `includeTopLevelIO` toggles it for the probe.
+    if includeTopLevelIO {
+        desc += lenF(1, fd("a", [1, procs[0].inputDim, 1, procs[0].sequenceLength]))
+        desc += lenF(10, fd("y", [1, procs[0].outputDim, 1, procs[0].sequenceLength]))
+    }
+    for p in procs {
+        var fnd = strF(1, p.name)
+        fnd += lenF(2, fd("a", [1, p.inputDim, 1, p.sequenceLength]))
+        fnd += lenF(3, fd("y", [1, p.outputDim, 1, p.sequenceLength]))
+        desc += lenF(20, fnd)
+    }
+    desc += strF(21, procs[0].name)
+
+    // Model{specificationVersion=1, description=2, mlProgram=502}.
+    return varF(1, 9) + lenF(2, desc) + lenF(502, program)
+}
+
 /// Same single-op conv program `buildConvMatmul` builds, but returns just the
 /// `program` submessage bytes -- what `_ANEInMemoryModelDescriptor`'s
 /// `initWithNetworkText:weights:optionsPlist:isMILModel:` wants for an

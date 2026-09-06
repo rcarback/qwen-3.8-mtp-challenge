@@ -3410,3 +3410,37 @@ only its `main` function is usable.
 This does not change the decode verdict. The ANE loses at one row by 5 to 10
 times, and the bank helps only prefill, where the ANE is compute-bound and the
 126-program count is a real constraint across 48 layers and their buckets.
+
+### The multifunction descriptor makes the packed functions dispatchable
+
+The procedure bank above relieves the load count but leaves only `main`
+runnable, because the bare in-memory descriptor registers one procedure. The
+missing half is the Core ML multifunction model description, a `functions`
+list of `FunctionDescription` records paired with the MIL program's functions.
+`buildMultiFunctionConvSpec` builds it, and `ANEMultiFunctionProbeTests`
+measures two load paths on the M4 Max.
+
+The in-memory path is a dead end. `MLModelAsset(specification:)` takes a
+`.mlmodel` blob and rejects a multifunction description with "This MLModel
+doesn't support the multi-function description sytnax", at both the CoreML8 and
+CoreML9 opsets. A top-level input feature beside the functions list is a hard
+error, so the description must be functions-only, and the blob path cannot
+carry it.
+
+The `.mlpackage` path works. Writing the same functions-only spec into a
+`.mlpackage`, compiling it with `MLModel.compileModel(at:)`, and loading each
+function by `MLModelConfiguration.functionName` runs every function on the ANE
+with its own weights:
+
+| function loaded by name | max-abs vs w0 | max-abs vs w1 | ran |
+| --- | --- | --- | --- |
+| `main` | 0.06 | 57.6 | its own w0 |
+| `proc1` | 57.6 | 0.07 | its own w1 |
+
+Both functions share one program, one of the 126 slots, and each dispatches by
+name at the fp16 floor. The dispatch half of the workaround is closed. The
+caveat is the path: this runs through `MLModel.prediction` with MLMultiArray
+copies, not the zero-copy IOSurface dispatch the direct lane uses. That cost
+amortizes over a compute-bound prefill and does not help decode, so the bank
+is a prefill tool, and only if the multifunction program is loaded through a
+`.mlpackage`.
