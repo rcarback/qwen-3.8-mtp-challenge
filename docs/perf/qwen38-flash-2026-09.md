@@ -3545,3 +3545,31 @@ bf16-projection configuration, a different memory regime whose GPU baseline is
 also bf16 rather than the q4 production matmul. That setup is the remaining work
 for the e2l on-model number; the primitive result above (ANE compute 0.92x the
 quantized GPU, output zero-copy) is what stands without it.
+
+### Correction: the ANE accepts int8, int4 and LUT weights, not just fp16
+
+An earlier claim in this file, that the ANE dense lane needs a bf16 projection
+tree, was wrong about the engine. It was a limitation of the MIL builder, which
+emits a plain `tensor<fp16> w = const()`. The ANE architecture paper is
+explicit: the datapath reconstructs a compressed weight to fp16 at the
+multiplier's input, dequantizing int8, int4 or a palettized weight on the way
+in, so fp16 is the compute precision, not the storage requirement.
+
+Measured on M1 in that paper: an int4 lookup-table (palette) weight streams
+natively at about 2.37x the bandwidth and runs about 2.37x faster than fp16;
+structured sparsity with at least half zeros runs 1.55 to 1.64x faster at 0.43x
+the bytes; int8 affine and blockwise forms are accepted and fold to dense fp16
+in the conversion. Core ML supports 8-bit and 4-bit weight quantization and
+palettization at 1, 2, 3, 4, 6 and 8 bits, and notes int8 weight-and-activation
+optimized compute on M4.
+
+So the crash the guard fixed is not the whole story. The real fix for an ANE
+lane on the quantized tree is to emit the weight as a MIL quantized constant
+(`constexpr_affine_dequantize` or the blockwise form for affine int8/int4,
+`constexpr_lut_to_dense` for palettization) instead of a dense fp16 const. The
+ANE compiler then holds the compressed weight and dequantizes on-chip, and the
+lane runs on the same quantized weights the GPU uses, with no bf16 expansion.
+The 2.37x bandwidth win is specific to the int4 palette form; MLX's affine
+group-64 is accepted but, as an affine form, folds to fp16, so capturing the
+bandwidth win means palettizing, which diverges from the GPU's affine format.
+This reopens the e2l on-model A/B, which is not blocked by weight representation.
