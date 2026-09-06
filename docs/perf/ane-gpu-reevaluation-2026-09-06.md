@@ -421,6 +421,9 @@ because the lane arms only at 128 tokens and above.
 | ANE shared expert, int8 | 267.9 (-2.3 percent) | 18.34 | 4.336 | 3 of 6 |
 | ANE shared expert, int4 | 265.9 (-3.0 percent) | 18.25 | 4.760 | 0 of 6 |
 | GPU plus ANE: split int8 with depth-2 drafting | not run: the q8 tree's depth-2 serve hung at load for 18 minutes (the 2026-09-03 depth-2 MoE lost 17 percent on the bf16 tree in any case) | | | |
+| under a 40 percent duty GPU load: control, then control repeat | 144.0, then 115.8 | 13.46, then 13.58 | | |
+| under the same load: ANE split projections, int8 | 142.5 (1.1 percent below the first control, 23.0 above the repeat) | 13.74 | | |
+| under the same load: ANE shared expert, int8 | 131.5 (8.7 percent below the first control, 13.6 above the repeat) | 13.85 | | |
 | reference, mlx-serve on an M4 Max: 4-bit pack, short context | | 60 to 69 | | |
 | reference, mlx-serve on an M4 Max: 32k prompt | 699 | | | |
 
@@ -697,3 +700,34 @@ arm, because the lane arms at 128 tokens and above, so its spread is the
 box's thermal state and the arm order, not the lane. The load process was
 stopped before it printed its busy share, so the achieved duty is the
 requested 40 percent by construction, not measured.
+
+### The loaded box, MoE tower
+
+Same load, same protocol, the q8 tree, arms in the order shown. Cool
+numbers are the fused-lane sweep above.
+
+| arm | prefill tok/s, prompts 2 to 6 | vs first control | paired range | last prompt | decode | cool prefill |
+| --- | --- | --- | --- | --- | --- | --- |
+| gpu-loaded (control) | 144.0 | | | 135.1 | 13.46 | 274.2 |
+| split projections, int8 | 142.5 | -1.1 percent | 0.80 to 1.16 | 107.8 | 13.74 | 271.8 |
+| shared expert, int8 | 131.5 | -8.7 percent | 0.57 to 1.09 | 126.5 | 13.85 | 267.9 |
+| gpu2-loaded (control repeat) | 115.8 | -19.6 percent | 0.51 to 1.27 | 171.4 | 13.58 | 270.7 |
+
+Against the control repeat the split lane is 23.0 percent above and the
+shared lane 13.6 above. Two readings. First, the MoE tower loses far more to
+the load than the dense tower: 47 to 58 percent of its cool prefill and 25
+percent of its decode, against 16 to 27 and 10 to 15 on the dense tower. A
+reading, not a measurement: the MoE prefill is hundreds of short kernels
+(the expert gathers, the gated-delta kernels, the n-gram gather) and each
+one waits behind a load dispatch, where the dense tower's big matmuls hold
+the GPU for longer per dispatch. Second, the lanes hold their cool standing
+under load, at the control's level and inside a control envelope 20 percent
+wide: split int8 at 0.9 percent below when cool and 1.1 below the first
+loaded control, shared int8 at 2.3 below cool and 8.7 below loaded. The
+per-prompt pairs spread 0.51 to 1.27 for the controls alone, so no MoE lane
+can be ranked against the control under this load without more repeats,
+and the last-prompt column carries no pattern here (the control repeat
+ended on its best prompt). What the MoE lanes offload is a small share of
+the layer (two projections, or the shared expert), so the GPU's share sets
+the pace under load as it does when cool; the resilience the dense tower
+showed needs a larger ANE share than these lanes carry.
