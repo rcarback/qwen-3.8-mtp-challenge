@@ -436,3 +436,87 @@ the int8 arms are lossless in perplexity and still diverge on most prompts.
 | dense fused MLP prefix, 0.3125 of the channels, bucket 1024 | | 167 MB fp16, 83 int8, 42 int4 per layer | compute-bound at this bucket, so the form buys about 2.5 points |
 | expert `gate_up` `[1280, 2560]` and `down` `[2560, 640]` | production q4 group-32 gather | fp16 and int4 palette | the `r` table below, bead `xi7` |
 | whole gated-delta layer at S=1 as one ANE program | 1.27 ms per layer on the GPU (pipelined) | pending | bead `i6v` |
+
+## `r`, re-measured with zero-copy I/O and production-quantized GPU arms
+
+Bead `xi7`. Median of 40 calls, ANE through Core ML with surface-backed
+input and output, GPU through `quantizedMatmul` at each projection's
+production form. `r` is GPU time over ANE time, so above 1 the ANE is faster.
+
+| shape | S=16 | S=128 | S=256 | S=512 | S=1024 |
+| --- | --- | --- | --- | --- | --- |
+| expert `gate_up` `[1280, 2560]`, GPU q4 g32 | 1.59 | 2.90 | 2.18 | 1.14 | 1.08 |
+| expert `down` `[2560, 640]`, GPU q4 g32 | 2.31 | 2.36 | 1.84 | 1.79 | 0.77 |
+| MoE `in_proj_qkv` `[10240, 2560]`, GPU q8 g32 | 0.82 | 1.56 | 1.01 | 0.73 | 0.93 |
+| dense MLP `gate` half `[8704, 5120]`, GPU q4 g64 | 0.94 | 0.99 | 0.41 | 0.47 | 0.70 |
+| dense MLP `down` half `[5120, 8704]`, GPU q4 g64 | 0.31 | 0.61 | 0.16 | 0.17 | 0.23 |
+
+ANE throughput behind those ratios, fp16 weights: the dense `gate` conv runs
+10.9 TF/s at S=128 and 4.7 to 5.5 TF/s at S of 256 and above; the expert
+`gate_up` runs 4.3 TF/s at S=128 and 7.3 at S=1024; `in_proj_qkv` 10.7 TF/s
+at S=128 and 11.5 at S=256. Numerics: max relative error 0.0004 to 0.0005
+against the fp32 product on every fp16 row.
+
+Four readings.
+
+1. **The expert partition is dead on the right denominator.** Against an
+   isolated GPU matmul the ANE wins 1.6 to 2.9x at the widths a routed
+   expert sees in prefill, so the old `r` was wrong in the other direction.
+   Production, though, runs the batched gather: 70,000 token-expert
+   pairs per layer in 22 ms, 0.31 microseconds per pair. The ANE's best
+   expert rate, 7.3 TF/s at S=1024, is 1.5 microseconds per pair, and a
+   grouped program at capacity 64 does not reach that. The GPU's batched
+   gather beats a perfectly batched ANE expert lane by about five times.
+   Bead `48v` closes on this arithmetic.
+2. **The ANE likes S=128.** On the large dense shapes its efficiency halves
+   above 128 rows, and 2D spatial layouts do not recover it: `[1,K,4,128]`
+   equals `[1,K,1,512]` and `[1,K,64,8]` is four times worse. A dense-lane
+   program at S=128 dispatched eight times could beat one at S=1024. That
+   is measured through Core ML at the top level; the in-memory fused
+   program is timed at real shape below before anything is redesigned.
+3. **The down projection is the ANE's weak spot.** Its 8704-deep input runs
+   at 1.9 TF/s where the gate runs 5.5 at the same S. In the fused prefix the
+   down is a third of the FLOPs and more than half of the ANE leg's time, so
+   a split that gives the ANE gate and up only, and the GPU every down, is
+   the next dense-lane design to measure.
+4. **Never scale a constexpr weight with a runtime op.** The int4 rows of this
+   run built the palette weight as `mul(lut_to_dense(...), scale)`; Core ML
+   rebuilt the dense weight on every call at 0.1 to 3.8 seconds per conv. The
+   production form applies the per-channel scale to the conv output and ran
+   at full speed in the sweep. The int4 `r` rows are void and are rerun in
+   the output-side form.
+
+One caveat on the dense rows: the sweep's own +7.5 percent at bucket 1024
+implies an ANE leg well under the GPU's 27 ms MLP, while these Core ML
+timings would put it near 50 ms. The two paths differ (Core ML `prediction`
+against the direct in-memory dispatch), so the direct path is timed at the
+real fused shape next, and the dense `r` rows are treated as the Core ML
+path's numbers until then.
+
+## The whole-layer decode program, probed
+
+Bead `i6v` asked whether one ANE dispatch per whole dense layer could beat
+the GPU's per-layer launch cost at decode. The probe is one gated-delta
+layer of Qwen3.8-Flash-Next at S=1 as a single Core ML program with int4
+palette weights: input norm, `in_proj_qkv`, `in_proj_z`, the `a` and `b`
+gates, the depthwise conv, the 48-head gated-delta state update against a
+constant state, the gated output norm, `out_proj`, the residual, the MLP
+norm, and the shared expert, 59 ops in all.
+
+| | ms per call |
+| --- | --- |
+| the whole layer on the ANE, Core ML path | 0.860 |
+| the same program CPU-only | 3.169 |
+| the GPU's gated-delta layer today, pipelined | about 1.27 |
+| the GPU's gated-delta layer, serialised | 2.52 |
+| mlx-serve's whole S=1 forward on an M4 Max, per layer | 0.33 |
+
+The compute plan places all 59 ops on the ANE. At 0.86 ms the program is
+three times the per-dispatch floor and it replaces only the dense part of
+the layer. The routed experts stay on the GPU at about 0.35 ms, and the two
+crossings cost about 0.2 ms each in the fused lanes. That sums to about 1.5
+ms against the GPU's 1.27, before the recurrent state's fp16 round trip and
+the full-attention layers' KV residency are solved. The design does not
+pay, and bead `i6v` closes. The line that matters is the last one. An open
+GPU runtime does the whole layer in 0.33 ms, a quarter of ours, so the
+launch-cost problem this design tried to route around has a GPU answer.

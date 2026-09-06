@@ -98,6 +98,12 @@ improves without leaving the confirmed op:
 4. **Do not chain a per-channel `constexpr_blockwise_shift_scale` after an
    int8-entry LUT.** It stays on the ANE but runs 2.9x slower (0.77 ms
    against 0.27). The output-side `mul` of option 2 is free.
+5. **Never apply a runtime op to the weight.** `mul(constexpr_lut_to_dense(...),
+   scale)` compiles, the compute plan keeps the conv on the ANE, and Core ML
+   then rebuilds the dense weight on every call: 0.1 to 3.8 seconds per conv
+   at real shapes (2026-09-06, the void int4 rows of the `r` table). Scale the
+   conv output (`mul(y, scale[1, O, 1, 1])`), which is what
+   `buildConvMILTextForm` and the fused int4 program do.
 
 Matching the GPU's group-64 affine int4 exactly is not possible on the ANE
 at all (the blockwise op is GPU-only, above), so the GPU and ANE hold the

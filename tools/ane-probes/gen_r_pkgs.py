@@ -41,9 +41,13 @@ def build(name, O, K, H, W, form, w, x):
         if form == "fp16":
             wt = mb.const(val=w.astype(np.float16).reshape(O, K, 1, 1))
         else:
+            # The per-channel scale goes on the conv OUTPUT. A runtime mul on the
+            # constexpr weight makes Core ML rebuild the dense weight every call
+            # (0.1 to 3.8 s per conv measured 2026-09-06).
             c, lut, s, _ = lut_pcs_fp16(w)
-            d = mb.constexpr_lut_to_dense(indices=c.astype(T.np_uint4_dtype).reshape(O, K, 1, 1), lut=lut.reshape(1, 1, 1, 1, 16, 1))
-            wt = mb.mul(x=d, y=s.reshape(O, 1, 1, 1))
+            wt = mb.constexpr_lut_to_dense(indices=c.astype(T.np_uint4_dtype).reshape(O, K, 1, 1), lut=lut.reshape(1, 1, 1, 1, 16, 1))
+            y = mb.conv(x=x, weight=wt, strides=[1, 1], pad_type="valid", dilations=[1, 1], groups=1)
+            return mb.mul(x=y, y=s.reshape(1, O, 1, 1))
         return mb.conv(x=x, weight=wt, strides=[1, 1], pad_type="valid", dilations=[1, 1], groups=1)
     w_eff = w.astype(np.float16).astype(np.float32) if form == "fp16" else lut_pcs_fp16(w)[3]
     m = ct.convert(prog, minimum_deployment_target=ct.target.iOS18, compute_units=ct.ComputeUnit.CPU_AND_NE)

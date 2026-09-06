@@ -237,3 +237,54 @@ struct ANEFusedFormProbeTests {
         }
     }
 }
+
+/// The dense tower's fused MLP prefix at its REAL shape (hidden 5120, F=5440
+/// at fraction 0.3125) through the production in-memory path, per weight form
+/// and per compiled row count, so the ANE leg's time is known on the path the
+/// lane actually dispatches (the Core ML path's big-shape times disagreed
+/// with the sweep's own result on 2026-09-06). Prints ms per call.
+@Suite(.serialized)
+struct ANEFusedRealShapeProbeTests {
+    static var enabled: Bool {
+        ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1"
+    }
+
+    @Test("fused MLP prefix at real shape, per form and row count", .enabled(if: enabled))
+    func fusedRealShape() throws {
+        try #require(ANERuntime.available())
+        let hidden = 5120, inner = 5440
+        MLXRandom.seed(5)
+        let gate = (MLXRandom.normal([inner, hidden]) * 0.02).asType(.float16)
+        let up = (MLXRandom.normal([inner, hidden]) * 0.02).asType(.float16)
+        let down = (MLXRandom.normal([hidden, inner]) * 0.02).asType(.float16)
+        eval(gate, up, down)
+        let forms = (ProcessInfo.processInfo.environment["MLXFAST_ANE_FORMS"] ?? "fp16,int8,int4")
+            .split(separator: ",").compactMap { ANEWeightForm(rawValue: String($0)) }
+        let rows = (ProcessInfo.processInfo.environment["MLXFAST_ANE_ROWS"] ?? "128,256,512,1024")
+            .split(separator: ",").compactMap { Int($0) }
+        for form in forms {
+            for S in rows {
+                let x = MLXRandom.normal([S, hidden]).asType(.float16)
+                eval(x)
+                do {
+                    let mlp = try ANEFusedMLP(
+                        hidden: hidden, innerFraction: inner, sequenceLength: S,
+                        gate: gate, up: up, down: down, activation: .expDiv, weightForm: form)
+                    for _ in 0 ..< 3 { _ = try mlp(x) }
+                    var t: [Double] = []
+                    for _ in 0 ..< 12 {
+                        let s = DispatchTime.now().uptimeNanoseconds
+                        _ = try mlp(x)
+                        t.append(Double(DispatchTime.now().uptimeNanoseconds - s) / 1e6)
+                    }
+                    t.sort()
+                    let flops = 2.0 * Double(S) * Double(3 * inner * hidden)
+                    print(String(format: "[fused-real] %@ S=%d: %.2f ms/call (%.2f TF/s), %.3f ms per row",
+                                 form.rawValue, S, t[t.count / 2], flops / t[t.count / 2] / 1e9, t[t.count / 2] / Double(S)))
+                } catch {
+                    print("[fused-real] \(form.rawValue) S=\(S): FAILED \(error)")
+                }
+            }
+        }
+    }
+}

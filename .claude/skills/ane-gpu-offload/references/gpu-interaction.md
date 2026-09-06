@@ -77,6 +77,21 @@ inside one.
 `MLX_ANE_MIN_SEQ=128` is the measured balance point: 0.94 to 1.05x at S=128,
 losing below it.
 
+## `r` re-measured (2026-09-06, zero-copy, production GPU arms)
+
+GPU time over ANE time, fp16 ANE weights, by S=16/128/256/512/1024: expert
+`gate_up` 1.59/2.90/2.18/1.14/1.08; expert `down` 2.31/2.36/1.84/1.79/0.77;
+MoE `in_proj_qkv` 0.82/1.56/1.01/0.73/0.93; dense MLP `gate` half
+0.94/0.99/0.41/0.47/0.70; dense MLP `down` half 0.31/0.61/0.16/0.17/0.23.
+Three things this settles. The ANE beats an ISOLATED GPU matmul on expert
+shapes at prefill widths, but production runs the batched gather at 0.31
+microseconds per token-expert pair against 1.5 for the ANE's best rate, so
+the expert partition is dead on the right denominator. The ANE's efficiency
+on large dense shapes peaks at S=128 (10.9 TF/s) and halves above it, and 2D
+spatial layouts do not recover it, so tile the ANE leg at 128 rows. The
+down projection with its 8704-deep input is the ANE's weak spot (1.9 TF/s);
+give the ANE gate and up and keep every down on the GPU.
+
 ## The bounded ceiling, stated honestly
 
 The dense projections the ANE can take are a minority of prefill FLOPs; the
