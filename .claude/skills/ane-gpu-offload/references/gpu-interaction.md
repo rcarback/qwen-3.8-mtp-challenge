@@ -97,7 +97,16 @@ a long-context turn once the checkpoint cache is warm.
    artifact.
 4. Measure the whole forward, counterbalanced, cool box, one process, both
    arms on the same weight tree. Do not compare an ANE arm on a bf16 tree to a
-   GPU arm on a q4 tree; that measures the trees.
+   GPU arm on a q4 tree; that measures the trees. Cool is not enough: the box
+   must also be quiet. On 2026-09-06 a Time Machine pass and the Photos
+   media analyser (`mediaanalysisd`, 170 percent CPU for ninety minutes)
+   churned the page cache the 95 GB n-gram table lives in, and every prompt
+   of a serve arm took minutes of wall time outside the model's own timers
+   while those timers reported normal rates. Gate on `tmutil status` and on
+   the analysers' CPU (`quiet_gate` in the close-out environment), pause the
+   analysers with SIGSTOP for the timed phases and resume them after, and
+   record the wall time of every request beside the model's timers so hidden
+   time is visible.
 5. Keep the GPU baseline honest: the production quantized matmul, not dense
    bf16.
 

@@ -125,5 +125,9 @@ probe's packages (`rpkgs`, 4.9 GB), the compute-plan packages (`anepkgs`),
 a bank generator's `tmp-S<bucket>` directory, activation captures. Model
 trees are never touched. Also read the program build counts every ANE arm
 logs (`built ... failed ...`); an arm that reports failures is not an ANE
-arm and its numbers are void.
+arm and its numbers are void, and an arm whose lane never built a program
+is the control in disguise (the MoE lanes refused quantized weights until
+2026-09-06 and reported the control's perplexity for hours). Before a timed
+arm, the box must be cool AND quiet: see the decision rule in
+`references/gpu-interaction.md`.
 
