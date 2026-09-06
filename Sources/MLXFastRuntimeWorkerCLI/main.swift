@@ -143,7 +143,10 @@ private enum ParticipantWorkerCLI {
             case "qwen4exp-transform":
                 // Local fork only: Qwen3.8-Flash-Next bf16 source -> runtime tree.
                 try options.requireOnly(
-                    values: ["--source", "--destination", "--expert-group-size", "--expert-bits"]
+                    values: [
+                        "--source", "--destination", "--expert-group-size", "--expert-bits",
+                        "--dense-bits", "--dense-group-size", "--link-ngram-from",
+                    ]
                 )
                 let source = options.value(for: "--source", default: "")
                 let destination = options.value(for: "--destination", default: "")
@@ -153,11 +156,18 @@ private enum ParticipantWorkerCLI {
                 }
                 let groupSize = Int(options.value(for: "--expert-group-size", default: "32")) ?? 32
                 let bits = Int(options.value(for: "--expert-bits", default: "4")) ?? 4
+                // --dense-bits 8 quantizes every dense Linear too (see
+                // Qwen4ExpTransform.Options.denseBits); absent keeps them bf16.
+                let denseBits = Int(options.value(for: "--dense-bits", default: ""))
+                let denseGroup = Int(options.value(for: "--dense-group-size", default: "32")) ?? 32
+                let linkFrom = options.value(for: "--link-ngram-from", default: "")
                 try Qwen4ExpTransform.run(
                     .init(
                         source: URL(fileURLWithPath: source),
                         destination: URL(fileURLWithPath: destination),
-                        expertGroupSize: groupSize, expertBits: bits))
+                        expertGroupSize: groupSize, expertBits: bits,
+                        linkNGramTableFrom: linkFrom.isEmpty ? nil : URL(fileURLWithPath: linkFrom),
+                        denseBits: denseBits, denseGroupSize: denseGroup))
                 print("qwen4exp-transform: wrote \(destination)")
 
             case "qwen4exp-ane-bench":
