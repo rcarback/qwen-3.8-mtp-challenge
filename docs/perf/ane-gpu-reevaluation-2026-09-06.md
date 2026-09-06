@@ -396,6 +396,9 @@ the GPU control. A cell that says pending is a queued arm, not an estimate.
 | ANE int4, fraction 0.5 | 115.7, throttles late | 12.82 | 5.923 | |
 | ANE bank, per-row int4, all 64 layers, Core ML path | 63.3 (-49 percent) | 11.87 | 5.565 | 0 of 6 |
 | GPU plus ANE: int8 0.3125 with depth-2 drafting, cool gap | 140.4 (+15.5 percent over the depth-2 control's 121.5) | 22.40 (control 21.94) | | |
+| under a 40 percent duty GPU load: control, then control repeat | 105.6, then 93.3 | 11.29, then 10.68 | | |
+| under the same load: ANE int8, fraction 0.5 | 106.1 (0.5 percent above the first control, 13.7 above the repeat) | 10.12 | | |
+| under the same load: ANE int4, fraction 0.3125 | 99.6 (5.6 percent below the first control, 6.8 above the repeat) | 9.27 | | |
 
 The dense tower's per-operation split at prefill: the MLP is three of its
 four dense projections by weight bytes, and the ANE prefix holds 0.3125 of
@@ -658,3 +661,39 @@ fraction 0.5. The output-side scale costs nothing measurable. The void rows of t
 run had the scale on the weight and were 100 to 3000 times slower on the
 same packages.
 
+## The loaded box, dense tower
+
+Bead `7yp`. A synthetic GPU client (`tools/ane-probes/gpu_load`, the
+`fma_burn` kernel at 40 percent duty on a 50 ms period) runs for the whole
+arm, control included, gaps included, so the GPU never cools inside an arm.
+Six prompts, 45 seconds between prompts, one arm per process, the four arms
+in the order shown. The mean is over prompts 2 to 6 because the ANE arms
+build their programs on prompt 1. Cool numbers are the gapped re-run above.
+
+| arm | prefill tok/s, prompts 2 to 6 | vs first control | paired range | last prompt | decode | cool prefill |
+| --- | --- | --- | --- | --- | --- | --- |
+| gpu-loaded (control) | 105.6 | | | 70.0 | 11.29 | 124.8 |
+| int8, fraction 0.5 | 106.1 | +0.5 percent | 0.70 to 1.52 | 106.5 | 10.12 | 145.5 |
+| int4, fraction 0.3125 | 99.6 | -5.6 percent | 0.75 to 1.57 | 109.8 | 9.27 | 143.3 |
+| gpu2-loaded (control repeat) | 93.3 | -11.6 percent | 0.84 to 0.95 | 64.4 | 10.68 | 128.2 |
+
+Three readings. First, the load costs the GPU control 16 to 27 percent of its
+cool prefill and 10 to 15 percent of its decode, and the control moves 12
+percent between its two runs, which is wider than the gap between any arm
+and either control. The per-prompt pairs spread from 0.70 to 1.57 for the
+same reason. A verdict finer than "at the control's level" needs more
+repeats. Second, the two ANE arms sit at that level, +0.5 and -5.6 percent
+on the first control and +13.7 and +6.8 on the repeat, and both hold the
+last prompt at 106 to 110 tok/s where both controls fell to 64 to 70. That
+last column is the resilience the owner's rule describes: the arm that
+shares the GPU degrades through the arm, the arm with an ANE share does
+not. Third, the cool gain of +15 to +17 percent shrinks to parity because the
+fraction is tuned for a cool GPU. The ANE's share of the split runs at its
+cool speed under load while the GPU's share slows, so the ANE finishes
+first and waits. The higher fraction held up better (int8 at 0.5 over int4
+at 0.3125), which points the same way. A load-aware fraction, raised when the
+GPU is shared, is the follow-up arm. The decode column is GPU-only in every
+arm, because the lane arms at 128 tokens and above, so its spread is the
+box's thermal state and the arm order, not the lane. The load process was
+stopped before it printed its busy share, so the achieved duty is the
+requested 40 percent by construction, not measured.
