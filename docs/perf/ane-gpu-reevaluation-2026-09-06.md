@@ -536,6 +536,52 @@ is a handful of hand-written Metal kernels (hyper-connection read and
 write, gated-delta prework and norm-gate, fused expert gate-up and
 down-reduce) and ours is 60 to 100 MLX operations, so the 45 ms difference
 is dispatch structure, not bytes. The skeptics could not size those kernels
-from the source, and mlx-serve ships each one behind a kill switch, so the
+from the source. mlx-serve ships each one behind a kill switch, and the
 empirical half of the bead attributes them on this box by switching them
 off one at a time in their own binary.
+
+## Dense tower re-run with a cool gap per prompt
+
+The first dense sweep gated the box only between arms, and the
+fraction-0.5 arms throttled through their six prompts. This re-run waits 45
+seconds before every prompt, control included, and measures the bank arm
+beside the two forms.
+
+| arm | prefill tok/s, prompts 2 to 6 | vs control | paired range | decode |
+| --- | --- | --- | --- | --- |
+| gpu3 (control) | 124.8 | | | 12.58 |
+| bank, per-row int4, Core ML path, 64 layers | 63.3 | -49.3 percent | 0.38 to 0.57 | 11.87 |
+| int4, fraction 0.3125 | 143.3 | +14.8 percent | 1.11 to 1.19 | 12.56 |
+| int8, fraction 0.5 | 145.5 | +16.6 percent | 1.12 to 1.21 | 12.61 |
+| gpu4 (control repeat) | 128.2 | +2.7 percent | 1.00 to 1.05 | 12.79 |
+
+Two results. With the engines cool, the ANE lane is worth twice what the
+hot sweep said (int4 at 0.3125: +7.1 hot, +14.8 cool) and the balance point
+is above 0.3125 (int8 at 0.5: +5.7 hot with a collapse on the last prompt,
++16.6 cool on every prompt). The lane's gain tracks the ANE's temperature,
+not the GPU's, and the control moved only 2.7 percent. Second, the Core ML
+bank path loses half the prefill: it engaged on all 64 layers at bucket 1024
+and its per-call cost on the big fused program is far above the direct
+path's, the same fact the `r` table's dense rows showed. The bank's
+per-row-codebook quality is still read from its perplexity arm; its speed
+needs the direct path, which cannot bank, or a per-row LUT in the in-memory
+program.
+
+The reading the owner asked to be kept in view is that these lanes are
+measured against an idle and cool GPU, which is the least common state of
+an interactive machine. Under UI load the GPU path slows and the ANE path does not, so a
+lane at parity here is the resilient primary path there. The loaded-box arms
+that make that concrete are queued.
+
+### The bank's quality
+
+Teacher-forced perplexity with the bank engaged on all 64 layers: 5.565,
+against the control's 5.566 and the per-tensor int4's 5.772. One codebook
+per weight row makes int4 lossless at this resolution. The int4 question
+has two separate answers. The per-row codebook is the right
+quantizer, while the Core ML dispatch path is the wrong carrier for it. The
+next probe is the per-row LUT
+in the in-memory program, whose compiler accepted the per-tensor palette and
+rejected the blockwise op; if it takes the grouped LUT, int4 at the direct
+path's speed and the bank's quality is one build away.
+

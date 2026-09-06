@@ -71,3 +71,5 @@ score.baseline-*.json
 docs/perf/accept-runs/*.json
 docs/perf/accept-runs/work-*
 __pycache__/
+tools/ane-probes/gpu_load
+tools/ane-probes/gpu_matmul.metallib

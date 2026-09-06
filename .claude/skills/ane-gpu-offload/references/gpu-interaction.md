@@ -102,6 +102,24 @@ slower than the quantized production matmul. So the whole ANE prefill lever is
 worth tens of percent on prefill at best, and prefill is the smaller half of
 a long-context turn once the checkpoint cache is warm.
 
+## The ANE under load: a close result is a win
+
+The tables above are measured on a cool, quiet box with the GPU otherwise
+idle. That is one of three conditions the box actually runs in, and the
+least common one for an interactive machine. Under UI load, another GPU
+client, or a throttled GPU, the GPU-only path slows and the ANE path does
+not, because the engines are independent. So an ANE arm that is within
+about 10 percent, or within 10 ms per call, of the GPU when cool is a
+competitive primary path under load, and the preferred one when the GPU is
+shared. Measure every candidate lane in three conditions: cool and idle
+(the tables here), loaded (a synthetic GPU load standing in for the UI, the
+`loaded` arms), and hot (no cool gap between prompts). The 2026-09-06
+dense re-run is the pattern: int8 at fraction 0.5 read +5.7 percent hot and
++16.6 percent with a 45-second cool gap per prompt, and every ANE arm's
+paired ratio moved with the engine's temperature, not the GPU's. Pipelining
+ANE work under the GPU's is better still; but a lane that only matches the
+GPU when cool is not a null result, it is the resilient path.
+
 ## The decision rule
 
 1. Is the op at S >= 128 and a whole projection between graph boundaries?
@@ -124,6 +142,10 @@ a long-context turn once the checkpoint cache is warm.
    time is visible.
 5. Keep the GPU baseline honest: the production quantized matmul, not dense
    bf16.
+6. Judge a close result under load, not only when cool: a lane within 10
+   percent of the GPU on a cool box is the primary path when the GPU is
+   shared with the UI or throttled, and the loaded arm is the one that
+   decides it.
 
 ## What would change the verdict
 
