@@ -548,42 +548,210 @@ public func buildConvWeightBlob(_ fp16Weight: Data) -> Data {
 /// `ANESplitConfig.activation`) and `.tanhForm` use the ANE's accurate
 /// `exp`/`tanh` and land at the conv rounding floor. `.none` skips the
 /// activation entirely (diagnostic: isolates the convs and mul).
+/// The two spellings of MIL text the ANE compiler accepts, and which one a
+/// program must use throughout. `ios18` programs (`program(1.3)`, `func
+/// main<ios18>`) write scalars bare: `string("x")`, `int32(1)`, `fp16(0.5)`.
+/// `ios16` programs (`program(1.0)`, `func main<ios16>`) write every scalar as
+/// a rank-0 tensor: `tensor<string, []>("x")`, `tensor<int32, []>(1)`. The
+/// int4 palette op is confirmed only in the ios16 spelling and the int8 affine
+/// op in the ios18 spelling, and mixing the two inside one program is an
+/// `InvalidMILProgram`, so every line of a program goes through one dialect.
+public enum MILDialect: Sendable {
+    case ios18, ios16
+
+    /// A string literal.
+    func str(_ v: String) -> String { self == .ios18 ? "string(\"\(v)\")" : "tensor<string, []>(\"\(v)\")" }
+    /// An fp16 scalar literal.
+    func f16(_ v: Float) -> String { self == .ios18 ? "fp16(\(v))" : "tensor<fp16, []>(\(v))" }
+    /// The declared type of an fp16 scalar variable.
+    var f16Type: String { self == .ios18 ? "fp16" : "tensor<fp16, []>" }
+    /// The declared type of a string variable.
+    var stringType: String { self == .ios18 ? "string" : "tensor<string, []>" }
+    /// The declared type of an int32 scalar variable.
+    var int32Type: String { self == .ios18 ? "int32" : "tensor<int32, []>" }
+    /// An int32 scalar literal.
+    func i32(_ v: Int) -> String { self == .ios18 ? "int32(\(v))" : "tensor<int32, []>(\(v))" }
+    /// The `name=` attribute of an op.
+    func named(_ v: String) -> String { "[name=\(str(v))]" }
+
+    /// The program header through the opening brace, with the tag stamped.
+    func header(programTag: String) -> String {
+        switch self {
+        case .ios18:
+            return """
+            program(1.3)
+            [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}, {"mlxfast-program-tag", "\(programTag)"}})]
+            {
+            """
+        case .ios16:
+            return """
+            program(1.0)
+            [buildInfo = dict<tensor<string, []>, tensor<string, []>>({{"coremlc-component-MIL", "3520.4.1"}, {"coremlc-version", "3520.5.1"}, {"mlxfast-program-tag", "\(programTag)"}})]
+            {
+            """
+        }
+    }
+
+    var funcTarget: String { self == .ios18 ? "ios18" : "ios16" }
+
+    /// The five conv attribute consts every 1x1-conv program declares.
+    /// `groups` above 1 makes every conv in the program a grouped conv.
+    var convConsts: String { convConsts(groups: 1) }
+    func convConsts(groups: Int) -> String {
+        """
+        \(stringType) pt = const()[name=\(str("pt")), val=\(str("valid"))];
+                tensor<int32, [2]> st = const()[name=\(str("st")), val=tensor<int32, [2]>([1, 1])];
+                tensor<int32, [4]> pd = const()[name=\(str("pd")), val=tensor<int32, [4]>([0, 0, 0, 0])];
+                tensor<int32, [2]> dl = const()[name=\(str("dl")), val=tensor<int32, [2]>([1, 1])];
+                \(int32Type) gr = const()[name=\(str("gr")), val=\(i32(groups))];
+        """
+    }
+
+    /// One 1x1 conv statement.
+    func conv(out: String, outputDim: Int, sequenceLength: Int, weight: String, x: String, name: String) -> String {
+        "tensor<fp16, [1, \(outputDim), 1, \(sequenceLength)]> \(out) = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=\(weight), x=\(x))\(named(name));"
+    }
+
+    /// A BLOBFILE reference into `weights/<file>` at a chunk header offset.
+    func blob(file: String, offset: UInt64) -> String {
+        "BLOBFILE(path=\(str("@model_path/weights/\(file)")), offset=\(self == .ios18 ? "uint64(\(offset))" : "tensor<uint64, []>(\(offset))"))"
+    }
+}
+
+/// Which storage the ANE program keeps a projection weight in. The engine
+/// multiplies in fp16 whatever the storage; `int8` is per-output-channel
+/// affine (`constexpr_affine_dequantize`), `int4` is a 16-entry palette shared
+/// by the whole tensor (`constexpr_lut_to_dense`) with a per-output-channel
+/// scale applied to the conv OUTPUT, which is exact for a linear op and keeps
+/// the weight a constexpr the ANE compiler accepts. Both are confirmed on the
+/// ANE through the in-memory path; the MLX group-affine forms are not
+/// ANE-executable at all (Core ML routes such a conv to the GPU), so no form
+/// here is byte-identical to the GPU's tensor.
+public enum ANEWeightForm: String, CaseIterable, Sendable {
+    case fp16, int8, int4
+}
+
 public enum ANEActivation: String, CaseIterable, Sendable {
     case silu, sigmoidMul, expDiv, tanhForm, none
 
     /// MIL statements defining `silu_out` (`[1, F, 1, S]` fp16) from `gate`.
-    func milLines(hiddenDim: Int, sequenceLength: Int) -> String {
+    func milLines(hiddenDim: Int, sequenceLength: Int, dialect d: MILDialect = .ios18) -> String {
         let t = "tensor<fp16, [1, \(hiddenDim), 1, \(sequenceLength)]>"
         switch self {
         case .silu:
-            return "\(t) silu_out = silu(x=gate)[name=string(\"silu\")];"
+            return "\(t) silu_out = silu(x=gate)\(d.named("silu"));"
         case .sigmoidMul:
             return """
-            \(t) sig = sigmoid(x=gate)[name=string("sig")];
-                    \(t) silu_out = mul(x=gate, y=sig)[name=string("silu")];
+            \(t) sig = sigmoid(x=gate)\(d.named("sig"));
+                    \(t) silu_out = mul(x=gate, y=sig)\(d.named("silu"));
             """
         case .expDiv:
             return """
-            fp16 negone = const()[name=string("negone"), val=fp16(-1.0)];
-                    fp16 one = const()[name=string("one"), val=fp16(1.0)];
-                    \(t) neg = mul(x=gate, y=negone)[name=string("neg")];
-                    \(t) e = exp(x=neg)[name=string("e")];
-                    \(t) den = add(x=e, y=one)[name=string("den")];
-                    \(t) silu_out = real_div(x=gate, y=den)[name=string("silu")];
+            \(d.f16Type) negone = const()[name=\(d.str("negone")), val=\(d.f16(-1.0))];
+                    \(d.f16Type) one = const()[name=\(d.str("one")), val=\(d.f16(1.0))];
+                    \(t) neg = mul(x=gate, y=negone)\(d.named("neg"));
+                    \(t) e = exp(x=neg)\(d.named("e"));
+                    \(t) den = add(x=e, y=one)\(d.named("den"));
+                    \(t) silu_out = real_div(x=gate, y=den)\(d.named("silu"));
             """
         case .tanhForm:
             return """
-            fp16 half = const()[name=string("half"), val=fp16(0.5)];
-                    fp16 one = const()[name=string("one"), val=fp16(1.0)];
-                    \(t) hg = mul(x=gate, y=half)[name=string("hg")];
-                    \(t) th = tanh(x=hg)[name=string("th")];
-                    \(t) thp = add(x=th, y=one)[name=string("thp")];
-                    \(t) sg = mul(x=thp, y=half)[name=string("sg")];
-                    \(t) silu_out = mul(x=gate, y=sg)[name=string("silu")];
+            \(d.f16Type) half = const()[name=\(d.str("half")), val=\(d.f16(0.5))];
+                    \(d.f16Type) one = const()[name=\(d.str("one")), val=\(d.f16(1.0))];
+                    \(t) hg = mul(x=gate, y=half)\(d.named("hg"));
+                    \(t) th = tanh(x=hg)\(d.named("th"));
+                    \(t) thp = add(x=th, y=one)\(d.named("thp"));
+                    \(t) sg = mul(x=thp, y=half)\(d.named("sg"));
+                    \(t) silu_out = mul(x=gate, y=sg)\(d.named("silu"));
             """
         case .none:
-            return "\(t) silu_out = identity(x=gate)[name=string(\"silu\")];"
+            return "\(t) silu_out = identity(x=gate)\(d.named("silu"));"
         }
+    }
+}
+
+/// Blob chunk references for a fused SwiGLU-down program in a compressed
+/// weight form. Offsets are `buildMultiWeightBlob` HEADER offsets into
+/// `weights/weight.bin`. Scales are fp16 chunks of one value per output
+/// channel of their weight (`[F]` for gate and up, `[hidden]` for down).
+public enum ANEFusedWeightRefs {
+    /// int8 per-channel affine: three int8 data chunks and three scale chunks.
+    case int8(gate: UInt64, up: UInt64, down: UInt64, gateScale: UInt64, upScale: UInt64, downScale: UInt64)
+    /// int4 palette: three packed-index chunks (type 3), ONE shared 16-entry
+    /// fp16 LUT chunk, and three per-channel output-scale chunks.
+    case int4(gateIdx: UInt64, upIdx: UInt64, downIdx: UInt64, lut: UInt64, gateScale: UInt64, upScale: UInt64, downScale: UInt64)
+}
+
+/// The fused SwiGLU-down program with COMPRESSED weights. Same dataflow as
+/// `buildSwiGLUDownMILText` (gate conv, up conv, activation, mul, down conv),
+/// with the weights dequantized on the ANE. int8 is written in the ios18
+/// dialect (the confirmed spelling of `constexpr_affine_dequantize`); int4 in
+/// the ios16 dialect (the confirmed spelling of `constexpr_lut_to_dense`),
+/// with each conv output multiplied by its per-channel `[1, O, 1, 1]` scale.
+public func buildSwiGLUDownMILTextCompressed(
+    inputDim: Int, hiddenDim: Int, outputDim: Int, sequenceLength: Int,
+    weights: ANEFusedWeightRefs,
+    activation: ANEActivation = ANESplitConfig.activation,
+    groups: Int = 1,
+    programTag: String = UUID().uuidString
+) -> String {
+    // With `groups > 1` (the grouped expert program) `inputDim`, `hiddenDim`
+    // and `outputDim` are the TOTAL channel counts across groups; each conv's
+    // weight is `[total_out, per_group_in, 1, 1]`.
+    let inPerGroup = inputDim / groups
+    let hidPerGroup = hiddenDim / groups
+    let file = "weight.bin"
+    switch weights {
+    case let .int8(gate, up, down, gateScale, upScale, downScale):
+        let d = MILDialect.ios18
+        func w(_ name: String, _ o: Int, _ i: Int, data: UInt64, scale: UInt64) -> String {
+            "tensor<fp16, [\(o), \(i), 1, 1]> \(name) = constexpr_affine_dequantize()[axis = int32(0), name = string(\"\(name)deq\"), quantized_data = tensor<int8, [\(o), \(i), 1, 1]>(\(d.blob(file: file, offset: data))), scale = tensor<fp16, [\(o)]>(\(d.blob(file: file, offset: scale))), zero_point = int8(0)];"
+        }
+        return """
+        \(d.header(programTag: programTag))
+          func main<\(d.funcTarget)>(tensor<fp16, [1, \(inputDim), 1, \(sequenceLength)]> x) {
+            \(w("gw", hiddenDim, inPerGroup, data: gate, scale: gateScale))
+            \(w("uw", hiddenDim, inPerGroup, data: up, scale: upScale))
+            \(w("dw", outputDim, hidPerGroup, data: down, scale: downScale))
+            \(d.convConsts(groups: groups))
+            \(d.conv(out: "gate", outputDim: hiddenDim, sequenceLength: sequenceLength, weight: "gw", x: "x", name: "gate"))
+            \(d.conv(out: "up", outputDim: hiddenDim, sequenceLength: sequenceLength, weight: "uw", x: "x", name: "up"))
+            \(activation.milLines(hiddenDim: hiddenDim, sequenceLength: sequenceLength, dialect: d))
+            tensor<fp16, [1, \(hiddenDim), 1, \(sequenceLength)]> act = mul(x=silu_out, y=up)\(d.named("swiglu"));
+            \(d.conv(out: "y", outputDim: outputDim, sequenceLength: sequenceLength, weight: "dw", x: "act", name: "down"))
+          } -> (y);
+        }
+        """
+    case let .int4(gateIdx, upIdx, downIdx, lut, gateScale, upScale, downScale):
+        let d = MILDialect.ios16
+        func w(_ name: String, _ o: Int, _ i: Int, idx: UInt64) -> String {
+            "tensor<fp16, [\(o), \(i), 1, 1]> \(name) = constexpr_lut_to_dense()[indices = tensor<uint8, [\(o * i / 2)]>(\(d.blob(file: file, offset: idx))), lut = tensor<fp16, [16]>(\(d.blob(file: file, offset: lut))), name = \(d.str("\(name)deq")), shape = tensor<uint32, [4]>([\(o), \(i), 1, 1])];"
+        }
+        func scale(_ name: String, _ o: Int, offset: UInt64) -> String {
+            "tensor<fp16, [1, \(o), 1, 1]> \(name) = const()[name=\(d.str(name)), val=tensor<fp16, [1, \(o), 1, 1]>(\(d.blob(file: file, offset: offset)))];"
+        }
+        let th = "tensor<fp16, [1, \(hiddenDim), 1, \(sequenceLength)]>"
+        return """
+        \(d.header(programTag: programTag))
+            func main<\(d.funcTarget)>(tensor<fp16, [1, \(inputDim), 1, \(sequenceLength)]> x) {
+                \(w("gw", hiddenDim, inPerGroup, idx: gateIdx))
+                \(w("uw", hiddenDim, inPerGroup, idx: upIdx))
+                \(w("dw", outputDim, hidPerGroup, idx: downIdx))
+                \(scale("gs", hiddenDim, offset: gateScale))
+                \(scale("us", hiddenDim, offset: upScale))
+                \(scale("ds", outputDim, offset: downScale))
+                \(d.convConsts(groups: groups))
+                \(d.conv(out: "gate_raw", outputDim: hiddenDim, sequenceLength: sequenceLength, weight: "gw", x: "x", name: "gate_raw"))
+                \(th) gate = mul(x=gate_raw, y=gs)\(d.named("gate"));
+                \(d.conv(out: "up_raw", outputDim: hiddenDim, sequenceLength: sequenceLength, weight: "uw", x: "x", name: "up_raw"))
+                \(th) up = mul(x=up_raw, y=us)\(d.named("up"));
+                \(activation.milLines(hiddenDim: hiddenDim, sequenceLength: sequenceLength, dialect: d))
+                \(th) act = mul(x=silu_out, y=up)\(d.named("swiglu"));
+                \(d.conv(out: "y_raw", outputDim: outputDim, sequenceLength: sequenceLength, weight: "dw", x: "act", name: "down_raw"))
+                tensor<fp16, [1, \(outputDim), 1, \(sequenceLength)]> y = mul(x=y_raw, y=ds)\(d.named("down"));
+            } -> (y);
+        }
+        """
     }
 }
 
@@ -821,4 +989,52 @@ public func multiArray_1C1S_toMLX(_ a: MLMultiArray) -> MLXArray {
                  "multiArray_1C1S_toMLX: packed buffer is \(bytes.count) bytes, expected F*S*2 = \(F * S * elementSize)")
     let arr = MLXArray(bytes, [F, S], type: Float16.self)
     return arr.transposed(1, 0) // [S,F]
+}
+
+// MARK: - MIL text: one 1x1 conv in a compressed weight form
+
+/// Blob chunk references for a single-projection program in a compressed form
+/// (`buildMultiWeightBlob` header offsets into `weights/weight.bin`).
+public enum ANEConvWeightRefs {
+    /// int8 per-channel affine: the int8 data chunk and the fp16 `[out]` scale chunk.
+    case int8(data: UInt64, scale: UInt64)
+    /// int4 palette: packed indices (type 3), the 16-entry fp16 LUT, and the
+    /// fp16 `[out]` scale applied to the conv output.
+    case int4(indices: UInt64, lut: UInt64, scale: UInt64)
+}
+
+/// `buildConvMILText`'s compressed twin: `x[1,IN,1,S] @ w[OUT,IN]^T` with the
+/// weight stored int8 (ios18 spelling) or as a 4-bit palette with a
+/// per-channel output scale (ios16 spelling).
+public func buildConvMILTextForm(
+    inputDim: Int, outputDim: Int, sequenceLength: Int,
+    weight: ANEConvWeightRefs, programTag: String = UUID().uuidString
+) -> String {
+    let file = "weight.bin"
+    switch weight {
+    case let .int8(data, scale):
+        let d = MILDialect.ios18
+        return """
+        \(d.header(programTag: programTag))
+          func main<\(d.funcTarget)>(tensor<fp16, [1, \(inputDim), 1, \(sequenceLength)]> x) {
+            tensor<fp16, [\(outputDim), \(inputDim), 1, 1]> w = constexpr_affine_dequantize()[axis = int32(0), name = string("wdeq"), quantized_data = tensor<int8, [\(outputDim), \(inputDim), 1, 1]>(\(d.blob(file: file, offset: data))), scale = tensor<fp16, [\(outputDim)]>(\(d.blob(file: file, offset: scale))), zero_point = int8(0)];
+            \(d.convConsts)
+            \(d.conv(out: "y", outputDim: outputDim, sequenceLength: sequenceLength, weight: "w", x: "x", name: "conv"))
+          } -> (y);
+        }
+        """
+    case let .int4(indices, lut, scale):
+        let d = MILDialect.ios16
+        return """
+        \(d.header(programTag: programTag))
+            func main<\(d.funcTarget)>(tensor<fp16, [1, \(inputDim), 1, \(sequenceLength)]> x) {
+                tensor<fp16, [\(outputDim), \(inputDim), 1, 1]> w = constexpr_lut_to_dense()[indices = tensor<uint8, [\(outputDim * inputDim / 2)]>(\(d.blob(file: file, offset: indices))), lut = tensor<fp16, [16]>(\(d.blob(file: file, offset: lut))), name = \(d.str("wdeq")), shape = tensor<uint32, [4]>([\(outputDim), \(inputDim), 1, 1])];
+                tensor<fp16, [1, \(outputDim), 1, 1]> ws = const()[name=\(d.str("ws")), val=tensor<fp16, [1, \(outputDim), 1, 1]>(\(d.blob(file: file, offset: scale)))];
+                \(d.convConsts)
+                \(d.conv(out: "y_raw", outputDim: outputDim, sequenceLength: sequenceLength, weight: "w", x: "x", name: "conv"))
+                tensor<fp16, [1, \(outputDim), 1, \(sequenceLength)]> y = mul(x=y_raw, y=ws)\(d.named("scale"));
+            } -> (y);
+        }
+        """
+    }
 }

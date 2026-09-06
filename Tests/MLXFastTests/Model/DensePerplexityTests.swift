@@ -38,21 +38,34 @@ struct DensePerplexityTests {
         let weightsURL = URL(fileURLWithPath: weights)
         Qwen4ExpRuntime.weightsDirectory = weightsURL
 
-        let box = Box<ModelContext>()
-        let failure = Box<String>()
-        let semaphore = DispatchSemaphore(value: 0)
-        Task {
-            do {
-                box.value = try await LLMModelFactory.shared.load(
-                    from: weightsURL, using: #huggingFaceTokenizerLoader())
-            } catch {
-                failure.value = String(describing: error)
+        // The MoE tree loads through the factory directly. The dense Qwen35
+        // tree carries a `language_model.` key prefix that only the head
+        // attachment's loader strips, so retry inside a headless attachment
+        // when the plain load fails on a missing key.
+        func factoryLoad() -> (ModelContext?, String?) {
+            let box = Box<ModelContext>()
+            let failure = Box<String>()
+            let semaphore = DispatchSemaphore(value: 0)
+            Task {
+                do {
+                    box.value = try await LLMModelFactory.shared.load(
+                        from: weightsURL, using: #huggingFaceTokenizerLoader())
+                } catch {
+                    failure.value = String(describing: error)
+                }
+                semaphore.signal()
             }
-            semaphore.signal()
+            semaphore.wait()
+            return (box.value, failure.value)
         }
-        semaphore.wait()
-        guard let context = box.value else {
-            throw MLXFastError.invalidInput("failed to load model: \(failure.value ?? "?")")
+        var (loaded, why) = factoryLoad()
+        if loaded == nil {
+            let retry = try? Qwen36MTPHeadAttachment.withHeadAttached(
+                backboneDirectory: weightsURL, headDirectory: nil) { _ in factoryLoad() }
+            if let retry { (loaded, why) = (retry.0, retry.1 ?? why) }
+        }
+        guard let context = loaded else {
+            throw MLXFastError.invalidInput("failed to load model: \(why ?? "?")")
         }
 
         let files = try FileManager.default.contentsOfDirectory(atPath: dir)

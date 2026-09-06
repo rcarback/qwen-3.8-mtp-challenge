@@ -111,14 +111,11 @@ final class Qwen4ExpGatedDeltaNet: Module {
     /// or nil when the lane is off or the program failed to build.
     func aneInProjection(sequenceLength: Int) -> Qwen4ExpANEProjection? {
         guard Qwen4ExpANELane.enabled else { return nil }
-        // The ANE fp16 lane needs dense weights. A QuantizedLinear's `.weight`
-        // is packed (for q8, dim(1) = in/4), so building the fp16 program from
-        // it uses the wrong inputDim and the real activation then trips
-        // ANEDirectDispatch's shape precondition. The split path guards on this;
-        // match it and stay on the GPU.
-        guard !(inProjQKV is QuantizedLinear), !(inProjZ is QuantizedLinear) else { return nil }
+        // A QuantizedLinear's `.weight` is the packed form; the program is built
+        // from the dequantized tensors in the configured storage form.
+        guard let wqkv = Qwen4ExpANELane.denseWeight(inProjQKV), let wz = Qwen4ExpANELane.denseWeight(inProjZ) else { return nil }
         return aneInProj.program(
-            weight: { concatenated([inProjQKV.weight, inProjZ.weight], axis: 0) },
+            weight: { concatenated([wqkv, wz], axis: 0) },
             sequenceLength: sequenceLength)
     }
 

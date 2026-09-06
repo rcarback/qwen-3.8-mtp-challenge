@@ -16,6 +16,24 @@ enum Qwen4ExpANELane {
         Int(ProcessInfo.processInfo.environment["MLX_QWEN4EXP_ANE_MICROBATCH"] ?? "") ?? 256
     static let minSeq: Int = Int(ProcessInfo.processInfo.environment["MLX_ANE_MIN_SEQ"] ?? "") ?? 128
     static let log: Bool = ProcessInfo.processInfo.environment["MLX_ANE_LOG"] == "1"
+    /// `MLX_ANE_WEIGHT_FORM=fp16|int8|int4`, the storage form of every ANE
+    /// program this tower builds. Shared with the dense tower's switch.
+    static let weightForm: ANEWeightForm = ANESplitConfig.weightForm
+
+    /// The dense `[out, in]` weight of a projection, dequantizing a
+    /// `QuantizedLinear` (whose `.weight` is the packed form, for q8
+    /// `dim(1) = in/4`) through MLX's own `dequantized` so the ANE program is
+    /// built from the same values the GPU computes with.
+    static func denseWeight(_ module: Module) -> MLXArray? {
+        if let q = module as? QuantizedLinear {
+            guard let biases = q.biases else { return nil }
+            let w = dequantized(q.weight, scales: q.scales, biases: biases, groupSize: q.groupSize, bits: q.bits)
+            eval(w)
+            return w
+        }
+        if let l = module as? Linear { return l.weight }
+        return nil
+    }
 
     /// The lane engages only when a prefill holds at least two full micro-batches.
     static func armed(sequenceLength: Int) -> Bool {
@@ -32,18 +50,42 @@ final class Qwen4ExpANEProjection {
     let sequenceLength: Int
     private let model: ANEInMemoryModel
 
-    init(weight: MLXArray, sequenceLength: Int) throws {
+    /// `weight` is the DENSE `[out, in]` projection (a `QuantizedLinear` is
+    /// dequantized first by `Qwen4ExpANELane.denseWeight`). `form` selects the
+    /// storage the ANE program keeps it in; see `ANEWeightForm`.
+    init(weight: MLXArray, sequenceLength: Int, form: ANEWeightForm = Qwen4ExpANELane.weightForm) throws {
         precondition(weight.ndim == 2, "Qwen4ExpANEProjection weight must be [out, in], got \(weight.shape)")
         out = weight.dim(0)
         inn = weight.dim(1)
         self.sequenceLength = sequenceLength
-        let blob = buildConvWeightBlob(f16Bytes(weight))
         // Same identity for the same weights in every process: the ANE daemon's
         // compiled-program cache hits instead of growing (see ANEFusedMLP).
-        let programTag = "sha256:" + SHA256.hash(data: blob).map { String(format: "%02x", $0) }.joined()
-        let milText = buildConvMILText(
-            inputDim: inn, outputDim: out, sequenceLength: sequenceLength, programTag: programTag)
-        let m = try ANEInMemoryModel(milText: milText, weightBlob: blob, weightFileName: "weight_data.bin")
+        func tag(_ blob: Data) -> String {
+            "sha256:" + SHA256.hash(data: blob).map { String(format: "%02x", $0) }.joined()
+        }
+        let m: ANEInMemoryModel
+        switch form {
+        case .fp16:
+            let blob = buildConvWeightBlob(f16Bytes(weight))
+            let milText = buildConvMILText(
+                inputDim: inn, outputDim: out, sequenceLength: sequenceLength, programTag: tag(blob))
+            m = try ANEInMemoryModel(milText: milText, weightBlob: blob, weightFileName: "weight_data.bin")
+        case .int8:
+            let q = ANEWeightQuant.int8PerChannel(weight)
+            let (blob, o) = buildMultiWeightBlob(chunks: [q.data, q.scale])
+            let milText = buildConvMILTextForm(
+                inputDim: inn, outputDim: out, sequenceLength: sequenceLength,
+                weight: .int8(data: o[0], scale: o[1]), programTag: tag(blob))
+            m = try ANEInMemoryModel(milText: milText, weightBlob: blob, weightFileName: "weight.bin")
+        case .int4:
+            let codebook = ANEWeightQuant.fitCodebook([weight])
+            let q = ANEWeightQuant.int4Palette(weight, codebook: codebook)
+            let (blob, o) = buildMultiWeightBlob(chunks: [q.indices, q.lut, q.scale], chunkTypes: [3, 1, 1])
+            let milText = buildConvMILTextForm(
+                inputDim: inn, outputDim: out, sequenceLength: sequenceLength,
+                weight: .int4(indices: o[0], lut: o[1], scale: o[2]), programTag: tag(blob))
+            m = try ANEInMemoryModel(milText: milText, weightBlob: blob, weightFileName: "weight.bin")
+        }
         try m.compile()
         try m.load()
         model = m

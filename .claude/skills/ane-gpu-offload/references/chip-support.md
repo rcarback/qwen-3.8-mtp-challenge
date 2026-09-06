@@ -16,8 +16,9 @@ cost, the program budget, and whether int8 activation compute exists.
 | ANE fp16 compute | 12 TFLOP/s (paper) | | | |
 | per-dispatch floor | ~190 us, ~98 percent software/firmware; `ANE_ProgramSendRequest` ~163 us (paper) | ~119 us fixed plus bytes/78 GB/s (field guide); ~95 us XPC+IOKit (Orion) | **0.30 ms per program including surface staging** | |
 | int8 weight storage, dequantized to fp16 on-chip | yes (paper: "folds to dense fp16") | | **confirmed, 0.8 percent error** | yes |
-| int4 palette (LUT) weights | yes, ~2.37x fp16 bandwidth and speed (paper, M1) | | **confirmed**, in-memory compile, 15.9 percent error at a per-tensor uniform palette | yes |
-| int4 blockwise (affine group) weights | accepted (paper) | | **rejected**, the in-memory compiler refuses the iOS18 op with a byte-identical blob | yes (Core ML int4) |
+| int4 palette (LUT) weights | yes, ~2.37x fp16 bandwidth and speed (paper, M1) | | **confirmed**, per-tensor (in memory) and grouped (`.mlpackage`); 0.27 ms vs 0.29 fp16 at `[1280x2560]` S=256 | yes |
+| int4 / int8 blockwise (affine group) weights | accepted (paper) | | **not ANE-executable**: the in-memory compiler rejects the op; Core ML places the consuming conv on the GPU | Core ML int4, on the GPU |
+| ANE-eligible activation and shape ops (`MLComputePlan`) | | | silu, gelu, sigmoid, tanh, exp, erf, clip, sqrt, rsqrt, abs, softmax, layer_norm, reduce_mean, reduce_max, mul, add, reshape, transpose, concat, slice_by_index, matmul, linear, scaled_dot_product_attention | |
 | structured sparsity (>= 50 percent zeros) | 1.55 to 1.64x at 0.43x bytes (paper) | | not probed | |
 | int8 activation compute (int8 x int8) | no evidence | no evidence | not measured here | **advertised**: "increased throughput for int8-int8 compute on Neural Engine" on A17 Pro and M4 |
 | fp32 compute | no, fp16-native (paper) | no | **rejected by compiler** | no |

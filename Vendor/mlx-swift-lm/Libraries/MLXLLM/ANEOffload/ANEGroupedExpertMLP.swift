@@ -72,7 +72,8 @@ public final class ANEGroupedExpertMLP {
 
     /// `gate`/`up` are `groupSize` arrays of `[inter, hidden]`; `down` of
     /// `[hidden, inter]`. Any float dtype; cast to fp16 inside.
-    public init(gate: [MLXArray], up: [MLXArray], down: [MLXArray], capacity: Int) throws {
+    public init(gate: [MLXArray], up: [MLXArray], down: [MLXArray], capacity: Int,
+                weightForm: ANEWeightForm = ANESplitConfig.weightForm) throws {
         precondition(!gate.isEmpty, "ANEGroupedExpertMLP needs at least one expert")
         precondition(gate.count == up.count && up.count == down.count,
                      "ANEGroupedExpertMLP: gate/up/down expert counts differ")
@@ -87,24 +88,61 @@ public final class ANEGroupedExpertMLP {
                 "ANEGroupedExpertMLP: expert \(e) shapes \(gate[e].shape)/\(up[e].shape)/\(down[e].shape) "
                     + "do not match [\(inter), \(hidden)] / [\(hidden), \(inter)]")
         }
-        programBytes = 3 * groupSize * inter * hidden * 2
+        let bytesPerWeight: Int
+        switch weightForm {
+        case .fp16: bytesPerWeight = 2
+        case .int8: bytesPerWeight = 1
+        case .int4: bytesPerWeight = 1  // packed nibbles: half a byte, rounded up for the budget
+        }
+        programBytes = 3 * groupSize * inter * hidden * bytesPerWeight
 
         // Concatenate along the OUTPUT-channel axis: a grouped conv reads its
         // weight as `groups` consecutive blocks of `C_out/groups` rows.
         let gw = concatenated(gate.map { $0.asType(.float16) }, axis: 0)  // [G*inter, hidden]
         let uw = concatenated(up.map { $0.asType(.float16) }, axis: 0)  // [G*inter, hidden]
         let dw = concatenated(down.map { $0.asType(.float16) }, axis: 0)  // [G*hidden, inter]
-        let (blob, offsets) = buildMultiWeightBlob(chunks: [f16Bytes(gw), f16Bytes(uw), f16Bytes(dw)])
         // Same weight-blob-hash program identity as `ANEFusedMLP`: the ANE
         // runtime derives the descriptor identity from the MIL text alone, so
         // without this tag every layer's group would collide on one staging
         // directory and only the first loaded program would hold its own
         // weights.
-        let programTag = "sha256:" + SHA256.hash(data: blob).map { String(format: "%02x", $0) }.joined()
-        let milText = buildGroupedSwiGLUDownMILText(
-            inputDim: hidden, hiddenDim: inter, groups: groupSize, sequenceLength: capacity,
-            gateOffset: offsets[0], upOffset: offsets[1], downOffset: offsets[2],
-            programTag: programTag)
+        func tag(_ blob: Data) -> String {
+            "sha256:" + SHA256.hash(data: blob).map { String(format: "%02x", $0) }.joined()
+        }
+        let blob: Data
+        let milText: String
+        switch weightForm {
+        case .fp16:
+            let (b, offsets) = buildMultiWeightBlob(chunks: [f16Bytes(gw), f16Bytes(uw), f16Bytes(dw)])
+            blob = b
+            milText = buildGroupedSwiGLUDownMILText(
+                inputDim: hidden, hiddenDim: inter, groups: groupSize, sequenceLength: capacity,
+                gateOffset: offsets[0], upOffset: offsets[1], downOffset: offsets[2],
+                programTag: tag(b))
+        case .int8:
+            let g = ANEWeightQuant.int8PerChannel(gw), u = ANEWeightQuant.int8PerChannel(uw), dn = ANEWeightQuant.int8PerChannel(dw)
+            let (b, o) = buildMultiWeightBlob(chunks: [g.data, u.data, dn.data, g.scale, u.scale, dn.scale])
+            blob = b
+            milText = buildSwiGLUDownMILTextCompressed(
+                inputDim: groupSize * hidden, hiddenDim: groupSize * inter, outputDim: groupSize * hidden,
+                sequenceLength: capacity,
+                weights: .int8(gate: o[0], up: o[1], down: o[2], gateScale: o[3], upScale: o[4], downScale: o[5]),
+                groups: groupSize, programTag: tag(b))
+        case .int4:
+            let codebook = ANEWeightQuant.fitCodebook([gw, uw, dw])
+            let g = ANEWeightQuant.int4Palette(gw, codebook: codebook)
+            let u = ANEWeightQuant.int4Palette(uw, codebook: codebook)
+            let dn = ANEWeightQuant.int4Palette(dw, codebook: codebook)
+            let (b, o) = buildMultiWeightBlob(
+                chunks: [g.indices, u.indices, dn.indices, g.lut, g.scale, u.scale, dn.scale],
+                chunkTypes: [3, 3, 3, 1, 1, 1, 1])
+            blob = b
+            milText = buildSwiGLUDownMILTextCompressed(
+                inputDim: groupSize * hidden, hiddenDim: groupSize * inter, outputDim: groupSize * hidden,
+                sequenceLength: capacity,
+                weights: .int4(gateIdx: o[0], upIdx: o[1], downIdx: o[2], lut: o[3], gateScale: o[4], upScale: o[5], downScale: o[6]),
+                groups: groupSize, programTag: tag(b))
+        }
         let m = try ANEInMemoryModel(milText: milText, weightBlob: blob, weightFileName: "weight.bin")
         try m.compile()
         try m.load()

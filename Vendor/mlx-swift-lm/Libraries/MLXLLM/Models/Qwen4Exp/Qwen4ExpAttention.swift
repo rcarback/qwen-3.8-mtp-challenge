@@ -244,13 +244,10 @@ final class Qwen4ExpAttention: Module {
 
     func aneQProjection(sequenceLength: Int) -> Qwen4ExpANEProjection? {
         guard Qwen4ExpANELane.enabled else { return nil }
-        // The ANE fp16 lane needs a dense weight. A QuantizedLinear's `.weight`
-        // is the packed representation (for q8, dim(1) = in/4), so handing it to
-        // the fp16 program builder makes a program at the wrong inputDim and the
-        // real activation then trips ANEDirectDispatch's shape precondition. The
-        // split path guards on this too; match it and stay on the GPU.
-        guard !(qProj is QuantizedLinear) else { return nil }
-        return aneQProj.program(weight: { qProj.weight }, sequenceLength: sequenceLength)
+        // A QuantizedLinear's `.weight` is the packed form; the program is built
+        // from the dequantized tensor in the configured storage form.
+        guard let w = Qwen4ExpANELane.denseWeight(qProj) else { return nil }
+        return aneQProj.program(weight: { w }, sequenceLength: sequenceLength)
     }
 
     /// The cache-free head of `finish`: split the fused q/gate projection, run

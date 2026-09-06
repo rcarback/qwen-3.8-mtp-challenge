@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXNN
 import MLXRandom
 import Testing
 
@@ -177,6 +178,62 @@ struct ANEQuantizedWeightProbeTests {
         } catch {
             print("[q-probe] int4-lut: FAILED \(error)")
             Issue.record("int4 palette weight storage not accepted: \(error)")
+        }
+    }
+}
+
+/// The fused SwiGLU-down program in each weight form, on the real ANE through
+/// the in-memory path, against an fp32 reference of the ORIGINAL weights: the
+/// error each form adds on top of the fp16 compute, and the per-call time at a
+/// small shape. This is the unit gate before the dense-tower end-to-end sweep.
+@Suite(.serialized)
+struct ANEFusedFormProbeTests {
+    static var enabled: Bool {
+        ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1"
+    }
+
+    @Test("fused SwiGLU-down in fp16, int8 and int4 forms", .enabled(if: enabled))
+    func fusedForms() throws {
+        try #require(ANERuntime.available())
+        let hidden = 1024, inner = 512, S = 256
+        MLXRandom.seed(3)
+        let gate = (MLXRandom.normal([inner, hidden]) * 0.02).asType(.bfloat16)
+        let up = (MLXRandom.normal([inner, hidden]) * 0.02).asType(.bfloat16)
+        let down = (MLXRandom.normal([hidden, inner]) * 0.02).asType(.bfloat16)
+        let x = MLXRandom.normal([S, hidden]).asType(.float16)
+        eval(gate, up, down, x)
+        let x32 = x.asType(.float32)
+        let g = matmul(x32, gate.asType(.float32).transposed(1, 0))
+        let u = matmul(x32, up.asType(.float32).transposed(1, 0))
+        let ref = matmul(silu(g) * u, down.asType(.float32).transposed(1, 0))
+        let refMax = MLX.abs(ref).max(); eval(refMax)
+        for form in ANEWeightForm.allCases {
+            do {
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                let mlp = try ANEFusedMLP(
+                    hidden: hidden, innerFraction: inner, sequenceLength: S,
+                    gate: gate.asType(.float16), up: up.asType(.float16), down: down.asType(.float16),
+                    activation: .expDiv, weightForm: form)
+                let buildMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+                let y = try mlp(x)
+                let d = MLX.abs(y.asType(.float32) - ref)
+                let maxAbs = d.max(); let meanAbs = d.mean(); let meanRef = MLX.abs(ref).mean()
+                eval(maxAbs, meanAbs, meanRef)
+                var t: [Double] = []
+                for _ in 0 ..< 5 { _ = try mlp(x) }
+                for _ in 0 ..< 20 {
+                    let s = DispatchTime.now().uptimeNanoseconds
+                    _ = try mlp(x)
+                    t.append(Double(DispatchTime.now().uptimeNanoseconds - s) / 1e6)
+                }
+                t.sort()
+                print(String(format: "[fused-form] %@: OK build %.0f ms | maxAbs %.4f rel %.4f meanRel %.4f | %.3f ms/call",
+                             form.rawValue, buildMs, maxAbs.item(Float.self), maxAbs.item(Float.self) / refMax.item(Float.self),
+                             meanAbs.item(Float.self) / meanRef.item(Float.self), t[t.count / 2]))
+            } catch {
+                print("[fused-form] \(form.rawValue): FAILED \(error)")
+                Issue.record("fused \(form.rawValue) program failed: \(error)")
+            }
         }
     }
 }

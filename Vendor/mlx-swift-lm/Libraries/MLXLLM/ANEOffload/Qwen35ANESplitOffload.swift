@@ -74,6 +74,15 @@ public enum ANESplitConfig {
         return ANEActivation(rawValue: String(cString: cString)) ?? .expDiv
     }()
 
+    /// `MLX_ANE_WEIGHT_FORM=fp16|int8|int4`: the storage form of the ANE
+    /// program's weights. `fp16` (default) is the dequantized tensor; `int8`
+    /// re-quantizes it per output channel; `int4` re-quantizes it to a shared
+    /// 16-entry codebook with a per-channel output scale. See `ANEWeightForm`.
+    public static let weightForm: ANEWeightForm = {
+        guard let cString = getenv("MLX_ANE_WEIGHT_FORM") else { return .fp16 }
+        return ANEWeightForm(rawValue: String(cString: cString)) ?? .fp16
+    }()
+
     /// `MLX_ANE_VERIFY=1` (diagnostic): at every offloaded call, also compute
     /// the all-GPU MLP and log the per-layer max error of the substituted
     /// result. Doubles MLP cost; never for timing.
@@ -182,6 +191,31 @@ public final class ANESplitMLPCache: @unchecked Sendable {
             // fallback + log) rather than silently dequantizing instead: a
             // set flag that quietly changed meaning would poison every
             // fidelity comparison made against it.
+            // Bank leg first (MLX_ANE_BANK_DIR): the offline multifunction
+            // package for this bucket, one function per layer. A missing
+            // package for this bucket falls through to the in-memory build.
+            if layerIndex >= 0, ANEFusedMLPBank.directory != nil {
+                do {
+                    let fn = try ANEFusedMLPBank.function(bucket: key, layer: layerIndex, hidden: hidden)
+                    let fBank = ANEFusedMLPBank.prefixChannels(bucket: key, layer: layerIndex)
+                    let fSplit = ANEFusedSplitMLP.prefixChannels(inter: inter, aneFraction: ANESplitConfig.fraction)
+                    guard fBank == nil || fBank == fSplit else {
+                        throw NSError(domain: "ANEFusedMLPBank", code: 5, userInfo: [NSLocalizedDescriptionKey:
+                            "bank F=\(fBank!) but MLX_ANE_FRACTION gives F=\(fSplit)"])
+                    }
+                    let split = try ANEFusedSplitMLP(
+                        gateW: gateW, gateScales: gateScales, gateBiases: gateBiases,
+                        upW: upW, upScales: upScales, upBiases: upBiases,
+                        downW: downW, downScales: downScales, downBiases: downBiases,
+                        hidden: hidden, inter: inter, sequenceLength: key,
+                        aneFraction: ANESplitConfig.fraction, bank: fn)
+                    programs[key] = split
+                    aneLog("built split program S=\(s) bucket=\(key) fraction=\(ANESplitConfig.fraction) hidden=\(hidden) inter=\(inter) source=bank")
+                    return split
+                } catch {
+                    aneLog("bank unavailable for layer \(layerIndex) bucket=\(key): \(error); building in memory")
+                }
+            }
             var prefix: ANEPrefixWeights? = nil
             if layerIndex >= 0, let source = ANEBF16WeightSource.shared {
                 let f = ANEFusedSplitMLP.prefixChannels(inter: inter, aneFraction: ANESplitConfig.fraction)

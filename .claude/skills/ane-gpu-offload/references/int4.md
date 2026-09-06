@@ -14,13 +14,16 @@ which is a quantizer choice, not a hardware question.
 | form | MIL op | vintage | in-memory ANE compile | bandwidth (paper) |
 | --- | --- | --- | --- | --- |
 | palette (lookup table) | `constexpr_lut_to_dense` | iOS16 | **confirmed** | streams natively, ~2.37x fp16 |
-| blockwise affine (group scale) | `constexpr_blockwise_shift_scale` | iOS18 | **rejected**, `InvalidMILProgram`, with a byte-identical blob | affine forms fold to fp16 |
+| blockwise affine (group scale) | `constexpr_blockwise_shift_scale` | iOS18 | **rejected** in memory (`InvalidMILProgram`, byte-identical blob); through `.mlpackage` Core ML compiles it and places the conv on the **GPU** (`MLComputePlan`, 2026-09-06: int8 g32, int4 g32, int4 g64, with and without offset, all `supported=cpu/gpu`) | affine forms fold to fp16 |
+| grouped palette (one LUT per row block) | `constexpr_lut_to_dense`, `lut` shaped `[O/64, 1, 1, 1, 16, 1]` | iOS18 | **confirmed on the ANE through `.mlpackage`** (0.27 ms, same as per-tensor; unprobed in memory) | palette |
 
-The pattern behind the split: the in-memory ANE compiler accepts the iOS16
-constexpr ops (`affine_dequantize`, `lut_to_dense`) and rejects the iOS18 one,
-even though coremltools emits it and Core ML compiles it. Use the palette op.
-It is also the form with the measured bandwidth win, so this is the right
-answer, not a fallback.
+The pattern behind the split is now settled: the blockwise op is not an ANE
+op at all. Core ML compiles it and then routes the conv that consumes the
+weight to the GPU, so the MLX group-affine tensor (q4 g32, q4 g64, q8 g32)
+can never be the ANE's tensor, and no ANE weight is byte-identical to the
+GPU's. The ANE's compressed forms are int8 per-channel affine and the
+palette, per-tensor or grouped. Use the palette op. It is also the form with
+the measured bandwidth win, so this is the right answer, not a fallback.
 
 ## The MIL text (byte-exact, iOS16 conventions, from `buildConvMILTextInt4LUT`)
 
@@ -89,14 +92,20 @@ improves without leaving the confirmed op:
    `[OUT, 1, 1, 1]` const; the `mul` is a confirmed accurate ANE op. This
    gives per-channel range at 4-bit storage.
 3. **Grouped LUTs.** The iOS18 `constexpr_lut_to_dense` carries a per-group
-   LUT shape; its in-memory compile is untested and, given the blockwise
-   result, likely rejected. Try it only after 1 and 2.
+   LUT shape. Confirmed on the ANE through the `.mlpackage` path with one
+   codebook per 64 output rows at no time cost; a per-row codebook
+   (`[O, 1, 1, 1, 16, 1]`) costs 32 bytes per row. Untested in memory.
+4. **Do not chain a per-channel `constexpr_blockwise_shift_scale` after an
+   int8-entry LUT.** It stays on the ANE but runs 2.9x slower (0.77 ms
+   against 0.27). The output-side `mul` of option 2 is free.
 
-Match the GPU's group-64 affine int4 exactly is not possible through the
-palette op (a palette is a codebook, an affine group is a scale); the GPU and
-ANE will hold the same tensor at different 4-bit representations. Since this
-is not the ranked model, that is acceptable; measure the end-to-end
-divergence, not byte identity.
+Matching the GPU's group-64 affine int4 exactly is not possible on the ANE
+at all (the blockwise op is GPU-only, above), so the GPU and ANE hold the
+same tensor at different 4-bit representations. The production form in this
+tree (`ANEWeightQuant.int4Palette`, `MLX_ANE_WEIGHT_FORM=int4`) is option 2:
+each row divided by its RMS, a 16-entry codebook fitted by Lloyd iterations
+on the pooled normalized values, and the per-row scale applied to the conv
+output. Measure the end-to-end divergence, not byte identity.
 
 ## NVFP4 on the ANE
 

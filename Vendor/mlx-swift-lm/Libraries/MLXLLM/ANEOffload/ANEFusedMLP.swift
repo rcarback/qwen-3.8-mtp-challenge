@@ -27,7 +27,8 @@ public final class ANEFusedMLP {
     public init(
         hidden: Int, innerFraction: Int, sequenceLength: Int,
         gate: MLXArray, up: MLXArray, down: MLXArray,
-        activation: ANEActivation = ANESplitConfig.activation
+        activation: ANEActivation = ANESplitConfig.activation,
+        weightForm: ANEWeightForm = ANESplitConfig.weightForm
     ) throws {
         precondition(gate.shape == [innerFraction, hidden],
                      "ANEFusedMLP: gate expected [\(innerFraction), \(hidden)], got \(gate.shape)")
@@ -39,7 +40,6 @@ public final class ANEFusedMLP {
         self.innerFraction = innerFraction
         self.sequenceLength = sequenceLength
 
-        let (blob, offsets) = buildMultiWeightBlob(chunks: [f16Bytes(gate), f16Bytes(up), f16Bytes(down)])
         // The program identity the ANE runtime derives covers the MIL text
         // only, so the tag stamped into `buildInfo` is what separates one
         // layer's program from another's (see `ANEInMemoryModel`). A random
@@ -50,12 +50,46 @@ public final class ANEFusedMLP {
         // every process, so a rebuild of an unchanged layer at the same
         // shape and activation is a cache hit: no recompile, no growth.
         // Shape and activation are already in the text the hash sits in.
-        let programTag = "sha256:" + SHA256.hash(data: blob).map { String(format: "%02x", $0) }.joined()
-        let milText = buildSwiGLUDownMILText(
-            inputDim: hidden, hiddenDim: innerFraction, outputDim: hidden, sequenceLength: sequenceLength,
-            gateOffset: offsets[0], upOffset: offsets[1], downOffset: offsets[2],
-            activation: activation, programTag: programTag
-        )
+        func tag(_ blob: Data) -> String {
+            "sha256:" + SHA256.hash(data: blob).map { String(format: "%02x", $0) }.joined()
+        }
+        let blob: Data
+        let milText: String
+        switch weightForm {
+        case .fp16:
+            let (b, offsets) = buildMultiWeightBlob(chunks: [f16Bytes(gate), f16Bytes(up), f16Bytes(down)])
+            blob = b
+            milText = buildSwiGLUDownMILText(
+                inputDim: hidden, hiddenDim: innerFraction, outputDim: hidden, sequenceLength: sequenceLength,
+                gateOffset: offsets[0], upOffset: offsets[1], downOffset: offsets[2],
+                activation: activation, programTag: tag(b)
+            )
+        case .int8:
+            let g = ANEWeightQuant.int8PerChannel(gate)
+            let u = ANEWeightQuant.int8PerChannel(up)
+            let dn = ANEWeightQuant.int8PerChannel(down)
+            let (b, o) = buildMultiWeightBlob(chunks: [g.data, u.data, dn.data, g.scale, u.scale, dn.scale])
+            blob = b
+            milText = buildSwiGLUDownMILTextCompressed(
+                inputDim: hidden, hiddenDim: innerFraction, outputDim: hidden, sequenceLength: sequenceLength,
+                weights: .int8(gate: o[0], up: o[1], down: o[2], gateScale: o[3], upScale: o[4], downScale: o[5]),
+                activation: activation, programTag: tag(b)
+            )
+        case .int4:
+            let codebook = ANEWeightQuant.fitCodebook([gate, up, down])
+            let g = ANEWeightQuant.int4Palette(gate, codebook: codebook)
+            let u = ANEWeightQuant.int4Palette(up, codebook: codebook)
+            let dn = ANEWeightQuant.int4Palette(down, codebook: codebook)
+            let (b, o) = buildMultiWeightBlob(
+                chunks: [g.indices, u.indices, dn.indices, g.lut, g.scale, u.scale, dn.scale],
+                chunkTypes: [3, 3, 3, 1, 1, 1, 1])
+            blob = b
+            milText = buildSwiGLUDownMILTextCompressed(
+                inputDim: hidden, hiddenDim: innerFraction, outputDim: hidden, sequenceLength: sequenceLength,
+                weights: .int4(gateIdx: o[0], upIdx: o[1], downIdx: o[2], lut: o[3], gateScale: o[4], upScale: o[5], downScale: o[6]),
+                activation: activation, programTag: tag(b)
+            )
+        }
         let m = try ANEInMemoryModel(milText: milText, weightBlob: blob, weightFileName: "weight.bin")
         try m.compile()
         try m.load()
