@@ -3444,3 +3444,49 @@ copies, not the zero-copy IOSurface dispatch the direct lane uses. That cost
 amortizes over a compute-bound prefill and does not help decode, so the bank
 is a prefill tool, and only if the multifunction program is loaded through a
 `.mlpackage`.
+
+### The banked dense-lane prefill does not ship, and why
+
+Beads e2l and p84 asked whether the multifunction bank turns the count-relieved
+dense lane into a prefill win. Measured on the M4 Max, the answer is no, for a
+reason that took the whole chain to see.
+
+The ANE compute is genuinely faster at a real prefill shape. `in_proj_qkv`
+[10240, 2560] at S=128, warm, median of 50:
+
+| arm | ms |
+| --- | --- |
+| ANE compute | 0.598 |
+| GPU 4-bit group-64 (production) | 0.689 |
+| GPU dense bf16 | 0.839 |
+| input marshalling copy | 0.177 |
+
+So the ANE beats the quantized GPU by 0.87x on compute alone. The catch is the
+delivery path. That 0.598 ms is the direct zero-copy IOSurface dispatch. The
+only path that reaches it, the in-memory `_ANEInMemoryModel`, registers one
+procedure, so it is capped at 126 programs. The dense lane is about 48 programs
+per bucket, 12 full-attention `q_proj` plus 36 linear `in_proj_qkv`, so one or
+two prefill buckets already fit under the cap on the zero-copy path. The bank
+is only needed for a third bucket and beyond.
+
+But the bank forfeits the zero-copy dispatch. A multifunction program runs only
+through `MLModel.prediction`, whose input copy alone (0.177 ms) makes the ANE a
+net loss: (ANE plus input copy) over the quantized GPU is 1.13x, before the
+output copy and before ANE and GPU contend for memory bandwidth.
+
+The zero-copy path that could dispatch a banked program by procedure index does
+not compose with the multifunction compile. `_ANEModel` plus `_ANEClient`
+expose `procedureInfoForProcedureIndex:` and a program handle, but their loader
+reads the old Espresso `model.espresso.net`, while `MLModel.compileModel` of an
+ML Program writes `model.mil` (the compiled `.mlmodelc` holds `model.mil`,
+`coremldata.bin` and `analytics`, no Espresso network and no pre-built ANE
+program). So the multifunction registration lives only in the copy-based
+prediction path, and the zero-copy handle path sees one procedure.
+
+The bank is a real answer to the 126-program count in the abstract, proven
+earlier. It does not yield a net-positive banked prefill here, because
+relieving the count costs the zero-copy dispatch that made the ANE win, and the
+zero-copy path already covers the dense lane at the one or two buckets that fit.
+A future bridge would need either a multifunction Espresso `NetworkDescription`
+that `_ANEModel` can load, or an ML-Program-aware raw ANE load path; both are
+deep private-framework work and are recorded on bead p84.

@@ -223,6 +223,208 @@ struct ANEMultiFunctionProbeTests {
         }
     }
 
+    /// p84 feasibility: can a multifunction program compiled to `.mlmodelc` be
+    /// loaded as a private `_ANEModel` whose procedures are individually
+    /// addressable, the prerequisite for zero-copy `procedureIndex` dispatch?
+    /// `_ANEModel` exposes `+modelAtURL:key:`, `-procedureInfoForProcedureIndex:`
+    /// and `-programHandle`. This probe loads the compiled model and reads
+    /// procedure info for indices 0 and 1; both non-nil means the direct path
+    /// can see every packed function, and the zero-copy bridge is buildable.
+    @Test("p84: compiled multifunction model exposes per-procedure info", .enabled(if: enabled))
+    func compiledModelProcedureInfo() throws {
+        try #require(ANERuntime.available())
+        guard #available(macOS 15.0, *) else { return }
+        guard let aneModelClass = ANERuntime.cls("_ANEModel") else {
+            Issue.record("_ANEModel class not present")
+            return
+        }
+        let inn = 64, out = 64, seq = 128
+        let spec = buildMultiFunctionConvSpec(procs: [
+            ANEMultiFunctionProc(name: "main", inputDim: inn, outputDim: out, sequenceLength: seq, weight: f16Bytes(randomWeight(out, inn, seed: 1))),
+            ANEMultiFunctionProc(name: "proc1", inputDim: inn, outputDim: out, sequenceLength: seq, weight: f16Bytes(randomWeight(out, inn, seed: 2))),
+        ])
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mf-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let pkg = try writeMLPackage(spec: spec, dir: tmp)
+
+        // Compile the .mlpackage to a .mlmodelc URL, blocking on the async API.
+        let box = LoadBox()  // reuse the box just for its error/URL carriage
+        let urlBox = { () -> URL? in
+            final class UB: @unchecked Sendable { var url: URL?; var err: Error? }
+            let ub = UB()
+            let sema = DispatchSemaphore(value: 0)
+            Task.detached {
+                do { ub.url = try await MLModel.compileModel(at: pkg) } catch { ub.err = error }
+                sema.signal()
+            }
+            sema.wait()
+            if let e = ub.err { box.error = e }
+            return ub.url
+        }()
+        guard let compiled = urlBox else {
+            Issue.record("compileModel failed: \(box.error.map { "\($0)" } ?? "nil url")")
+            return
+        }
+        print("[p84] compiled -> \(compiled.lastPathComponent)")
+        if let items = try? FileManager.default.contentsOfDirectory(atPath: compiled.path).sorted() {
+            print("[p84] .mlmodelc contents: \(items.joined(separator: ", "))")
+        }
+
+        // `+modelAtURL:key:` — class factory, autoreleased (+0).
+        let msgSend = dlsym(dlopen(nil, RTLD_LAZY), "objc_msgSend")!
+        typealias ModelAtURL = @convention(c) (AnyObject?, Selector, AnyObject?, AnyObject?) -> Unmanaged<AnyObject>?
+        let modelAtURL = unsafeBitCast(msgSend, to: ModelAtURL.self)
+        let sel = Selector(("modelAtURL:key:"))
+        guard let modelU = modelAtURL(aneModelClass, sel, compiled as NSURL, nil) else {
+            Issue.record("modelAtURL:key: returned nil")
+            return
+        }
+        let model = modelU.takeUnretainedValue()
+        print("[p84] _ANEModel loaded: \(type(of: model))")
+
+        typealias ProcInfo = @convention(c) (AnyObject?, Selector, Int) -> Unmanaged<AnyObject>?
+        let procInfo = unsafeBitCast(msgSend, to: ProcInfo.self)
+        let piSel = Selector(("procedureInfoForProcedureIndex:"))
+        func readProcedures(_ tag: String) {
+            for idx in 0 ... 1 {
+                let info = procInfo(model, piSel, idx)?.takeUnretainedValue()
+                print("[p84] \(tag) procedureInfo(\(idx)): \(info.map { "\($0)" } ?? "nil")")
+            }
+            let handle = ANERuntime.sendUInt64(model, Selector(("programHandle")))
+            print("[p84] \(tag) programHandle: 0x\(String(handle, radix: 16))")
+        }
+        readProcedures("pre-load")
+
+        // Load onto the ANE via a fresh _ANEClient, which should populate the
+        // program handle and the procedure table.
+        guard let clientClass = ANERuntime.cls("_ANEClient") else {
+            Issue.record("_ANEClient class not present"); return
+        }
+        // Plain alloc/init returns nil; the client is a shared connection.
+        guard let client = ANERuntime.send(clientClass, Selector(("sharedConnection"))) else {
+            Issue.record("_ANEClient sharedConnection nil"); return
+        }
+        print("[p84] _ANEClient: \(type(of: client))")
+
+        typealias LoadModel = @convention(c) (AnyObject?, Selector, AnyObject?, AnyObject?, Int, UnsafeMutablePointer<Unmanaged<NSError>?>?) -> ObjCBool
+        let loadModel = unsafeBitCast(msgSend, to: LoadModel.self)
+        let loadSel = Selector(("loadModel:options:qos:error:"))
+        var errU: Unmanaged<NSError>?
+        let ok = withUnsafeMutablePointer(to: &errU) { p in
+            loadModel(client, loadSel, model, NSDictionary(), 0x15, p).boolValue
+        }
+        if ok {
+            print("[p84] _ANEClient loadModel: OK")
+        } else {
+            print("[p84] _ANEClient loadModel FAILED: \(errU?.takeUnretainedValue().localizedDescription ?? "unknown")")
+        }
+        readProcedures("post-load")
+    }
+
+    /// The pivotal measurement for beads e2l and p84: warm per-function
+    /// dispatch cost of a banked multifunction program at a REAL dense-lane
+    /// shape, through `MLModel.prediction`, versus the GPU matmul it would
+    /// replace. The bank cuts program COUNT, not dispatch COUNT, so this cost
+    /// is paid once per layer per projection regardless of banking. If it far
+    /// exceeds the GPU matmul, the MLModel.prediction path cannot carry a
+    /// full-coverage dense lane and e2l needs the zero-copy bridge (p84)
+    /// before it is worth wiring; if it is close, e2l can ship on this path.
+    ///
+    /// `in_proj_qkv` [10240, 2560] at S=128 is the largest real dense-lane
+    /// projection (52 MB fp16 per layer). Two functions keep the inline-const
+    /// spec under the 2 GB protobuf limit while still measuring per-call cost.
+    @Test("multifunction dispatch cost at real shape vs GPU", .enabled(if: enabled))
+    func realShapeDispatchCost() throws {
+        try #require(ANERuntime.available())
+        guard #available(macOS 15.0, *) else { return }
+        let inn = 2560, out = 10240, seq = 128
+        let w0 = randomWeight(out, inn, seed: 1)
+        let w1 = randomWeight(out, inn, seed: 2)
+        let x = { () -> MLXArray in MLXRandom.seed(9); let v = MLXRandom.normal([seq, inn]).asType(.float16); eval(v); return v }()
+
+        let spec = buildMultiFunctionConvSpec(procs: [
+            ANEMultiFunctionProc(name: "main", inputDim: inn, outputDim: out, sequenceLength: seq, weight: f16Bytes(w0)),
+            ANEMultiFunctionProc(name: "proc1", inputDim: inn, outputDim: out, sequenceLength: seq, weight: f16Bytes(w1)),
+        ])
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mf-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let pkg = try writeMLPackage(spec: spec, dir: tmp)
+
+        let model = try loadFromPackage(pkg, functionName: "proc1")
+        // Correctness first: this function must run its own weights.
+        let y = try predict(model, x: x)
+        let e1 = maxAbsError(y, x: x, w: w1)
+        #expect(e1 < 0.5, "proc1 at real shape diverged from its own weights by \(e1)")
+
+        // Warm, then time N predictions. Stage the MLMultiArray input once and
+        // reuse it, so the timed region is prediction only (the copy cost the
+        // zero-copy bridge would remove is measured separately below).
+        let input = try mlxToMultiArray_1C1S(x.asType(.float16))
+        let provider = try MLDictionaryFeatureProvider(dictionary: ["a": MLFeatureValue(multiArray: input)])
+        for _ in 0 ..< 10 { _ = try model.prediction(from: provider) }
+        let iters = 50
+        var aneTimes: [Double] = []
+        for _ in 0 ..< iters {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            _ = try model.prediction(from: provider)
+            aneTimes.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
+        }
+        aneTimes.sort()
+        let aneMs = aneTimes[iters / 2]
+
+        // GPU matmul [128,2560] @ [10240,2560].T, warm, same iteration count.
+        let xg = x
+        let wg = w1
+        for _ in 0 ..< 10 { let r = matmul(xg, wg.transposed(1, 0)); eval(r) }
+        var gpuTimes: [Double] = []
+        for _ in 0 ..< iters {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            let r = matmul(xg, wg.transposed(1, 0))
+            eval(r)
+            gpuTimes.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
+        }
+        gpuTimes.sort()
+        let gpuMs = gpuTimes[iters / 2]
+
+        // The REAL production baseline: 4-bit group-64 affine quantized matmul,
+        // the representation the dense projections actually run in. This is
+        // faster than the dense bf16 arm above and is the honest comparison.
+        let (wq, scales, biases) = quantized(wg, groupSize: 64, bits: 4)
+        eval(wq, scales, biases)
+        for _ in 0 ..< 10 {
+            let r = quantizedMatmul(xg, wq, scales: scales, biases: biases, transpose: true, groupSize: 64, bits: 4)
+            eval(r)
+        }
+        var qTimes: [Double] = []
+        for _ in 0 ..< iters {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            let r = quantizedMatmul(xg, wq, scales: scales, biases: biases, transpose: true, groupSize: 64, bits: 4)
+            eval(r)
+            qTimes.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
+        }
+        qTimes.sort()
+        let qMs = qTimes[iters / 2]
+
+        // The MLMultiArray copy cost the zero-copy bridge (p84) would remove.
+        for _ in 0 ..< 10 { _ = try mlxToMultiArray_1C1S(x.asType(.float16)) }
+        var copyTimes: [Double] = []
+        for _ in 0 ..< iters {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            _ = try mlxToMultiArray_1C1S(x.asType(.float16))
+            copyTimes.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
+        }
+        copyTimes.sort()
+
+        print(String(format: "[mf-cost] in_proj_qkv [10240x2560] S=128: ANE predict %.3f ms | GPU bf16 %.3f ms | GPU q4g64 %.3f ms | input-copy %.3f ms",
+                     aneMs, gpuMs, qMs, copyTimes[iters / 2]))
+        print(String(format: "[mf-cost] ratios ANE/bf16 %.2f | ANE/q4 %.2f | (ANE+copy)/q4 %.2f",
+                     aneMs / gpuMs, aneMs / qMs, (aneMs + copyTimes[iters / 2]) / qMs))
+        print("[mf-cost] one prefill forward has 64 layers; per-projection x64 = "
+            + String(format: "%.1f ms ANE vs %.1f ms GPU-q4", aneMs * 64, qMs * 64))
+    }
+
     /// Attempts one (spec-variant, load-mode) combination and prints the
     /// max-abs error of the result against BOTH weight sets, or the error.
     private func attempt(label: String, spec: Data, functionName: String?, x: MLXArray, w0: MLXArray, w1: MLXArray) {
