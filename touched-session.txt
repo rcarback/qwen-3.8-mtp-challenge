@@ -1,0 +1,32 @@
+60b36856 perf(mtp): price Qwen4Exp draft rounds with the measured row cost
+aab8bb32 feat(qwen4exp): serve Qwen3.8-Flash-Next through the headless MTP session
+eb59262c feat(qwen4exp): serve Qwen3.8-Flash-Next through the headless MTP session
+dd8b852e docs(mtp): record the 2026-09-02 head cost-ratio re-fit and correct the stale readout claim
+70eba8a3 Merge branch 'wt/wall' into local/perf-2026-08
+03b1f342 perf(trace): stamp the depth-0 round at every boundary on parent, worker and session
+1bc3aab2 Make the two verify-depth caps runtime-settable and clamp them to what is measured
+1e9d686f Merge branch 'wt/depth-unlock' into local/perf-2026-08
+2ed89780 Correct the Qwen36MTPLimits doc comment now that the ceiling is resolved from the environment
+7c3aae2e Merge branch 'wt/b5-ngram' into local/perf-2026-08
+49d0b86f Cap the MTP head's seed priming rows
+21a8d248 fix(model): filter the lookup warm against the swept depth, and correct the packaged-tree comment
+9238c0ce feat(model): warm the lookup ladder verify widths
+7e2ccd8c feat(model): draft a round from the prompt-lookup index
+6531140b feat(model): add the lookup draft-source decision and width bound
+9f795cf5 final-review fixes: tail omission without worker rounds, single tape-path concat, packed-gate kernel guard, gate band print, comment corrections
+abe3fff5 session: evaluate cache roots rather than throwaway trimmed slices
+b2833214 the chunk cost surface reverses with measurement order; retract the 8.3 percent claim
+bc228d06 feat: opt-in bf16 recurrent state for session snapshots
+8726f84b name the chunk surface's own confound and mark the superseded summary
+4b997895 feat: resolve the prefill chunk cap at runtime
+102810de docs: correct checkpoint sizing, close the chunk-size sweep
+81d44c5b fix: adopt a disk checkpoint into a cold session
+45696f0b feat: persist prefill checkpoints across restarts
+d8cd555a feat: chunked prefill checkpointing with turn-aligned boundaries
+684d9202 feat: install the KV rotation from the session policy, widen bit widths to 2-8
+a48029af fix: price the block drafter's depth from measurement
+67b82c4a feat: load and install a declared block drafter
+42056d84 feat: drive a block drafter from the MTP session
+09581fb5 feat: run sibling qwen3_5_text towers behind a local geometry escape
+4ed9a2c4 feat: allow a session to extend rather than re-prefill a shared prefix
+3bb4f323 feat: add exact speculative sampling behind an optional policy

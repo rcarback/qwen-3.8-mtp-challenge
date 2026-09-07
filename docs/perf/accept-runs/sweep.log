@@ -1,0 +1,1360 @@
+generate-golden: generating 200 reference continuation tokens for case gpu_README (prompt_tokens=512)
+generated golden case=gpu_README prompt_tokens=512 expected_tokens=200 output=docs/perf/accept-runs/golden-gpu-README.json
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-gpu-README.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: waiting for GPU to cool down before timing (current 47.1C, target <=40C, waited 0s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 42.9C, target <=40C, waited 10s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 41.4C, target <=40C, waited 20s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 40.5C, target <=40C, waited 30s)...
+benchmark.sh: GPU cool-down gate passed (current 39.5C, target <=40C, waited 40s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=8)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=20 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: waiting for GPU to cool down before timing (current 46.9C, target <=40C, waited 0s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 44.3C, target <=40C, waited 10s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 42.9C, target <=40C, waited 20s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 42.3C, target <=40C, waited 30s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 41.5C, target <=40C, waited 40s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 41.1C, target <=40C, waited 50s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 40.8C, target <=40C, waited 60s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 40.3C, target <=40C, waited 70s)...
+benchmark.sh: GPU cool-down gate passed (current 39.1C, target <=40C, waited 80s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.105815
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: waiting for GPU to cool down before timing (current 47.2C, target <=40C, waited 0s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 44.7C, target <=40C, waited 10s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 46.4C, target <=40C, waited 20s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 49.1C, target <=40C, waited 30s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 50.4C, target <=40C, waited 40s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 50.1C, target <=40C, waited 50s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 50.7C, target <=40C, waited 60s)...
+benchmark.sh: GPU cool-down is stalled and no interactive terminal is attached;
+benchmark.sh: to force the fans to 70% manually, run: /Users/carback1/Code/llms/qwen-3.8-mtp-challenge/tools/fan-control.sh boost
+benchmark.sh: waiting for GPU to cool down before timing (current 48.0C, target <=40C, waited 70s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 45.0C, target <=40C, waited 80s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 42.7C, target <=40C, waited 90s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 41.6C, target <=40C, waited 100s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 40.7C, target <=40C, waited 110s)...
+benchmark.sh: GPU cool-down gate passed (current 39.8C, target <=40C, waited 120s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=8)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=8 rounds=55 accepted_draft_rate=0.5401 all_tokens_matched=true reference_checked_rows=192/192 seconds_per_token=0.077649
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.3627418494189147 (serial K=1 0.10581526532769203s/token / MTP 0.077648797072470188s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.3627418494189147,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 8,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 2.4909090909090907,
+    "serial_seconds_per_token": 0.10581526532769203,
+    "mtp_seconds_per_token": 0.077648797072470188,
+    "mtp_decode_speedup": 1.3627418494189147,
+    "accepted_draft_rate": 0.54014598540145986,
+    "residual_divergence_count": 0
+  }
+}
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-gpu-README.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: waiting for GPU to cool down before timing (current 49.7C, target <=40C, waited 0s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 45.7C, target <=40C, waited 10s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 43.3C, target <=40C, waited 20s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 42.2C, target <=40C, waited 30s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 41.2C, target <=40C, waited 40s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 40.4C, target <=40C, waited 50s)...
+benchmark.sh: GPU cool-down gate passed (current 39.6C, target <=40C, waited 60s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=2)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=20 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: waiting for GPU to cool down before timing (current 47.1C, target <=40C, waited 0s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 43.7C, target <=40C, waited 10s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 42.0C, target <=40C, waited 20s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 40.9C, target <=40C, waited 30s)...
+benchmark.sh: GPU cool-down gate passed (current 39.9C, target <=40C, waited 40s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.105280
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: waiting for GPU to cool down before timing (current 47.7C, target <=40C, waited 0s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 43.9C, target <=40C, waited 10s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 42.1C, target <=40C, waited 20s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 41.0C, target <=40C, waited 30s)...
+benchmark.sh: waiting for GPU to cool down before timing (current 40.3C, target <=40C, waited 40s)...
+benchmark.sh: GPU cool-down gate passed (current 39.4C, target <=40C, waited 50s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=2)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=2 rounds=58 accepted_draft_rate=0.6195 all_tokens_matched=true reference_checked_rows=171/171 seconds_per_token=0.075988
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.385494974561591 (serial K=1 0.10528034344315529s/token / MTP 0.075987531803548336s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.385494974561591,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 2,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 1.9482758620689655,
+    "serial_seconds_per_token": 0.10528034344315529,
+    "mtp_seconds_per_token": 0.075987531803548336,
+    "mtp_decode_speedup": 1.385494974561591,
+    "accepted_draft_rate": 0.61946902654867253,
+    "residual_divergence_count": 0
+  }
+}
+generate-golden: generating 200 reference continuation tokens for case dequant_README (prompt_tokens=512)
+generated golden case=dequant_README prompt_tokens=512 expected_tokens=200 output=docs/perf/accept-runs/golden-dequant-README.json
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-dequant-README.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=8)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=108 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: waiting for GPU to cool down before timing (current 48.6C, target <=40C, waited 0s)...
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 10s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.105320
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=8)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=8 rounds=21 accepted_draft_rate=0.9469 all_tokens_matched=true reference_checked_rows=134/134 seconds_per_token=0.050985
+benchmark-qwen-mtp.sh: local estimated decode speedup 2.065694130382874 (serial K=1 0.10532014071941376s/token / MTP 0.050985351204872131s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 2.065694130382874,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 8,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 5.3809523809523814,
+    "serial_seconds_per_token": 0.10532014071941376,
+    "mtp_seconds_per_token": 0.050985351204872131,
+    "mtp_decode_speedup": 2.065694130382874,
+    "accepted_draft_rate": 0.94690265486725667,
+    "residual_divergence_count": 0
+  }
+}
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-dequant-README.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=2)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=108 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.102890
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=2)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=2 rounds=44 accepted_draft_rate=0.9655 all_tokens_matched=true reference_checked_rows=131/131 seconds_per_token=0.060239
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.7080201438178004 (serial K=1 0.10288966447114944s/token / MTP 0.060239139944314957s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.7080201438178004,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 2,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 1.9772727272727273,
+    "serial_seconds_per_token": 0.10288966447114944,
+    "mtp_seconds_per_token": 0.060239139944314957,
+    "mtp_decode_speedup": 1.7080201438178004,
+    "accepted_draft_rate": 0.96551724137931039,
+    "residual_divergence_count": 0
+  }
+}
+generate-golden: generating 200 reference continuation tokens for case bf16_README (prompt_tokens=512)
+generated golden case=bf16_README prompt_tokens=512 expected_tokens=200 output=docs/perf/accept-runs/golden-bf16-README.json
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-bf16-README.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=8)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=108 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.105396
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: waiting for GPU to cool down before timing (current 50.0C, target <=40C, waited 0s)...
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 10s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=8)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=8 rounds=21 accepted_draft_rate=0.9469 all_tokens_matched=true reference_checked_rows=134/134 seconds_per_token=0.050951
+benchmark-qwen-mtp.sh: local estimated decode speedup 2.0685797268321453 (serial K=1 0.10539615619927645s/token / MTP 0.050950976088643074s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 2.0685797268321453,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 8,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 5.3809523809523814,
+    "serial_seconds_per_token": 0.10539615619927645,
+    "mtp_seconds_per_token": 0.050950976088643074,
+    "mtp_decode_speedup": 2.0685797268321453,
+    "accepted_draft_rate": 0.94690265486725667,
+    "residual_divergence_count": 0
+  }
+}
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-bf16-README.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: waiting for GPU to cool down before timing (current 48.2C, target <=40C, waited 0s)...
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 10s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=2)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=108 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.105290
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=2)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=2 rounds=44 accepted_draft_rate=0.9655 all_tokens_matched=true reference_checked_rows=131/131 seconds_per_token=0.060366
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.7442048152487195 (serial K=1 0.10529000032693148s/token / MTP 0.060365617275238037s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.7442048152487195,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 2,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 1.9772727272727273,
+    "serial_seconds_per_token": 0.10529000032693148,
+    "mtp_seconds_per_token": 0.060365617275238037,
+    "mtp_decode_speedup": 1.7442048152487195,
+    "accepted_draft_rate": 0.96551724137931039,
+    "residual_divergence_count": 0
+  }
+}
+generate-golden: generating 200 reference continuation tokens for case gpu_qwen-prefill-research-plan (prompt_tokens=512)
+generated golden case=gpu_qwen-prefill-research-plan prompt_tokens=512 expected_tokens=200 output=docs/perf/accept-runs/golden-gpu-qwen-prefill-research-plan.json
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-gpu-qwen-prefill-research-plan.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=8)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=7793 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.107854
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=8)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=8 rounds=54 accepted_draft_rate=0.4902 all_tokens_matched=true reference_checked_rows=207/207 seconds_per_token=0.078989
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.3654352387772595 (serial K=1 0.107854257337749s/token / MTP 0.078988921828567982s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.3654352387772595,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 8,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 2.8333333333333335,
+    "serial_seconds_per_token": 0.107854257337749,
+    "mtp_seconds_per_token": 0.078988921828567982,
+    "mtp_decode_speedup": 1.3654352387772595,
+    "accepted_draft_rate": 0.49019607843137253,
+    "residual_divergence_count": 0
+  }
+}
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-gpu-qwen-prefill-research-plan.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=2)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=7793 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.108173
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=2)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=2 rounds=62 accepted_draft_rate=0.5492 all_tokens_matched=true reference_checked_rows=184/184 seconds_per_token=0.079923
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.3534702787020885 (serial K=1 0.10817320365458727s/token / MTP 0.079922851175069809s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.3534702787020885,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 2,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 1.967741935483871,
+    "serial_seconds_per_token": 0.10817320365458727,
+    "mtp_seconds_per_token": 0.079922851175069809,
+    "mtp_decode_speedup": 1.3534702787020885,
+    "accepted_draft_rate": 0.54918032786885251,
+    "residual_divergence_count": 0
+  }
+}
+generate-golden: generating 200 reference continuation tokens for case dequant_qwen-prefill-research-plan (prompt_tokens=512)
+generated golden case=dequant_qwen-prefill-research-plan prompt_tokens=512 expected_tokens=200 output=docs/perf/accept-runs/golden-dequant-qwen-prefill-research-plan.json
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-dequant-qwen-prefill-research-plan.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=8)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=96486 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.104750
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=8)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=8 rounds=20 accepted_draft_rate=0.9391 all_tokens_matched=true reference_checked_rows=135/135 seconds_per_token=0.051160
+benchmark-qwen-mtp.sh: local estimated decode speedup 2.047486793305737 (serial K=1 0.10475036688148975s/token / MTP 0.051160460337996483s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 2.047486793305737,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 8,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 5.75,
+    "serial_seconds_per_token": 0.10475036688148975,
+    "mtp_seconds_per_token": 0.051160460337996483,
+    "mtp_decode_speedup": 2.047486793305737,
+    "accepted_draft_rate": 0.93913043478260871,
+    "residual_divergence_count": 0
+  }
+}
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-dequant-qwen-prefill-research-plan.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=2)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=96486 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.104430
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=2)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=2 rounds=44 accepted_draft_rate=0.9545 all_tokens_matched=true reference_checked_rows=132/132 seconds_per_token=0.061120
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.708619027962471 (serial K=1 0.10443046037107706s/token / MTP 0.061119804158806801s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.708619027962471,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 2,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 2,
+    "serial_seconds_per_token": 0.10443046037107706,
+    "mtp_seconds_per_token": 0.061119804158806801,
+    "mtp_decode_speedup": 1.708619027962471,
+    "accepted_draft_rate": 0.95454545454545459,
+    "residual_divergence_count": 0
+  }
+}
+generate-golden: generating 200 reference continuation tokens for case bf16_qwen-prefill-research-plan (prompt_tokens=512)
+generated golden case=bf16_qwen-prefill-research-plan prompt_tokens=512 expected_tokens=200 output=docs/perf/accept-runs/golden-bf16-qwen-prefill-research-plan.json
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-bf16-qwen-prefill-research-plan.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=8)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=96486 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.104009
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=8)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=8 rounds=20 accepted_draft_rate=0.9391 all_tokens_matched=true reference_checked_rows=135/135 seconds_per_token=0.050954
+benchmark-qwen-mtp.sh: local estimated decode speedup 2.0412193962486556 (serial K=1 0.10400928184390068s/token / MTP 0.050954484380781651s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 2.0412193962486556,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 8,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 5.75,
+    "serial_seconds_per_token": 0.10400928184390068,
+    "mtp_seconds_per_token": 0.050954484380781651,
+    "mtp_decode_speedup": 2.0412193962486556,
+    "accepted_draft_rate": 0.93913043478260871,
+    "residual_divergence_count": 0
+  }
+}
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-bf16-qwen-prefill-research-plan.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=2)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=96486 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.103901
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=2)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=2 rounds=44 accepted_draft_rate=0.9545 all_tokens_matched=true reference_checked_rows=132/132 seconds_per_token=0.060957
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.7044842187782052 (serial K=1 0.1039006169885397s/token / MTP 0.060957218520343304s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.7044842187782052,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 2,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 2,
+    "serial_seconds_per_token": 0.1039006169885397,
+    "mtp_seconds_per_token": 0.060957218520343304,
+    "mtp_decode_speedup": 1.7044842187782052,
+    "accepted_draft_rate": 0.95454545454545459,
+    "residual_divergence_count": 0
+  }
+}
+generate-golden: generating 200 reference continuation tokens for case gpu_qwen-mtp-go-live-runbook (prompt_tokens=512)
+generated golden case=gpu_qwen-mtp-go-live-runbook prompt_tokens=512 expected_tokens=200 output=docs/perf/accept-runs/golden-gpu-qwen-mtp-go-live-runbook.json
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-gpu-qwen-mtp-go-live-runbook.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=8)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=310 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.108108
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=8)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=8 rounds=42 accepted_draft_rate=0.6615 all_tokens_matched=true reference_checked_rows=172/172 seconds_per_token=0.069328
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.5593854678890888 (serial K=1 0.10810832027345896s/token / MTP 0.069327515549957752s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.5593854678890888,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 8,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 3.0952380952380953,
+    "serial_seconds_per_token": 0.10810832027345896,
+    "mtp_seconds_per_token": 0.069327515549957752,
+    "mtp_decode_speedup": 1.5593854678890888,
+    "accepted_draft_rate": 0.66153846153846152,
+    "residual_divergence_count": 0
+  }
+}
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-gpu-qwen-mtp-go-live-runbook.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=2)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=310 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.108198
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=2)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=2 rounds=51 accepted_draft_rate=0.7624 all_tokens_matched=true reference_checked_rows=152/152 seconds_per_token=0.070562
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.5333833406084627 (serial K=1 0.10819803178310394s/token / MTP 0.070561632513999939s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.5333833406084627,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 2,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 1.9803921568627452,
+    "serial_seconds_per_token": 0.10819803178310394,
+    "mtp_seconds_per_token": 0.070561632513999939,
+    "mtp_decode_speedup": 1.5333833406084627,
+    "accepted_draft_rate": 0.76237623762376239,
+    "residual_divergence_count": 0
+  }
+}
+generate-golden: generating 200 reference continuation tokens for case dequant_qwen-mtp-go-live-runbook (prompt_tokens=512)
+generated golden case=dequant_qwen-mtp-go-live-runbook prompt_tokens=512 expected_tokens=200 output=docs/perf/accept-runs/golden-dequant-qwen-mtp-go-live-runbook.json
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-dequant-qwen-mtp-go-live-runbook.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=8)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=94 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.104417
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=8)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=8 rounds=20 accepted_draft_rate=0.9730 all_tokens_matched=true reference_checked_rows=131/131 seconds_per_token=0.050778
+benchmark-qwen-mtp.sh: local estimated decode speedup 2.0563523278467466 (serial K=1 0.10441668797284365s/token / MTP 0.050777625292539597s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 2.0563523278467466,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 8,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 5.5499999999999998,
+    "serial_seconds_per_token": 0.10441668797284365,
+    "mtp_seconds_per_token": 0.050777625292539597,
+    "mtp_decode_speedup": 2.0563523278467466,
+    "accepted_draft_rate": 0.97297297297297303,
+    "residual_divergence_count": 0
+  }
+}
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-dequant-qwen-mtp-go-live-runbook.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=2)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=94 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.104486
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=2)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=2 rounds=43 accepted_draft_rate=0.9884 all_tokens_matched=true reference_checked_rows=129/129 seconds_per_token=0.060312
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.732426839063056 (serial K=1 0.10448625031858683s/token / MTP 0.06031207088381052s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.732426839063056,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 2,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 2,
+    "serial_seconds_per_token": 0.10448625031858683,
+    "mtp_seconds_per_token": 0.06031207088381052,
+    "mtp_decode_speedup": 1.732426839063056,
+    "accepted_draft_rate": 0.98837209302325579,
+    "residual_divergence_count": 0
+  }
+}
+generate-golden: generating 200 reference continuation tokens for case bf16_qwen-mtp-go-live-runbook (prompt_tokens=512)
+generated golden case=bf16_qwen-mtp-go-live-runbook prompt_tokens=512 expected_tokens=200 output=docs/perf/accept-runs/golden-bf16-qwen-mtp-go-live-runbook.json
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-bf16-qwen-mtp-go-live-runbook.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=8)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=94 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.104367
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=8)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=8 rounds=20 accepted_draft_rate=0.9730 all_tokens_matched=true reference_checked_rows=131/131 seconds_per_token=0.050655
+benchmark-qwen-mtp.sh: local estimated decode speedup 2.0603511463711945 (serial K=1 0.1043670391663909s/token / MTP 0.05065497662872076s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 2.0603511463711945,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 8,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 5.5499999999999998,
+    "serial_seconds_per_token": 0.1043670391663909,
+    "mtp_seconds_per_token": 0.05065497662872076,
+    "mtp_decode_speedup": 2.0603511463711945,
+    "accepted_draft_rate": 0.97297297297297303,
+    "residual_divergence_count": 0
+  }
+}
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-bf16-qwen-mtp-go-live-runbook.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=2)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=94 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.104396
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=2)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=2 rounds=43 accepted_draft_rate=0.9884 all_tokens_matched=true reference_checked_rows=129/129 seconds_per_token=0.060135
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.7360457820503228 (serial K=1 0.10439646057784557s/token / MTP 0.060134624131023884s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.7360457820503228,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 2,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 2,
+    "serial_seconds_per_token": 0.10439646057784557,
+    "mtp_seconds_per_token": 0.060134624131023884,
+    "mtp_decode_speedup": 1.7360457820503228,
+    "accepted_draft_rate": 0.98837209302325579,
+    "residual_divergence_count": 0
+  }
+}
+generate-golden: generating 200 reference continuation tokens for case gpu_private-benchmark-security (prompt_tokens=512)
+generated golden case=gpu_private-benchmark-security prompt_tokens=512 expected_tokens=200 output=docs/perf/accept-runs/golden-gpu-private-benchmark-security.json
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-gpu-private-benchmark-security.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=8)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=27370 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.107428
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=8)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=8 rounds=62 accepted_draft_rate=0.4552 all_tokens_matched=true reference_checked_rows=207/207 seconds_per_token=0.082974
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.2947131742507236 (serial K=1 0.10742804687470198s/token / MTP 0.082974398508667946s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.2947131742507236,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 8,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 2.338709677419355,
+    "serial_seconds_per_token": 0.10742804687470198,
+    "mtp_seconds_per_token": 0.082974398508667946,
+    "mtp_decode_speedup": 1.2947131742507236,
+    "accepted_draft_rate": 0.45517241379310347,
+    "residual_divergence_count": 0
+  }
+}
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-gpu-private-benchmark-security.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=2)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=27370 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.107935
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=2)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=2 rounds=62 accepted_draft_rate=0.5410 all_tokens_matched=true reference_checked_rows=184/184 seconds_per_token=0.080222
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.3454635374213946 (serial K=1 0.10793549194931984s/token / MTP 0.080221788957715034s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.3454635374213946,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 2,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 1.967741935483871,
+    "serial_seconds_per_token": 0.10793549194931984,
+    "mtp_seconds_per_token": 0.080221788957715034,
+    "mtp_decode_speedup": 1.3454635374213946,
+    "accepted_draft_rate": 0.54098360655737709,
+    "residual_divergence_count": 0
+  }
+}
+generate-golden: generating 200 reference continuation tokens for case dequant_private-benchmark-security (prompt_tokens=512)
+generated golden case=dequant_private-benchmark-security prompt_tokens=512 expected_tokens=200 output=docs/perf/accept-runs/golden-dequant-private-benchmark-security.json
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-dequant-private-benchmark-security.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=8)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=220 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.104367
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=8)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=8 rounds=24 accepted_draft_rate=0.8814 all_tokens_matched=true reference_checked_rows=142/142 seconds_per_token=0.053937
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.9349667653261915 (serial K=1 0.10436675697565079s/token / MTP 0.053937234915792942s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.9349667653261915,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 8,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 4.916666666666667,
+    "serial_seconds_per_token": 0.10436675697565079,
+    "mtp_seconds_per_token": 0.053937234915792942,
+    "mtp_decode_speedup": 1.9349667653261915,
+    "accepted_draft_rate": 0.88135593220338981,
+    "residual_divergence_count": 0
+  }
+}
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-dequant-private-benchmark-security.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=2)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=220 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.104776
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=2)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=2 rounds=46 accepted_draft_rate=0.9121 all_tokens_matched=true reference_checked_rows=137/137 seconds_per_token=0.062832
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.6675635488787959 (serial K=1 0.10477611795067787s/token / MTP 0.062831859104335308s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.6675635488787959,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 2,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 1.9782608695652173,
+    "serial_seconds_per_token": 0.10477611795067787,
+    "mtp_seconds_per_token": 0.062831859104335308,
+    "mtp_decode_speedup": 1.6675635488787959,
+    "accepted_draft_rate": 0.91208791208791207,
+    "residual_divergence_count": 0
+  }
+}
+generate-golden: generating 200 reference continuation tokens for case bf16_private-benchmark-security (prompt_tokens=512)
+generated golden case=bf16_private-benchmark-security prompt_tokens=512 expected_tokens=200 output=docs/perf/accept-runs/golden-bf16-private-benchmark-security.json
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-bf16-private-benchmark-security.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=8)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=220 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.104391
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=8)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=8 rounds=24 accepted_draft_rate=0.8814 all_tokens_matched=true reference_checked_rows=142/142 seconds_per_token=0.053712
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.9435130934111762 (serial K=1 0.10439067240804434s/token / MTP 0.053712358698248863s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.9435130934111762,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 8,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 4.916666666666667,
+    "serial_seconds_per_token": 0.10439067240804434,
+    "mtp_seconds_per_token": 0.053712358698248863,
+    "mtp_decode_speedup": 1.9435130934111762,
+    "accepted_draft_rate": 0.88135593220338981,
+    "residual_divergence_count": 0
+  }
+}
+benchmark-qwen-mtp.sh: public drift tripwire (correctness against docs/perf/accept-runs/golden-bf16-private-benchmark-security.json)
+benchmark-qwen-mtp.sh: GPU cool gate before the MTP reference pass (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: generating the MTP reference rows (128 rows, depth=2)
+mtp-verify: generate 32/129 (context 545)
+mtp-verify: generate 64/129 (context 577)
+mtp-verify: generate 96/129 (context 609)
+mtp-verify: generate 128/129 (context 641)
+mtp-verify: generate 129/129 (context 642)
+mtp-verify: rows=129 seed_tokens=512 reference_seed_token=220 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0
+benchmark-qwen-mtp.sh: GPU cool gate before the true serial control (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring the TRUE serial control, MTP off (128 tokens)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=0 rounds=128 accepted_draft_rate=0.0000 all_tokens_matched=true reference_checked_rows=128/128 seconds_per_token=0.103965
+benchmark-qwen-mtp.sh: GPU cool gate before the native-MTP decode (./benchmark.sh --local-cool-gate-only)
+benchmark.sh: warning: the GPU temperature reads 1.6C, at or below the 5C plausibility floor; the temperature reading looks implausible on this hardware/OS, so the thermal gate may be ineffective and gated timings may effectively be ungated
+benchmark.sh: GPU cool-down gate passed (current 1.6C, target <=40C, waited 0s)
+benchmark-qwen-mtp.sh: measuring native-MTP decode (128 tokens, depth=2)
+mtp-timed: weights=weights mtp_head=/Users/carback1/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head pinned_reference=<unset>
+mtp-timed: tokens=128 depth=2 rounds=46 accepted_draft_rate=0.9121 all_tokens_matched=true reference_checked_rows=137/137 seconds_per_token=0.062587
+benchmark-qwen-mtp.sh: local estimated decode speedup 1.6611294685407916 (serial K=1 0.10396510921418667s/token / MTP 0.062586999498307705s/token)
+benchmark-qwen-mtp.sh: the RANKED decode floor enforced on the ranked box is 0.90 (.github/workflows/qwen-mtp-ranked-benchmark.yml)
+benchmark-qwen-mtp.sh: this local number is shown against that floor for DIRECTION ONLY; it is not a verdict
+benchmark-qwen-mtp.sh: NOT RANKABLE: official_scoring_enabled=true, hidden timed prompt pool holds 8 entries,
+benchmark-qwen-mtp.sh: and these reference rows came from the candidate build, not the pinned baseline. Only the
+benchmark-qwen-mtp.sh: ranked .github/workflows/qwen-mtp-ranked-benchmark.yml run can produce a score that ranks.
+{
+  "score": 1.6611294685407916,
+  "passed": true,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "metrics": {
+    "mode": "qwen-mtp-local-iterate",
+    "oracle": "candidate-local-mtp-golden-rows",
+    "official_score": false,
+    "rankable": false,
+    "not_rankable_reason": "candidate-generated reference rows; official scoring disabled; ranked run is the only authority",
+    "ranked_decode_speedup_floor": 0.90,
+    "public_drift_tripwire_passed": true,
+    "decode_tokens": 128,
+    "mtp_depth": 2,
+    "all_tokens_matched": true,
+    "uses_pinned_mtp_head": true,
+    "head_provenance_sha256": "2801d8edf2c974840f14198d01254275c3e476ef930940484803891836386ec2",
+    "effective_mean_draft_len": 1.9782608695652173,
+    "serial_seconds_per_token": 0.10396510921418667,
+    "mtp_seconds_per_token": 0.062586999498307705,
+    "mtp_decode_speedup": 1.6611294685407916,
+    "accepted_draft_rate": 0.91208791208791207,
+    "residual_divergence_count": 0
+  }
+}
+wrote docs/perf/accept-runs/mtp-accept-20260901-225614.csv
+exit=0 00:49:36
