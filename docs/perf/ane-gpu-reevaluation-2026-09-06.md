@@ -429,8 +429,11 @@ because the lane arms only at 128 tokens and above.
 | under a 40 percent duty GPU load: control, then control repeat | 144.0, then 115.8 | 13.46, then 13.58 | | |
 | under the same load: ANE split projections, int8 | 142.5 (1.1 percent below the first control, 23.0 above the repeat) | 13.74 | | |
 | under the same load: ANE shared expert, int8 | 131.5 (8.7 percent below the first control, 13.6 above the repeat) | 13.85 | | |
-| reference, mlx-serve on an M4 Max: 4-bit pack, short context | | 60 to 69 | | |
-| reference, mlx-serve on an M4 Max: 32k prompt | 699 | | | |
+| reference, mlx-serve release notes, M4 Max, 4-bit pack, short context | | 60 to 69 | | |
+| reference, mlx-serve release notes, M4 Max, 32k prompt | 699 | | | |
+| mlx-serve at HEAD on this box (2026-09-07, mixed 4/8 pack, kv8, serial: no MTP, no PLD), short / 4k / 32k / 128k | 309 / 224 / 219 / 253 | 22.3 / 19.7 / 15.5 / 17.5 | | |
+| mlx-serve at HEAD on this box, its MTP on, same rungs | 267 / 297 / 296 / 281 | 36.3 / 33.1 / 31.1 / 33.4 | | |
+| ours on this box the same night (q8 tree, bf16 KV, depth 0), short / 4.8k / 38k / 150k | 83 / 258 / 149 / timed out | 13.3 / 14.4 / 10.5 / timed out | | |
 
 On the MoE the routing amplifies small activation differences, so the
 completion-agreement column is a weaker instrument than on the dense tower:
@@ -852,3 +855,51 @@ SiLU spelled as `x / (1 + exp(-x))` with a `real_div`, a `mul`, the down
 conv) and the 64-function package. The next probe, queued, builds one
 layer three ways and plan-checks each: 64-row codebooks with that SiLU
 chain, the same with the native `silu` op, and per-row codebooks.
+
+## The mlx-serve ladder, both runtimes on this box
+
+Bead `qex`, the empirical half. mlx-serve at HEAD (`862bddf`, PR #363
+merged, built from source with the pinned Zig nightly and the pinned MLX
+submodules) on ddalcu's mixed 4/8-bit pack (8-bit dense, 4-bit experts, a
+merged 4-bit n-gram table, 107 GB on disk), `--kv-quant 8`, against our
+serve on the q8 tree (q8 dense, q4 experts, bf16 KV) at depth 0. The same
+`llmprobe --bench-only --rungs 4k,32k,128k --runs 1` ladder on each, one
+server at a time, minutes apart, on the UI-active box (our dense controls
+decoded at 10 to 12 that evening against 12.6 quiet, and our MoE control at
+18.3 quiet earlier the same day). mlx-serve's numbers are llmprobe's from
+its report; ours are our server's own timers, because llmprobe reads no
+throughput from our stream (its report carries only our TTFT). The two
+tokenizers differ: the same rung text is 4,244 tokens to mlx-serve and
+4,837 to us.
+
+| runtime, arm | short prompt decode | 4k: prefill, decode | 32k: prefill, decode | 128k: prefill, decode | resident |
+| --- | --- | --- | --- | --- | --- |
+| mlx-serve, serial (no MTP, no PLD) | 22.3 | 224 tok/s, 19.7 | 219, 15.5 | 253, 17.5 (TTFT 518 s) | 5.6 GB RSS after, pack mapped lazily |
+| mlx-serve, its MTP (`--mtp`, adaptive depth up to 3) | 36.3 | 297, 33.1 | 296, 31.1 | 281, 33.4 (TTFT 467 s) | 31.6 GB RSS after |
+| ours, depth 0 | 13.3 | 258 (4.8k tokens), 13.7 to 15.1 | 149 (38k tokens), 9.6 to 11.4 | failed: the worker timed out on a 150k-token prefill | worker 19 GB RSS plus the mapped trees |
+
+Four readings. First, the 3.5x decode gap the bead opened with is two
+factors and a different machine. On this box mlx-serve's serial decode is
+1.5 to 1.7 times ours (22.3 against 13.3 short, 19.7 against 14.4 at 4k,
+15.5 against 10.5 at 32k), and its MTP adds 1.6 to 1.9 on top (36.3, 33.1,
+31.1, 33.4). The 60 to 69 tok/s of the release notes is the 4-bit pack on a
+quiet box with prompt lookup on; their serial number on the mixed pack
+here is 22. Second, prefill is at parity at 4k (224 against 258 on our
+longer token count) and diverges with context: 219 against 149 at 32k, and
+253 at 128k where ours does not finish. Their QSA arms and the split-K
+kernels from PR #363 are what holds prefill flat to 128k. Third, they
+reuse prefixes and we do not: their second 32k request prefilled 8k new
+tokens over 24k cached, ours prefilled all 38k again (258 s twice). Fourth,
+their MTP works on the MoE at every rung and ours hangs at load (bug
+`9o0`), so the 1.6 to 1.9 they take from speculation is a lever we hold
+and cannot pull today.
+
+The 128k failure is ours to fix before any long-context claim: the serve
+parent gives the worker a fixed request timeout
+(`RuntimeWorkerOptions.defaultRequestTimeoutSeconds`) and a 150k-token
+prefill at 100 to 150 tok/s runs past it, so the parent kills the worker
+mid-prefill. Filed as a bug. What transfers, in the order the numbers rank
+it: the decode step (their 22 against our 13 on the same pack class is the
+step, not the pack), prefix reuse, the long-context prefill arms, and MTP
+on the MoE. Each is its own bead with an A/B against 13.3 and 258 on this
+box, or against 18.3 and 274 quiet.
