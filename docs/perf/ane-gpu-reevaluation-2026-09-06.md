@@ -401,6 +401,9 @@ the GPU control. A cell that says pending is a queued arm, not an estimate.
 | under a 40 percent duty GPU load: control, then control repeat | 105.6, then 93.3 | 11.29, then 10.68 | | |
 | under the same load: ANE int8, fraction 0.5 | 106.1 (0.5 percent above the first control, 13.7 above the repeat) | 10.12 | | |
 | under the same load: ANE int4, fraction 0.3125 | 99.6 (5.6 percent below the first control, 6.8 above the repeat) | 9.27 | | |
+| under the same load, later in the evening: control, then control repeat | 92.2, then 74.6 | 10.4, then 9.2 | | |
+| under the same load: ANE int8, fraction 0.625 | 116.8 (26.7 percent above the first control, 56.5 above the repeat) | 10.2 | | |
+| under the same load: ANE int8, fraction 0.75 | 96.2 (4.3 percent above the first control, 28.9 above the repeat) | 10.2 | | |
 
 The dense tower's per-operation split at prefill: the MLP is three of its
 four dense projections by weight bytes, and the ANE prefix holds 0.3125 of
@@ -704,6 +707,36 @@ arm, because the lane arms at 128 tokens and above, so its spread is the
 box's thermal state and the arm order, not the lane. The load process was
 stopped before it printed its busy share, so the achieved duty is the
 requested 40 percent by construction, not measured.
+
+### Higher fractions under the same load
+
+The follow-up arm the first loaded table asked for: int8 at fractions 0.625
+and 0.75 under the same 40 percent duty load, a control on each side, on
+the UI-active box (23:00). Means over prompts 2 to 6.
+
+| arm | prefill tok/s | vs gpu3-loaded | vs gpu4-loaded | paired range vs gpu3-loaded | last prompt | decode |
+| --- | --- | --- | --- | --- | --- | --- |
+| gpu3-loaded (control) | 92.2 | | | | 71.6 | 10.0 to 10.8 |
+| int8, fraction 0.625 | 116.8 | +26.7 percent | +56.5 | 1.07 to 1.53 | 109.7 | 9.5 to 10.7 |
+| int8, fraction 0.75 | 96.2 | +4.3 percent | +28.9 | 0.92 to 1.37 | 97.9 | 8.3 to 11.9 |
+| gpu4-loaded (control repeat) | 74.6 | -19.0 percent | | 0.62 to 1.06 | 76.1 | 7.6 to 10.0 |
+
+With the controls at 92 and 75, fraction 0.625 is above both on every
+prompt, where 0.5 sat at parity under the same load earlier in the
+evening. Fraction 0.75 falls back toward parity: past the balance point
+the ANE's share becomes the long pole, since its time does not shrink
+under load while the GPU's share does. The balance under this load is
+near 0.625, against 0.3125 to 0.5 on a quiet cool box, which is the
+load-aware fraction the first table asked for, now with a number.
+
+One property of every serve arm in this record needs stating. A prompt of
+600 to 665 tokens builds two programs per layer, bucket 512 and bucket
+1024, so 128 programs against the 126-program limit per process
+(`references/chip-support.md`). The last two layers' bucket-1024 programs
+fail with 0x50004 and those layers run their GPU path at that bucket; the
+int8 arms at 0.625 and 0.75 lost four. Every arm carries the same
+shortfall, so the comparisons stand and the ANE numbers are a little
+conservative. A single-bucket layout, or the procedure bank, removes it.
 
 ### The ANE-side time under the same load
 
