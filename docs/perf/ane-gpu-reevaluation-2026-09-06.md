@@ -743,8 +743,8 @@ The queue that carried the int4 balance-point arms and the 64-row bank ran
 while the owner was using the machine (mail clients and a browser at 100
 to 160 percent CPU, WindowServer at 20 to 40 percent), and Time Machine's
 hourly backup copied a fresh 92 GB download during the fraction-0.5 arm.
-The gates timed out without reaching the quiet state. These arms are
-therefore paired against their own controls. Those controls sit at the
+The gates timed out without reaching the quiet state. So these arms are
+paired against their own controls. Those controls sit at the
 synthetic-load level (105.8 and 110.9 against 124.8 and 128.2 when quiet). Six prompts, 45 s gap,
 means over prompts 2 to 6 with any prompt whose request wall exceeded 60 s
 excluded as stalled.
