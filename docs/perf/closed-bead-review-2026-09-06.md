@@ -140,3 +140,114 @@ Every bead contains the prior evidence, the missed alternative, concrete steps, 
 - The current ANE bank loss was later traced to GPU placement of per-row LUT programs. `8xv` already owns the plan-checked grouped-LUT retry; `7yp` owns loaded-GPU measurement.
 - Long-context, repeated restore, and held-out quality follow-ups are evidence gaps, not claims that existing outputs are wrong. Tiny short-context agreement cannot prove those regimes.
 - No source/runtime behavior was changed, no model runs were started, and existing working-tree edits were preserved.
+
+## Re-evaluation against the record, 2026-09-07
+
+This section re-checks all 96 closed beads against `docs/perf/ane-gpu-reevaluation-2026-09-06.md`, the ANE and GPU re-evaluation record. Every verdict was tested on 2026-09-07, and each proposed change or supersession had to survive a refutation pass.
+
+| Bead | Title | Verdict | Deciding number or section |
+| --- | --- | --- | --- |
+| `yvk` | Measure r: ANE vs GPU throughput on expert-shaped GEMMs | superseded | Row `yvk`, superseded by bead `xi7` and its zero-copy remeasure |
+| `1ar` | ANE versus GPU at M=1: decides every decode-time ANE split | stands | Row `1ar`, a weight form cannot lower a dispatch floor |
+| `3y8` | Dense weights bf16, 85 percent of per-token bytes | stands | q8 dense tree row, closed unchanged |
+| `mw7` | B2 Mixed q8/q4 dense policy with its own perplexity gate | stands | q8 dense tree row, int8 5.563 to 5.571 against control 5.566 |
+| `voh` | B3 Quantized GEMV kernel: q4 at 55 percent of peak | stands | q8 dense tree row, the record carries no GPU qmv number |
+| `lk9` | L8 Census of host round trips per decode step | stands | Launch-cost family row, nothing touches the 5.4 and 54.5 ms split |
+| `2t6` | Fused router kernel: gate GEMM, top-k and softmax fused | stands | Launch-cost family row, no router-fusion number in the record |
+| `2u9` | Qwen4Exp decode is not compiled: CompiledDecode unused | stands | Launch-cost family row, the n-gram gather stays host-side |
+| `738` | L1 Whole-layer compile of the decode step | stands | Launch-cost family row, the ANE whole-layer design closed dead |
+| `4cr` | L4 Indirect command buffers, zero-allocation decode loop | stands | Launch-cost family row, the CPU term stays 5.4 ms |
+| `afu` | L5 Async graph pipelining across steps (asyncEval) | stands | Launch-cost family row, closed unchanged |
+| `azl` | L3 Megakernel or persistent kernel for the whole step | stands | Launch-cost family row, the ANE whole-layer design closed dead |
+| `bog` | M=1 forward stream efficiency (enqueue, compiled decode) | stands | Launch-cost family row, closed unchanged |
+| `ptc` | Profile one decode step: where does the other 44 ms go | stands | Per-operation breakdown reuses 2.40 and 2.52 ms per layer |
+| `xgy` | L7 Fused router top-k and softmax kernel | stands | Launch-cost family row, plus 12.9 percent at 7000 rows |
+| `7yp` | Measure the ANE lanes under GPU load, both towers | stands | The loaded box section, int8 0.625 at plus 26.7 and 56.5 percent |
+| `avk` | Dense tower: ANE split MLP in fp16, int8 and int4 | stands | Dense tower summary table, cited as measured by bead `avk` |
+| `wok` | MoE tower: fused ANE lanes on the q8 tree | stands | MoE section, split int8 parity at minus 0.9 percent |
+| `e2l` | Re-measure ANE dense-lane prefill via the multifunction bank | stands | Row `e2l`, 0.632 ms ANE against 0.684 ms GPU at S=128 |
+| `p84` | Bridge multifunction compile to zero-copy IOSurface dispatch | stands | Row `p84`, solved, predict is 0.92x the quantized GPU |
+| `xi7` | Re-measure r: zero-copy ANE at fp16 and int4 vs GPU | stands | The record's own r section, int4 rows fixed under grouped codebooks |
+| `8xv` | Fused SwiGLU bank through Core ML, all 64 layers per bucket | stands | Grouped codebooks section, bank 47.8 against GPU 108.0 tok/s |
+| `i6v` | Decode: one ANE program per whole dense layer | stands | Whole-layer probe, about 1.5 ms against mlx-serve 0.33 ms |
+| `bhz` | Re-evaluate the ANE and GPU expert split at decode geometry | stands | Row `bhz`, both engines dispatch-bound on a 3.3 MFLOP problem |
+| `48v` | Expert partition across ANE and GPU: r2 and the int4 palette | stands | GPU gather 0.31 against ANE 1.5 microseconds per pair |
+| `5ae` | int4 ANE weight consts for an ANE and GPU expert partition | stands | Row `5ae` reopened as `48v`, which closed on the same verdict |
+| `z4p` | Audit every conclusion in the method table against decode | stands | Rows `1ar` and `bhz`, closed unchanged at decode geometry |
+| `2i7` | prefill compute, N-split scheduling and CPU column assist | stands | Row `2i7`, closed by the compute-engine map, nothing changes |
+| `v0c.13` | Task 12: ANE fp16 dense lane, micro-batch pipelined prefill | stands | Row `v0c.13`, nothing at 700 tokens, long context filed as `60w` |
+| `pj9` | B4 Measure the expert gather GEMM at one row | stands | The r section reuses 0.31 microseconds per token-expert pair |
+| `0ja` | M1 Fused MoE op at M=1 (decode-only kernel) | stands | MoE kernel and pool family row, GPU-side, closed unchanged |
+| `ccj` | BaseRT single-launch fused MoE kernel for Qwen4Exp | stands | MoE kernel and pool family row, GPU-side, closed unchanged |
+| `muj` | M2 Run the shared expert as expert 11 inside the gather | stands | MoE kernel and pool family row, GPU-side, closed unchanged |
+| `0e7` | Expert merging by weight averaging, 512 to 128 per layer | stands | MoE kernel and pool family row, quality question, unchanged |
+| `fnd` | Expert pairing 512 to 256: test for clusters of four | stands | MoE kernel and pool family row, quality question, unchanged |
+| `6us` | Capacity-factor token dropping with saliency pruning | stands | MoE kernel and pool family row, quality question, unchanged |
+| `8fg` | Expert-parallel sharding | stands | MoE kernel and pool family row, the six ANE losses hold |
+| `583` | M4 Expert prefetch or offload (MoE-SpeQ) | stands | MoE kernel and pool family row, experts stay RAM-resident |
+| `msy` | Expert offload and streaming | stands | MoE kernel and pool family row, experts stay resident |
+| `qtp` | Expert prefetching | stands | MoE kernel and pool family row, no fetch to hide |
+| `a8w` | M3 Batch-aware opportunistic expert activation | stands | MoE kernel and pool family row, batch size is 1 |
+| `jrv` | Re-quantize routed experts to a smaller footprint | stands | Expert group-64 row, do not adopt, closed unchanged |
+| `fio` | B6 Expert weights at group-64 | stands | Expert group-64 row, 9 percent of decisions change |
+| `2x7` | Group-64 experts: end-to-end divergence before adoption | stands | Expert group-64 row, an ANE expert copy is a separate form |
+| `o0w` | N-gram gather is 12.5 percent of a forward | stands | N-gram table row, the ANE has no gather |
+| `abl` | Cut the n-gram fault COUNT, not just its cost | stands | N-gram table row, readahead two layers early |
+| `t79` | Re-measure the three n-gram encodings after the relayout | stands | MoE summary n-gram rows, int4 at 856 ms adopted |
+| `d7f` | Correct the doc: the n-gram gather is hot | stands | N-gram table row, int4 856 ms against bf16 1014 ms |
+| `wjl` | L2 Make the layer-2 n-gram gather a graph op | stands | N-gram table row, the ANE has no gather |
+| `2o8` | distinctPages instrumentation: verify it is exact | stands | N-gram table row, closed unchanged |
+| `6ct` | Hadamard rotation before int4 quantization of the table | stands | N-gram table row, closed unchanged |
+| `8ol` | Add nvfp4 as a fourth n-gram table encoding | stands | N-gram table row, int4 25 flips against nvfp4 23, int4 kept |
+| `3pq` | Deeper nvfp4 evaluation: one prompt cannot separate them | stands | N-gram table row, int4 adopted, nvfp4 rejected |
+| `4x6` | Transform should reference the n-gram table, not copy 95 GB | stands | N-gram table row, plumbing the record does not touch |
+| `njq` | B7 KV cache int4 for the 12 full-attention layers | stands | Row `njq`, 0.2 percent of the step, nothing changes |
+| `do6` | S2 Confidence-adaptive draft depth in draftPolicy | stands | Speculative family row, closed unchanged |
+| `6qv` | S1 Self-distilled MTP head, deeper chain (FastMTP recipe) | stands | Speculative family row, the head runs at one row |
+| `xt9` | S3 Draft trees (EAGLE-2 or EAGLE-3) over the MTP head | stands | Speculative family row, closed unchanged |
+| `506` | MTP head chain cost (remaining after fused paths) | stands | Speculative family row, closed unchanged |
+| `1fc` | S4 Prompt-lookup drafting as a second draft source | stands | Speculative family row, closed unchanged |
+| `367` | n-gram prompt-lookup drafting (serve decode) | stands | Speculative family row, closed unchanged |
+| `cul` | S5 Self-speculative decoding by layer skipping | stands | Speculative family row, closed unchanged |
+| `cmf` | S6 Lookahead decoding (Jacobi n-gram candidates) | stands | Speculative family row, closed unchanged |
+| `osn` | L9 Re-measure the fused gate and up gather GEMM at decode | unrelated | Not named in the record, a GPU-only decode fusion |
+| `53a` | L6 Fuse the remaining elementwise chains per layer | unrelated | Not named in the record, superseded earlier by bead `738` |
+| `85s` | Small-batch top-k dispatch: 0.226 ms at one row | unrelated | A router warmup artifact, no top-k text in the record |
+| `a3f` | wide-verify internals: width tile probe and ladder band | unrelated | Wide-verify tiling, never cited in the record |
+| `nlo` | decode round-path overhead (serve tails, worker budget) | unrelated | Serve protocol overhead, not cited in the record |
+| `mbn` | Ship: single worker rebuild and serve A/B for landed plans | unrelated | A build and ship step, not cited in the record |
+| `6gw` | [EPIC] Execute plan: divergence-learned prefill checkpoints | unrelated | Prefill checkpoints sit outside the record's inventory |
+| `a5e` | Plan task 1: prefixKey at arbitrary boundaries | unrelated | Prefill boundary keys, outside the record's inventory |
+| `spb` | Plan task 2: stream memo ring and learnedBoundary | unrelated | Prefill memo ring, outside the record's inventory |
+| `4uy` | Plan task 3: insertingBoundary key-list merge | unrelated | Prefill checkpoint merge logic, outside the record |
+| `is0` | Plan task 4: worker integration of learned boundaries | unrelated | Prefill checkpoint worker wiring, outside the record |
+| `6j7` | Plan task 5: persist memo ring across restarts | unrelated | Prefill checkpoint persistence, outside the record |
+| `0ck` | Plan task 6 (droppable): delta kvBytes accounting | unrelated | Prefill checkpoint accounting, outside the record |
+| `9me` | [EPIC] numeric agreement harness and quantized MTP head | unrelated | Agreement harness plan, outside the record's inventory |
+| `59y` | Plan task 1: QwenAgreementReport comparison type | unrelated | A harness utility type, outside the record |
+| `djo` | Plan task 2: runtime-gated generation harness | unrelated | Harness plumbing, the record uses other instruments |
+| `59k` | Plan task 3: opt-in bf16 recurrent-state snapshots | unrelated | Runtime state snapshot dtype, outside the record |
+| `9d7` | Plan task 4: quantize pinned bf16 MTP head to q4g64 | unrelated | Head weight quantization, outside the ANE weight-form scope |
+| `duw` | Plan task 5: run the 7-arm measurement runbook | unrelated | Agreement runbook, separate from the record's instruments |
+| `v0c` | [EPIC] Qwen3.8-Flash-Next (qwen4_exp) port | unrelated | A tracking epic, it makes no claim the record tests |
+| `v0c.1` | Task 0 (user): free 550+ GB disk and clear ANE caches | unrelated | An operational disk task with no technical claim |
+| `v0c.2` | Task 1: pinned download and verify script | unrelated | Provisioning tooling with no performance claim |
+| `v0c.3` | Task 2: Qwen4ExpTextConfiguration and outer configuration | unrelated | A configuration landing, not cited in the record |
+| `v0c.4` | Task 3: zero-centred norms and gated residual | unrelated | Norm and residual math, not cited in the record |
+| `v0c.5` | Task 4: n-gram hash, mmap table store, PLE layer | unrelated | The n-gram mechanism build, not the encoding decision |
+| `v0c.6` | Task 5: gated DeltaNet with split projections | unrelated | The DeltaNet input split, not the ANE split lane |
+| `v0c.7` | Task 6: QSA sparse attention, indexer, Qwen4ExpAttnCache | unrelated | A QSA landing, the record's KV int4 bead is `njq` |
+| `v0c.8` | Task 7: sparse MoE block | unrelated | Reference correctness, bead `wok` tests the added lanes |
+| `v0c.9` | Task 8: decoder layer, text model, sanitize, registry | unrelated | Architecture wiring, not cited in the record |
+| `v0c.10` | Task 9: offline transform (bf16 source to runtime tree) | unrelated | The transform pipeline, later trees are measured elsewhere |
+| `v0c.11` | Task 10: generate verb, reference parity, real-model smoke | unrelated | A GPU-only baseline smoke that predates the ANE arms |
+| `v0c.12` | Task 11: serve wiring through the headless MTP session | unrelated | Serve plumbing and a depth-0 baseline, not revisited |
+| `v0c.14` | Task 13: native MTP head | unrelated | A head build task, the record's head row is another group |
+
+### What the record changes
+
+- `yvk` concluded that the ratio r collapses as batch grows, from 0.937 to 0.164 on gate_up between S=16 and S=1024. The record shows that measurement paid a Core ML input and output copy per call, and set a dense fp16 GPU arm against a production 4-bit path. Bead `xi7` supersedes it with zero-copy input and output, int4 and fp16 ANE forms, and production-quantized GPU arms.
+
+### Actions
+
+No action is recommended. Every follow-up the record leaves open is already an open bead: `4r9` for the grouped LUT in the in-memory program, `60w` for long-context micro-batch prefill, and `6t8` for expert similarity across all experts.
