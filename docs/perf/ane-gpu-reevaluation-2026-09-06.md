@@ -443,6 +443,10 @@ because the lane arms only at 128 tokens and above.
 | under a 40 percent duty GPU load: control, then control repeat | 144.0, then 115.8 | 13.46, then 13.58 | | |
 | under the same load: ANE split projections, int8 | 142.5 (1.1 percent below the first control, 23.0 above the repeat) | 13.74 | | |
 | under the same load: ANE shared expert, int8 | 131.5 (8.7 percent below the first control, 13.6 above the repeat) | 13.85 | | |
+| n-gram table, bf16 (102 GB): gather 1014 to 1064 ms of a 512-token prefill, 14.0 percent of the forward (2026-09-04) | | | 0 flips of 512 (control) | |
+| n-gram table, int8 (49 GB): gather 868 to 876 ms, 11.6 percent | | | 24 flips of 512 | |
+| n-gram table, int4 (25 GB), adopted: gather 856 ms, 11.9 percent | | | 25 flips of 512, every flip at a top-2 gap under 0.57 | |
+| n-gram table, nvfp4 (28 GB): gather 853 to 873 ms, 11.5 percent | | | 23 flips of 512, loses to int4 on five of six prompts | |
 | reference, mlx-serve release notes, M4 Max, 4-bit pack, short context | | 60 to 69 | | |
 | reference, mlx-serve release notes, M4 Max, 32k prompt | 699 | | | |
 | mlx-serve at HEAD on this box (2026-09-07, mixed 4/8 pack, kv8, serial with MTP and PLD off), short / 4k / 32k / 128k | 309 / 224 / 219 / 253 | 22.3 / 19.7 / 15.5 / 17.5 | | |
@@ -452,6 +456,15 @@ because the lane arms only at 128 tokens and above.
 On the MoE the routing amplifies small activation differences, so the
 completion-agreement column is a weaker instrument than on the dense tower:
 the int8 arms are lossless in perplexity and still diverge on most prompts.
+
+The n-gram rows are the 2026-09-04 measurement from
+`docs/perf/qwen38-flash-2026-09.md` ("The four n-gram encodings, decided"),
+one real 512-token prefill per encoding: quantizing the table at all moves
+about 5 percent of next-token decisions, all at positions the model was
+unsure of, and the choice between int8, int4 and nvfp4 does not change
+that count, so int4 was adopted on size and gather time. That is the
+table's quality and speed row for the request's "int4 for the n-gram
+table" option, and it stands: the ANE never touches the gather.
 
 ### Per-operation breakdown, where it is measured
 
