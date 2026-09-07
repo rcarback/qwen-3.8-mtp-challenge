@@ -705,6 +705,26 @@ box's thermal state and the arm order, not the lane. The load process was
 stopped before it printed its busy share, so the achieved duty is the
 requested 40 percent by construction, not measured.
 
+### The ANE-side time under the same load
+
+The fused prefix program at real shape (hidden 5120, F=5440, gate, up, silu,
+mul, down as one program, the real-shape probe), timed on the ANE alone,
+cool, then with the same 40 percent duty GPU load running (its busy share
+measured at 41 percent), then cool again. Milliseconds per call.
+
+| form, rows | cool | loaded | cool repeat |
+| --- | --- | --- | --- |
+| int8, S=512 | 9.82 | 9.33 | 9.82 |
+| int8, S=1024 | 18.46 | 18.32 | 18.44 |
+| int4, S=512 | 7.83 | 7.48 | 7.87 |
+| int4, S=1024 | 14.77 | 14.55 | 14.75 |
+
+The ANE's time does not move when the GPU is loaded (the loaded column is
+1 to 5 percent faster, within the run-to-run spread of a warm chip). So
+everything the loaded tables lose is on the GPU's side of the split and in
+the host's crossings, which is why a larger ANE share holds up better under
+load and why a fixed fraction tuned cool under-uses the ANE there.
+
 ### The loaded box, MoE tower
 
 Same load, same protocol, the q8 tree, arms in the order shown. Cool
