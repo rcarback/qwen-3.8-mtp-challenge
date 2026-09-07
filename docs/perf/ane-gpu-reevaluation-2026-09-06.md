@@ -462,10 +462,10 @@ the int8 arms are lossless in perplexity and still diverge on most prompts.
 
 The n-gram rows are the 2026-09-04 measurement from
 `docs/perf/qwen38-flash-2026-09.md` ("The four n-gram encodings, decided"),
-one real 512-token prefill per encoding: quantizing the table at all moves
+one real 512-token prefill per encoding. Quantizing the table at all moves
 about 5 percent of next-token decisions, all at positions the model was
-unsure of, and the choice between int8, int4 and nvfp4 does not change
-that count, so int4 was adopted on size and gather time. That is the
+unsure of. The choice between int8, int4 and nvfp4 does not change that
+count, and int4 was adopted on size and gather time. That is the
 table's quality and speed row for the request's "int4 for the n-gram
 table" option, and it stands: the ANE never touches the gather.
 
@@ -521,12 +521,12 @@ split MLP is slower than the GPU MLP in isolation, and the +4.8 percent it
 showed end to end came from overlap with neighbouring work. int8 and int4
 turn the operation itself faster at S=1024, by 1.1 to 1.6, with the peak at
 0.5 for int8 and at 0.625 for int4, which is where the ANE leg and the GPU
-remainder balance; that is the balance point the end-to-end arms found. At
+remainder balance. That is the balance point the end-to-end arms found. At
 S=512 only int8 at 0.5 and int4 at 0.625 beat the GPU alone (1.11 to 1.12),
 so a shorter bucket wants a smaller share, and the lane's 128-token floor
 is well placed. The GPU-alone column moves from 41 to 64 ms between
 processes on this box, which is the same run-to-run spread the serve
-controls show; the ratio inside a process is the number to read.
+controls show. The ratio inside a process is the number to read.
 
 ### Per-operation breakdown, where it is measured
 
