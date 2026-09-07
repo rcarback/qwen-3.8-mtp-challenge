@@ -990,3 +990,31 @@ mid-prefill. Filed as a bug. What transfers, in the order the numbers rank it:
 
 Each is its own bead with an A/B against 13.3 and 258 on this box, or
 against 18.3 and 274 quiet.
+
+## Micro-batch pipelining at long context, MoE tower
+
+Bead `60w`. The 2026-09-03 micro-batched lane lost 11 to 25 percent at 700
+tokens because the GPU forward is restructured into micro-batches, and a
+700-token prompt has no pipeline depth to pay that back. The bead's first
+question is the restructuring cost alone at a length that does: one
+7,526-token prompt (`prompts-long/sixfold.txt`), the q8 tree, 32 decode
+tokens, the plain forward against the forced micro-batched forward with no
+ANE work (`MLX_QWEN4EXP_FORCE_MICROBATCH`), gates at 240 s, Spotlight
+workers paused, 2026-09-07 03:30.
+
+| arm | prefill tok/s | prefill s | decode | vs the two controls |
+| --- | --- | --- | --- | --- |
+| plain forward (control) | 255.7 | 29.4 | 14.5 | |
+| forced micro-batches of 512 | 221.3 | 34.0 | 15.2 | -13.5 and -20.9 percent |
+| forced micro-batches of 1024 | 264.7 | 28.4 | 14.1 | +3.5 and -5.4 |
+| forced micro-batches of 2048 | 249.1 | 30.2 | 14.3 | -2.6 and -11.0 |
+| plain forward (control repeat) | 279.9 | 26.9 | 16.0 | |
+
+At 1024 the restructuring sits inside the control spread (255.7 to 279.9),
+so the bead's gate for the ANE arm ("under 5 percent at 1024") is met at
+this length, and 512 is still the wrong size. The two ANE arms that
+followed (the legacy lane with `MLX_QWEN4EXP_ANE_MICROBATCH=1024`, int8 and
+fp16) built no ANE program at all: their logs carry no lane line and their
+numbers (260.6 and 276.5) sit inside the control spread, so they are
+controls in disguise and are not entered here. Why the lane stayed inert
+under an environment that arms it in the source is being traced.
