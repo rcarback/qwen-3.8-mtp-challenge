@@ -1013,13 +1013,13 @@ workers paused, 2026-09-07 03:30.
 Correction, 04:30, from a forward-shape trace added under the log flag:
 the serve chunks every prefill at 1,024 tokens (`prefillChunkCapDefault`),
 and both the forced probe and the ANE lane arm only when a forward holds
-at least two micro-batches. So the 7,526-token prompt ran as seven
-forwards of 1,024 and one of 351, the 512 arm micro-batched (two per
-forward, no pipeline depth) and lost 13.5 to 20.9 percent, and the 1024
+at least two micro-batches. The 7,526-token prompt ran as seven
+forwards of 1,024 and one of 351. The 512 arm micro-batched, two per
+forward with nothing to overlap, and lost 13.5 to 20.9 percent. The 1024
 and 2048 arms ran the plain forward: their numbers sit inside the control
 spread because they are controls in disguise. The two ANE arms that
 followed (the legacy lane at micro-batch 1024, int8 and fp16) built no
-program for the same reason; their logs carry no lane line. Nothing in
+program for the same reason, and their logs carry no lane line. Nothing in
 this table measures pipelining yet. The measurement the bead asks for
 needs the prefill chunk raised to hold four or more micro-batches (4,096
 or above), which is the rerun queued next, GPU-only first and then the
