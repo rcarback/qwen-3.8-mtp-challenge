@@ -1016,8 +1016,8 @@ and both the forced probe and the ANE lane arm only when a forward holds
 at least two micro-batches. The 7,526-token prompt ran as seven
 forwards of 1,024 and one of 351. The 512 arm micro-batched, two per
 forward with nothing to overlap, and lost 13.5 to 20.9 percent. The 1024
-and 2048 arms ran the plain forward: their numbers sit inside the control
-spread because they are controls in disguise. The two ANE arms that
+and 2048 arms ran the plain forward,
+which is the reason their numbers sit inside the control spread. The two ANE arms that
 followed (the legacy lane at micro-batch 1024, int8 and fp16) built no
 program for the same reason, and their logs carry no lane line. Nothing in
 this table measures pipelining yet. The measurement the bead asks for
