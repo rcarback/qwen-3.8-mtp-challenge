@@ -752,11 +752,11 @@ measured at 41 percent), then cool again. Milliseconds per call.
 | int4, S=512 | 7.83 | 7.48 | 7.87 |
 | int4, S=1024 | 14.77 | 14.55 | 14.75 |
 
-The ANE's time does not move when the GPU is loaded (the loaded column is
-1 to 5 percent faster, within the run-to-run spread of a warm chip).
-Everything the loaded tables lose sits on the GPU's side of the split and
-in the host's crossings. A larger ANE share holds up better under load for
-that reason, and a fixed fraction tuned cool under-uses the ANE there.
+The ANE's time does not move when the GPU is loaded. The loaded column is
+1 to 5 percent faster, inside the run-to-run spread of a warm chip. What
+the loaded tables lose belongs to the GPU's side of the split and to the
+host's crossings, so a larger ANE share holds up better under load, and a
+fixed fraction tuned cool under-uses the ANE there.
 
 ### The loaded box, MoE tower
 
