@@ -474,21 +474,21 @@ table" option, and it stands: the ANE never touches the gather.
 One row per way of dividing work between the ANE and the GPU, both
 towers, with the record section that carries the numbers. Speed is the
 change in prefill tok/s against the paired GPU control unless a row says
-otherwise; fidelity is the teacher-forced perplexity against 5.566 (dense)
+otherwise. Fidelity is the teacher-forced perplexity against 5.566 (dense)
 or 4.327 (MoE).
 
 | option | tower | what runs where | speed | fidelity | verdict |
 | --- | --- | --- | --- | --- | --- |
 | split MLP, fp16 prefix, fraction 0.3125 | dense | ANE computes the first 0.3125 of the MLP channels as one fused program beside the GPU's remainder, inside the forward | +4.8 percent hot | 5.565 | superseded by int8 |
-| split MLP, int8 prefix, 0.3125 / 0.5 / 0.625 | dense | same, int8 per-channel weights | +7.5 hot; +16.6 cool gap at 0.5; +27 to +57 under GPU load at 0.625 | 5.563 / 5.571 / 5.564 | adopted: 0.5 cool, 0.625 when the GPU is shared |
+| split MLP, int8 prefix, 0.3125 / 0.5 / 0.625 | dense | same, int8 per-channel weights | +7.5 hot. +16.6 with a cool gap at 0.5. +27 to +57 under GPU load at 0.625 | 5.563 / 5.571 / 5.564 | adopted: 0.5 cool, 0.625 when the GPU is shared |
 | split MLP, int4 palette prefix, 0.3125 / 0.5 / 0.625 | dense | same, per-tensor 16-entry palette | +7.1 hot, +14.8 cool; +2 to +17; +11 to +16 (UI-active box) | 5.772 / 5.923 / 6.188 | speed-equal to int8, loses fidelity with the share |
-| split MLP through the Core ML bank | dense | the same prefix as a multifunction Core ML model, per-row or 64-row codebooks | -36 to -56 percent at any placement | 5.722 / 6.031 | dead: the dispatch, not the device |
+| split MLP through the Core ML bank | dense | the same prefix as a multifunction Core ML model, per-row or 64-row codebooks | 36 to 56 percent below at any placement | 5.722 / 6.031 | dead: the dispatch, not the device |
 | split MLP with depth-2 drafting | dense | int8 0.3125 prefix beside the GPU, MTP head drafting two tokens | +15.5 percent prefill over the depth-2 control, decode 22.4 against 21.9 | | the two compose |
-| split projections, int8 / int4 | MoE | ANE computes a channel prefix of in_proj_qkv and q_proj beside the GPU | -0.9 / -1.5 cool; -1.1 to +23 under load | 4.315 / 4.551 | parity: the share is too small to show |
-| shared expert, fp16 / int8 / int4 | MoE | the shared expert's MLP on the ANE beside the routed experts on the GPU | -2.6 / -2.3 / -3.0 cool; -8.7 to +13.6 under load | 4.338 / 4.336 / 4.760 | parity at best |
+| split projections, int8 / int4 | MoE | ANE computes a channel prefix of in_proj_qkv and q_proj beside the GPU | 0.9 and 1.5 below cool. 1.1 below to 23 above under load | 4.315 / 4.551 | parity: the share is too small to show |
+| shared expert, fp16 / int8 / int4 | MoE | the shared expert's MLP on the ANE beside the routed experts on the GPU | 2.6, 2.3 and 3.0 below cool. 8.7 below to 13.6 above under load | 4.338 / 4.336 / 4.760 | parity at best |
 | expert partition, ANE and GPU | MoE | a subset of routed experts as ANE programs | dead on the gather denominator: 0.31 us per token-expert pair on the GPU against 1.5 us or more on the ANE | | dead (beads xi7, 48v) |
 | whole gated-delta layer as one ANE program at decode | MoE | all 59 ops of a layer's dense part on the ANE at S=1 | 0.86 ms per layer, about 1.5 ms with experts and crossings, against 1.27 ms pipelined on the GPU | | dead (bead i6v) |
-| micro-batch pipelined prefill | MoE | the forward restructured into micro-batches of 1024, the ANE running each micro-batch's phase-1 projection while the GPU runs the previous one | -10 percent for the restructuring alone at 7.5k tokens, -16 to -23 with the lane | | dead at this design (bead 60w) |
+| micro-batch pipelined prefill | MoE | the forward restructured into micro-batches of 1024, the ANE running each micro-batch's phase-1 projection while the GPU runs the previous one | 10 percent below for the restructuring alone at 7.5k tokens, 16 to 23 below with the lane | | dead at this design (bead 60w) |
 | n-gram table at int4 | MoE | the 3-gram embedding table quantized offline, gathered by the CPU; the ANE plays no part | gather 856 ms against 1,014 bf16 in a 512-token prefill, 25 GB against 102 | 25 of 512 decisions move, all at top-2 gaps under 0.57 | adopted (2026-09-04) |
 | prefill chunk cap 4,096 | MoE | no ANE; fewer, larger forwards | +5 to +17 percent at 7.5k tokens | | new bead |
 

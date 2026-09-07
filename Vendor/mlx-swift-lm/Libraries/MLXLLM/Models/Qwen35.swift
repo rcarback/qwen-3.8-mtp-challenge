@@ -4084,6 +4084,38 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 
 // MARK: - Decoder Layer
 
+/// Per-layer, per-sublayer timing inside the real dense forward, opt-in via
+/// MLX_QWEN35_LAYER_TIMING=1. An eval after the attention sublayer and after
+/// the MLP serialises what the lazy graph would pipeline, so the sums
+/// overstate the unmeasured forward; the split between the sublayers, and the
+/// change under an ANE lane, is what it is for. Printed once per forward.
+enum Qwen35LayerTiming {
+    static let enabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN35_LAYER_TIMING"] == "1"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var attnFull: UInt64 = 0
+    nonisolated(unsafe) private static var attnLinear: UInt64 = 0
+    nonisolated(unsafe) private static var mlp: UInt64 = 0
+    nonisolated(unsafe) private static var layers = 0
+
+    static func record(isLinear: Bool, attnNanos: UInt64, mlpNanos: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        if isLinear { attnLinear += attnNanos } else { attnFull += attnNanos }
+        mlp += mlpNanos
+        layers += 1
+    }
+
+    static func flush(sequenceLength: Int) {
+        lock.lock(); defer { lock.unlock() }
+        guard layers > 0 else { return }
+        let total = Double(attnFull + attnLinear + mlp) / 1e6
+        fputs(String(
+            format: "[qwen35-timing] S=%d layers=%d attn_full=%.2fms attn_linear=%.2fms mlp=%.2fms serialised=%.2fms\n",
+            sequenceLength, layers, Double(attnFull) / 1e6, Double(attnLinear) / 1e6, Double(mlp) / 1e6, total), stderr)
+        attnFull = 0; attnLinear = 0; mlp = 0; layers = 0
+    }
+}
+
 final class Qwen35DecoderLayer: Module {
     let isLinear: Bool
 
@@ -4140,6 +4172,7 @@ final class Qwen35DecoderLayer: Module {
         // Port of omlx commit 696d90a:
         //   patches/mlx_lm_mtp/qwen35_model.py DecoderLayer.__call__
         // Passes nConfirmed through to the linear-attention sublayer.
+        let t0 = Qwen35LayerTiming.enabled ? DispatchTime.now().uptimeNanoseconds : 0
         let r: MLXArray
         if isLinear {
             r = linearAttn!(
@@ -4148,6 +4181,8 @@ final class Qwen35DecoderLayer: Module {
         } else {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
+        if Qwen35LayerTiming.enabled { eval(r) }
+        let t1 = Qwen35LayerTiming.enabled ? DispatchTime.now().uptimeNanoseconds : 0
 
         // Fused residual+RMSNorm when shapes and dtype match the common
         // decode path (hidden 5120, BF16).  Bit-exact with the eager
@@ -4163,7 +4198,12 @@ final class Qwen35DecoderLayer: Module {
             h = x + r
             postAttnNorm = postAttentionLayerNorm(h)
         }
-        return h + (mlp as! UnaryLayer)(postAttnNorm)
+        let out = h + (mlp as! UnaryLayer)(postAttnNorm)
+        if Qwen35LayerTiming.enabled {
+            eval(out)
+            Qwen35LayerTiming.record(isLinear: isLinear, attnNanos: t1 - t0, mlpNanos: DispatchTime.now().uptimeNanoseconds - t1)
+        }
+        return out
     }
 
     /// Boundary-fused variant for the BF16/5120 decode path: the incoming
@@ -4194,6 +4234,7 @@ final class Qwen35DecoderLayer: Module {
             hIn = base
             normedIn = inputLayerNorm(base)
         }
+        let t0 = Qwen35LayerTiming.enabled ? DispatchTime.now().uptimeNanoseconds : 0
         let r: MLXArray
         if isLinear {
             r = linearAttn!(
@@ -4202,11 +4243,18 @@ final class Qwen35DecoderLayer: Module {
         } else {
             r = selfAttn!(normedIn, mask: attentionMask, cache: cache)
         }
+        if Qwen35LayerTiming.enabled { eval(r) }
+        let t1 = Qwen35LayerTiming.enabled ? DispatchTime.now().uptimeNanoseconds : 0
         let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
             x: hIn, r: r,
             weight: postAttentionLayerNorm.weight,
             eps: postAttentionLayerNorm.eps)
-        return (h, (mlp as! UnaryLayer)(postAttnNorm))
+        let mlpOut = (mlp as! UnaryLayer)(postAttnNorm)
+        if Qwen35LayerTiming.enabled {
+            eval(h, mlpOut)
+            Qwen35LayerTiming.record(isLinear: isLinear, attnNanos: t1 - t0, mlpNanos: DispatchTime.now().uptimeNanoseconds - t1)
+        }
+        return (h, mlpOut)
     }
 }
 
@@ -4430,6 +4478,7 @@ public class Qwen35TextModelInner: Module {
             }
         }
 
+        if Qwen35LayerTiming.enabled { Qwen35LayerTiming.flush(sequenceLength: hiddenStates.dim(1)) }
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
         return hiddenStates
     }
