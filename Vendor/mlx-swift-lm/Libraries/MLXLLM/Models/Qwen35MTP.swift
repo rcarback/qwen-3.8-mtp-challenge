@@ -27,6 +27,26 @@ public nonisolated(unsafe) var _qwen35MTPEnabled: Bool = false
 let qwen35FusedEmbedConcatEnabled: Bool =
     ProcessInfo.processInfo.environment["MLX_E85_FUSED_EMBED"] != "0"
 
+/// Proposal-only derived quantization of the MTP head, in bits.
+///
+/// Unset resolves to `8`. `MLX_QWEN_MTP_HEAD_QUANT` accepts `4` to select
+/// 4-bit instead, or `0` (or any other value) to disable the derivation and
+/// leave the head bfloat16 exactly as loaded. The `MLX_` prefix is required
+/// for the same reason as the gate above.
+///
+/// WHAT THIS CHANGES AND WHAT IT CANNOT. It changes which tokens the head
+/// PROPOSES. It cannot change which tokens are EMITTED: the target verify
+/// decides every one of those, and the accept walk is untouched. So the whole
+/// effect of a bad choice here is a lower accept rate, which the agreement
+/// harness measures directly.
+let qwen35HeadProposalQuantizationBits: Int? = {
+    guard let raw = ProcessInfo.processInfo
+        .environment["MLX_QWEN_MTP_HEAD_QUANT"]
+    else { return 8 }
+    guard let bits = Int(raw), bits == 4 || bits == 8 else { return nil }
+    return bits
+}()
+
 // MARK: - MTPDecoderLayer
 
 /// Full-attention transformer layer used inside the Qwen3.5/3.6 MTP head.
@@ -115,6 +135,15 @@ final class Qwen35MTPModule: Module {
     let layers: [Qwen35MTPDecoderLayer]
     let norm: RMSNorm
 
+    /// Derived quantized twin of `fc`, built at first forward when the gate is
+    /// on. It stays out of the module's parameter walk by timing, not by
+    /// annotation: `Module` snapshots its items once in `buildCaches()`, before
+    /// the weights load and before any forward, and this field is still nil
+    /// then. A later rebuild of that snapshot would turn the twin into a
+    /// parameter.
+    private var _quantizedFC: QuantizedLinear?
+    private var _proposalQuantizationApplied = false
+
     init(_ args: Qwen35TextConfiguration) {
         _preFcNormHidden.wrappedValue = RMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
@@ -184,6 +213,26 @@ final class Qwen35MTPModule: Module {
             [preFcNormEmbedding(embeds), preFcNormHidden(hidden)], axis: -1)
     }
 
+    /// Install the derived proposal-only quantization once, if the gate is set.
+    private func applyProposalQuantizationIfNeeded() {
+        guard !_proposalQuantizationApplied else { return }
+        _proposalQuantizationApplied = true
+        guard let bits = qwen35HeadProposalQuantizationBits else { return }
+        if !(fc is QuantizedLinear) {
+            _quantizedFC = QuantizedLinear(
+                fc, groupSize: 64, bits: bits, mode: .affine)
+        }
+        for layer in layers {
+            (layer.mlp as? Qwen35FusedMLP)?.proposalQuantizationBits = bits
+        }
+    }
+
+    /// `fc`, through the derived twin when one exists.
+    private func applyFC(_ x: MLXArray) -> MLXArray {
+        if let quantized = _quantizedFC { return quantized(x) }
+        return fc(x)
+    }
+
     func callAsFunction(
         hidden: MLXArray,
         nextTokenIds: MLXArray,
@@ -192,7 +241,8 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
-        var fused = fc(
+        applyProposalQuantizationIfNeeded()
+        var fused = applyFC(
             preFcConcat(
                 nextTokenIds: nextTokenIds, embedTokens: embedTokens,
                 hidden: hidden))
@@ -226,7 +276,8 @@ final class Qwen35MTPModule: Module {
               nextTokenIds.dim(1) == hidden.dim(1)
         else { return nil }
 
-        let fused = fc(
+        applyProposalQuantizationIfNeeded()
+        let fused = applyFC(
             preFcConcat(
                 nextTokenIds: nextTokenIds, embedTokens: embedTokens,
                 hidden: hidden))

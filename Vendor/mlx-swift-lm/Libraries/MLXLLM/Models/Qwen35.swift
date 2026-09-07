@@ -2041,6 +2041,13 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     private var _fbfW: MLXArray?
     private var _gateOut = 0
 
+    /// Proposal-only derived quantization, in bits. Set before the first
+    /// forward on a head-side perceptron and left nil everywhere else. The
+    /// backbone's own perceptrons arrive already quantized from the
+    /// checkpoint and never take this path.
+    var proposalQuantizationBits: Int?
+    private var _dqDown: QuantizedLinear?
+
     init(dimensions: Int, hiddenDimensions: Int) {
         _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
         _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
@@ -2071,6 +2078,30 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
             _gateOut = g.shape.0
             return fusedGateUp(x)
         }
+        if let bits = proposalQuantizationBits,
+           !(gateProj is QuantizedLinear), !(upProj is QuantizedLinear)
+        {
+            // Derived once, from weights already in memory, for proposals
+            // only. Same concatenated gate-and-up layout the quantized
+            // branch above builds, so the existing dispatch serves it
+            // unchanged.
+            let dense = concatenated(
+                [gateProj.weight, upProj.weight], axis: 0)
+            let (w, s, z) = MLX.quantized(
+                dense, groupSize: 64, bits: bits, mode: .affine)
+            guard let z else {
+                preconditionFailure(
+                    "affine quantization returned no zero points")
+            }
+            _fqW = w.contiguous()
+            _fqS = s.contiguous()
+            _fqZ = z.contiguous()
+            _fqGS = 64
+            _fqBits = bits
+            _fqMode = .affine
+            _gateOut = gateProj.weight.dim(0)
+            return fusedGateUp(x)
+        }
         if !(gateProj is QuantizedLinear), !(upProj is QuantizedLinear) {
             _fbfW = concatenated([gateProj.weight, upProj.weight], axis: 0)
                 .contiguous()
@@ -2080,15 +2111,28 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         return nil
     }
 
+    /// The down projection, through a derived quantized twin when proposal-only
+    /// quantization is enabled on this instance.
+    private func downProjection(_ y: MLXArray) -> MLXArray {
+        guard let bits = proposalQuantizationBits,
+              !(downProj is QuantizedLinear)
+        else { return qwen35RoutedLinear(downProj, y) }
+        if _dqDown == nil {
+            _dqDown = QuantizedLinear(
+                downProj, groupSize: 64, bits: bits, mode: .affine)
+        }
+        return qwen35RoutedLinear(_dqDown!, y)
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         // The fused path is only taken when the gate/up split is provably
         // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
-            return qwen35RoutedLinear(downProj, qwen35CompiledFusedSwiGLU(y))
+            return downProjection(qwen35CompiledFusedSwiGLU(y))
         }
-        return qwen35RoutedLinear(downProj, silu(gateProj(x)) * upProj(x))
+        return downProjection(silu(gateProj(x)) * upProj(x))
     }
 
 }
