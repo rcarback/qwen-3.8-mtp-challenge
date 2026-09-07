@@ -414,8 +414,8 @@ gpu-loaded and gpu2-loaded in another; gpu3-loaded alone), and any two
 families differ from the first or second token ("The text provided" against
 "This is a fascinating"). That is a first-token near-tie resolved
 differently by processes that run the same weights and the same kernels,
-and the cause is not found. So an arm's 0 of 6 against a control from
-another family says nothing about the lane; the perplexity column is the
+and the cause is not found. An arm's 0 of 6 against a control from
+another family says nothing about the lane, and the perplexity column is the
 fidelity instrument on this tower, and the agreement column is read only
 against a control of the same family.
 
@@ -902,14 +902,14 @@ its result decides whether the Core ML path competes with the direct path
 once its programs run on the ANE.
 
 It does not. The per-row bank as two 32-layer parts, 63 of 64 bank
-functions used at bucket 1024 (the 64th hit the 126-program limit beside
+functions used at bucket 1024 (the last one hit the 126-program limit beside
 the 64 direct bucket-512 programs), one build failure, on the ANE by its
 compute plan:
 
 | arm | prefill tok/s, clean prompts | decode | note |
 | --- | --- | --- | --- |
 | gpu8 (control) | 69.5 | 7.9 to 9.4 | Spotlight's store at 130 percent CPU through the arm |
-| bank parts, per-row, fraction 0.3125 | 47.8 | 10.4 to 12.4 | 0.64 to 0.78 of gpu8, 0.40 to 0.46 of gpu9; first prompt 4.0 tok/s while the parts loaded |
+| bank parts, per-row, fraction 0.3125 | 47.8 | 10.4 to 12.4 | 0.64 to 0.78 of gpu8, 0.40 to 0.46 of gpu9. First prompt 4.0 tok/s while the parts loaded |
 | gpu9 (control repeat, Spotlight workers paused) | 108.0 | 10.6 to 11.5 | |
 
 With its programs on the ANE the bank runs at 44 to 56 percent below the
@@ -920,7 +920,7 @@ input and output handling per call, is what the direct path's in-memory
 programs and IOSurface handoff avoid. Verdict for the bank: dead as a
 carrier at any placement. What survives it is the per-row codebook's
 fidelity (5.722), which reaches the direct path only if the in-memory
-compiler accepts a grouped LUT; that probe is the open item.
+compiler accepts a grouped LUT. That probe is the open item.
 
 ## The mlx-serve ladder, both runtimes on this box
 
