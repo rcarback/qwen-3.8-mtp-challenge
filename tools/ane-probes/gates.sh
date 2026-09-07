@@ -1,9 +1,9 @@
 # shellcheck shell=bash
 # Measurement gates for timed arms on the local box. Source, do not execute.
 #
-#   cool_gate      wait for the GPU below 40C (macmon), 900 s ceiling
+#   cool_gate      wait for the GPU below 40C (macmon), COOL_CEILING s (900)
 #   quiet_gate     wait until no Time Machine backup is copying and the media,
-#                  photo and Spotlight analysers are idle, 900 s ceiling
+#                  photo and Spotlight analysers are idle, QUIET_CEILING s (900)
 #   ensure_metallib  put mlx.metallib beside a freshly built test bundle
 #
 # Time Machine and the analysers churn the page cache the n-gram table
@@ -24,7 +24,7 @@ cool_gate() {
     else
       if awk -v c="$c" 'BEGIN{exit !(c < 41.0)}' && [ "$elapsed" -ge 45 ]; then echo "cool_gate: gpu sensor implausible (${t}C), cpu ${c}C ok after ${elapsed}s $(date +%T)"; return 0; fi
     fi
-    if [ "$elapsed" -gt 900 ]; then echo "cool_gate: ceiling hit (gpu ${t}C cpu ${c}C)"; return 1; fi
+    if [ "$elapsed" -gt "${COOL_CEILING:-900}" ]; then echo "cool_gate: ceiling hit (gpu ${t}C cpu ${c}C)"; return 1; fi
     sleep 10
   done
 }
@@ -37,7 +37,7 @@ quiet_gate() {
     tm=$(tmutil status 2>/dev/null | rg -c "Running = 1" || true)
     busy=$(ps -A -o pcpu,comm | rg -i "mediaanalysisd$|photoanalysisd$|backupd$|mdworker_shared|mds_stores" | awk '{s+=$1} END {print int(s)}')
     if [ "${tm:-0}" -eq 0 ] && [ "${busy:-0}" -lt 20 ]; then echo "quiet_gate: ok (analysers ${busy}% cpu, no backup) after ${elapsed}s $(date +%T)"; return 0; fi
-    if [ "$elapsed" -gt 900 ]; then echo "quiet_gate: ceiling hit (analysers ${busy}% cpu, backup running=${tm})"; return 1; fi
+    if [ "$elapsed" -gt "${QUIET_CEILING:-900}" ]; then echo "quiet_gate: ceiling hit (analysers ${busy}% cpu, backup running=${tm})"; return 1; fi
     sleep 15
   done
 }
