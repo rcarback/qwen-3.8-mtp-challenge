@@ -463,7 +463,7 @@ the int8 arms are lossless in perplexity and still diverge on most prompts.
 | MoE `in_proj_qkv` `[10240, 2560]` at S=128 | 0.684 ms, q4 group-64 | 0.632 ms, fp16, zero-copy output | 0.92x, the compute win the lanes cannot bank |
 | dense fused MLP prefix, 0.3125 of the channels, bucket 1024 | | 167 MB fp16, 83 int8, 42 int4 per layer | compute-bound at this bucket, so the form buys about 2.5 points |
 | expert `gate_up` `[1280, 2560]` and `down` `[2560, 640]` | production q4 group-32 gather | fp16 and int4 palette | the `r` table below, bead `xi7` |
-| whole gated-delta layer at S=1 as one ANE program | 1.27 ms per layer on the GPU (pipelined) | 0.86 ms for the dense part alone, all 59 ops on the ANE; about 1.5 ms with the experts and the crossings | bead `i6v`, closed: dead |
+| whole gated-delta layer at S=1 as one ANE program | 1.27 ms per layer on the GPU (pipelined) | 0.86 ms for the dense part alone, all 59 ops on the ANE, about 1.5 ms with the experts and the crossings | bead `i6v`, closed: dead |
 
 ## `r`, re-measured with zero-copy I/O and production-quantized GPU arms
 
@@ -753,9 +753,9 @@ the UI-active box (23:00). Means over prompts 2 to 6.
 
 With the controls at 92 and 75, fraction 0.625 is above both on every
 prompt, where 0.5 sat at parity under the same load earlier in the
-evening. Fraction 0.75 falls back toward parity: past the balance point
-the ANE's share becomes the long pole, since its time does not shrink
-under load while the GPU's share does. The balance under this load is
+evening. Fraction 0.75 falls back toward parity. Past the balance point the
+ANE's share becomes the long pole, because its time does not shrink under
+load while the GPU's share does. The balance under this load is
 near 0.625, against 0.3125 to 0.5 on a quiet cool box, which is the
 load-aware fraction the first table asked for, now with a number.
 
