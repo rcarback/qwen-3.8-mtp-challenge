@@ -528,6 +528,33 @@ is well placed. The GPU-alone column moves from 41 to 64 ms between
 processes on this box, which is the same run-to-run spread the serve
 controls show. The ratio inside a process is the number to read.
 
+### The MoE forward by layer family under each lane, measured inside the forward
+
+`MLX_QWEN4EXP_LAYER_TIMING=1`, 2026-09-07 05:00, the q8 tree, three
+prompts of 603 to 649 tokens and 32 decode tokens per arm, medians over
+the forwards. An eval per layer serialises what the graph would pipeline,
+so the sums overstate the real forward (prefill ran at 160 to 200 tok/s
+under the instrument against 274 without it, decode at 16 against 18) and
+the split between families and the change under a lane are what the table
+is for. Milliseconds per forward, then per layer.
+
+| arm | prefill, 12 full-attention layers | prefill, 36 gated-delta layers | prefill tail | decode, 12 full | decode, 36 gated-delta | decode serialised |
+| --- | --- | --- | --- | --- | --- | --- |
+| GPU control | 480 (40.0 per layer) | 1,699 (47.2) | 2.3 | 14.7 (1.22) | 42.8 (1.19) | 57.8 |
+| split projections, int8 (97 programs) | 487 (40.6) | 1,684 (46.8) | 1.9 | 14.9 | 42.9 | 57.9 |
+| shared expert, int8 (97 programs) | 483 (40.3) | 1,714 (47.6) | 1.9 | 14.1 | 41.2 | 55.4 |
+
+The lanes move no family by more than 1 percent at prefill, which is the
+per-operation form of the parity the end-to-end arms found: the
+projections the split lane offloads and the shared expert the other lane
+offloads are each a few percent of a layer whose cost is the routed
+experts and the gated-delta recurrence, and the ANE's share of them runs
+at the GPU's pace. At decode the lanes are off (they arm at 128 tokens)
+and the rows agree to the noise. The gated-delta family is 78 percent of
+prefill layer time and 74 percent of decode layer time by count, at the
+same per-layer cost as full attention; a lane that wants to move the MoE
+tower has to move the experts or the recurrence, not the projections.
+
 ### Per-operation breakdown, where it is measured
 
 | operation | GPU | ANE | note |
