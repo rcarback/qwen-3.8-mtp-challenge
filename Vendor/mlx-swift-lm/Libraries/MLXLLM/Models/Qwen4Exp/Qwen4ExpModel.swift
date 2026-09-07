@@ -265,6 +265,9 @@ public final class Qwen4ExpTextModel: Module {
     /// wide residual before the mixer (`[B, S, hcDim]`, the MTP head's input).
     func forward(_ ids: MLXArray, cache: [KVCache]?) -> (hidden: MLXArray, wide: MLXArray) {
         let S = ids.dim(1)
+        if Qwen4ExpANELane.log, S > 1 {
+            fputs("[qwen4exp-ane] forward S=\(S) batch=\(ids.dim(0)) forced=\(Self.forcedMicroBatch.map(String.init) ?? "nil") microBatchEnabled=\(Qwen4ExpANEFused.microBatchEnabled) armed=\(Qwen4ExpANELane.armed(sequenceLength: S))\n", stderr)
+        }
         if ids.dim(0) == 1 {
             if let forced = Self.forcedMicroBatch, S >= 2 * forced {
                 return forwardMicroBatched(ids, cache: cache, microBatch: forced, useANE: false)

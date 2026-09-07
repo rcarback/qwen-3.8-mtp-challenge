@@ -1010,11 +1010,17 @@ workers paused, 2026-09-07 03:30.
 | forced micro-batches of 2048 | 249.1 | 30.2 | 14.3 | 2.6 and 11.0 below |
 | plain forward (control repeat) | 279.9 | 26.9 | 16.0 | |
 
-At 1024 the restructuring sits inside the control spread (255.7 to 279.9),
-so the bead's gate for the ANE arm ("under 5 percent at 1024") is met at
-this length, and 512 is still the wrong size. The two ANE arms that
-followed (the legacy lane with `MLX_QWEN4EXP_ANE_MICROBATCH=1024`, int8 and
-fp16) built no ANE program at all: their logs carry no lane line and their
-numbers (260.6 and 276.5) sit inside the control spread, so they are
-controls in disguise and are not entered here. Why the lane stayed inert
-under an environment that arms it in the source is being traced.
+Correction, 04:30, from a forward-shape trace added under the log flag:
+the serve chunks every prefill at 1,024 tokens (`prefillChunkCapDefault`),
+and both the forced probe and the ANE lane arm only when a forward holds
+at least two micro-batches. So the 7,526-token prompt ran as seven
+forwards of 1,024 and one of 351, the 512 arm micro-batched (two per
+forward, no pipeline depth) and lost 13.5 to 20.9 percent, and the 1024
+and 2048 arms ran the plain forward: their numbers sit inside the control
+spread because they are controls in disguise. The two ANE arms that
+followed (the legacy lane at micro-batch 1024, int8 and fp16) built no
+program for the same reason; their logs carry no lane line. Nothing in
+this table measures pipelining yet. The measurement the bead asks for
+needs the prefill chunk raised to hold four or more micro-batches (4,096
+or above), which is the rerun queued next, GPU-only first and then the
+lane.
