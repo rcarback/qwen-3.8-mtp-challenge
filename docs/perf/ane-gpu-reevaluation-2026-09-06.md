@@ -443,6 +443,9 @@ because the lane arms only at 128 tokens and above.
 | under a 40 percent duty GPU load: control, then control repeat | 144.0, then 115.8 | 13.46, then 13.58 | | |
 | under the same load: ANE split projections, int8 | 142.5 (1.1 percent below the first control, 23.0 above the repeat) | 13.74 | | |
 | under the same load: ANE shared expert, int8 | 131.5 (8.7 percent below the first control, 13.6 above the repeat) | 13.85 | | |
+| micro-batch pipelined prefill at 7.5k tokens, chunk 4,096: control | 294.1, then 298.9 | 15.8, then 17.0 | | |
+| micro-batch pipelined prefill at 7.5k tokens: forced GPU micro-batches of 1024 | 265.2 (9.8 to 11.3 percent below) | 16.7 | | |
+| micro-batch pipelined prefill at 7.5k tokens: ANE lane at 1024, int8 / fp16 | 246.9 / 229.3 (16 to 23 percent below) | 17.1 / 17.2 | | |
 | n-gram table, bf16 (102 GB): gather 1014 to 1064 ms of a 512-token prefill, 14.0 percent of the forward (2026-09-04) | | | 0 flips of 512 (control) | |
 | n-gram table, int8 (49 GB): gather 868 to 876 ms, 11.6 percent | | | 24 flips of 512 | |
 | n-gram table, int4 (25 GB), adopted: gather 856 ms, 11.9 percent | | | 25 flips of 512, every flip at a top-2 gap under 0.57 | |
@@ -1021,6 +1024,34 @@ which is the reason their numbers sit inside the control spread. The two ANE arm
 followed (the legacy lane at micro-batch 1024, int8 and fp16) built no
 program for the same reason, and their logs carry no lane line. Nothing in
 this table measures pipelining yet. The measurement the bead asks for
-needs the prefill chunk raised to hold four or more micro-batches (4,096
-or above), which is the rerun queued next, GPU-only first and then the
-lane.
+needs the prefill chunk raised to hold four or more micro-batches, which
+is the rerun below.
+
+### The rerun at a 4,096-token prefill chunk
+
+`DARKBLOOM_PREFILL_CHUNK_CAP=4096`, so the prompt runs as forwards of 512
+(warm), 4,096 and 3,423. The trace shows `armed=true` on the two long
+forwards and the lane built 48 programs (one per layer at micro-batch
+1024) in both ANE arms. Same prompt, same protocol, 04:18 to 04:36.
+
+| arm | prefill tok/s | prefill s | decode | vs the two controls |
+| --- | --- | --- | --- | --- |
+| plain forward, chunk 4,096 (control) | 294.1 | 25.6 | 15.8 | |
+| forced micro-batches of 1024, GPU only | 265.2 | 28.4 | 16.7 | 9.8 and 11.3 percent below |
+| ANE micro-batch lane, int8, 1024 | 246.9 | 30.5 | 17.1 | 16.0 and 17.4 below |
+| ANE micro-batch lane, fp16, 1024 | 229.3 | 32.8 | 17.2 | 22.0 and 23.3 below |
+| plain forward, chunk 4,096 (control repeat) | 298.9 | 25.2 | 17.0 | |
+
+Two results, and a third by the way. The restructuring alone costs about
+10 percent at four micro-batches per forward, above the bead's 5 percent
+gate, and the ANE lane loses a further 6 to 12 points on top of it: the
+per-layer phase-1 projection it offloads (in_proj for the gated-delta
+layers, q_proj for attention) is a small share of a layer, its program at
+S=1024 runs no faster than the GPU's copy of that share, and each
+micro-batch pays a crossing. Pipelining by restructuring the forward is
+dead on this tower at this length. The pipelining that does pay is the
+kind the fused split lanes already do, the ANE's share running beside the
+GPU's inside one forward, and on the MoE that share is too small to show.
+The third result is the chunk cap itself: 4,096-token chunks prefill the
+same prompt at 294 to 299 tok/s against 256 to 280 at the default 1,024,
+a 5 to 17 percent gain from a knob, filed as its own bead.
