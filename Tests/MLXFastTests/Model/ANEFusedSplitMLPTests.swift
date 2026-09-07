@@ -116,14 +116,8 @@ struct ANEFusedSplitMLPTests {
     /// prefill shape S=512. The task brief's starting bound is
     /// `(maxAbs<1.0, meanAbs<0.05)`; a live run measured
     /// `maxAbsDiff=0.015625, meanAbsDiff=0.0017330822`
-    /// (`ChannelSplitMLPTests` measured the identical `maxAbsDiff=0.015625`
-    /// at its own real-size shape with a similar fraction of fp16-vs-4bit
-    /// channels, so this is the representative regime, not a fluke). This
-    /// bound is ~6x the measured max and ~12x the measured mean --
-    /// consistent margin with `ChannelSplitMLPTests`' own tolerance choice
-    /// -- generous for run-to-run noise while still well below the
-    /// unscaled-weights failure mode (maxAbsDiff in the thousands) that
-    /// would flag a real layout/axis/dtype bug.
+    /// The bounds below leave margin for this measured rounding error while
+    /// detecting layout, axis, or dtype errors. They are not token-fidelity gates.
     private static let tolerance: Float = 0.09375
     private static let meanTolerance: Float = 0.02
 

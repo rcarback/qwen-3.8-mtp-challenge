@@ -1,19 +1,9 @@
 // LOCAL M4 FORK ONLY. Private Apple frameworks; breaks on macOS updates.
-// Never wired into the ranked forward; gated by MLXFAST_ANE_DIRECT=1 at call sites.
+// Never wired into the ranked forward; gated by MLX_ANE_DIRECT=1 at call sites.
 //
-// Task C (ANE IOSurface / procedure-bank plan): combines Task B's fused
-// ANE MLP (`ANEFusedMLP`, gate/up/down for the first `F` intermediate
-// channels as ONE ANE program, fp16) with a GPU 4-bit complementary
-// partial (the remaining `inter-F` channels, native `quantizedMM`) into a
-// drop-in MLP, validated at real Qwen dimensions
-// (hidden=5120, inter=17408). Mirrors `ANEOffload/ChannelSplitMLP.swift`'s
-// slicing conventions (row slice for the output-channel axis of gate/up,
-// column slice for `down`'s input-channel axis), but splits ACROSS the
-// gate/up/down chain rather than per-projection: gate/up/down all use the
-// SAME `F` intermediate channels, so `down`'s ANE prefix and GPU suffix
-// are dequantized/sliced along its INPUT (inter) axis, not its output
-// axis. See
-// `.superpowers/sdd/2026-08-31-ane-iosurface-procedure-bank/task-C-brief.md`.
+// One fused ANE prefix and a complementary q4 GPU suffix share the same
+// intermediate channels. Gate/up split along output rows; down splits along
+// input columns. All three prefix projections run in one ANE program.
 import Foundation
 import MLX
 import MLXNN
@@ -30,9 +20,6 @@ public final class ANEFusedSplitMLP {
     /// only; see `padForANE`.
     private let sequenceLength: Int
     private let aneMLP: ANEFusedMLP?
-    /// The Core ML bank leg (`MLX_ANE_BANK_DIR`), which replaces `aneMLP` when
-    /// present: same three-phase call, weights from the offline package.
-    private let bankLeg: ANEFusedMLPBankFunction?
     // GPU-fp16 ablation (MLX_ANE_FP16_GPU=1): the dequantized fp16 prefix
     // weights, kept so the prefix partial can run as a pure-GPU fp16 matmul
     // instead of on the ANE. Isolates fp16-vs-4bit from ANE-specific error.
@@ -75,8 +62,7 @@ public final class ANEFusedSplitMLP {
         upW: MLXArray, upScales: MLXArray, upBiases: MLXArray,
         downW: MLXArray, downScales: MLXArray, downBiases: MLXArray,
         hidden: Int, inter: Int, sequenceLength: Int, aneFraction: Double,
-        prefixFP16: ANEPrefixWeights? = nil,
-        bank: ANEFusedMLPBankFunction? = nil
+        prefixFP16: ANEPrefixWeights? = nil
     ) throws {
         let f = Self.prefixChannels(inter: inter, aneFraction: aneFraction)
         self.hidden = hidden
@@ -85,16 +71,7 @@ public final class ANEFusedSplitMLP {
         self.sequenceLength = sequenceLength
 
         self.ablate = ANESplitConfig.fp16GpuAblate
-        self.bankLeg = bank
-        if let bank {
-            precondition(bank.hidden == hidden && bank.sequenceLength == sequenceLength,
-                         "ANEFusedSplitMLP: bank function is [\(bank.sequenceLength), \(bank.hidden)], split is [\(sequenceLength), \(hidden)]")
-            // The bank holds the prefix; nothing to dequantize or build here.
-            gatePrefixFP16 = nil
-            upPrefixFP16 = nil
-            downPrefixFP16 = nil
-            aneMLP = nil
-        } else if f > 0 {
+        if f > 0 {
             let gatePrefix: MLXArray
             let upPrefix: MLXArray
             let downPrefix: MLXArray
@@ -250,24 +227,6 @@ public final class ANEFusedSplitMLP {
             }
             let gpu = try gpuPartial(x)
             let y = anePartial.asType(gpu.dtype) + gpu
-            eval(y)
-            return y
-        }
-        if let bankLeg {
-            // Bank leg: identical structure to the in-memory leg below, with
-            // the Core ML prediction on the background queue.
-            let tokens = x.dim(0)
-            let prepared = try bankLeg.makeInput(padForANE(x.asType(.float16)))
-            let (_, gpu) = try ConcurrentEngines.run(
-                ane: { try bankLeg.predict(prepared) },
-                gpu: {
-                    let g = try self.gpuPartial(x)
-                    eval(g)
-                    return g
-                })
-            let anePartial = bankLeg.readOutput(prepared)
-            let anePrefix = tokens == sequenceLength ? anePartial : anePartial[0 ..< tokens, 0...]
-            let y = anePrefix.asType(gpu.dtype) + gpu
             eval(y)
             return y
         }

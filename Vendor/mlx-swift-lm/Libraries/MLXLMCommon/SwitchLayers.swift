@@ -249,8 +249,9 @@ public class SwitchGLU: Module {
 
     /// Per-instance override for ``SwitchGLUFusion/fuseGateUp``. The env knob is
     /// a `static let` read once, so tests that need both arms in one process
-    /// set this instead.
-    public var forceFuseGateUp = false
+    /// set this before the first forward. Nil uses the process default.
+    /// False retains the unfused stacks; true builds the fused stack.
+    public var forceFuseGateUp: Bool? = nil
 
     /// Default SiLU GLU path -- uses the compiled fused (silu * up) kernel.
     public init(
@@ -335,7 +336,7 @@ public class SwitchGLU: Module {
     /// steady-state footprint is unchanged. ``denseGateUpDown(expert:)`` reads
     /// the released halves back out of the fused stack.
     public func fusedGateUp() -> SwitchLinear? {
-        guard SwitchGLUFusion.fuseGateUp || forceFuseGateUp, gateUpProj == nil else { return nil }
+        guard forceFuseGateUp ?? SwitchGLUFusion.fuseGateUp, gateUpProj == nil else { return nil }
         if let already = fusedGateUpStore.built { return already }
         guard let gateProj, let upProj else { return nil }
         guard let fused = fusedGateUpStore.get(gate: gateProj, up: upProj) else { return nil }
@@ -367,19 +368,6 @@ public class SwitchGLU: Module {
         let both = fused.denseExpertWeight(expert)  // [2 * hiddenDims, inputDims]
         return (both[0 ..< hiddenDims, 0...], both[hiddenDims ..< (2 * hiddenDims), 0...], down)
     }
-
-    /// `MLX_MOE_ACT_SPARSITY`. Intra-expert activation sparsity, training-free
-    /// form: zero the SwiGLU intermediate channels whose magnitude falls below
-    /// this multiple of the row's mean absolute value. The literature reports
-    /// large gains from skipping those channels' work; MLX computes the down
-    /// projection densely, so masking cannot skip anything and only adds a pass.
-    /// This exists to measure that, not to ship.
-    static let actSparsity: Float? = {
-        guard let raw = ProcessInfo.processInfo.environment["MLX_MOE_ACT_SPARSITY"],
-            let v = Float(raw), v > 0
-        else { return nil }
-        return v
-    }()
 
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
@@ -427,13 +415,7 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        var gated = activated
-        if let f = Self.actSparsity {
-            let mag = MLX.abs(gated)
-            let thr = mag.mean(axis: -1, keepDims: true) * f
-            gated = MLX.where(mag .>= thr, gated, MLXArray(0).asType(gated.dtype))
-        }
-        x = downProj(gated, idx, sortedIndices: doSort)
+        x = downProj(activated, idx, sortedIndices: doSort)
 
         if doSort {
             x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)

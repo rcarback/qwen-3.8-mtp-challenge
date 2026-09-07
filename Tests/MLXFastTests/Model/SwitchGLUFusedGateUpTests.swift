@@ -24,7 +24,9 @@ final class SwitchGLUFusedGateUpTests: XCTestCase {
             quantize(model: b) { _, _ in (32, 4, .affine) }
         }
         b.update(parameters: ModuleParameters.unflattened(a.parameters().flattened()))
+        a.forceFuseGateUp = false
         b.forceFuseGateUp = true
+        XCTAssertNil(a.fusedGateUp(), "control must retain separate gate/up stacks")
         return (a, b)
     }
 
@@ -103,7 +105,9 @@ final class SwitchGLUFusedGateUpTests: XCTestCase {
         quantize(model: a) { _, _ in (32, 4, .affine) }
         quantize(model: b) { _, _ in (32, 4, .affine) }
         b.update(parameters: ModuleParameters.unflattened(a.parameters().flattened()))
+        a.forceFuseGateUp = false
         b.forceFuseGateUp = true
+        XCTAssertNil(a.fusedGateUp(), "control must retain separate gate/up stacks")
         let idx = skewedIndices(tokens: 40, k: 4, experts: experts)
         let x = MLXRandom.normal([1, 40, hidden])
         assertExactlyEqual(b(x, idx), a(x, idx), "tower geometry")
