@@ -573,9 +573,9 @@ per forward.
 | int8, fraction 0.625 (127 programs) | 252 | 948 | 3,218 (50.3) | 73 | 8.7 | 28.5 | 48.4 | 85.9 |
 
 Two readings. The MLP is two thirds of the dense tower's prefill and 56
-percent of its decode step, which is why the dense lanes, which touch only
-the MLP, can move the tower at all and why nothing that touches attention
-alone could move it much. And the instrument shows what the lane costs
+percent of its decode step. The dense lanes touch only the MLP, and that
+share is the reason they can move the tower at all, and the reason nothing
+that touches attention alone could move it much. And the instrument shows what the lane costs
 without overlap: with an eval closing each sublayer, the split MLP reads at
 the control's cost (41 against 40 ms per layer at 0.5) or above it (50 at
 0.625), while the same lane in the pipelined forward saves about 12 ms
@@ -956,9 +956,10 @@ showed needs a larger ANE share than these lanes carry.
 ## Cool dense arms on a UI-active box
 
 The queue that carried the int4 balance-point arms and the 64-row bank ran
-while the owner was using the machine (mail clients and a browser at 100
-to 160 percent CPU, WindowServer at 20 to 40 percent), and Time Machine's
-hourly backup copied a fresh 92 GB download during the fraction-0.5 arm.
+while the owner was using the machine, with mail clients and a browser at
+100 to 160 percent CPU and WindowServer at 20 to 40 percent. Time
+Machine's hourly backup also copied a fresh 92 GB download during the
+fraction-0.5 arm.
 The gates timed out without reaching the quiet state, and these arms are
 paired against their own controls. Those controls sit at the
 synthetic-load level (105.8 and 110.9 against 124.8 and 128.2 when quiet). Six prompts, 45 s gap,
@@ -978,8 +979,8 @@ excluded as stalled.
 Three readings. The int4 form at fractions 0.5 and 0.625 holds the full
 +16 percent on a box whose GPU is shared with the owner's session, where
 the fixed fractions 0.3125 and 0.5 under the synthetic load sat at parity.
-This is the same direction as the loaded table: the more of the MLP the ANE
-carries, the less the arm depends on the GPU's share. The clean rerun of
+This is the same direction as the loaded table. The more of the MLP the
+ANE carries, the less the arm depends on the GPU's share. The clean rerun of
 the fraction-0.5 arm, paired with a fresh control forty minutes later, came
 in at +1.8 percent (+7.8 against the earlier repeat), with four of its six
 decodes at 9.3 to 9.8 where the control decoded at 12.2, so the owner's
