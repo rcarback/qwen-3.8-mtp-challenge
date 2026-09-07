@@ -393,7 +393,7 @@ the GPU control. A cell that says pending is a queued arm, not an estimate.
 | ANE int8, fraction 0.3125 | 133.1 (+7.5 percent) | 12.59 | 5.563 | 3 of 6 |
 | ANE int4, fraction 0.3125 | 132.5 (+7.1 percent) | 12.44 | 5.772 | 2 of 6 |
 | ANE int8, fraction 0.5 | 130.8, throttles late | 12.40 | 5.571 | 2 of 6 |
-| ANE int4, fraction 0.5 | 115.7 hot, throttles late. 125.4 with a cool gap on a UI-active box (+16.9 percent over its 105.8 control, three clean prompts) | 12.82 | 5.923 | |
+| ANE int4, fraction 0.5 | 115.7 hot, throttles late. 125.4 with a cool gap on a UI-active box (+16.9 percent over its 105.8 control, three clean prompts); clean rerun 119.6 (+1.8 over a 117.5 control, +7.8 over the 110.9 repeat) | 12.82 | 5.923 | |
 | ANE int4, fraction 0.625, cool gap on a UI-active box | 123.1 (+16.3 percent over 105.8, +11.0 over the 110.9 repeat) | 11.7 | pending | |
 | ANE bank, per-row int4, all 64 layers, Core ML path | 63.3 (-49 percent) | 11.87 | not measured: the arm fell back to fp16 at bucket 512 (queue14) | 0 of 6 |
 | ANE bank, 64-row int4 codebooks, Core ML path (placed on the GPU by Core ML) | 67.4 (-36 percent over 105.8, UI-active box) | 12.1 | not measured: same fallback (queue14) | |
@@ -809,14 +809,21 @@ excluded as stalled.
 | int4, fraction 0.625 | 123.1 | +16.3 percent | +11.0 | 1.01 to 1.41 | 11.2 to 11.9 | none |
 | bank, 64-row codebooks, Core ML path | 67.4 | -36.3 percent | -39.2 | 0.57 to 0.71 | 11.6 to 12.7 | none |
 | gpu6 (control repeat) | 110.9 | +4.8 percent | | 1.01 to 1.16 | 10.8 to 12.0 | none |
+| gpu7 (control, 23:23) | 117.5 | | | | 9.3 to 12.3 | none |
+| int4, fraction 0.5, clean rerun (23:33) | 119.6 | +1.8 percent vs gpu7, +7.8 vs gpu6 | | 0.70 to 1.30 vs gpu7 | 9.3 to 12.1 | none |
 
 Three readings. The int4 form at fractions 0.5 and 0.625 holds the full
 +16 percent on a box whose GPU is shared with the owner's session, where
 the fixed fractions 0.3125 and 0.5 under the synthetic load sat at parity.
 This is the same direction as the loaded table: the more of the MLP the ANE
-carries, the less the arm depends on the GPU's share. The fraction-0.5 arm
-needs its clean rerun (queued with a fresh control) before its number
-stands beside 0.625. The 64-row bank confirms its compute plan. Core ML
+carries, the less the arm depends on the GPU's share. The clean rerun of
+the fraction-0.5 arm, paired with a fresh control forty minutes later, came
+in at +1.8 percent (+7.8 against the earlier repeat), with four of its six
+decodes at 9.3 to 9.8 where the control decoded at 12.2, so the owner's
+session was busier during that arm than during its control. The stalled
+run's three clean prompts (+16.9) and the rerun (+1.8 to +7.8) bracket the
+answer for 0.5 on a UI-active box; 0.625 (+11 to +16) is the safer setting
+there, and under the synthetic load it is the clear one. The 64-row bank confirms its compute plan. Core ML
 placed all 8 ops of its layer program on the GPU, and the arm ran at the
 same 63 to 67 tok/s the per-row bank did. The stalls are the third reading.
 Three requests in one arm took 240 to 310 s against 12 to 15 for the
