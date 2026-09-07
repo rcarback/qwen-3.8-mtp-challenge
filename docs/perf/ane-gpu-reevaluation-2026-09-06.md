@@ -492,6 +492,42 @@ or 4.327 (MoE).
 | n-gram table at int4 | MoE | the 3-gram embedding table quantized offline, gathered by the CPU; the ANE plays no part | gather 856 ms against 1,014 bf16 in a 512-token prefill, 25 GB against 102 | 25 of 512 decisions move, all at top-2 gaps under 0.57 | adopted (2026-09-04) |
 | prefill chunk cap 4,096 | MoE | no ANE; fewer, larger forwards | +5 to +17 percent at 7.5k tokens | | new bead |
 
+### The dense MLP operation under each split, one layer, measured
+
+`ANEFusedSplitSpeedTests`, 2026-09-07 04:40: one layer's MLP (hidden 5120,
+intermediate 17408, q4 group-64 on the GPU) at S=512 and S=1024, the GPU
+MLP alone against the split MLP with the ANE prefix running beside the
+GPU remainder, best of 9 in one process per cell, each form and fraction
+its own process. This is the operation the dense lanes change; attention,
+norms and the head are the control's in every dense method. Milliseconds
+per layer, and the ratio GPU alone over split.
+
+| form, fraction | S=512: GPU alone, split, ratio | S=1024: GPU alone, split, ratio |
+| --- | --- | --- |
+| fp16, 0.3125 | 20.2, 21.6, 0.93 | 40.9, 58.7, 0.70 |
+| fp16, 0.5 | 20.2, 43.3, 0.47 | 41.6, 82.8, 0.50 |
+| fp16, 0.625 | 20.5, 53.4, 0.38 | 40.9, 102.8, 0.40 |
+| int8, 0.3125 | 22.1, 32.5, 0.68 | 61.8, 54.2, 1.14 |
+| int8, 0.5 | 21.5, 19.2, 1.12 | 63.7, 39.6, 1.61 |
+| int8, 0.625 | 21.2, 23.4, 0.91 | 52.6, 44.5, 1.18 |
+| int4, 0.3125 | 24.3, 35.7, 0.68 | 54.7, 52.4, 1.04 |
+| int4, 0.5 | 21.8, 23.6, 0.92 | 48.5, 38.6, 1.26 |
+| int4, 0.625 | 22.1, 20.0, 1.11 | 49.1, 35.0, 1.40 |
+
+Three things the operation view adds to the end-to-end tables. The fp16
+prefix is the long pole at every fraction: its ANE time (34 ms per layer at
+S=1024 for 0.3125, rising with the share) exceeds the GPU remainder, so the
+split MLP is slower than the GPU MLP in isolation, and the +4.8 percent it
+showed end to end came from overlap with neighbouring work. int8 and int4
+turn the operation itself faster at S=1024, by 1.1 to 1.6, with the peak at
+0.5 for int8 and at 0.625 for int4, which is where the ANE leg and the GPU
+remainder balance; that is the balance point the end-to-end arms found. At
+S=512 only int8 at 0.5 and int4 at 0.625 beat the GPU alone (1.11 to 1.12),
+so a shorter bucket wants a smaller share, and the lane's 128-token floor
+is well placed. The GPU-alone column moves from 41 to 64 ms between
+processes on this box, which is the same run-to-run spread the serve
+controls show; the ratio inside a process is the number to read.
+
 ### Per-operation breakdown, where it is measured
 
 | operation | GPU | ANE | note |
