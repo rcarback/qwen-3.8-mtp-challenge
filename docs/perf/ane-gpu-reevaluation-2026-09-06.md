@@ -397,6 +397,7 @@ the GPU control. A cell that says pending is a queued arm, not an estimate.
 | ANE int4, fraction 0.625, cool gap on a UI-active box | 123.1 (+16.3 percent over 105.8, +11.0 over the 110.9 repeat) | 11.7 | pending | |
 | ANE bank, per-row int4, all 64 layers, Core ML path | 63.3 (-49 percent) | 11.87 | 5.722 (S512 package, 64 bank functions used, no fallback) | 0 of 6 |
 | ANE bank, 64-row int4 codebooks, Core ML path (placed on the GPU by Core ML) | 67.4 (-36 percent over 105.8, UI-active box) | 12.1 | 6.031 (S512 package, 64 bank functions used, no fallback) | |
+| ANE bank, per-row int4, as two 32-layer parts that Core ML places on the ANE | 47.8 (-56 percent over a 108.0 control with Spotlight paused; the first control, under Spotlight, ran at 69.5) | 11.4 | 5.722 (same codebooks as the per-row row) | 0 of 6 |
 | GPU plus ANE: int8 0.3125 with depth-2 drafting, cool gap | 140.4 (+15.5 percent over the depth-2 control's 121.5) | 22.40 (control 21.94) | | |
 | under a 40 percent duty GPU load: control, then control repeat | 105.6, then 93.3 | 11.29, then 10.68 | | |
 | under the same load: ANE int8, fraction 0.5 | 106.1 (0.5 percent above the first control, 13.7 above the repeat) | 10.12 | | |
@@ -404,6 +405,19 @@ the GPU control. A cell that says pending is a queued arm, not an estimate.
 | under the same load, later in the evening: control, then control repeat | 92.2, then 74.6 | 10.4, then 9.2 | | |
 | under the same load: ANE int8, fraction 0.625 | 116.8 (26.7 percent above the first control, 56.5 above the repeat) | 10.2 | | |
 | under the same load: ANE int8, fraction 0.75 | 96.2 (4.3 percent above the first control, 28.9 above the repeat) | 10.2 | | |
+
+A caution on the "identical completions" column, found while filling it
+for the later arms: the GPU control's own greedy completion is not one
+completion. Across the evening's control runs there are three families,
+each internally identical (gpu3 through gpu9 and gpu4-loaded in one; gpu,
+gpu-loaded and gpu2-loaded in another; gpu3-loaded alone), and any two
+families differ from the first or second token ("The text provided" against
+"This is a fascinating"). That is a first-token near-tie resolved
+differently by processes that run the same weights and the same kernels,
+and the cause is not found. So an arm's 0 of 6 against a control from
+another family says nothing about the lane; the perplexity column is the
+fidelity instrument on this tower, and the agreement column is read only
+against a control of the same family.
 
 The dense tower's per-operation split at prefill: the MLP is three of its
 four dense projections by weight bytes, and the ANE prefix holds 0.3125 of
@@ -886,6 +900,27 @@ now does. The per-row bank generated as two 32-layer parts, plan-checked
 and measured end to end between two controls, is queued (queue16), and
 its result decides whether the Core ML path competes with the direct path
 once its programs run on the ANE.
+
+It does not. The per-row bank as two 32-layer parts, 63 of 64 bank
+functions used at bucket 1024 (the 64th hit the 126-program limit beside
+the 64 direct bucket-512 programs), one build failure, on the ANE by its
+compute plan:
+
+| arm | prefill tok/s, clean prompts | decode | note |
+| --- | --- | --- | --- |
+| gpu8 (control) | 69.5 | 7.9 to 9.4 | Spotlight's store at 130 percent CPU through the arm |
+| bank parts, per-row, fraction 0.3125 | 47.8 | 10.4 to 12.4 | 0.64 to 0.78 of gpu8, 0.40 to 0.46 of gpu9; first prompt 4.0 tok/s while the parts loaded |
+| gpu9 (control repeat, Spotlight workers paused) | 108.0 | 10.6 to 11.5 | |
+
+With its programs on the ANE the bank runs at 44 to 56 percent below the
+control, the same band as the GPU-placed banks (63 to 67 tok/s against 105
+to 125). The device was never the cost. The Core ML dispatch of a
+multifunction model, one `MLModel` per function with the runtime's own
+input and output handling per call, is what the direct path's in-memory
+programs and IOSurface handoff avoid. Verdict for the bank: dead as a
+carrier at any placement. What survives it is the per-row codebook's
+fidelity (5.722), which reaches the direct path only if the in-memory
+compiler accepts a grouped LUT; that probe is the open item.
 
 ## The mlx-serve ladder, both runtimes on this box
 
