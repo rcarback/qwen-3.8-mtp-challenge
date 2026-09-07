@@ -396,7 +396,7 @@ the GPU control. A cell that says pending is a queued arm, not an estimate.
 | ANE int4, fraction 0.5 | 115.7 hot, throttles late. 125.4 with a cool gap on a UI-active box (+16.9 percent over its 105.8 control, three clean prompts). Clean rerun 119.6 (+1.8 over a 117.5 control, +7.8 over the 110.9 repeat) | 12.82 | 5.923 | |
 | ANE int4, fraction 0.625, cool gap on a UI-active box | 123.1 (+16.3 percent over 105.8, +11.0 over the 110.9 repeat) | 11.7 | pending | |
 | ANE bank, per-row int4, all 64 layers, Core ML path | 63.3 (-49 percent) | 11.87 | not measured: the arm fell back to fp16 at bucket 512 (queue14) | 0 of 6 |
-| ANE bank, 64-row int4 codebooks, Core ML path (placed on the GPU by Core ML) | 67.4 (-36 percent over 105.8, UI-active box) | 12.1 | not measured: same fallback (queue14) | |
+| ANE bank, 64-row int4 codebooks, Core ML path (placed on the GPU by Core ML) | 67.4 (-36 percent over 105.8, UI-active box) | 12.1 | 6.031 (S512 package, 64 bank functions used, no fallback) | |
 | GPU plus ANE: int8 0.3125 with depth-2 drafting, cool gap | 140.4 (+15.5 percent over the depth-2 control's 121.5) | 22.40 (control 21.94) | | |
 | under a 40 percent duty GPU load: control, then control repeat | 105.6, then 93.3 | 11.29, then 10.68 | | |
 | under the same load: ANE int8, fraction 0.5 | 106.1 (0.5 percent above the first control, 13.7 above the repeat) | 10.12 | | |
@@ -594,9 +594,15 @@ configured, and that number is the fp16 lane's, not the bank's. The harness
 feeds 512-token windows, the bank holds only an S1024 package, and the lane
 logged "bank unavailable for bucket 512" on every layer and built the fp16
 direct program instead ("source=dequant4"). The same happened to the 64-row
-bank's arm. Neither codebook's quality is measured yet. queue14 generates a
-bucket-512 package for each bank and reruns the arm with the count of bank
-functions used printed beside the number. The speed question is separate:
+bank's arm. queue14 generated a
+bucket-512 package for each bank and reran the arm with the count of bank
+functions used printed beside the number. The 64-row bank, with all 64
+functions used and no fallback: perplexity 6.031, against 5.566 for the
+control, 5.565 for the fp16 lane and 5.772 for the per-tensor int4 palette
+on the direct path. One 16-entry codebook shared by 64 rows is worse than
+one palette with a per-row scale, because the rows inside a block differ in
+scale and the block's codebook covers the largest of them. The per-row
+bank's number is pending in the same queue. The speed question is separate:
 the Core ML dispatch path is the wrong carrier for either bank (the next
 section, and the 64-row plan below), so the per-row and grouped codebooks
 matter only if the in-memory program accepts them, which is the next probe.
