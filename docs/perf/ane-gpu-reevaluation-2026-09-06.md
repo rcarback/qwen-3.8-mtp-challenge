@@ -602,8 +602,8 @@ control, 5.565 for the fp16 lane and 5.772 for the per-tensor int4 palette
 on the direct path. One 16-entry codebook shared by 64 rows is worse than
 one palette with a per-row scale, because the rows inside a block differ in
 scale and the block's codebook covers the largest of them. The per-row
-bank, same protocol: 5.722. So one codebook per row lands between the
-per-tensor palette (5.772) and int8 (5.563); it is the best int4 form
+bank, same protocol: 5.722. One codebook per row lands between the
+per-tensor palette (5.772) and int8 (5.563). It is the best int4 form
 measured, and it is not lossless. The int4 fidelity ladder on this tower
 now reads per-tensor palette 5.772, per-row codebook 5.722, 64-row codebook
 6.031, int8 5.563, control 5.566. The speed question is separate:
