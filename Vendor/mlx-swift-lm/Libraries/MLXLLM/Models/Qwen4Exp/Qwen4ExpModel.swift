@@ -301,6 +301,19 @@ public final class Qwen4ExpTextModel: Module {
             layers[pleIdx].ple?.embedding.prefetchAhead(ids: ids, prevContext: context)
         }
         if Qwen4ExpLayerTiming.enabled {
+            let before = Qwen4ExpLayerTiming.snapshotMs()
+            let countsBefore = Qwen4ExpLayerTiming.counts()
+            defer {
+                // One line per forward, as a delta so a test that snapshots
+                // around the forward still reads its own totals.
+                let after = Qwen4ExpLayerTiming.snapshotMs()
+                let countsAfter = Qwen4ExpLayerTiming.counts()
+                fputs(String(
+                    format: "[qwen4exp-timing] S=%d full=%.2fms/%d linear=%.2fms/%d tail=%.2fms serialised=%.2fms\n",
+                    ids.dim(1), after.full - before.full, countsAfter.full - countsBefore.full,
+                    after.linear - before.linear, countsAfter.linear - countsBefore.linear,
+                    after.tail, after.full - before.full + after.linear - before.linear + after.tail), stderr)
+            }
             // Per-layer cost inside the REAL forward. This forces an eval per
             // layer, which SERIALISES what the lazy graph would otherwise
             // pipeline, so the sum overstates the unmeasured forward. That gap
