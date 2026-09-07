@@ -3,7 +3,7 @@ import MLX
 import MLXLMCommon
 import Testing
 
-@testable import MLXLLM  // `qwen35EpsScalar` is internal; see GatedDeltaScanCostTests
+@testable import MLXLLM  // `qwen35EpsScalar` is internal
 
 /// Width-1 forward stream: what the host builds per decode step, and the
 /// byte-equality receipts for each launch reduction that removes part of it.
