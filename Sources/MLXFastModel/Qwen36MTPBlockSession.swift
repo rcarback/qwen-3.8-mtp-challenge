@@ -842,8 +842,9 @@ public final class Qwen36MTPBlockSession {
     /// constant the marginal rule needs. Derivation from the campaign's
     /// measured budgets: the verify forward is weight-stream bound on the
     /// ~14.1 GiB 4-bit backbone and near-flat in width; a head step streams
-    /// the head layer plus the full lm_head readout (~0.65 GiB 4-bit) and
-    /// carries the chained-launch overhead of the committed-history path.
+    /// the head layer plus its compact draft projection (283,207,680 bytes,
+    /// not the full lm_head readout the first fits assumed) and carries
+    /// the chained-launch overhead of the committed-history path.
     /// h HISTORY, because it was mispriced twice. 0.12 (arm 1) and 0.09
     /// (arm 2) both divided total window time by rounds WITHOUT subtracting
     /// the ~0.9 s seed prologue charged inside the local window — a prologue
@@ -1328,7 +1329,17 @@ public final class Qwen36MTPBlockSession {
             let serialLastRow = serialLogits[
                 0..., (serialLogits.dim(1) - 1) ..< serialLogits.dim(1), 0...]
             let (tailIDs, tailValues) = Self.linearTopTwoRows(serialLastRow)
-            eval(cache.flatMap { $0.state } + [tailIDs, tailValues])
+            // ROOTS, NOT THE TRIMMED VIEW. `state` on the 16 full-attention
+            // layers returns `keys[.ellipsis, ..<offset, 0...]` whenever the
+            // offset is below the allocated depth, which is every round but
+            // one in 256 (KVCache.swift:443-454, step 256). Those slices exist
+            // only to be evaluated and discarded. `innerState()` returns the
+            // same roots without them, and the barrier wants the roots: the
+            // root subsumes everything the barrier needs while skipping the
+            // throwaway slice ops, and no host read is taken from these
+            // arrays. The 48 recurrent layers are unaffected -- `state` and
+            // `innerState()` are the same expression there.
+            eval(cache.flatMap { $0.innerState() } + [tailIDs, tailValues])
             let readTail = (
                 tailIDs.asArray(Int32.self).map { Int($0) },
                 tailValues.asArray(Float.self).map { Double($0) }
@@ -1493,7 +1504,7 @@ public final class Qwen36MTPBlockSession {
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        eval(cache.flatMap { $0.innerState() } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
@@ -1586,7 +1597,7 @@ public final class Qwen36MTPBlockSession {
                     0..., (repairLogits.dim(1) - 1) ..< repairLogits.dim(1),
                     0...]
                 let (tailIDs, tailValues) = Self.linearTopTwoRows(repairLastRow)
-                eval(cache.flatMap { $0.state } + [tailIDs, tailValues])
+                eval(cache.flatMap { $0.innerState() } + [tailIDs, tailValues])
                 let ids = tailIDs.asArray(Int32.self).map { Int($0) }
                 let values = tailValues.asArray(Float.self).map { Double($0) }
                 // Top-2 first ID == row argmax; no separate argMax launch.
