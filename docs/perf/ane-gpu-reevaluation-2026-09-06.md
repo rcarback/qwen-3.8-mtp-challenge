@@ -832,3 +832,24 @@ others, with the model's own prefill or decode timer absorbing the stall
 cache under memory-mapped weights. The request wall column caught it; the
 pack, the scratchpad and the Hub cache are excluded from Time Machine now
 and the rule is in the skill.
+
+## Grouped codebooks at real shape, one conv at a time
+
+The 64-row bank's layer program is placed on the GPU with its convs
+reported `supported=cpu/gpu`, and the question was whether Core ML rejects
+the grouped palette itself at real shape. It does not. A sweep of
+single-conv packages (`tools/ane-probes/gen_lut_group_probe.py`, iOS18,
+one 16-entry codebook per block of rows) at the bank's own shapes:
+
+| shape | rows per codebook (groups) | placement |
+| --- | --- | --- |
+| gate `[5440 x 5120]` | per tensor; 2720 (2); 1360 (4); 680 (8); 320 (17); 160 (34); 64 (85) | ANE, all seven |
+| down `[5120 x 5440]` | per tensor; 2560 (2); 1280 (4); 640 (8); 320 (16); 64 (80) | ANE, all six |
+| probe `[1280 x 2560]` | 64 (20) | ANE |
+
+So a conv with 80 to 85 codebooks at real shape is ANE-eligible on its
+own. What the bank's program adds is the fused SwiGLU (two convs, the
+SiLU spelled as `x / (1 + exp(-x))` with a `real_div`, a `mul`, the down
+conv) and the 64-function package. The next probe, queued, builds one
+layer three ways and plan-checks each: 64-row codebooks with that SiLU
+chain, the same with the native `silu` op, and per-row codebooks.
