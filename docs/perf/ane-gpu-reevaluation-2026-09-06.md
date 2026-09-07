@@ -393,8 +393,10 @@ the GPU control. A cell that says pending is a queued arm, not an estimate.
 | ANE int8, fraction 0.3125 | 133.1 (+7.5 percent) | 12.59 | 5.563 | 3 of 6 |
 | ANE int4, fraction 0.3125 | 132.5 (+7.1 percent) | 12.44 | 5.772 | 2 of 6 |
 | ANE int8, fraction 0.5 | 130.8, throttles late | 12.40 | 5.571 | 2 of 6 |
-| ANE int4, fraction 0.5 | 115.7, throttles late | 12.82 | 5.923 | |
-| ANE bank, per-row int4, all 64 layers, Core ML path | 63.3 (-49 percent) | 11.87 | 5.565 | 0 of 6 |
+| ANE int4, fraction 0.5 | 115.7 hot, throttles late. 125.4 with a cool gap on a UI-active box (+16.9 percent over its 105.8 control, three clean prompts) | 12.82 | 5.923 | |
+| ANE int4, fraction 0.625, cool gap on a UI-active box | 123.1 (+16.3 percent over 105.8, +11.0 over the 110.9 repeat) | 11.7 | pending | |
+| ANE bank, per-row int4, all 64 layers, Core ML path | 63.3 (-49 percent) | 11.87 | not measured: the arm fell back to fp16 at bucket 512 (queue14) | 0 of 6 |
+| ANE bank, 64-row int4 codebooks, Core ML path (placed on the GPU by Core ML) | 67.4 (-36 percent over 105.8, UI-active box) | 12.1 | not measured: same fallback (queue14) | |
 | GPU plus ANE: int8 0.3125 with depth-2 drafting, cool gap | 140.4 (+15.5 percent over the depth-2 control's 121.5) | 22.40 (control 21.94) | | |
 | under a 40 percent duty GPU load: control, then control repeat | 105.6, then 93.3 | 11.29, then 10.68 | | |
 | under the same load: ANE int8, fraction 0.5 | 106.1 (0.5 percent above the first control, 13.7 above the repeat) | 10.12 | | |
@@ -569,9 +571,9 @@ not the GPU's, and the control moved only 2.7 percent. Second, the Core ML
 bank path loses half the prefill: it engaged on all 64 layers at bucket 1024
 and its per-call cost on the big fused program is far above the direct
 path's, the same fact the `r` table's dense rows showed. The bank's
-per-row-codebook quality is still read from its perplexity arm; its speed
-needs the direct path, which cannot bank, or a per-row LUT in the in-memory
-program.
+per-row-codebook quality is not read from its perplexity arm after all (see
+the correction under "The bank's quality"); its speed needs the direct path,
+which cannot bank, or a per-row LUT in the in-memory program.
 
 The reading the owner asked to be kept in view is that these lanes are
 measured against an idle and cool GPU, which is the least common state of
@@ -581,15 +583,17 @@ that make that concrete are queued.
 
 ### The bank's quality
 
-Teacher-forced perplexity with the bank engaged on all 64 layers: 5.565,
-against the control's 5.566 and the per-tensor int4's 5.772. One codebook
-per weight row makes int4 lossless at this resolution. The int4 question
-has two separate answers. The per-row codebook is the right
-quantizer, while the Core ML dispatch path is the wrong carrier for it. The
-next probe is the per-row LUT
-in the in-memory program, whose compiler accepted the per-tensor palette and
-rejected the blockwise op; if it takes the grouped LUT, int4 at the direct
-path's speed and the bank's quality is one build away.
+Correction, 22:35. The perplexity arm reported 5.565 with the bank
+configured, and that number is the fp16 lane's, not the bank's. The harness
+feeds 512-token windows, the bank holds only an S1024 package, and the lane
+logged "bank unavailable for bucket 512" on every layer and built the fp16
+direct program instead ("source=dequant4"). The same happened to the 64-row
+bank's arm. Neither codebook's quality is measured yet. queue14 generates a
+bucket-512 package for each bank and reruns the arm with the count of bank
+functions used printed beside the number. The speed question is separate:
+the Core ML dispatch path is the wrong carrier for either bank (the next
+section, and the 64-row plan below), so the per-row and grouped codebooks
+matter only if the in-memory program accepts them, which is the next probe.
 
 ### Why the bank was slow
 
@@ -732,3 +736,39 @@ ended on its best prompt). What the MoE lanes offload is a small share of
 the layer (two projections, or the shared expert), so the GPU's share sets
 the pace under load as it does when cool; the resilience the dense tower
 showed needs a larger ANE share than these lanes carry.
+
+## Cool dense arms on a UI-active box
+
+The queue that carried the int4 balance-point arms and the 64-row bank ran
+while the owner was using the machine (mail clients and a browser at 100
+to 160 percent CPU, WindowServer at 20 to 40 percent), and Time Machine's
+hourly backup copied a fresh 92 GB download during the fraction-0.5 arm.
+The gates timed out without reaching the quiet state. These arms are
+therefore paired against their own controls. Those controls sit at the
+synthetic-load level (105.8 and 110.9 against 124.8 and 128.2 when quiet). Six prompts, 45 s gap,
+means over prompts 2 to 6 with any prompt whose request wall exceeded 60 s
+excluded as stalled.
+
+| arm | prefill tok/s, clean prompts | vs gpu5 | vs gpu6 | paired range vs gpu5 | decode | stalled prompts |
+| --- | --- | --- | --- | --- | --- | --- |
+| gpu5 (control) | 105.8 | | | | 9.9 to 11.4 | none |
+| int4, fraction 0.5 | 125.4 | +16.9 percent | +14.1 | 0.95 to 1.40 | 10.7 to 12.5 clean | cooking, geology, law: walls 242 to 312 s |
+| int4, fraction 0.625 | 123.1 | +16.3 percent | +11.0 | 1.01 to 1.41 | 11.2 to 11.9 | none |
+| bank, 64-row codebooks, Core ML path | 67.4 | -36.3 percent | -39.2 | 0.57 to 0.71 | 11.6 to 12.7 | none |
+| gpu6 (control repeat) | 110.9 | +4.8 percent | | 1.01 to 1.16 | 10.8 to 12.0 | none |
+
+Three readings. The int4 form at fractions 0.5 and 0.625 holds the full
++16 percent on a box whose GPU is shared with the owner's session, where
+the fixed fractions 0.3125 and 0.5 under the synthetic load sat at parity.
+This is the same direction as the loaded table: the more of the MLP the ANE
+carries, the less the arm depends on the GPU's share. The fraction-0.5 arm
+needs its clean rerun (queued with a fresh control) before its number
+stands beside 0.625. The 64-row bank confirms its compute plan. Core ML
+placed all 8 ops of its layer program on the GPU, and the arm ran at the
+same 63 to 67 tok/s the per-row bank did. The stalls are the third reading.
+Three requests in one arm took 240 to 310 s against 12 to 15 for the
+others, with the model's own prefill or decode timer absorbing the stall
+(0.3 tok/s decode, 2.1 tok/s prefill), which is a backup churning the page
+cache under memory-mapped weights. The request wall column caught it; the
+pack, the scratchpad and the Hub cache are excluded from Time Machine now
+and the rule is in the skill.
