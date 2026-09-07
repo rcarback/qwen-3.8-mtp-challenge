@@ -105,6 +105,22 @@ sample to match, never as a statement about ANE behavior. Confirm every op and
 format in hardware with the probes:
 `MLXFAST_RUN_MLX_RUNTIME_TESTS=1 MLXFAST_NO_SANDBOX=1 swift test -c release`.
 
+## Keep new large trees out of Time Machine and Spotlight
+
+A backup or an index pass over a freshly written model tree churns the page
+cache the memory-mapped weights live in. On 2026-09-06 a backup copying a
+92 GB download made every GPU step of a timed arm 35 times slower for 16
+minutes (request walls of 240 to 310 s against 12 to 15 s), and Spotlight
+workers held the quiet gate for 12 minutes. Neither needs sudo to stop:
+
+- `tmutil addexclusion <dir>` on every new large directory before its first
+  hourly backup (packs, generated banks, the session scratchpad).
+- Name a download or generator directory with a `.noindex` suffix so
+  Spotlight skips it; `kill -STOP` the user-owned `mdworker_shared`
+  processes for a timed phase and `kill -CONT` them after.
+- Record the request wall time beside every row; a wall far above the
+  model's own prefill plus decode time is the contamination signal.
+
 ## Housekeeping: clean up after every run
 
 Every ANE run leaves large generated data behind, and this box runs with a
