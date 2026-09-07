@@ -847,8 +847,7 @@ one 16-entry codebook per block of rows) at the bank's own shapes:
 | down `[5120 x 5440]` | per tensor; 2560 (2); 1280 (4); 640 (8); 320 (16); 64 (80) | ANE, all six |
 | probe `[1280 x 2560]` | 64 (20) | ANE |
 
-So a conv with 80 to 85 codebooks at real shape is ANE-eligible on its
-own. What the bank's program adds is the fused SwiGLU (two convs, the
+A conv with 80 to 85 codebooks at real shape is ANE-eligible on its own. What the bank's program adds is the fused SwiGLU (two convs, the
 SiLU spelled as `x / (1 + exp(-x))` with a `real_div`, a `mul`, the down
 conv) and the 64-function package. The next probe, queued, builds one
 layer three ways and plan-checks each: 64-row codebooks with that SiLU
