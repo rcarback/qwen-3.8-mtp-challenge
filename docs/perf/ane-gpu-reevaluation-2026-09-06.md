@@ -733,7 +733,7 @@ One property of every serve arm in this record needs stating. A prompt of
 600 to 665 tokens builds two programs per layer, bucket 512 and bucket
 1024, so 128 programs against the 126-program limit per process
 (`references/chip-support.md`). The last two layers' bucket-1024 programs
-fail with 0x50004 and those layers run their GPU path at that bucket; the
+fail with `0x50004` and those layers run their GPU path at that bucket; the
 int8 arms at 0.625 and 0.75 lost four. Every arm carries the same
 shortfall, so the comparisons stand and the ANE numbers are a little
 conservative. A single-bucket layout, or the procedure bank, removes it.
@@ -754,10 +754,9 @@ measured at 41 percent), then cool again. Milliseconds per call.
 
 The ANE's time does not move when the GPU is loaded (the loaded column is
 1 to 5 percent faster, within the run-to-run spread of a warm chip).
-Everything the loaded tables lose is on the GPU's side of the split and in
-the host's crossings. That is the reason a larger ANE share holds up better
-under load, and the reason a fixed fraction tuned cool under-uses the ANE
-there.
+Everything the loaded tables lose sits on the GPU's side of the split and
+in the host's crossings. A larger ANE share holds up better under load for
+that reason, and a fixed fraction tuned cool under-uses the ANE there.
 
 ### The loaded box, MoE tower
 
