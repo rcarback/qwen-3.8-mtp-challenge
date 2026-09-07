@@ -1005,9 +1005,9 @@ workers paused, 2026-09-07 03:30.
 | arm | prefill tok/s | prefill s | decode | vs the two controls |
 | --- | --- | --- | --- | --- |
 | plain forward (control) | 255.7 | 29.4 | 14.5 | |
-| forced micro-batches of 512 | 221.3 | 34.0 | 15.2 | -13.5 and -20.9 percent |
-| forced micro-batches of 1024 | 264.7 | 28.4 | 14.1 | +3.5 and -5.4 |
-| forced micro-batches of 2048 | 249.1 | 30.2 | 14.3 | -2.6 and -11.0 |
+| forced micro-batches of 512 | 221.3 | 34.0 | 15.2 | 13.5 and 20.9 percent below |
+| forced micro-batches of 1024 | 264.7 | 28.4 | 14.1 | 3.5 above and 5.4 below |
+| forced micro-batches of 2048 | 249.1 | 30.2 | 14.3 | 2.6 and 11.0 below |
 | plain forward (control repeat) | 279.9 | 26.9 | 16.0 | |
 
 At 1024 the restructuring sits inside the control spread (255.7 to 279.9),
