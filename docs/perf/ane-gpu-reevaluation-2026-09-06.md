@@ -431,7 +431,7 @@ because the lane arms only at 128 tokens and above.
 | under the same load: ANE shared expert, int8 | 131.5 (8.7 percent below the first control, 13.6 above the repeat) | 13.85 | | |
 | reference, mlx-serve release notes, M4 Max, 4-bit pack, short context | | 60 to 69 | | |
 | reference, mlx-serve release notes, M4 Max, 32k prompt | 699 | | | |
-| mlx-serve at HEAD on this box (2026-09-07, mixed 4/8 pack, kv8, serial: no MTP, no PLD), short / 4k / 32k / 128k | 309 / 224 / 219 / 253 | 22.3 / 19.7 / 15.5 / 17.5 | | |
+| mlx-serve at HEAD on this box (2026-09-07, mixed 4/8 pack, kv8, serial with MTP and PLD off), short / 4k / 32k / 128k | 309 / 224 / 219 / 253 | 22.3 / 19.7 / 15.5 / 17.5 | | |
 | mlx-serve at HEAD on this box, its MTP on, same rungs | 267 / 297 / 296 / 281 | 36.3 / 33.1 / 31.1 / 33.4 | | |
 | ours on this box the same night (q8 tree, bf16 KV, depth 0), short / 4.8k / 38k / 150k | 83 / 258 / 149 / timed out | 13.3 / 14.4 / 10.5 / timed out | | |
 
@@ -874,7 +874,7 @@ tokenizers differ: the same rung text is 4,244 tokens to mlx-serve and
 
 | runtime, arm | short prompt decode | 4k: prefill, decode | 32k: prefill, decode | 128k: prefill, decode | resident |
 | --- | --- | --- | --- | --- | --- |
-| mlx-serve, serial (no MTP, no PLD) | 22.3 | 224 tok/s, 19.7 | 219, 15.5 | 253, 17.5 (TTFT 518 s) | 5.6 GB RSS after, pack mapped lazily |
+| mlx-serve, serial (MTP and PLD off) | 22.3 | 224 tok/s, 19.7 | 219, 15.5 | 253, 17.5 (TTFT 518 s) | 5.6 GB RSS after, pack mapped lazily |
 | mlx-serve, its MTP (`--mtp`, adaptive depth up to 3) | 36.3 | 297, 33.1 | 296, 31.1 | 281, 33.4 (TTFT 467 s) | 31.6 GB RSS after |
 | ours, depth 0 | 13.3 | 258 (4.8k tokens), 13.7 to 15.1 | 149 (38k tokens), 9.6 to 11.4 | failed: the worker timed out on a 150k-token prefill | worker 19 GB RSS plus the mapped trees |
 
@@ -898,8 +898,13 @@ The 128k failure is ours to fix before any long-context claim: the serve
 parent gives the worker a fixed request timeout
 (`RuntimeWorkerOptions.defaultRequestTimeoutSeconds`) and a 150k-token
 prefill at 100 to 150 tok/s runs past it, so the parent kills the worker
-mid-prefill. Filed as a bug. What transfers, in the order the numbers rank
-it: the decode step (their 22 against our 13 on the same pack class is the
-step, not the pack), prefix reuse, the long-context prefill arms, and MTP
-on the MoE. Each is its own bead with an A/B against 13.3 and 258 on this
-box, or against 18.3 and 274 quiet.
+mid-prefill. Filed as a bug. What transfers, in the order the numbers rank it:
+
+- the decode step (their 22 against our 13 on the same pack class is the
+  step, not the pack)
+- prefix reuse across requests
+- the long-context prefill arms
+- MTP on the MoE
+
+Each is its own bead with an A/B against 13.3 and 258 on this box, or
+against 18.3 and 274 quiet.
