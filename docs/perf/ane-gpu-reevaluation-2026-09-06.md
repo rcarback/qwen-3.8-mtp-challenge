@@ -547,13 +547,44 @@ is for. Milliseconds per forward, then per layer.
 The lanes move no family by more than 1 percent at prefill, which is the
 per-operation form of the parity the end-to-end arms found: the
 projections the split lane offloads and the shared expert the other lane
-offloads are each a few percent of a layer whose cost is the routed
+offloads are each a small share of a layer whose cost is the routed
 experts and the gated-delta recurrence, and the ANE's share of them runs
 at the GPU's pace. At decode the lanes are off (they arm at 128 tokens)
 and the rows agree to the noise. The gated-delta family is 78 percent of
 prefill layer time and 74 percent of decode layer time by count, at the
 same per-layer cost as full attention; a lane that wants to move the MoE
 tower has to move the experts or the recurrence, not the projections.
+
+### The dense forward by sublayer under each lane, measured inside the forward
+
+`MLX_QWEN35_LAYER_TIMING=1`, 2026-09-07 05:08, an eval after each layer's
+attention sublayer and after its MLP, three prompts of 603 to 649 tokens
+and 32 decode tokens per arm, medians. Sixteen full-attention and 48
+gated-delta layers. The same caveat as the MoE table: the evals serialise
+the forward (prefill ran at 115 to 148 tok/s under the instrument against
+125 to 145 without it on this box, decode at 11 against 12.6). Milliseconds
+per forward.
+
+| arm | prefill: attention, 16 full | attention, 48 gated-delta | MLP, 64 layers | MLP share | decode: attention full | attention gated-delta | MLP | serialised |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| GPU control | 290 | 1,043 | 2,551 (39.9 per layer) | 66 percent | 9.3 | 29.0 | 49.9 | 88.4 |
+| int8, fraction 0.5 (127 programs) | 283 | 969 | 2,640 (41.3) | 68 | 8.9 | 28.3 | 48.8 | 86.5 |
+| int4, fraction 0.3125 (127 programs) | 284 | 992 | 2,464 (38.5) | 66 | 9.3 | 29.2 | 50.3 | 88.6 |
+| int8, fraction 0.625 (127 programs) | 252 | 948 | 3,218 (50.3) | 73 | 8.7 | 28.5 | 48.4 | 85.9 |
+
+Two readings. The MLP is two thirds of the dense tower's prefill and 56
+percent of its decode step, which is why the dense lanes, which touch only
+the MLP, can move the tower at all and why nothing that touches attention
+alone could move it much. And the instrument shows what the lane costs
+without overlap: with an eval closing each sublayer, the split MLP reads at
+the control's cost (41 against 40 ms per layer at 0.5) or above it (50 at
+0.625), while the same lane in the pipelined forward saves about 12 ms
+per layer (the +16.6 percent at 0.5 is 0.74 s over 64 layers). That
+difference is the overlap the lane earns from the GPU queue running ahead
+across the sublayer boundary, which an eval removes; it is the dense
+tower's version of the amortisation factor, and it is the whole of the
+lane's gain. At decode the lane is off and the four rows agree within 3
+percent.
 
 ### Per-operation breakdown, where it is measured
 
