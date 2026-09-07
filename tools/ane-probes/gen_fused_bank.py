@@ -91,8 +91,11 @@ def layer_program(hidden, F, gc, gl, uc, ul, dc, dl):
         gate = mb.conv(x=x, weight=gw, strides=[1, 1], pad_type="valid", dilations=[1, 1], groups=1, name="gate")
         up = mb.conv(x=x, weight=uw, strides=[1, 1], pad_type="valid", dilations=[1, 1], groups=1, name="up")
         # SiLU spelled as x / (1 + exp(-x)): the ANE's silu op is a coarse table.
-        den = mb.add(x=mb.exp(x=mb.mul(x=gate, y=np.float16(-1.0))), y=np.float16(1.0))
-        act = mb.mul(x=mb.real_div(x=gate, y=den), y=up, name="swiglu")
+        if os.environ.get("SILU_OP") == "native":
+            act = mb.mul(x=mb.silu(x=gate), y=up, name="swiglu")   # placement probe: the single silu op
+        else:
+            den = mb.add(x=mb.exp(x=mb.mul(x=gate, y=np.float16(-1.0))), y=np.float16(1.0))
+            act = mb.mul(x=mb.real_div(x=gate, y=den), y=up, name="swiglu")
         return mb.conv(x=act, weight=dw, strides=[1, 1], pad_type="valid", dilations=[1, 1], groups=1, name="y")
     return prog
 

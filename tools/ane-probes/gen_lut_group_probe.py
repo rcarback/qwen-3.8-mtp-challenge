@@ -72,7 +72,7 @@ for shape_name, (O, K) in SHAPES.items():
             w_eff.astype(np.float16).tofile(os.path.join(side, "w_eff_f16.bin"))
             x.tofile(os.path.join(side, "x_f16.bin"))
             (x32 @ w_eff.T).astype(np.float32).tofile(os.path.join(side, "y_ref_f32.bin"))
-            json.dump({"O": O, "K": K, "S": S, "input": "x", "output": list(m.output_description.keys())[0]}, open(os.path.join(side, "meta.json"), "w"))
+            json.dump({"O": O, "K": K, "S": S, "input": "x", "output": m.get_spec().description.output[0].name}, open(os.path.join(side, "meta.json"), "w"))
             manifest[name] = "ok"
             print("built", name)
         except Exception as e:  # noqa: BLE001 - record the converter's refusal beside the packages that built
