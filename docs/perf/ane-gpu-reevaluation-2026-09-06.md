@@ -394,7 +394,7 @@ the GPU control. A cell that says pending is a queued arm, not an estimate.
 | ANE int4, fraction 0.3125 | 132.5 (+7.1 percent) | 12.44 | 5.772 | 2 of 6 |
 | ANE int8, fraction 0.5 | 130.8, throttles late | 12.40 | 5.571 | 2 of 6 |
 | ANE int4, fraction 0.5 | 115.7 hot, throttles late. 125.4 with a cool gap on a UI-active box (+16.9 percent over its 105.8 control, three clean prompts). Clean rerun 119.6 (+1.8 over a 117.5 control, +7.8 over the 110.9 repeat) | 12.82 | 5.923 | |
-| ANE int4, fraction 0.625, cool gap on a UI-active box | 123.1 (+16.3 percent over 105.8, +11.0 over the 110.9 repeat) | 11.7 | pending | |
+| ANE int4, fraction 0.625, cool gap on a UI-active box | 123.1 (+16.3 percent over 105.8, +11.0 over the 110.9 repeat) | 11.7 | 6.188 | 0 of 6 (see the family caution) |
 | ANE bank, per-row int4, all 64 layers, Core ML path | 63.3 (-49 percent) | 11.87 | 5.722 (S512 package, 64 bank functions used, no fallback) | 0 of 6 |
 | ANE bank, 64-row int4 codebooks, Core ML path (placed on the GPU by Core ML) | 67.4 (-36 percent over 105.8, UI-active box) | 12.1 | 6.031 (S512 package, 64 bank functions used, no fallback) | |
 | ANE bank, per-row int4, as two 32-layer parts that Core ML places on the ANE | 47.8 (-56 percent over a 108.0 control with Spotlight paused; the first control, under Spotlight, ran at 69.5) | 11.4 | 5.722 (same codebooks as the per-row row) | 0 of 6 |
@@ -403,7 +403,7 @@ the GPU control. A cell that says pending is a queued arm, not an estimate.
 | under the same load: ANE int8, fraction 0.5 | 106.1 (0.5 percent above the first control, 13.7 above the repeat) | 10.12 | | |
 | under the same load: ANE int4, fraction 0.3125 | 99.6 (5.6 percent below the first control, 6.8 above the repeat) | 9.27 | | |
 | under the same load, later in the evening: control, then control repeat | 92.2, then 74.6 | 10.4, then 9.2 | | |
-| under the same load: ANE int8, fraction 0.625 | 116.8 (26.7 percent above the first control, 56.5 above the repeat) | 10.2 | | |
+| under the same load: ANE int8, fraction 0.625 | 116.8 (26.7 percent above the first control, 56.5 above the repeat) | 10.2 | 5.564 | |
 | under the same load: ANE int8, fraction 0.75 | 96.2 (4.3 percent above the first control, 28.9 above the repeat) | 10.2 | | |
 
 A caution on the "identical completions" column, found while filling it
@@ -463,7 +463,7 @@ the int8 arms are lossless in perplexity and still diverge on most prompts.
 | MoE `in_proj_qkv` `[10240, 2560]` at S=128 | 0.684 ms, q4 group-64 | 0.632 ms, fp16, zero-copy output | 0.92x, the compute win the lanes cannot bank |
 | dense fused MLP prefix, 0.3125 of the channels, bucket 1024 | | 167 MB fp16, 83 int8, 42 int4 per layer | compute-bound at this bucket, so the form buys about 2.5 points |
 | expert `gate_up` `[1280, 2560]` and `down` `[2560, 640]` | production q4 group-32 gather | fp16 and int4 palette | the `r` table below, bead `xi7` |
-| whole gated-delta layer at S=1 as one ANE program | 1.27 ms per layer on the GPU (pipelined) | pending | bead `i6v` |
+| whole gated-delta layer at S=1 as one ANE program | 1.27 ms per layer on the GPU (pipelined) | 0.86 ms for the dense part alone, all 59 ops on the ANE; about 1.5 ms with the experts and the crossings | bead `i6v`, closed: dead |
 
 ## `r`, re-measured with zero-copy I/O and production-quantized GPU arms
 
@@ -619,8 +619,11 @@ scale and the block's codebook covers the largest of them. The per-row
 bank, same protocol: 5.722. One codebook per row lands between the
 per-tensor palette (5.772) and int8 (5.563). It is the best int4 form
 measured, and it is not lossless. The int4 fidelity ladder on this tower
-now reads per-tensor palette 5.772, per-row codebook 5.722, 64-row codebook
-6.031, int8 5.563, control 5.566. The speed question is separate:
+now reads per-tensor palette 5.772 at fraction 0.3125, 5.923 at 0.5 and
+6.188 at 0.625, per-row codebook 5.722, 64-row codebook 6.031, against int8
+at 5.563, 5.571 and 5.564 for the same three fractions and the control at
+5.566. The palette's loss grows with the share of the layer it carries;
+int8's does not. The speed question is separate:
 the Core ML dispatch path is the wrong carrier for either bank (the next
 section, and the 64-row plan below), so the per-row and grouped codebooks
 matter only if the in-memory program accepts them, which is the next probe.
