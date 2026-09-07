@@ -852,9 +852,30 @@ one 16-entry codebook per block of rows) at the bank's own shapes:
 
 A conv with 80 to 85 codebooks at real shape is ANE-eligible on its own. What the bank's program adds is the fused SwiGLU (two convs, the
 SiLU spelled as `x / (1 + exp(-x))` with a `real_div`, a `mul`, the down
-conv) and the 64-function package. The next probe, queued, builds one
-layer three ways and plan-checks each: 64-row codebooks with that SiLU
-chain, the same with the native `silu` op, and per-row codebooks.
+conv) and the 64-function package. The next probe built one
+layer as its own package and plan-checked it, then packages with more
+functions:
+
+| package | functions | size | placement of layer 0's 8 ops |
+| --- | --- | --- | --- |
+| one layer, 64-row codebooks, the SiLU chain | 1 | 42 MB | ANE, 8 of 8 |
+| one layer, per-row codebooks, the SiLU chain | 1 | 42 MB | ANE, 8 of 8 |
+| layers 0 to 1, 64-row | 2 | 85 MB | ANE, 8 of 8 |
+| layers 0 to 3 | 4 | 159 MB | ANE, 8 of 8 |
+| layers 0 to 7 | 8 | 319 MB | ANE, 8 of 8 |
+| layers 0 to 15 | 16 | 638 MB | ANE, 8 of 8 |
+| layers 0 to 31 | 32 | 1.2 GB | ANE, 8 of 8 |
+| layers 0 to 63, the bank as built | 64 | 2.7 GB | GPU, 8 of 8 |
+
+Neither the codebooks nor the fused program is the cause. A multifunction
+package of 32 layers is placed on the ANE and the 64-layer package is not,
+so the boundary sits between 32 and 64 functions, or between 1.2 and 2.7
+GB of one package. The fix is to ship a bank as parts by layer range
+(`S<bucket>.p<k>.mlpackage`, each with its metadata), which the loader
+now does. The per-row bank generated as two 32-layer parts, plan-checked
+and measured end to end between two controls, is queued (queue16), and
+its result decides whether the Core ML path competes with the direct path
+once its programs run on the ANE.
 
 ## The mlx-serve ladder, both runtimes on this box
 
