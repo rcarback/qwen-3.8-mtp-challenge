@@ -6,7 +6,8 @@ the compute plan confirmed on the ANE at no time cost over a per-tensor LUT.
 usage: gen_fused_bank.py WEIGHTS_DIR OUT_DIR FRACTION BUCKET [LAYERS e.g. 0-63 or 0,1]
 Reads the MLX q4 group-64 safetensors directly (uint32 packed nibbles, low
 nibble first; bf16 scales and biases per group along the input axis).
-Output: OUT_DIR/S<BUCKET>.mlpackage with functions layer<N>; input x
+Output: OUT_DIR/S<BUCKET>.mlpackage with functions layer<N> (PART=k in the
+environment names it S<BUCKET>.p<k>, one part of a bank split by layer range); input x
 [1,hidden,1,S] fp16, output y [1,hidden,1,S] fp16 = down(silu(gate x) * up x)
 over the first F intermediate channels, F = round(FRACTION*inter/64)*64."""
 import json, os, struct, sys, shutil, time
@@ -122,9 +123,10 @@ for n in layers:
     meta["layers"].append({"layer": n, "F": F, "hidden": hidden, "rel_err_gate": err(g, gc, gl), "rel_err_down": err(d, dc, dl)})
     print("layer %d F=%d gate relerr %.4f down relerr %.4f  %.1fs" % (n, F, meta["layers"][-1]["rel_err_gate"], meta["layers"][-1]["rel_err_down"], time.time() - t0), flush=True)
 desc.default_function_name = "layer%d" % layers[0]
-out = os.path.join(OUT, "S%d.mlpackage" % S)
+STEM = "S%d" % S + (".p%s" % os.environ["PART"] if os.environ.get("PART") else "")   # PART=k names a part: S<bucket>.p<k>
+out = os.path.join(OUT, STEM + ".mlpackage")
 if os.path.exists(out): shutil.rmtree(out)
 save_multifunction(desc, out)
-json.dump(meta, open(os.path.join(OUT, "S%d.json" % S), "w"), indent=1)
+json.dump(meta, open(os.path.join(OUT, STEM + ".json"), "w"), indent=1)
 shutil.rmtree(tmp)
 print("saved", out, flush=True)

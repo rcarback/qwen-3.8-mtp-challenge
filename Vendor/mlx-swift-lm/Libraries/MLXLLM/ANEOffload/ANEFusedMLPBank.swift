@@ -88,9 +88,10 @@ public final class ANEFusedMLPBankFunction: @unchecked Sendable {
     }
 }
 
-/// The bank directory (`MLX_ANE_BANK_DIR`): `S<bucket>.mlpackage` plus its
-/// `S<bucket>.json` metadata from `gen_fused_bank.py`. Compiled once per
-/// process into `S<bucket>.mlmodelc` beside the package.
+/// The bank directory (`MLX_ANE_BANK_DIR`): `S<bucket>.mlpackage`, or the parts
+/// `S<bucket>.p<k>.mlpackage`, each with its `.json` metadata from
+/// `gen_fused_bank.py`. Compiled once per process into `.mlmodelc` beside the
+/// package.
 public enum ANEFusedMLPBank {
     public static let directory: URL? = {
         guard let c = getenv("MLX_ANE_BANK_DIR") else { return nil }
@@ -100,7 +101,17 @@ public enum ANEFusedMLPBank {
 
     private final class Box<T>: @unchecked Sendable { var value: T?; var error: Error? }
     private static let lock = NSLock()
-    nonisolated(unsafe) private static var compiledByBucket: [Int: URL] = [:]
+    /// One package per part: `S<bucket>.mlpackage` alone, or `S<bucket>.p<k>.mlpackage`
+    /// parts that each hold a layer range with their own `.json`. Core ML placed a
+    /// 64-function package on the GPU and 16-function packages on the ANE
+    /// (2026-09-07), so a bank ships as parts. Each part compiles on first use.
+    private struct Part {
+        let package: URL
+        let compiledURL: URL
+        let layers: Set<Int>
+        var compiled: Bool
+    }
+    nonisolated(unsafe) private static var partsByBucket: [Int: [Part]] = [:]
     nonisolated(unsafe) private static var metaByBucket: [Int: (fraction: Double, f: [Int: Int])] = [:]
 
     private static func awaitSync<T>(_ body: @escaping @Sendable () async throws -> T) throws -> T {
@@ -119,50 +130,84 @@ public enum ANEFusedMLPBank {
         return v
     }
 
-    /// The compiled model for `bucket`, compiling the package on first use and
-    /// keeping the `.mlmodelc` beside it for later processes.
-    private static func compiled(bucket: Int) throws -> URL {
+    /// The bucket's parts, scanned once from the bank directory. Caller holds `lock`.
+    private static func parts(bucket: Int) throws -> [Part] {
+        if let p = partsByBucket[bucket] { return p }
         guard let dir = directory else {
             throw NSError(domain: "ANEFusedMLPBank", code: 2, userInfo: [NSLocalizedDescriptionKey: "MLX_ANE_BANK_DIR unset"])
         }
+        let fm = FileManager.default
+        let names = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).sorted()
+        let stemPrefix = "S\(bucket)"
+        var found: [Part] = []
+        var f: [Int: Int] = [:]
+        var fraction = 0.0
+        for name in names where name.hasSuffix(".mlpackage") {
+            let stem = String(name.dropLast(".mlpackage".count))
+            guard stem == stemPrefix || stem.hasPrefix(stemPrefix + ".p") else { continue }
+            var layers = Set<Int>()
+            if let data = try? Data(contentsOf: dir.appendingPathComponent(stem + ".json")),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let list = obj["layers"] as? [[String: Any]]
+            {
+                for l in list {
+                    if let n = l["layer"] as? Int {
+                        layers.insert(n)
+                        if let ff = l["F"] as? Int { f[n] = ff }
+                    }
+                }
+                fraction = (obj["fraction"] as? Double) ?? fraction
+            }
+            found.append(Part(package: dir.appendingPathComponent(name),
+                              compiledURL: dir.appendingPathComponent(stem + ".mlmodelc"),
+                              layers: layers, compiled: false))
+        }
+        guard !found.isEmpty else {
+            throw NSError(domain: "ANEFusedMLPBank", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "no bank package for bucket \(bucket) at \(dir.path)"])
+        }
+        metaByBucket[bucket] = (fraction, f)
+        partsByBucket[bucket] = found
+        return found
+    }
+
+    /// The compiled part holding `layer` at `bucket`, compiling it on first use and
+    /// keeping the `.mlmodelc` beside the package for later processes.
+    private static func compiled(bucket: Int, layer: Int) throws -> URL {
         lock.lock()
         defer { lock.unlock() }
-        if let c = compiledByBucket[bucket] { return c }
-        let pkg = dir.appendingPathComponent("S\(bucket).mlpackage")
-        let cached = dir.appendingPathComponent("S\(bucket).mlmodelc")
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: pkg.path) else {
-            throw NSError(domain: "ANEFusedMLPBank", code: 3,
-                          userInfo: [NSLocalizedDescriptionKey: "no bank package for bucket \(bucket) at \(pkg.path)"])
+        var parts = try parts(bucket: bucket)
+        // A lone package without metadata is taken to hold every layer.
+        let index = parts.firstIndex { $0.layers.contains(layer) }
+            ?? (parts.count == 1 && parts[0].layers.isEmpty ? 0 : nil)
+        guard let i = index else {
+            throw NSError(domain: "ANEFusedMLPBank", code: 5,
+                          userInfo: [NSLocalizedDescriptionKey: "the bank for bucket \(bucket) holds no layer \(layer)"])
         }
-        if !fm.fileExists(atPath: cached.path) {
-            let tmp = try awaitSync { try await MLModel.compileModel(at: pkg) }
-            try fm.moveItem(at: tmp, to: cached)
+        if !parts[i].compiled {
+            let fm = FileManager.default
+            if !fm.fileExists(atPath: parts[i].compiledURL.path) {
+                let package = parts[i].package
+                let tmp = try awaitSync { try await MLModel.compileModel(at: package) }
+                try fm.moveItem(at: tmp, to: parts[i].compiledURL)
+            }
+            parts[i].compiled = true
+            partsByBucket[bucket] = parts
         }
-        // Metadata: the prefix width F per layer, to check against the split's own F.
-        let metaURL = dir.appendingPathComponent("S\(bucket).json")
-        if let data = try? Data(contentsOf: metaURL),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let layers = obj["layers"] as? [[String: Any]]
-        {
-            var f: [Int: Int] = [:]
-            for l in layers { if let n = l["layer"] as? Int, let ff = l["F"] as? Int { f[n] = ff } }
-            metaByBucket[bucket] = ((obj["fraction"] as? Double) ?? 0, f)
-        }
-        compiledByBucket[bucket] = cached
-        return cached
+        return parts[i].compiledURL
     }
 
     /// The prefix width the bank holds for `layer` at `bucket`, if known.
     public static func prefixChannels(bucket: Int, layer: Int) -> Int? {
         lock.lock()
         defer { lock.unlock() }
+        _ = try? parts(bucket: bucket)
         return metaByBucket[bucket]?.f[layer]
     }
 
     /// Loads function `layer<layer>` of the bucket's package on the ANE.
     public static func function(bucket: Int, layer: Int, hidden: Int) throws -> ANEFusedMLPBankFunction {
-        let url = try compiled(bucket: bucket)
+        let url = try compiled(bucket: bucket, layer: layer)
         guard #available(macOS 15.0, *) else {
             throw NSError(domain: "ANEFusedMLPBank", code: 4, userInfo: [NSLocalizedDescriptionKey: "multifunction needs macOS 15+"])
         }
