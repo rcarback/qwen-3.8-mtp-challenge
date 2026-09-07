@@ -252,7 +252,7 @@ private let qwen35CompiledSigmoidMultiply:
 }()
 
 
-// MARK: - packed GDN prework mixer (verify widths 3...9)
+// MARK: - packed GDN prework mixer (decode and verify widths 1...9)
 //
 // ONE launch replacing the wide verify's GDN prework chain — conv1d + SiLU +
 // split + Q/K rmsNorm-and-scale + the g/beta producer — for S in 3...9 on
@@ -267,9 +267,11 @@ private let qwen35CompiledSigmoidMultiply:
 // S=3...9 over 5 seeds x 4 compile modes (12,983,040 element comparisons,
 // zero mismatches)
 // on the vendored MLX version, with a +1-row conv-window negative control
-// failing exactly the three outputs that read the window. S=2 breaks the
-// conv-state copy (a state row would come from the OLD conv state, which the
-// copy loop does not read), hence the hard S >= 3 gate. The fused in-proj
+// failing exactly the three outputs that read the window. Widths 1 and 2 need a state
+// row from the OLD conv state. The copy loop reads it: logical rows
+// below NKeep are written by row 0 from `conv_state`, and the
+// qkv-sourced stores are untouched, so widths 3 and above are
+// byte-for-byte what the receipt above covers. The fused in-proj
 // carrier's live row stride (16480, not 10240) is consumed via the provided
 // stride arrays — ensureRowContiguous stays FALSE; forcing contiguity here
 // would silently insert a full-carrier copy and give back the launch saving.
@@ -403,6 +405,15 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
           }
         }
 
+        // The next conv state is the last NKeep rows of the logical input
+        // [conv_state (NKeep rows) | qkv (T rows)], that is logical rows
+        // T .. T + NKeep - 1. A logical row at or above NKeep comes from
+        // qkv row (logical - NKeep) and is written by the threadgroup that
+        // owns it, which is the mapping below and is unchanged. When T is
+        // smaller than NKeep the remaining logical rows are still inside the
+        // OLD conv state; no qkv row owns them, so row 0 writes them. T at or
+        // above NKeep never enters that second loop, so widths 3 and above
+        // keep the exact stores the width-3 receipt was taken over.
         if (row + NKeep >= uint(T)) {
           const uint state_row = row + NKeep - T;
           const ulong raw_base = ulong(row) * ulong(qkv_strides[1])
@@ -412,6 +423,23 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
           for (uint i = 0; i < 4; ++i) {
             conv_out[state_base + i] =
                 qkv[raw_base + ulong(i) * ulong(qkv_strides[2])];
+          }
+        }
+        if (uint(T) < uint(NKeep) && row == 0) {
+          for (uint state_row = 0;
+               state_row + uint(T) < uint(NKeep); ++state_row) {
+            const uint logical = uint(T) + state_row;
+            const ulong old_base =
+                ulong(logical) * ulong(conv_state_strides[1])
+                + ulong(channel_base + lane * 4)
+                    * ulong(conv_state_strides[2]);
+            const uint state_base = state_row * C + channel_base + lane * 4;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+              conv_out[state_base + i] =
+                  conv_state[old_base
+                      + ulong(i) * ulong(conv_state_strides[2])];
+            }
           }
         }
         """
@@ -743,8 +771,13 @@ final class Qwen35GatedDeltaNet: Module {
                 q: q, k: k, v: v, a: a, b: b,
                 aLog: aLog, dtBias: dtBias, state: state, mask: mask)
         }
-        let beta = sigmoid(b).asType(.float32)
-        let g = exp(negExpALog * softplus(a + dtBias))
+        // Same two expressions, one compiled launch instead of six eager ones.
+        // This is the form the width-2 and width-3-to-9 paths already run
+        // (the boundary fuser and the fused in-projection arm); width 1 was
+        // the last caller still
+        // building them node by node. `qwen35VerifyCompiledGBeta` is the
+        // byte-equality receipt.
+        let (g, beta) = qwen35CompiledGatedDeltaGBeta(a, b, negExpALog, dtBias)
         let B = q.dim(0)
         let Dk = q.dim(3)
         let Hv = v.dim(2)
@@ -884,6 +917,128 @@ final class Qwen35GatedDeltaNet: Module {
         return (q, k)
     }
 
+    /// The six tensors the gated-delta recurrence needs from its prework.
+    fileprivate struct Prework {
+        let q: MLXArray
+        let k: MLXArray
+        let v: MLXArray
+        let convState: MLXArray
+        let g: MLXArray
+        let beta: MLXArray
+    }
+
+    /// The envelope in which `qwen35PackedGDNPreworkKernel` reproduces the
+    /// eager prework byte for byte. Both prework call sites read this, so the
+    /// two cannot drift apart.
+    ///
+    /// `mask` must be nil. The kernel does not apply the SSM mask, and on the
+    /// eager path the mask is applied to `qkv` before the prework runs
+    /// (callAsFunction, the `MLX.where` at the top).
+    ///
+    /// The three parameter-dtype checks are new relative to the width-3
+    /// receipt. The kernel reads `dt_bias` and `A_log` at the g/beta epilogue
+    /// and `conv1d.weight` in the tap loop through bfloat16 pointers, so a
+    /// checkpoint that carried any of them at another width would round
+    /// differently from the eager chain. The pinned checkpoint carries all
+    /// three as BF16.
+    ///
+    /// Prefill sits outside the gate on purpose: above width 9 the eager
+    /// chain keeps the pinned reduction order.
+    fileprivate func packedPreworkEligible(
+        qkv: MLXArray, a: MLXArray, b: MLXArray, convState: MLXArray,
+        mask: MLXArray?
+    ) -> Bool {
+        let nKeep = convKernelSize - 1
+        return MLXHardwareInfo.isCompiledDecodeSupported
+            && qwen35GatedDeltaMidKernel != nil
+            && mask == nil
+            && qkv.dim(0) == 1 && qkv.dim(1) >= 1 && qkv.dim(1) <= 9
+            && nKeep == 3
+            && numKHeads == 16 && numVHeads == 48
+            && headKDim == 128 && headVDim == 128
+            && qkv.dim(2) == 16 * 128 * 2 + 48 * 128
+            && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
+            && a.dtype == .bfloat16 && b.dtype == .bfloat16
+            && dtBias.dtype == .bfloat16 && aLog.dtype == .bfloat16
+            && conv1d.weight.dtype == .bfloat16
+    }
+
+    /// One launch for the whole prework: the depthwise conv over
+    /// `[convState | qkv]`, the SiLU, the split, the Q and K RMS norms with
+    /// their scale multiplies, the next conv state, and `g` and `beta`.
+    /// Call only when `packedPreworkEligible` returns true.
+    fileprivate func packedPrework(
+        qkv: MLXArray, a: MLXArray, b: MLXArray, convState: MLXArray
+    ) -> Prework {
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let nKeep = convKernelSize - 1
+        let (qScaleConst, kScaleConst) = normScaleConstants(.bfloat16)
+        let outs = qwen35PackedGDNPreworkKernel(
+            [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
+             qScaleConst, kScaleConst],
+            template: [
+                ("Hk", numKHeads), ("Dk", headKDim),
+                ("Hv", numVHeads), ("Dv", headVDim),
+                ("NKeep", nKeep), ("C", qkv.dim(2)), ("T", S),
+            ],
+            grid: (32, S, 2 * numKHeads + numVHeads),
+            threadGroup: (32, 1, 1),
+            outputShapes: [
+                [B, S, numKHeads, headKDim],
+                [B, S, numKHeads, headKDim],
+                [B, S, numVHeads, headVDim],
+                [B, nKeep, qkv.dim(2)],
+                [B, S, numVHeads],
+                [B, S, numVHeads],
+            ],
+            outputDTypes: [
+                .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
+                .float32,
+            ]
+        )
+        return Prework(
+            q: outs[0], k: outs[1], v: outs[2], convState: outs[3],
+            g: outs[4], beta: outs[5])
+    }
+
+    /// The eager prework chain, node by node. This is both the fallback for
+    /// every input outside `packedPreworkEligible` and the reference the
+    /// packed kernel's receipt compares against, so the two can never describe
+    /// different arithmetic.
+    fileprivate func referencePrework(
+        qkv: MLXArray, a: MLXArray, b: MLXArray, convState: MLXArray,
+        convInput existing: MLXArray? = nil
+    ) -> Prework {
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let nKeep = convKernelSize - 1
+        // The stashing-prefix caller already built this concat for the tape;
+        // reuse it there so widths above 9 do not pay it twice per layer.
+        let convInput = existing ?? concatenated([convState, qkv], axis: 1)
+        let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
+        let convOut = silu(conv1d(convInput))
+
+        let convSplit = MLX.split(
+            convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+
+        let (qScaleConst, kScaleConst) = normScaleConstants(q.dtype)
+        let qNormed =
+            qScaleConst
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            kScaleConst
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        let (g, beta) = qwen35CompiledGatedDeltaGBeta(a, b, negExpALog, dtBias)
+        return Prework(
+            q: qNormed, k: kNormed, v: v, convState: newConvState,
+            g: g, beta: beta)
+    }
+
     private func processChunk(
         qkv: MLXArray,
         a: MLXArray,
@@ -894,6 +1049,23 @@ final class Qwen35GatedDeltaNet: Module {
     ) -> (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray) {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
+        // Decode-width packed prework. One launch replaces the conv concat,
+        // the depthwise conv, the SiLU, the two Q/K RMS norms with their two
+        // scale multiplies, and the compiled g/beta pair. There is no tape on
+        // this path, so the concat disappears entirely — unlike the verify
+        // twin, which keeps it for the tape. The eager arm below stays exactly
+        // as it was for every input the gate declines, including prefill.
+        if packedPreworkEligible(
+            qkv: qkv, a: a, b: b, convState: convState, mask: mask)
+        {
+            let prework = packedPrework(
+                qkv: qkv, a: a, b: b, convState: convState)
+            let (out, newSsm) = qwen35GatedDeltaPrepared(
+                q: prework.q, k: prework.k, v: prework.v,
+                g: prework.g, beta: prework.beta,
+                state: ssmState, mask: mask)
+            return (out, prework.convState, newSsm)
+        }
 
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
@@ -941,87 +1113,23 @@ final class Qwen35GatedDeltaNet: Module {
         out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray,
         tape: ArraysCache.PrefixReplayTape
     ) {
-        let B = qkv.dim(0)
         let S = qkv.dim(1)
-        let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
-        // Packed-prework mixer gate: fail closed onto the stock chain for any
-        // shape, geometry, or dtype outside the byte-receipt envelope. The
-        // S >= 3 lower bound is hard (the kernel's conv-state copy reads only
-        // qkv rows, which is wrong at S < nKeep); above 9 no verify exists.
-        let mixerHit = MLXHardwareInfo.isCompiledDecodeSupported
-            && B == 1 && S >= 3 && S <= 9 && nKeep == 3
-            && numKHeads == 16 && numVHeads == 48
-            && headKDim == 128 && headVDim == 128
-            && qkv.dim(2) == 16 * 128 * 2 + 48 * 128
-            && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
-            && a.dtype == .bfloat16 && b.dtype == .bfloat16
-        let qNormed: MLXArray
-        let kNormed: MLXArray
-        let v: MLXArray
-        let g: MLXArray
-        let beta: MLXArray
-        let newConvState: MLXArray
-        if mixerHit {
-            let (qScaleConst, kScaleConst) = normScaleConstants(.bfloat16)
-            let outs = qwen35PackedGDNPreworkKernel(
-                [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
-                 qScaleConst,
-                 kScaleConst],
-                template: [
-                    ("Hk", numKHeads), ("Dk", headKDim),
-                    ("Hv", numVHeads), ("Dv", headVDim),
-                    ("NKeep", nKeep), ("C", qkv.dim(2)), ("T", S),
-                ],
-                grid: (32, S, 2 * numKHeads + numVHeads),
-                threadGroup: (32, 1, 1),
-                outputShapes: [
-                    [B, S, numKHeads, headKDim],
-                    [B, S, numKHeads, headKDim],
-                    [B, S, numVHeads, headVDim],
-                    [B, nKeep, qkv.dim(2)],
-                    [B, S, numVHeads],
-                    [B, S, numVHeads],
-                ],
-                outputDTypes: [
-                    .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
-                    .float32,
-                ]
-            )
-            qNormed = outs[0]
-            kNormed = outs[1]
-            v = outs[2]
-            newConvState = outs[3]
-            g = outs[4]
-            beta = outs[5]
-        } else {
-            newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
-            let convOut = silu(conv1d(convInput))
-
-            let convSplit = MLX.split(
-                convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-            let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-            let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-            v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
-
-            let dtype = q.dtype
-            let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
-            qNormed =
-                qScaleConst
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            kNormed =
-                kScaleConst
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
-
-            // Keep the recurrence and conv prologue wide. The promoted
-            // compiled g/beta launch reduction feeds the same single
-            // recurrence, while the SDPA helper alone bridges the
-            // width-sensitive kernel boundary.
-            let gBeta = qwen35CompiledGatedDeltaGBeta(
-                a, b, negExpALog, dtBias)
-            g = gBeta.0
-            beta = gBeta.1
-        }
+        // The tape needs `convInput`, so this path keeps the concat whether or
+        // not the packed prework runs. `processChunk` has no tape and drops it.
+        let convInput = concatenated([convState, qkv], axis: 1)
+        let prework = packedPreworkEligible(
+            qkv: qkv, a: a, b: b, convState: convState, mask: mask)
+            ? packedPrework(qkv: qkv, a: a, b: b, convState: convState)
+            : referencePrework(
+                qkv: qkv, a: a, b: b, convState: convState,
+                convInput: convInput)
+        let qNormed = prework.q
+        let kNormed = prework.k
+        let v = prework.v
+        let g = prework.g
+        let beta = prework.beta
+        let newConvState = prework.convState
         let recurrence: (MLXArray, MLXArray)
         if MLXHardwareInfo.isCompiledDecodeSupported {
             recurrence = qwen35GatedDeltaPrepared(
@@ -1312,13 +1420,14 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        let normedOut: MLXArray
-        if S >= 2 {
-            let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
-            normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
-        } else {
-            normedOut = norm(out, gate: z)
-        }
+        // The fused pair at every width, including 1. It is the expression
+        // `Qwen3NextRMSNormGated` evaluates: the same `MLXFast.rmsNorm`, then
+        // `silu(gate.asType(.float32))` written out as `gate32 *
+        // sigmoid(gate32)` — which is what `silu` compiles to — then the same
+        // fp32 product and the same cast back. Two launches replace six.
+        // `qwen35VerifyGatedPostNorm` is the byte-equality receipt.
+        let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+        let normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
         return qwen35RoutedLinear(outProj, normedOut.reshaped(B, S, -1))
     }
 }
@@ -2331,6 +2440,29 @@ private let qwen35FusedResidualRMSNormXSumsKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+/// Input-independent epsilon scalars for the fused residual+RMSNorm kernel.
+///
+/// `MLXArray(eps)` built a fresh scalar node on every call: 127 of them per
+/// width-1 forward, one per residual boundary, every one holding the same
+/// `rmsNormEps`. The value is weight-derived and never varies with the
+/// request, so it is memoized on the same terms as `negExpALog` and
+/// `normScaleConstants` above. `qwen35EpsScalarMisses` counts the builds so a
+/// test can prove the memo is live; it advances only on a miss.
+public nonisolated(unsafe) var qwen35EpsScalarMisses = 0
+private nonisolated(unsafe) var qwen35EpsScalars: [UInt32: MLXArray] = [:]
+private let qwen35EpsScalarLock = NSLock()
+
+func qwen35EpsScalar(_ eps: Float) -> MLXArray {
+    let key = eps.bitPattern
+    qwen35EpsScalarLock.lock()
+    defer { qwen35EpsScalarLock.unlock() }
+    if let cached = qwen35EpsScalars[key] { return cached }
+    let value = MLXArray(eps)
+    qwen35EpsScalars[key] = value
+    qwen35EpsScalarMisses += 1
+    return value
+}
+
 /// Wraps the fused residual+RMSNorm kernel.  Returns `(residual, normed)` where
 /// `residual = bf16(x + r)` and `normed = weight * RMSNorm(residual)` with the
 /// same arithmetic as the eager `postAttentionLayerNorm(x + r)`.
@@ -2346,7 +2478,7 @@ func qwen35FusedResidualRMSNorm(
         let k = x.dim(-1)
         let kBlocks = k / 512
         let outputs = qwen35FusedResidualRMSNormXSumsKernel(
-            [x, r, weight, MLXArray(eps)],
+            [x, r, weight, qwen35EpsScalar(eps)],
             grid: (nRows * 1024, 1, 1),
             threadGroup: (1024, 1, 1),
             outputShapes: [
@@ -2358,7 +2490,7 @@ func qwen35FusedResidualRMSNorm(
         return (outputs[0], outputs[1])
     }
     let outputs = qwen35FusedResidualRMSNormKernel(
-        [x, r, weight, MLXArray(eps)],
+        [x, r, weight, qwen35EpsScalar(eps)],
         grid: (nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [shape, shape],
@@ -5118,6 +5250,256 @@ public func qwen35VerifySelectedRerankOrderInvariance(
         if rerank(x, MLXArray(members)) != rerank(x, ids) { controlChanged += 1 }
     }
     return (trials, mismatches, firstBad, setMismatches, controlChanged)
+}
+
+/// Byte-equality receipt for the compiled g/beta helper against the eager
+/// expression the width-1 recurrence path used to build inline.
+///
+/// The two expressions are textually the same — `exp(negExpALog *
+/// softplus(a + dtBias))` and `sigmoid(b).asType(.float32)` — so the only
+/// question this answers is whether `compile(shapeless: true)` changes any
+/// intermediate rounding. It must not: MLX fusion keeps each node's output
+/// dtype. Shapes and dtypes follow the loaded checkpoint, where `dt_bias` and
+/// `A_log` are BF16 and the activations are BF16.
+///
+/// Returns `(trials, bad, firstBad)`.
+public func qwen35VerifyCompiledGBeta(
+    widths: [Int] = [1, 2, 3, 4, 9], trials: Int = 8, seed: UInt64 = 1
+) -> (trials: Int, bad: Int, firstBad: Int) {
+    MLXRandom.seed(seed)
+    let heads = 48
+    var run = 0
+    var bad = 0
+    var firstBad = -1
+    for width in widths {
+        for _ in 0 ..< trials {
+            let a = MLXRandom.normal([1, width, heads]).asType(.bfloat16)
+            let b = MLXRandom.normal([1, width, heads]).asType(.bfloat16)
+            let aLog = MLXRandom.normal([heads]).asType(.bfloat16)
+            let dtBias = MLXRandom.normal([heads]).asType(.bfloat16)
+            let negExpALog = -exp(aLog.asType(.float32))
+            eval(a, b, negExpALog, dtBias)
+            let (g, beta) = qwen35CompiledGatedDeltaGBeta(
+                a, b, negExpALog, dtBias)
+            let gEager = exp(negExpALog * softplus(a + dtBias))
+            let betaEager = sigmoid(b).asType(.float32)
+            eval(g, beta, gEager, betaEager)
+            let same = MLX.all(MLX.equal(g, gEager)).item(Bool.self)
+                && MLX.all(MLX.equal(beta, betaEager)).item(Bool.self)
+            if !same {
+                bad += 1
+                if firstBad < 0 { firstBad = run }
+            }
+            run += 1
+        }
+    }
+    return (run, bad, firstBad)
+}
+
+/// Negative control for `qwen35VerifyCompiledGBeta`. Shifts one element of
+/// `a`, which must move `g` and must leave `beta` alone, and requires the same
+/// comparison to report both facts. A gate that cannot fail is not a gate.
+/// Returns `(gMoved, betaHeld)`.
+public func qwen35CompiledGBetaNegativeControl(
+    seed: UInt64 = 7
+) -> (gMoved: Bool, betaHeld: Bool) {
+    MLXRandom.seed(seed)
+    let heads = 48
+    let a = MLXRandom.normal([1, 1, heads]).asType(.bfloat16)
+    let b = MLXRandom.normal([1, 1, heads]).asType(.bfloat16)
+    let aLog = MLXRandom.normal([heads]).asType(.bfloat16)
+    let dtBias = MLXRandom.normal([heads]).asType(.bfloat16)
+    let negExpALog = -exp(aLog.asType(.float32))
+    eval(a, b, negExpALog, dtBias)
+    var host = a.asType(.float32).asArray(Float.self)
+    host[0] += 1
+    let damaged = MLXArray(host).reshaped([1, 1, heads]).asType(.bfloat16)
+    let (g, beta) = qwen35CompiledGatedDeltaGBeta(a, b, negExpALog, dtBias)
+    let (gDamaged, betaDamaged) = qwen35CompiledGatedDeltaGBeta(
+        damaged, b, negExpALog, dtBias)
+    eval(g, beta, gDamaged, betaDamaged)
+    return (
+        !MLX.all(MLX.equal(g, gDamaged)).item(Bool.self),
+        MLX.all(MLX.equal(beta, betaDamaged)).item(Bool.self)
+    )
+}
+
+/// Byte-equality receipt for the fused gated post-norm pair against
+/// `Qwen3NextRMSNormGated`, the module the width-1 path used to call.
+///
+/// The module runs `MLXFast.rmsNorm`, then `silu(gate.asType(.float32))`,
+/// then `(g * x.asType(.float32)).asType(dtype)` (Qwen3Next.swift:32-36).
+/// `silu` compiles to `x * sigmoid(x)` (Activations.swift:1049-1053), which is
+/// what `qwen35CompiledGatedDeltaPostNorm` writes out. Same expression, same
+/// dtypes, two launches instead of six.
+///
+/// Returns `(trials, bad, firstBad)`.
+public func qwen35VerifyGatedPostNorm(
+    widths: [Int] = [1, 2, 3, 9], trials: Int = 8, seed: UInt64 = 1
+) -> (trials: Int, bad: Int, firstBad: Int) {
+    MLXRandom.seed(seed)
+    let heads = 48
+    let headDim = 128
+    let norm = Qwen3NextRMSNormGated(dimensions: headDim, eps: 1e-6)
+    norm.apply { $0.asType(.bfloat16) }
+    var run = 0
+    var bad = 0
+    var firstBad = -1
+    for width in widths {
+        for _ in 0 ..< trials {
+            let out = MLXRandom.normal([1, width, heads, headDim])
+                .asType(.bfloat16)
+            let z = MLXRandom.normal([1, width, heads, headDim])
+                .asType(.bfloat16)
+            eval(out, z)
+            let fused = qwen35CompiledGatedDeltaPostNorm(
+                MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps), z)
+            let module = norm(out, gate: z)
+            eval(fused, module)
+            if !MLX.all(MLX.equal(fused, module)).item(Bool.self) {
+                bad += 1
+                if firstBad < 0 { firstBad = run }
+            }
+            run += 1
+        }
+    }
+    return (run, bad, firstBad)
+}
+
+/// Negative control for `qwen35VerifyGatedPostNorm`. Shifts one gate element,
+/// which must change the fused output, and requires the comparison against an
+/// unshifted fused output to report it.
+public func qwen35GatedPostNormNegativeControl(seed: UInt64 = 7) -> Bool {
+    MLXRandom.seed(seed)
+    let heads = 48
+    let headDim = 128
+    let norm = Qwen3NextRMSNormGated(dimensions: headDim, eps: 1e-6)
+    norm.apply { $0.asType(.bfloat16) }
+    let out = MLXRandom.normal([1, 1, heads, headDim]).asType(.bfloat16)
+    let z = MLXRandom.normal([1, 1, heads, headDim]).asType(.bfloat16)
+    eval(out, z)
+    var host = z.asType(.float32).asArray(Float.self)
+    host[0] += 4
+    let damaged = MLXArray(host)
+        .reshaped([1, 1, heads, headDim]).asType(.bfloat16)
+    let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+    let clean = qwen35CompiledGatedDeltaPostNorm(normed, z)
+    let dirty = qwen35CompiledGatedDeltaPostNorm(normed, damaged)
+    eval(clean, dirty)
+    return !MLX.all(MLX.equal(clean, dirty)).item(Bool.self)
+}
+
+/// Byte-equality receipt for the packed gated-delta prework against the eager
+/// chain, at every width the decode and verify paths use, including the two
+/// the kernel could not serve before its conv-state copy was generalized.
+///
+/// The layer is built at a small `hidden_size`, because the kernel never reads
+/// the input projections: only the conv weight, `A_log`, `dt_bias` and the
+/// activations reach it, and those are at full geometry.
+///
+/// Returns `(trials, bad, firstBad)`.
+public func qwen35VerifyPackedPrework(
+    widths: [Int] = [1, 2, 3, 4, 5, 9], trials: Int = 4, seed: UInt64 = 1
+) -> (trials: Int, bad: Int, firstBad: Int) {
+    MLXRandom.seed(seed)
+    guard let layer = qwen35PreworkFixtureLayer() else { return (0, 1, 0) }
+    let convDim = 16 * 128 * 2 + 48 * 128
+    var run = 0
+    var bad = 0
+    var firstBad = -1
+    for width in widths {
+        for _ in 0 ..< trials {
+            let qkv = MLXRandom.normal([1, width, convDim]).asType(.bfloat16)
+            let a = MLXRandom.normal([1, width, 48]).asType(.bfloat16)
+            let b = MLXRandom.normal([1, width, 48]).asType(.bfloat16)
+            let convState = MLXRandom.normal([1, 3, convDim])
+                .asType(.bfloat16)
+            eval(qkv, a, b, convState)
+            let mine = layer.packedPrework(
+                qkv: qkv, a: a, b: b, convState: convState)
+            let theirs = layer.referencePrework(
+                qkv: qkv, a: a, b: b, convState: convState)
+            let pairs = [
+                (mine.q, theirs.q), (mine.k, theirs.k), (mine.v, theirs.v),
+                (mine.convState, theirs.convState),
+                (mine.g, theirs.g), (mine.beta, theirs.beta),
+            ]
+            for pair in pairs { eval(pair.0, pair.1) }
+            let same = pairs.allSatisfy {
+                MLX.all(MLX.equal($0.0, $0.1)).item(Bool.self)
+            }
+            if !same {
+                bad += 1
+                if firstBad < 0 { firstBad = run }
+            }
+            run += 1
+        }
+    }
+    return (run, bad, firstBad)
+}
+
+/// Negative control for `qwen35VerifyPackedPrework`, aimed at the store the
+/// generalized copy adds.
+///
+/// At width 1 the next conv state is logical rows 1, 2 and 3 of
+/// `[convState (3 rows) | qkv (1 row)]`, so conv-state row 1 MUST reach it and
+/// conv-state row 0 MUST NOT. Both directions are checked, because a store
+/// that copies the wrong row and a store that copies nothing both pass a
+/// one-sided control.
+///
+/// Returns `(sensitive, insensitive)`; both must be true.
+public func qwen35PackedPreworkNegativeControl(
+    seed: UInt64 = 7
+) -> (sensitive: Bool, insensitive: Bool) {
+    MLXRandom.seed(seed)
+    guard let layer = qwen35PreworkFixtureLayer() else {
+        return (false, false)
+    }
+    let convDim = 16 * 128 * 2 + 48 * 128
+    let qkv = MLXRandom.normal([1, 1, convDim]).asType(.bfloat16)
+    let a = MLXRandom.normal([1, 1, 48]).asType(.bfloat16)
+    let b = MLXRandom.normal([1, 1, 48]).asType(.bfloat16)
+    let convState = MLXRandom.normal([1, 3, convDim]).asType(.bfloat16)
+    eval(qkv, a, b, convState)
+
+    func damaged(_ row: Int) -> MLXArray {
+        var host = convState.asType(.float32).asArray(Float.self)
+        host[row * convDim] += 8
+        return MLXArray(host).reshaped([1, 3, convDim]).asType(.bfloat16)
+    }
+
+    let clean = layer.packedPrework(
+        qkv: qkv, a: a, b: b, convState: convState).convState
+    let movedRow1 = layer.packedPrework(
+        qkv: qkv, a: a, b: b, convState: damaged(1)).convState
+    let movedRow0 = layer.packedPrework(
+        qkv: qkv, a: a, b: b, convState: damaged(0)).convState
+    eval(clean, movedRow1, movedRow0)
+    return (
+        !MLX.all(MLX.equal(clean, movedRow1)).item(Bool.self),
+        MLX.all(MLX.equal(clean, movedRow0)).item(Bool.self)
+    )
+}
+
+/// A gated-delta layer at the pinned geometry and a small hidden size, with
+/// every parameter cast to BF16 as the checkpoint carries them. Fixture for
+/// the prework receipts above; never on a serve path.
+private func qwen35PreworkFixtureLayer() -> Qwen35GatedDeltaNet? {
+    let json = """
+        {"model_type":"qwen3_5_text","hidden_size":64,
+         "num_hidden_layers":4,"intermediate_size":128,
+         "num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,
+         "linear_num_value_heads":48,"linear_num_key_heads":16,
+         "linear_key_head_dim":128,"linear_value_head_dim":128,
+         "linear_conv_kernel_dim":4,"rms_norm_eps":1e-6,"vocab_size":32,
+         "full_attention_interval":4}
+        """
+    guard let config = try? JSONDecoder().decode(
+        Qwen35TextConfiguration.self, from: Data(json.utf8))
+    else { return nil }
+    let layer = Qwen35GatedDeltaNet(config)
+    layer.apply { $0.asType(.bfloat16) }
+    return layer
 }
 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
