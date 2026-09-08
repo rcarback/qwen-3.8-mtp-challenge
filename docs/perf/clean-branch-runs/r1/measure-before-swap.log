@@ -1,0 +1,29 @@
+== base cooking 19:20:10
+   rc=0 {"score":1.1185675917152615,"serial":0.090967310592532158,"mtp":0.081324822269380093,"eff":0.64460784313725494,"acc":0.39543726235741444,"matched":true,"tripwire":true}
+== clean cooking 19:25:02
+   rc=0 {"score":1.1173385253005168,"serial":0.089625738328322768,"mtp":0.080213593551889062,"eff":0.63170731707317074,"acc":0.39382239382239381,"matched":true,"tripwire":true}
+== clean geology 19:29:35
+   rc=0 {"score":2.0784947146491994,"serial":0.090423970716074109,"mtp":0.043504546862095594,"eff":3.6014492753623188,"acc":0.7525150905432596,"matched":true,"tripwire":true}
+== base geology 19:33:57
+   rc=0 {"score":2.001436902702816,"serial":0.090306185651570559,"mtp":0.045120675815269351,"eff":3.6014492753623188,"acc":0.7525150905432596,"matched":true,"tripwire":true}
+== base music 19:38:20
+   rc=0 {"score":1.5903013411496123,"serial":0.090234611416235566,"mtp":0.05674057430587709,"eff":2.5961538461538463,"acc":0.562962962962963,"matched":true,"tripwire":true}
+== clean music 19:43:00
+   rc=0 {"score":1.6158667315802449,"serial":0.089418476447463036,"mtp":0.055337779223918915,"eff":2.6153846153846154,"acc":0.55882352941176472,"matched":true,"tripwire":true}
+== clean readme 19:47:37
+   rc=0 {"score":2.121842997061144,"serial":0.089696478564292192,"mtp":0.042272910242900252,"eff":3.9296875,"acc":0.76341948310139163,"matched":true,"tripwire":true}
+== base readme 19:52:16
+   rc=0 {"score":2.0342375382664395,"serial":0.090156267397105694,"mtp":0.044319439446553588,"eff":3.953846153846154,"acc":0.74319066147859925,"matched":true,"tripwire":true}
+== base prefill-plan 19:56:52
+   rc=1 no payload; 
+== clean prefill-plan 19:58:52
+   rc=1 no payload; 
+== clean runbook 20:00:53
+   rc=0 {"score":2.196452203223125,"serial":0.089520519599318504,"mtp":0.040756871225312352,"eff":4.1166666666666663,"acc":0.79352226720647778,"matched":true,"tripwire":true}
+== base runbook 20:05:12
+   rc=0 {"score":2.163126277307688,"serial":0.090176349505782127,"mtp":0.041687972843647003,"eff":4.2307692307692308,"acc":0.79797979797979801,"matched":true,"tripwire":true}
+== base security 20:09:29
+   rc=1 no payload; 
+== clean security 20:11:44
+   rc=1 no payload; 
+== measure done 20:13:43

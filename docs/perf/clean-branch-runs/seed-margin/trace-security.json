@@ -1,0 +1,39 @@
+{
+  "actual_expected_logit_delta" : 0,
+  "actual_token" : 2531,
+  "actual_token_logit" : 15.8125,
+  "case_name" : "base_security",
+  "expected_token" : 2531,
+  "expected_token_logit" : 15.8125,
+  "expected_token_rank" : 1,
+  "generated_prefix" : [
+    2531
+  ],
+  "golden_hash" : "4fbb2153a848e55e7b46c4d1ec36116f7a011eb45cae38661cf5f042b10700bd",
+  "matched_prefix_steps" : 1,
+  "prompt_token_count" : 512,
+  "step" : 0,
+  "top_logit_margin" : 0,
+  "top_logits" : [
+    {
+      "logit" : 15.8125,
+      "token" : 2531
+    },
+    {
+      "logit" : 15.8125,
+      "token" : 3074
+    },
+    {
+      "logit" : 15.8125,
+      "token" : 27370
+    },
+    {
+      "logit" : 15.6875,
+      "token" : 20364
+    },
+    {
+      "logit" : 15.6875,
+      "token" : 21568
+    }
+  ]
+}

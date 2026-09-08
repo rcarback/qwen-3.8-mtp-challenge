@@ -1,0 +1,17 @@
+== clean2 public 18:49:28
+   rc=0 {"score":2.593655887392811,"serial":0.089673732407391071,"mtp":0.034574259771034122,"eff":6.3766233766233764,"acc":0.88594704684317716,"matched":true,"tripwire":true}
+== clean2 cooking 18:53:46
+   rc=0 {"score":1.1169812837603341,"serial":0.089608187321573496,"mtp":0.080223535187542439,"eff":0.63170731707317074,"acc":0.39382239382239381,"matched":true,"tripwire":true}
+== clean2 geology 18:58:21
+   rc=0 {"score":2.060585320611477,"serial":0.090406619245186448,"mtp":0.043874242110177875,"eff":3.6014492753623188,"acc":0.7525150905432596,"matched":true,"tripwire":true}
+== clean2 music 19:02:45
+   rc=0 {"score":1.6393594349664176,"serial":0.090735800797119737,"mtp":0.055348326219245791,"eff":2.6153846153846154,"acc":0.55882352941176472,"matched":true,"tripwire":true}
+== clean2 readme 19:07:23
+   rc=0 {"score":2.050961176503256,"serial":0.089597300859168172,"mtp":0.043685517739504576,"eff":3.9296875,"acc":0.76341948310139163,"matched":true,"tripwire":true}
+== clean2 prefill-plan 19:11:48
+   rc=1 no payload; 
+== clean2 runbook 19:13:48
+   rc=0 {"score":2.2379441061951484,"serial":0.091189499944448471,"mtp":0.040746996179223061,"eff":4.1166666666666663,"acc":0.79352226720647778,"matched":true,"tripwire":true}
+== clean2 security 19:18:10
+   rc=1 no payload; 
+== measure done 19:20:10

@@ -1,0 +1,5 @@
+== base dyeing 21:18:52
+   rc=0 {"score":1.364713569890749,"serial":0.094382623210549355,"mtp":0.069159291218966246,"eff":2.2862745098039214,"acc":0.44082332761578047,"matched":true,"tripwire":true}
+== clean dyeing 21:24:59
+   rc=1 no payload; benchmark.sh: ERROR: GPU is hot and not cooling down (current 43.8C, min seen 42.0C, target <=40C, waited 500s).
+== measure done 21:37:24

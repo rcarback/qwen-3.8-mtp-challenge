@@ -1,0 +1,39 @@
+{
+  "actual_expected_logit_delta" : 0,
+  "actual_token" : 314,
+  "actual_token_logit" : 21.75,
+  "case_name" : "base_cooking",
+  "expected_token" : 314,
+  "expected_token_logit" : 21.75,
+  "expected_token_rank" : 1,
+  "generated_prefix" : [
+    314
+  ],
+  "golden_hash" : "708aa6b64f1e0199f7e1e22668ee3cebe02bda405932fa36eb7f86aefebf46f2",
+  "matched_prefix_steps" : 1,
+  "prompt_token_count" : 512,
+  "step" : 0,
+  "top_logit_margin" : 4.125,
+  "top_logits" : [
+    {
+      "logit" : 21.75,
+      "token" : 314
+    },
+    {
+      "logit" : 17.625,
+      "token" : 6463
+    },
+    {
+      "logit" : 16,
+      "token" : 11013
+    },
+    {
+      "logit" : 15.875,
+      "token" : 18991
+    },
+    {
+      "logit" : 15.0625,
+      "token" : 17973
+    }
+  ]
+}

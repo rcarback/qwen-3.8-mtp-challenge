@@ -162,3 +162,112 @@ fidelity gate forbids. Its files also sit outside `editablePaths`.
 - Two ratios per prompt: the local ratio (each tree's own serial leg) and the
   ranked-style estimate (the base tree's serial leg over the clean tree's MTP
   leg).
+
+## Results (measured 2026-09-07, 18:31 to 22:47)
+
+Four rounds ran on the two worktrees, one model-holding process at a time.
+Every arm decoded 512 tokens at the ranked offer of depth 8. Every arm that
+produced a payload matched all tokens and passed the drift tripwire. The
+receipts, the goldens, the prompts, and the scripts are under
+`docs/perf/clean-branch-runs/`.
+
+| round | arms | order |
+| --- | --- | --- |
+| 1 | base, clean | alternating per prompt |
+| 2 | base repeat, clean with the 8-bit head off (`MLX_QWEN_MTP_HEAD_QUANT=0`) | alternating per prompt |
+| 3 | clean repeat | single arm |
+| 4 | clean with the head at 4 bits (`MLX_QWEN_MTP_HEAD_QUANT=4`) | single arm |
+
+### Prompt pool
+
+Seven of the nine generated goldens are valid. Two of the original seven and
+one replacement failed the seed check at step 0 on both trees, with the same
+token pair on each tree. The step-0 probe on the golden path shows why:
+
+| prompt | golden token | timed-verb token | top-2 margin |
+| --- | --- | --- | --- |
+| prefill-plan | 7793 | 2695 | 0.125 |
+| security | 2531 | 27370 | 0.000, three tokens tied |
+| sailing | 34669 | 6463 | 0.125 |
+| cooking (control) | 314 | 314 | 4.125 |
+
+At logit magnitudes of 16 to 20, bf16 resolves to steps of 0.125, so the
+three failing prompts are within one representable step of a tie. The timed
+verb projects one hidden row through the head with the stock width-1
+quantized matrix-vector kernel. Every other path takes the logits of a
+512-row forward through the matrix-matrix kernel. Decode never compares
+across the two kernels, because the candidate rows and the reference walk
+share the width-1 path. Only the seed does. This is a base-tree property. The
+clean diff leaves the seed path untouched. The dyeing passage replaced the two
+excluded prompts, and sailing was screened out before any long arm ran.
+
+### Seconds per token, MTP leg
+
+| prompt | base r1 | base r2 | clean r1 | clean r3 | head off r2 | 4-bit r4 |
+| --- | --- | --- | --- | --- | --- | --- |
+| cooking | 0.0813 | 0.0813 | 0.0802 | 0.0802 | 0.0808 | 0.0806 |
+| dyeing | 0.0692 (warm) | 0.0643 | void (gate) | 0.0633 | 0.0652 | 0.0638 |
+| geology | 0.0451 | 0.0450 | 0.0435 | 0.0439 | 0.0455 | 0.0419 |
+| music | 0.0567 | 0.0567 | 0.0553 | 0.0553 | 0.0569 | 0.0542 |
+| readme | 0.0443 | 0.0451 | 0.0423 | 0.0437 | 0.0442 | 0.0425 |
+| runbook | 0.0417 | 0.0417 | 0.0408 | 0.0407 | 0.0416 | 0.0407 |
+| public | 0.0354 | 0.0357 | 0.0346 | 0.0346 | 0.0362 | 0.0340 |
+
+The round 1 base arm on dyeing ran with its serial leg at 0.0944 against the
+0.090 every other arm shows, so its MTP figure is the warm outlier and the
+round 2 base arm is the base reading for that prompt. The serial legs of the
+two trees agree within noise on every other prompt.
+
+### Medians of the per-prompt ratio
+
+| arm | median | prompts |
+| --- | --- | --- |
+| base, round 1 | 2.001 | 7 |
+| base, round 2 | 2.003 | 7 |
+| clean, round 1 | 2.100 | 6 |
+| clean, round 3 | 2.051 | 7 |
+| clean, head off | 1.967 | 7 |
+| clean, 4-bit head | 2.106 | 7 |
+
+The ranked-style estimate for clean in round 1, the base serial leg over the
+clean MTP leg, has a median of 2.104. Base reproduces between rounds to 0.1
+percent. Clean varies by about 2 percent between rounds, and readme and
+geology carry that spread.
+
+### What each change is worth
+
+The head-off arm is level with base on every prompt. The two other ported
+changes, the packed gated-delta prework and the cache-root eval barriers, are
+within noise of base at this window. The derived head twin carries the gain.
+
+| prompt | acceptance base / 8-bit / 4-bit | draft length base / 8-bit / 4-bit |
+| --- | --- | --- |
+| cooking | 0.395 / 0.394 / 0.367 | 0.64 / 0.63 / 0.65 |
+| dyeing | 0.441 / 0.440 / 0.434 | 2.29 / 2.31 / 2.20 |
+| geology | 0.753 / 0.753 / 0.767 | 3.60 / 3.60 / 3.69 |
+| music | 0.563 / 0.559 / 0.560 | 2.60 / 2.62 / 2.71 |
+| readme | 0.743 / 0.763 / 0.730 | 3.95 / 3.93 / 3.98 |
+| runbook | 0.798 / 0.794 / 0.751 | 4.23 / 4.12 / 4.50 |
+| public | 0.886 / 0.886 / 0.884 | 6.38 / 6.38 / 6.29 |
+
+The 4-bit head is as fast as the 8-bit head on cooking, dyeing, readme, and
+runbook, and faster on geology, music, and public. Acceptance drops by up to
+five points at 4 bits, and the cheaper head step lets the adaptive schedule
+draft deeper, so the cost per emitted token holds or improves. All 4-bit arms
+matched tokens. The shipped default is 8 bits. The data supports 4 bits as the
+default, which also halves the derived head's footprint.
+
+### Measurement notes
+
+- The GPU temperature sensor reports 1.6C whenever the GPU is fully
+  power-gated, and the cool gate accepts that reading. Every arm before 21:20
+  cleared its gates at once for that reason. With the display active and
+  Spotlight indexing, the sensor reported the real die temperature and two
+  arms voided at 42C against the 40C target. Disabling Spotlight indexing let
+  the following arms cool below 40C and pass.
+- The seed prologue is charged inside the local window. The ranked parent
+  starts its clock after the seed-prefill response, so local ratios sit a
+  little below what the box would publish.
+- The Photos analysis daemon and two leaked gterm test readers were frozen
+  with SIGSTOP for the campaign. The measure script resumes the analysis
+  daemons on exit.

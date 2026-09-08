@@ -1,0 +1,21 @@
+== trace prefill-plan step 0 22:46:01
+   rc=0 {'actual_expected_logit_delta': 0, 'actual_token_logit': 18.625, 'expected_token': 7793, 'expected_token_logit': 18.625, 'expected_token_rank': 1, 'top_logit_margin': 0.125, 'top_logits': [{'logit': 18.625, 'token': 7793}, {'logit': 18.5, 'token': 2695}, {'logit': 18.375, 'token': 1528}, {'logit': 17.5, 'token': 13}, {'logit': 16.375, 'token': 198}]}
+{'logit': 18.625}
+{'logit': 18.5}
+{'logit': 18.375}
+== trace security step 0 22:46:13
+   rc=0 {'actual_expected_logit_delta': 0, 'actual_token_logit': 15.8125, 'expected_token': 2531, 'expected_token_logit': 15.8125, 'expected_token_rank': 1, 'top_logit_margin': 0, 'top_logits': [{'logit': 15.8125, 'token': 2531}, {'logit': 15.8125, 'token': 3074}, {'logit': 15.8125, 'token': 27370}, {'logit': 15.6875, 'token': 20364}, {'logit': 15.6875, 'token': 21568}]}
+{'logit': 15.8125}
+{'logit': 15.8125}
+{'logit': 15.8125}
+== trace sailing step 0 22:46:25
+   rc=0 {'actual_expected_logit_delta': 0, 'actual_token_logit': 17.75, 'expected_token': 34669, 'expected_token_logit': 17.75, 'expected_token_rank': 1, 'top_logit_margin': 0.125, 'top_logits': [{'logit': 17.75, 'token': 34669}, {'logit': 17.625, 'token': 6463}, {'logit': 17.5, 'token': 6966}, {'logit': 16.875, 'token': 16547}, {'logit': 16.75, 'token': 23424}]}
+{'logit': 17.75}
+{'logit': 17.625}
+{'logit': 17.5}
+== trace cooking step 0 22:46:36
+   rc=0 {'actual_expected_logit_delta': 0, 'actual_token_logit': 21.75, 'expected_token': 314, 'expected_token_logit': 21.75, 'expected_token_rank': 1, 'top_logit_margin': 4.125, 'top_logits': [{'logit': 21.75, 'token': 314}, {'logit': 17.625, 'token': 6463}, {'logit': 16, 'token': 11013}, {'logit': 15.875, 'token': 18991}, {'logit': 15.0625, 'token': 17973}]}
+{'logit': 21.75}
+{'logit': 17.625}
+{'logit': 16}
+== seed-margin done 22:46:48

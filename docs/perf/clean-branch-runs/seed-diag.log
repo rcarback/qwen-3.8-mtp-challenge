@@ -1,0 +1,29 @@
+== verify base-prefill-plan 21:07:30
+   verify rc=0 reference_seed_token=7793
+== timed depth 0 base-prefill-plan 21:07:54
+   timed0 rc=1 seed prefill token 2695 disagreed with the reference's 7793
+== timed depth 8 base-prefill-plan 21:08:21
+   timed8 rc=1 seed prefill token 2695 disagreed with the reference's 7793
+   row0: {"top2_tokens":[13,25],"top2_logits":[23.375,21.875],"token":null,"emitted_token":null,"logits":null}
+== verify base-security 21:08:49
+   verify rc=0 reference_seed_token=2531
+== timed depth 0 base-security 21:09:13
+   timed0 rc=1 seed prefill token 27370 disagreed with the reference's 2531
+== timed depth 8 base-security 21:09:41
+   timed8 rc=1 seed prefill token 27370 disagreed with the reference's 2531
+   row0: {"top2_tokens":[8213,369],"top2_logits":[18.875,17.75],"token":null,"emitted_token":null,"logits":null}
+== verify clean-prefill-plan 21:10:08
+   verify rc=0 reference_seed_token=7793
+== timed depth 0 clean-prefill-plan 21:10:32
+   timed0 rc=1 seed prefill token 2695 disagreed with the reference's 7793
+== timed depth 8 clean-prefill-plan 21:10:59
+   timed8 rc=1 seed prefill token 2695 disagreed with the reference's 7793
+   row0: {"top2_tokens":[13,25],"top2_logits":[23.375,21.875],"token":null,"emitted_token":null,"logits":null}
+== verify clean-security 21:11:26
+   verify rc=0 reference_seed_token=2531
+== timed depth 0 clean-security 21:11:49
+   timed0 rc=1 seed prefill token 27370 disagreed with the reference's 2531
+== timed depth 8 clean-security 21:12:17
+   timed8 rc=1 seed prefill token 27370 disagreed with the reference's 2531
+   row0: {"top2_tokens":[8213,369],"top2_logits":[18.875,17.75],"token":null,"emitted_token":null,"logits":null}
+== seed-diag done 21:12:44

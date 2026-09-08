@@ -1,0 +1,2 @@
+mtp-verify: generate 17/17 (context 530)
+mtp-verify: rows=17 seed_tokens=512 reference_seed_token=7793 self_consistent=true (replayed 1 row bit-identically) chain_contradictions=0

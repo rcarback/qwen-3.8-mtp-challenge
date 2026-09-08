@@ -1,0 +1,39 @@
+{
+  "actual_expected_logit_delta" : 0,
+  "actual_token" : 34669,
+  "actual_token_logit" : 17.75,
+  "case_name" : "base_sailing",
+  "expected_token" : 34669,
+  "expected_token_logit" : 17.75,
+  "expected_token_rank" : 1,
+  "generated_prefix" : [
+    34669
+  ],
+  "golden_hash" : "3d807dc3b1fed2a81f9a469f53d4486c0b6efed2cc7e54cf65d405c4b2614ce8",
+  "matched_prefix_steps" : 1,
+  "prompt_token_count" : 512,
+  "step" : 0,
+  "top_logit_margin" : 0.125,
+  "top_logits" : [
+    {
+      "logit" : 17.75,
+      "token" : 34669
+    },
+    {
+      "logit" : 17.625,
+      "token" : 6463
+    },
+    {
+      "logit" : 17.5,
+      "token" : 6966
+    },
+    {
+      "logit" : 16.875,
+      "token" : 16547
+    },
+    {
+      "logit" : 16.75,
+      "token" : 23424
+    }
+  ]
+}

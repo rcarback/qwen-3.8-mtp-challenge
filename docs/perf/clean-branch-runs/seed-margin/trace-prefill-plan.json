@@ -1,0 +1,39 @@
+{
+  "actual_expected_logit_delta" : 0,
+  "actual_token" : 7793,
+  "actual_token_logit" : 18.625,
+  "case_name" : "base_prefill-plan",
+  "expected_token" : 7793,
+  "expected_token_logit" : 18.625,
+  "expected_token_rank" : 1,
+  "generated_prefix" : [
+    7793
+  ],
+  "golden_hash" : "c93f40319b314ded5ada413e4b00ef1ef02e9b986a96373578b85d5aea98c5d4",
+  "matched_prefix_steps" : 1,
+  "prompt_token_count" : 512,
+  "step" : 0,
+  "top_logit_margin" : 0.125,
+  "top_logits" : [
+    {
+      "logit" : 18.625,
+      "token" : 7793
+    },
+    {
+      "logit" : 18.5,
+      "token" : 2695
+    },
+    {
+      "logit" : 18.375,
+      "token" : 1528
+    },
+    {
+      "logit" : 17.5,
+      "token" : 13
+    },
+    {
+      "logit" : 16.375,
+      "token" : 198
+    }
+  ]
+}
