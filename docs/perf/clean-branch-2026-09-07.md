@@ -315,3 +315,46 @@ Two consequences follow for this branch:
 The decision on 2026-09-08 is to measure and ship with the declared head. The
 4-bit default in `ce85157b` stays because it is inert with a quantized head
 and helps any run on the pinned head.
+
+### Round 6, the three configurations compared (2026-09-08)
+
+Seven prompts, three arms, alternating order, every arm token-matched. Seconds
+per token on the MTP leg:
+
+| prompt | base + declared | clean + declared | clean + pinned 4-bit | acceptance |
+| --- | --- | --- | --- | --- |
+| cooking | 0.0859 | 0.0871 | 0.0805 | 0.38 |
+| dyeing | 0.0614 | 0.0615 | 0.0634 | 0.44 |
+| geology | 0.0437 | 0.0411 | 0.0423 | 0.77 |
+| music | 0.0528 | 0.0531 | 0.0546 | 0.57 |
+| public | 0.0321 | 0.0324 | 0.0338 | 0.88 |
+| readme | 0.0418 | 0.0417 | 0.0430 | 0.72 |
+| runbook | 0.0383 | 0.0390 | 0.0412 | 0.79 |
+
+| arm | median per-prompt ratio | prompts | all tokens matched |
+| --- | --- | --- | --- |
+| base + declared head | 2.151 | 7 | True |
+| clean + declared head | 2.178 | 7 | True |
+| clean + pinned head, 4-bit twin | 2.120 | 7 | True |
+
+The declared head beats the pinned head with the 4-bit twin on five of the
+seven prompts. It loses on cooking and dyeing, the two lowest-acceptance
+prompts, where a round pays for proposals it does not get back. Base and clean
+with the declared head agree within 1.5 percent on six prompts. That is the
+predicted result. The twin derives nothing from a head whose projection is
+already quantized, and the branch's other two changes are within noise at this
+window. Geology is the exception at 6 percent, measured on a warm box and not
+reproduced.
+
+The cooking and geology arms ran with serial legs 4 to 7 percent slower than
+the rest of the session, so their absolute times are inflated. Ratios inside a
+pair are unaffected, because both legs of a pair run in the same session.
+
+The two conclusions that carry forward:
+
+- Ship and measure with the declared head. Its advantage is real on the
+  prompts where acceptance is high, which is where the ranked pool sits.
+- The branch's local advantage over base does not survive the change of head.
+  Any further gain has to come from the declared head's own round: a 2-bit
+  compact draft vocabulary of 98,336 rows, a 4-bit rerank, and bf16 precision
+  islands, none of which this fork has profiled.
