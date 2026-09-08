@@ -276,3 +276,42 @@ same acceptance and draft length as round 4 and all tokens matched.
 - The Photos analysis daemon and two leaked gterm test readers were frozen
   with SIGSTOP for the campaign. The measure script resumes the analysis
   daemons on exit.
+
+## The leader's configuration (2026-09-08)
+
+The board entry at 273.6 percent is a ratio of 3.74 on the M5 box: 97.8 decode
+tokens per second against the fixture's serial calibration of 0.0380 seconds
+per token, 26.3 tokens per second. Its commit, the xsums fill fusion, is in
+`0863b06a`, so the base tree of this campaign is the leader's code. The entry
+was measured with the head that `mtp-head.manifest.json` declares, and the
+ranked candidate leg runs that head while the baseline leg runs the pinned
+head.
+
+The declared head is `amal-david/qwen38-mtp-head-q2-q4-rerank-v1` at revision
+`ae6282749a52e052496dd5300b4aa441df7301e8`, one `model.safetensors` of
+427,742,600 bytes. The manifest's digest is not the file's digest. The runner
+hashes the staged tree: for each file in sorted order, the line
+`<sha256>  <name>`, and the SHA-256 of those lines. For this one-file tree the
+file hashes to `d038fd41...` and the tree to `559b24eb...`, which matches the
+manifest. The head's weights are already quantized. It has a 4-bit group-64
+projection and MLP, a 2-bit compact draft vocabulary of 98,336 rows with a
+4-bit rerank, and bf16 precision islands for the attention projections. Its
+metadata names the format `qwen38-mtp-incumbent-q4-g64-plus-bf16-qkv-islands-v1`.
+
+Two consequences follow for this branch:
+
+- The derived head twin builds a quantized copy only when the head's
+  projection is not already quantized. With the declared head it builds
+  nothing, and the local gain of this branch, which the head-off arms
+  attribute to the twin, does not apply to the ranked candidate leg. On the
+  first compared prompt, base and clean with the declared head decode within
+  1 percent of each other with identical acceptance.
+- The local script cannot load a bare head file. A copy of the pinned head's
+  `config.json` beside the declared file satisfies its check, and the worker
+  loads the file the way the runner's staged tree is loaded. The local
+  measurements from this point use the declared head unless a row says
+  otherwise.
+
+The decision on 2026-09-08 is to measure and ship with the declared head. The
+4-bit default in `ce85157b` stays because it is inert with a quantized head
+and helps any run on the pinned head.
