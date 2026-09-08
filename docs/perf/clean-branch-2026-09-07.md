@@ -59,7 +59,7 @@ test-only commits follow them.
 | --- | --- | --- | --- | --- |
 | 1 | Gated-delta prework packed at widths 1 and 2, compiled g and beta and the fused gated post-norm at width 1, one memoized epsilon scalar | `Qwen35.swift` | always on | byte-equal, six receipt tests with negative controls |
 | 2 | The three session eval barriers evaluate the cache roots (`innerState()`) instead of a per-round trimmed slice of the full-attention keys | `Qwen36MTPBlockSession.swift` | always on | no computed value changes |
-| 3 | A derived 8-bit copy of the MTP head serves proposals; `MLX_QWEN_MTP_HEAD_QUANT=0` disables it, `4` selects 4 bits | `Qwen35.swift`, `Qwen35MTP.swift` | on at 8 bits | head only, the target decides every emitted token |
+| 3 | A derived quantized copy of the MTP head serves proposals; `MLX_QWEN_MTP_HEAD_QUANT=0` disables it, `8` selects 8 bits | `Qwen35.swift`, `Qwen35MTP.swift` | on at 4 bits since `ce85157b`, 8 bits before | head only, the target decides every emitted token |
 
 The branch after the port, oldest first:
 
@@ -68,6 +68,7 @@ The branch after the port, oldest first:
 | `3cf2b861` | perf(qwen35): packed gated-delta prework at widths 1 and 2 | `Qwen35.swift` |
 | `aad40971` | perf(mtp): evaluate cache roots instead of trimmed slices | `Qwen36MTPBlockSession.swift` |
 | `308b786c` | perf(mtp): quantize the MTP head for proposals at 8 bits by default | `Qwen35.swift`, `Qwen35MTP.swift` |
+| `ce85157b` | perf(mtp): quantize the proposal head at 4 bits by default | `Qwen35MTP.swift` |
 | `f240258f` | test: drop a stale suite reference from the forward-stream receipts | none |
 | `b151eb08` | test: fix the Comment conversion error blocking the test target | none |
 
@@ -177,6 +178,7 @@ receipts, the goldens, the prompts, and the scripts are under
 | 2 | base repeat, clean with the 8-bit head off (`MLX_QWEN_MTP_HEAD_QUANT=0`) | alternating per prompt |
 | 3 | clean repeat | single arm |
 | 4 | clean with the head at 4 bits (`MLX_QWEN_MTP_HEAD_QUANT=4`) | single arm |
+| 5 | clean rebuilt at `ce85157b`, no head variable, the 4-bit default | geology and cooking |
 
 ### Prompt pool
 
@@ -254,8 +256,11 @@ The 4-bit head is as fast as the 8-bit head on cooking, dyeing, readme, and
 runbook, and faster on geology, music, and public. Acceptance drops by up to
 five points at 4 bits, and the cheaper head step lets the adaptive schedule
 draft deeper, so the cost per emitted token holds or improves. All 4-bit arms
-matched tokens. The shipped default is 8 bits. The data supports 4 bits as the
-default, which also halves the derived head's footprint.
+matched tokens. The default moved to 4 bits in `ce85157b` on
+`mlx-fast-submission` after this campaign, which also halves the derived
+head's footprint. Round 5, on the rebuilt tree with no head variable set,
+measured geology at 0.0410 and cooking at 0.0806 seconds per token with the
+same acceptance and draft length as round 4 and all tokens matched.
 
 ### Measurement notes
 

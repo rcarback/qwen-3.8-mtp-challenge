@@ -1,0 +1,5 @@
+== cleandef geology 09:27:32
+   rc=0 {"score":2.140135037424795,"serial":0.087723712902516127,"mtp":0.040989802684634924,"eff":3.6865671641791047,"acc":0.76720647773279349,"matched":true,"tripwire":true}
+== cleandef cooking 09:31:47
+   rc=0 {"score":1.0976086426053322,"serial":0.088517630938440561,"mtp":0.080645894631743431,"eff":0.65375302663438262,"acc":0.36666666666666664,"matched":true,"tripwire":true}
+== measure done 09:36:17
