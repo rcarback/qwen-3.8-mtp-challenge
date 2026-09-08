@@ -64,9 +64,14 @@ let qwen35FusedEmbedConcatEnabled: Bool =
 
 /// Proposal-only derived quantization of the MTP head, in bits.
 ///
-/// `MLX_QWEN_MTP_HEAD_QUANT` accepts `4` or `8`; anything else, including
-/// unset, leaves the head bfloat16 exactly as loaded. The `MLX_` prefix is
-/// required for the same reason as the gate above.
+/// Unset resolves to `4`. `MLX_QWEN_MTP_HEAD_QUANT` accepts `8` to select
+/// 8-bit instead, or `0` (or any other value) to disable the derivation and
+/// leave the head bfloat16 exactly as loaded. The 4-bit default follows the
+/// 2026-09-07 campaign (`docs/perf/clean-branch-2026-09-07.md`): 4 bits
+/// matched or beat 8 bits on every prompt with all tokens matched, and both
+/// beat the bfloat16 head. The derivation only applies to a head whose
+/// projection is not already quantized. The `MLX_` prefix is required for
+/// the same reason as the gate above.
 ///
 /// WHAT THIS CHANGES AND WHAT IT CANNOT. It changes which tokens the head
 /// PROPOSES. It cannot change which tokens are EMITTED: the target verify
@@ -75,9 +80,9 @@ let qwen35FusedEmbedConcatEnabled: Bool =
 /// harness measures directly.
 let qwen35HeadProposalQuantizationBits: Int? = {
     guard let raw = ProcessInfo.processInfo
-        .environment["MLX_QWEN_MTP_HEAD_QUANT"],
-        let bits = Int(raw), bits == 4 || bits == 8
-    else { return nil }
+        .environment["MLX_QWEN_MTP_HEAD_QUANT"]
+    else { return 4 }
+    guard let bits = Int(raw), bits == 4 || bits == 8 else { return nil }
     return bits
 }()
 
