@@ -18,12 +18,37 @@ struct ChatCompletionRequest: Decodable {
     let temperature: Double?
     let topP: Double?
     let seed: UInt64?
+    /// `xhigh`, `medium`, or `low`. Validated where it is resolved, not here:
+    /// a bad value must come back as a 400 naming the supported set, and a
+    /// decoding error would come back as a 400 naming a Swift type.
+    let reasoningEffort: String?
+    let enableThinking: Bool?
 
     enum CodingKeys: String, CodingKey {
         case model, messages, tools, stream, stop, n, temperature, seed
         case topP = "top_p"
         case maxTokens = "max_tokens"
         case maxCompletionTokens = "max_completion_tokens"
+        case reasoningEffort = "reasoning_effort"
+        case enableThinking = "enable_thinking"
+        case chatTemplateKwargs = "chat_template_kwargs"
+    }
+
+    /// The other spelling of the same two knobs.
+    ///
+    /// `reasoning_effort` is the OpenAI-shaped field and the one this server's
+    /// own harness sends. `chat_template_kwargs` is what vLLM and SGLang ask
+    /// Qwen clients for, because those servers hand the dictionary straight to
+    /// the Jinja template. Accepting both costs a nested struct and means a
+    /// client written against either convention works unchanged.
+    private struct ChatTemplateKwargs: Decodable {
+        let enableThinking: Bool?
+        let reasoningEffort: String?
+
+        enum CodingKeys: String, CodingKey {
+            case enableThinking = "enable_thinking"
+            case reasoningEffort = "reasoning_effort"
+        }
     }
 
     init(from decoder: Decoder) throws {
@@ -46,6 +71,15 @@ struct ChatCompletionRequest: Decodable {
         // `max_completion_tokens` is the newer spelling; honour either.
         maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens)
             ?? container.decodeIfPresent(Int.self, forKey: .maxCompletionTokens)
+        // Top level wins over the template-kwargs spelling. A client that sends
+        // both is stating the same intent twice, and the flat field is the one
+        // it chose deliberately.
+        let kwargs = try container.decodeIfPresent(
+            ChatTemplateKwargs.self, forKey: .chatTemplateKwargs)
+        reasoningEffort = try container.decodeIfPresent(
+            String.self, forKey: .reasoningEffort) ?? kwargs?.reasoningEffort
+        enableThinking = try container.decodeIfPresent(
+            Bool.self, forKey: .enableThinking) ?? kwargs?.enableThinking
     }
 }
 
@@ -184,10 +218,17 @@ struct ChatCompletionResponse: Encodable {
     struct ResponseMessage: Encodable {
         let role = "assistant"
         let content: String?
+        /// The chain of thought, when the request asked for one. Not an OpenAI
+        /// field; it is the DeepSeek spelling that vLLM, SGLang, and OpenRouter
+        /// all adopted, so clients already read it. Keeping it OUT of `content`
+        /// is the point: a harness that scrapes a code block from `content`
+        /// must not get the deliberation as well.
+        let reasoningContent: String?
         let toolCalls: [ToolCallPayload]?
 
         enum CodingKeys: String, CodingKey {
             case role, content
+            case reasoningContent = "reasoning_content"
             case toolCalls = "tool_calls"
         }
     }
@@ -253,10 +294,12 @@ struct ChatCompletionChunk: Encodable {
     struct Delta: Encodable {
         let role: String?
         let content: String?
+        let reasoningContent: String?
         let toolCalls: [StreamedToolCall]?
 
         enum CodingKeys: String, CodingKey {
             case role, content
+            case reasoningContent = "reasoning_content"
             case toolCalls = "tool_calls"
         }
     }

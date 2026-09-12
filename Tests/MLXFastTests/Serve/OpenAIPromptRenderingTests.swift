@@ -24,7 +24,8 @@ struct OpenAIPromptRenderingTests {
     @Test("a bare user turn gets the thinking-disabled generation prompt")
     func rendersUserTurn() throws {
         let rendered = try OpenAIPromptRendering.renderPrompt(
-            messages: [message("user", "hi")], tools: nil)
+            messages: [message("user", "hi")], tools: nil,
+            reasoning: .off)
         #expect(rendered == """
             <|im_start|>user
             hi<|im_end|>
@@ -42,7 +43,7 @@ struct OpenAIPromptRenderingTests {
         let rendered = try OpenAIPromptRendering.renderPrompt(
             messages: [try message("system", "be terse"),
                        try message("user", "hi")],
-            tools: nil)
+            tools: nil, reasoning: .off)
         #expect(rendered.hasPrefix("<|im_start|>system\nbe terse<|im_end|>\n"))
     }
 
@@ -50,7 +51,7 @@ struct OpenAIPromptRenderingTests {
     func skipsEmptySystem() throws {
         let rendered = try OpenAIPromptRendering.renderPrompt(
             messages: [try message("system", "   "), try message("user", "hi")],
-            tools: nil)
+            tools: nil, reasoning: .off)
         #expect(!rendered.contains("<|im_start|>system"))
     }
 
@@ -59,7 +60,8 @@ struct OpenAIPromptRenderingTests {
         let tool = try OrderedJSON.parse(
             #"{"type":"function","function":{"name":"read","description":"d"}}"#)
         let rendered = try OpenAIPromptRendering.renderPrompt(
-            messages: [try message("user", "hi")], tools: [tool])
+            messages: [try message("user", "hi")], tools: [tool],
+            reasoning: .off)
         #expect(rendered.hasPrefix("""
             <|im_start|>system
             # Tools
@@ -79,7 +81,7 @@ struct OpenAIPromptRenderingTests {
         let rendered = try OpenAIPromptRendering.renderPrompt(
             messages: [try message("system", "be terse"),
                        try message("user", "hi")],
-            tools: [tool])
+            tools: [tool], reasoning: .off)
         let toolsIndex = rendered.range(of: "</tools>")!.lowerBound
         let systemIndex = rendered.range(of: "be terse")!.lowerBound
         #expect(toolsIndex < systemIndex)
@@ -97,7 +99,7 @@ struct OpenAIPromptRenderingTests {
                 try message("assistant", nil, toolCalls: [call]),
                 try message("tool", "ok", toolCallId: "call_1"),
             ],
-            tools: nil)
+            tools: nil, reasoning: .off)
         #expect(rendered.contains("""
             <tool_call>
             <function=read>
@@ -122,7 +124,7 @@ struct OpenAIPromptRenderingTests {
                 try message("tool", "a", toolCallId: "1"),
                 try message("tool", "b", toolCallId: "2"),
             ],
-            tools: nil)
+            tools: nil, reasoning: .off)
         #expect(rendered.contains("""
             <|im_start|>user
             <tool_response>
@@ -137,8 +139,207 @@ struct OpenAIPromptRenderingTests {
     @Test("no messages is rejected rather than rendered")
     func rejectsEmptyConversation() {
         #expect(throws: (any Error).self) {
-            _ = try OpenAIPromptRendering.renderPrompt(messages: [], tools: nil)
+            _ = try OpenAIPromptRendering.renderPrompt(
+                messages: [], tools: nil, reasoning: .off)
         }
+    }
+
+    // MARK: - reasoning
+
+    private func reasoning(
+        _ effort: OpenAIPromptRendering.Reasoning.Effort
+    ) -> OpenAIPromptRendering.Reasoning {
+        OpenAIPromptRendering.Reasoning(enabled: true, effort: effort)
+    }
+
+    @Test("thinking on leaves the generation prompt's think block open")
+    func opensThinkBlock() throws {
+        let rendered = try OpenAIPromptRendering.renderPrompt(
+            messages: [try message("user", "hi")], tools: nil,
+            reasoning: reasoning(.medium))
+        #expect(rendered.hasSuffix("<|im_start|>assistant\n<think>\n"))
+        // `medium` opens the block and says nothing about effort, so a
+        // conversation with no system message gains no system turn at all.
+        #expect(!rendered.contains("<|im_start|>system"))
+    }
+
+    @Test("an effort with no system message becomes the whole system turn")
+    func synthesisesSystemTurn() throws {
+        let rendered = try OpenAIPromptRendering.renderPrompt(
+            messages: [try message("user", "hi")], tools: nil,
+            reasoning: reasoning(.low))
+        #expect(rendered.hasPrefix("""
+            <|im_start|>system
+            Reasoning effort is set to low. Keep your thinking brief and \
+            focused, moving directly to the conclusion without unnecessary \
+            elaboration.<|im_end|>
+            """))
+    }
+
+    @Test("the effort sentence leads an existing system message")
+    func prependsToSystemMessage() throws {
+        let rendered = try OpenAIPromptRendering.renderPrompt(
+            messages: [try message("system", "be terse"),
+                       try message("user", "hi")],
+            tools: nil, reasoning: reasoning(.xhigh))
+        let effortIndex = rendered.range(of: "Reasoning effort")!.lowerBound
+        let systemIndex = rendered.range(of: "be terse")!.lowerBound
+        #expect(effortIndex < systemIndex)
+        #expect(rendered.contains("clarity in the final answer.\n\nbe terse"))
+    }
+
+    @Test("the effort sentence leads the tool block too")
+    func prependsToToolBlock() throws {
+        let tool = try OrderedJSON.parse(#"{"type":"function"}"#)
+        let rendered = try OpenAIPromptRendering.renderPrompt(
+            messages: [try message("user", "hi")], tools: [tool],
+            reasoning: reasoning(.xhigh))
+        #expect(rendered.hasPrefix(
+            "<|im_start|>system\nReasoning effort is set to xhigh."))
+        #expect(rendered.contains("final answer.\n\n# Tools"))
+    }
+
+    /// A prior assistant turn keeps its empty pre-closed block whatever this
+    /// turn asks for. Replaying a whole chain of thought would charge every
+    /// later turn for reasoning the model already spent.
+    @Test("a prior assistant turn keeps its closed think block")
+    func priorTurnsStayClosed() throws {
+        let rendered = try OpenAIPromptRendering.renderPrompt(
+            messages: [try message("user", "hi"),
+                       try message("assistant", "hello"),
+                       try message("user", "again")],
+            tools: nil, reasoning: reasoning(.xhigh))
+        #expect(rendered.contains(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\nhello<|im_end|>"))
+        #expect(rendered.hasSuffix("<|im_start|>assistant\n<think>\n"))
+    }
+
+    @Test("thinking off renders exactly what it rendered before the knob")
+    func offIsUnchanged() throws {
+        let rendered = try OpenAIPromptRendering.renderPrompt(
+            messages: [try message("system", "be terse"),
+                       try message("user", "hi")],
+            tools: nil, reasoning: .off)
+        #expect(rendered == """
+            <|im_start|>system
+            be terse<|im_end|>
+            <|im_start|>user
+            hi<|im_end|>
+            <|im_start|>assistant
+            <think>
+
+            </think>
+
+
+            """)
+    }
+}
+
+@Suite("Reasoning resolution")
+struct ReasoningResolutionTests {
+    @Test("a request that says nothing gets thinking off")
+    func defaultsOff() throws {
+        let resolved = try OpenAIPromptRendering.Reasoning.resolve(
+            enableThinking: nil, effort: nil)
+        #expect(resolved == .off)
+        #expect(resolved.instructions.isEmpty)
+    }
+
+    /// The template reads the effort only inside the `enable_thinking` branch,
+    /// so an effort that did not turn thinking on would be discarded silently.
+    @Test("an effort alone turns thinking on")
+    func effortImpliesThinking() throws {
+        let resolved = try OpenAIPromptRendering.Reasoning.resolve(
+            enableThinking: nil, effort: "low")
+        #expect(resolved.enabled)
+        #expect(resolved.effort == .low)
+    }
+
+    @Test("an explicit enable_thinking false beats an effort")
+    func explicitDisableWins() throws {
+        let resolved = try OpenAIPromptRendering.Reasoning.resolve(
+            enableThinking: false, effort: "xhigh")
+        #expect(!resolved.enabled)
+        #expect(resolved.instructions.isEmpty)
+    }
+
+    @Test("enable_thinking alone takes the template's xhigh default")
+    func thinkingAloneIsXhigh() throws {
+        let resolved = try OpenAIPromptRendering.Reasoning.resolve(
+            enableThinking: true, effort: nil)
+        #expect(resolved.effort == .xhigh)
+        #expect(resolved.instructions.hasPrefix(
+            "Reasoning effort is set to xhigh."))
+    }
+
+    @Test("medium opens the block without an effort sentence")
+    func mediumSaysNothing() throws {
+        let resolved = try OpenAIPromptRendering.Reasoning.resolve(
+            enableThinking: nil, effort: "medium")
+        #expect(resolved.enabled)
+        #expect(resolved.instructions.isEmpty)
+    }
+
+    @Test("an unsupported effort is rejected, not clamped")
+    func rejectsUnknownEffort() {
+        #expect(throws: (any Error).self) {
+            _ = try OpenAIPromptRendering.Reasoning.resolve(
+                enableThinking: nil, effort: "high")
+        }
+    }
+}
+
+@Suite("Think-block splitting")
+struct ThinkSplitterTests {
+    @Test("disabled, every reply is answer and nothing is reasoning")
+    func passesThroughWhenDisabled() {
+        var splitter = OpenAIPromptRendering.ThinkSplitter(enabled: false)
+        let split = splitter.split("plain </think> text")
+        #expect(split.reasoning.isEmpty)
+        #expect(split.answer == "plain </think> text")
+        #expect(!splitter.closed)
+    }
+
+    @Test("text before the close tag is reasoning, text after it is the answer")
+    func splitsAtCloseTag() {
+        var splitter = OpenAIPromptRendering.ThinkSplitter(enabled: true)
+        #expect(splitter.split("weighing it").answer.isEmpty)
+        #expect(splitter.split("weighing it").reasoning == "weighing it")
+        let split = splitter.split("weighing it</think>\n\nthe answer")
+        #expect(split.reasoning == "weighing it")
+        #expect(split.answer == "\n\nthe answer")
+        #expect(splitter.closed)
+    }
+
+    /// A trailing run that could still grow into `</think>` is withheld, so a
+    /// half-written close tag never reaches a caller as reasoning it has to
+    /// strip itself.
+    @Test("a partial close tag is withheld until it resolves")
+    func withholdsPartialTag() {
+        var splitter = OpenAIPromptRendering.ThinkSplitter(enabled: true)
+        #expect(splitter.split("done </thi").reasoning == "done ")
+        #expect(splitter.split("done </think").reasoning == "done ")
+        #expect(splitter.split("done </thing").reasoning == "done </thing")
+    }
+
+    /// The reasoning half is frozen when the tag is found. Later rounds append
+    /// to the ANSWER only, and must not disturb what was already settled.
+    @Test("the reasoning half stops growing once the block closes")
+    func freezesReasoning() {
+        var splitter = OpenAIPromptRendering.ThinkSplitter(enabled: true)
+        _ = splitter.split("why</think>a")
+        let later = splitter.split("why</think>ab")
+        #expect(later.reasoning == "why")
+        #expect(later.answer == "ab")
+    }
+
+    @Test("a turn that never closes the block yields no answer at all")
+    func neverClosed() {
+        var splitter = OpenAIPromptRendering.ThinkSplitter(enabled: true)
+        let split = splitter.split("still thinking about it")
+        #expect(split.answer.isEmpty)
+        #expect(split.reasoning == "still thinking about it")
+        #expect(!splitter.closed)
     }
 }
 

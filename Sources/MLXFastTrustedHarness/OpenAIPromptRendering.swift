@@ -5,18 +5,102 @@ import MLXFastCore
 /// OpenAI request can reach.
 ///
 /// WHY A PORT AND NOT AN EVALUATOR. There is no Jinja engine in the frozen
-/// dependency graph and none can be added. The template is 169 lines and half of
-/// them are unreachable here: this server always renders with
-/// `enable_thinking = false`, which makes `reasoning_instructions` the empty
-/// string and collapses the template's four reasoning branches to one.
+/// dependency graph and none can be added. The template is 169 lines and the
+/// unreachable half is vision content, `add_vision_id`, and `preserve_thinking`.
 ///
-/// WHY THINKING IS DISABLED. With thinking open the model reasons past any
-/// sensible budget -- the same failure the GPQA gate measured -- and the worker's
-/// per-session decode ceiling is 1536 tokens. A coding harness needs the answer,
-/// not the deliberation.
+/// REASONING IS A REQUEST KNOB, NOT A CONSTANT. Every render takes a
+/// ``Reasoning`` value that decides both template positions the two knobs touch:
+/// the instruction sentence in the system turn (`chat_template.jinja:59-60` and
+/// `:80-85`) and whether the generation prompt leaves the think block open
+/// (`:163-169`). It defaults to OFF rather than to the template's own
+/// `enable_thinking = true` at `xhigh`; see ``Reasoning/off``.
 ///
 /// LOCAL DEVELOPER TOOLING. Outside `editablePaths`.
 enum OpenAIPromptRendering {
+    /// The template's two reasoning controls, resolved together.
+    ///
+    /// They resolve together because the template resolves them together:
+    /// `chat_template.jinja:46-56` reads `reasoning_effort` only INSIDE the
+    /// `enable_thinking` branch, so an effort with thinking off is a value
+    /// nothing ever reads.
+    struct Reasoning: Equatable, Sendable {
+        enum Effort: String, CaseIterable, Sendable {
+            case xhigh, medium, low
+        }
+
+        let enabled: Bool
+        let effort: Effort
+
+        /// What this server renders when a request says nothing.
+        ///
+        /// NOT the template's default, which is thinking on at `xhigh`. The
+        /// worker holds one KV session and decodes it to completion before the
+        /// next request starts, so an open think block is charged to every
+        /// other caller as queue time. Clients that want reasoning ask for it,
+        /// and `resolve(enableThinking:effort:)` makes asking for an effort
+        /// enough.
+        static let off = Reasoning(enabled: false, effort: .xhigh)
+
+        /// `chat_template.jinja:51-55`, verbatim. Only `xhigh` and `low` carry
+        /// text: `medium` opens the think block and says nothing about effort,
+        /// which is a distinct state from thinking being off.
+        var instructions: String {
+            guard enabled else { return "" }
+            switch effort {
+            case .xhigh:
+                return "Reasoning effort is set to xhigh. Please think "
+                    + "carefully through the task, validate key assumptions, "
+                    + "consider plausible alternatives, and prioritize "
+                    + "correctness, consistency, and clarity in the final "
+                    + "answer."
+            case .low:
+                return "Reasoning effort is set to low. Keep your thinking "
+                    + "brief and focused, moving directly to the conclusion "
+                    + "without unnecessary elaboration."
+            case .medium:
+                return ""
+            }
+        }
+
+        /// `chat_template.jinja:163-169`. With thinking off the block is
+        /// pre-closed, so the model's first emitted token is already the
+        /// answer. With thinking on it is left open and the model closes it
+        /// itself, which is what ``ThinkSplitter`` exists to undo.
+        var generationPrompt: String {
+            enabled
+                ? "<|im_start|>assistant\n<think>\n"
+                : "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        }
+
+        /// Resolve a request's two fields under the template's own rules.
+        ///
+        /// An effort with no `enable_thinking` turns thinking ON. Honouring
+        /// `reasoning_effort: "low"` while leaving thinking off would discard
+        /// the only thing the caller asked for, and silently accepting a knob
+        /// this server does not honour is the posture `OpenAIWireTypes`
+        /// deliberately refuses. An explicit `enable_thinking: false` still
+        /// wins: it is the more specific statement.
+        ///
+        /// An unsupported effort is rejected rather than clamped, exactly as
+        /// `chat_template.jinja:48-50` raises.
+        static func resolve(
+            enableThinking: Bool?, effort: String?
+        ) throws -> Reasoning {
+            var resolved = Effort.xhigh
+            if let effort {
+                guard let parsed = Effort(rawValue: effort) else {
+                    throw MLXFastError.invalidInput(
+                        "unexpected reasoning effort '\(effort)'. Supported "
+                            + "values are xhigh (the template default), "
+                            + "medium, and low")
+                }
+                resolved = parsed
+            }
+            return Reasoning(
+                enabled: enableThinking ?? (effort != nil), effort: resolved)
+        }
+    }
+
     /// The literal instruction block the template emits after `</tools>`.
     /// Copied verbatim from `chat_template.jinja:68`; the model was tuned on
     /// these exact bytes, so it is a constant, not prose to improve.
@@ -55,24 +139,27 @@ enum OpenAIPromptRendering {
     /// corresponding prefix of the whole render. A boundary in the middle of
     /// ordinary text would carry no such guarantee.
     static func renderPromptWithTurnBoundaries(
-        messages: [ChatMessage], tools: [OrderedJSON]?
+        messages: [ChatMessage], tools: [OrderedJSON]?, reasoning: Reasoning
     ) throws -> (prompt: String, turnEnds: [Int]) {
         var turnEnds: [Int] = []
         let prompt = try renderPrompt(
-            messages: messages, tools: tools, turnEnds: &turnEnds)
+            messages: messages, tools: tools, reasoning: reasoning,
+            turnEnds: &turnEnds)
         return (prompt, turnEnds)
     }
 
     static func renderPrompt(
-        messages: [ChatMessage], tools: [OrderedJSON]?
+        messages: [ChatMessage], tools: [OrderedJSON]?, reasoning: Reasoning
     ) throws -> String {
         var ignored: [Int] = []
         return try renderPrompt(
-            messages: messages, tools: tools, turnEnds: &ignored)
+            messages: messages, tools: tools, reasoning: reasoning,
+            turnEnds: &ignored)
     }
 
     private static func renderPrompt(
-        messages: [ChatMessage], tools: [OrderedJSON]?, turnEnds: inout [Int]
+        messages: [ChatMessage], tools: [OrderedJSON]?, reasoning: Reasoning,
+        turnEnds: inout [Int]
     ) throws -> String {
         guard !messages.isEmpty else {
             throw MLXFastError.invalidInput("no messages provided")
@@ -85,8 +172,15 @@ enum OpenAIPromptRendering {
                 : nil
         }
 
+        // `chat_template.jinja:59-60` and `:80-85`: the reasoning sentence
+        // leads the system turn wherever that turn comes from, and when there
+        // is no other reason to emit one it becomes the whole turn.
+        let instructions = reasoning.instructions
+        let instructionBlock = instructions.isEmpty ? "" : instructions + "\n\n"
+
         if let tools, !tools.isEmpty {
             out += "<|im_start|>system\n"
+            out += instructionBlock
             out += "# Tools\n\nYou have access to the following functions:\n\n<tools>"
             for tool in tools {
                 out += "\n" + tool.serialized()
@@ -99,7 +193,11 @@ enum OpenAIPromptRendering {
             out += "<|im_end|>\n"
             turnEnds.append(out.count)
         } else if let leadingSystem, !leadingSystem.isEmpty {
-            out += "<|im_start|>system\n" + leadingSystem + "<|im_end|>\n"
+            out += "<|im_start|>system\n" + instructionBlock + leadingSystem
+                + "<|im_end|>\n"
+            turnEnds.append(out.count)
+        } else if !instructions.isEmpty {
+            out += "<|im_start|>system\n" + instructions + "<|im_end|>\n"
             turnEnds.append(out.count)
         }
 
@@ -118,8 +216,13 @@ enum OpenAIPromptRendering {
                 out += "<|im_start|>user\n" + content + "<|im_end|>\n"
                 turnEnds.append(out.count)
             case "assistant":
-                // `reasoning_content` is never round-tripped by this server, so
-                // the think block is always empty and always pre-closed.
+                // A PRIOR turn's think block is always empty and always
+                // pre-closed, whatever this turn's reasoning setting is.
+                // `chat_template.jinja:111-117` would replay
+                // `message.reasoning_content`, but this server does not
+                // round-trip it: the wire type never decodes the field, and
+                // replaying a reply's whole chain of thought would charge
+                // every later turn for reasoning the model has already spent.
                 out += "<|im_start|>assistant\n<think>\n\n</think>\n\n" + content
                 if let calls = message.toolCalls, !calls.isEmpty {
                     for (callIndex, call) in calls.enumerated() {
@@ -160,7 +263,7 @@ enum OpenAIPromptRendering {
             }
         }
 
-        out += "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        out += reasoning.generationPrompt
         return out
     }
 
@@ -287,6 +390,83 @@ enum OpenAIPromptRendering {
             return types
         }
         return [:]
+    }
+
+    // MARK: - Splitting the think block off a reply
+
+    /// Separates the reasoning half of a reply from the answer half.
+    ///
+    /// With thinking enabled the generation prompt ends at an OPEN `<think>`
+    /// (`chat_template.jinja:168`), so the model emits its reasoning first and
+    /// writes the closing tag itself. Everything before `</think>` is the
+    /// chain of thought and everything after it is the answer. With thinking
+    /// disabled the prompt already carries a closed block, the model never
+    /// writes another one, and this is a pass-through that costs one branch.
+    ///
+    /// Splitting here rather than at the caller has a second effect that
+    /// matters: the tool-call gate and the stop strings then see the ANSWER
+    /// only, so a model that writes `<tool_call>` or a caller's stop string
+    /// while reasoning aloud no longer ends its own turn.
+    ///
+    /// The answer keeps whatever whitespace follows the tag, usually `\n\n`.
+    /// Trimming it would make the two modes agree, because with thinking off
+    /// those two newlines sit in the PROMPT instead and never reach the reply.
+    /// It is left alone anyway: vLLM's reasoning parsers hand back the raw
+    /// remainder, a caller comparing against a reference implementation should
+    /// see the same bytes, and a server that silently edits model output is a
+    /// worse default than one whose callers trim.
+    struct ThinkSplitter {
+        static let marker = "</think>"
+        let enabled: Bool
+
+        /// Character offset just past the close tag, once seen. Stable across
+        /// rounds: the reply only ever grows at its end, so an offset found in
+        /// one round means the same position in the next.
+        private var answerStart: Int?
+        /// Frozen the round the tag is found. The reasoning half cannot change
+        /// after that, and recopying it every round is the quadratic cost
+        /// ``ToolCallGate`` was rewritten to avoid.
+        private var frozenReasoning: String?
+
+        init(enabled: Bool) { self.enabled = enabled }
+
+        /// True once the model has closed the block. A turn that ends with
+        /// this still false spent its whole budget reasoning.
+        var closed: Bool { answerStart != nil }
+
+        mutating func split(
+            _ full: String
+        ) -> (reasoning: String, answer: String) {
+            guard enabled else { return ("", full) }
+            if answerStart == nil, let found = full.range(of: Self.marker) {
+                answerStart = full.distance(
+                    from: full.startIndex, to: found.upperBound)
+                frozenReasoning = String(full[full.startIndex ..< found.lowerBound])
+            }
+            guard let start = answerStart, let reasoning = frozenReasoning else {
+                // Still inside the block. Withhold a trailing run that could
+                // still grow into `</think>`, so a half-written close tag never
+                // reaches a caller as reasoning text it has to strip itself.
+                return (Self.withoutPartialMarker(full), "")
+            }
+            let index = full.index(
+                full.startIndex, offsetBy: Swift.min(start, full.count))
+            return (reasoning, String(full[index...]))
+        }
+
+        /// Longest suffix of `text` that is a proper prefix of the marker,
+        /// removed. Same rule as ``ToolCallGate``, and for the same reason.
+        private static func withoutPartialMarker(_ text: String) -> String {
+            for length in stride(
+                from: Swift.min(marker.count - 1, text.count), through: 1,
+                by: -1)
+            {
+                if text.hasSuffix(String(marker.prefix(length))) {
+                    return String(text.dropLast(length))
+                }
+            }
+            return text
+        }
     }
 
     // MARK: - Streaming gate

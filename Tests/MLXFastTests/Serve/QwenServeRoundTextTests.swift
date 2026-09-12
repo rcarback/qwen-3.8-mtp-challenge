@@ -20,7 +20,7 @@ struct QwenServeRoundTextTests {
     @Test("the delta is the text not yet handed to the caller")
     func emitsOnlyNewText() {
         var stage = QwenRuntime.ServeRoundText(
-            stopStrings: [], streaming: true)
+            stopStrings: [], streaming: true, thinking: false)
         var decoder = FakeDecoder(steps: ["Hel", "Hello", "Hello there"])
         #expect(stage.advance { decoder.next() }.delta == "Hel")
         #expect(stage.advance { decoder.next() }.delta == "lo")
@@ -30,7 +30,7 @@ struct QwenServeRoundTextTests {
     @Test("a partial tool-call marker is held back until it resolves")
     func holdsBackAPartialMarker() {
         var stage = QwenRuntime.ServeRoundText(
-            stopStrings: [], streaming: true)
+            stopStrings: [], streaming: true, thinking: false)
         var decoder = FakeDecoder(steps: ["ok <too", "ok <tool_call>{}"])
         #expect(stage.advance { decoder.next() }.delta == "ok ")
         let second = stage.advance { decoder.next() }
@@ -41,18 +41,21 @@ struct QwenServeRoundTextTests {
     @Test("a stop string truncates the text and reports the hit")
     func truncatesAtAStopString() {
         var stage = QwenRuntime.ServeRoundText(
-            stopStrings: ["END"], streaming: false)
+            stopStrings: ["END"], streaming: false, thinking: false)
         var decoder = FakeDecoder(steps: ["hello", "hello END tail"])
         _ = stage.advance { decoder.next() }
         let second = stage.advance { decoder.next() }
         #expect(second.hitStop)
-        #expect(second.full == "hello ")
+        // `answer` carries the truncation; `full` stays the raw decode, so the
+        // turn-end log can still report what the model actually produced.
+        #expect(second.answer == "hello ")
+        #expect(second.full == "hello END tail")
     }
 
     @Test("a multi-byte character completed by a later round is not doubled")
     func survivesASeamRepair() {
         var stage = QwenRuntime.ServeRoundText(
-            stopStrings: [], streaming: true)
+            stopStrings: [], streaming: true, thinking: false)
         var decoder = FakeDecoder(steps: ["caf\u{FFFD}", "café", "café au"])
         _ = stage.advance { decoder.next() }
         _ = stage.advance { decoder.next() }
@@ -144,7 +147,7 @@ struct QwenServeRoundTextTests {
     @Test("a non-streaming request with no stop strings decodes once")
     func skipsThePerRoundDecode() {
         var stage = QwenRuntime.ServeRoundText(
-            stopStrings: [], streaming: false)
+            stopStrings: [], streaming: false, thinking: false)
         #expect(!stage.runsPerRound)
         var calls = 0
         for _ in 0 ..< 5 {
@@ -160,19 +163,80 @@ struct QwenServeRoundTextTests {
     @Test("streaming or stop strings keep the per-round decode")
     func keepsThePerRoundDecodeWhenNeeded() {
         #expect(QwenRuntime.ServeRoundText(
-            stopStrings: [], streaming: true).runsPerRound)
+            stopStrings: [], streaming: true, thinking: false).runsPerRound)
         #expect(QwenRuntime.ServeRoundText(
-            stopStrings: ["END"], streaming: false).runsPerRound)
+            stopStrings: ["END"], streaming: false, thinking: false).runsPerRound)
     }
 
     @Test("finish is idempotent for a stage that already ran per round")
     func finishDoesNotRedecodeAfterAPerRoundStage() {
         var stage = QwenRuntime.ServeRoundText(
-            stopStrings: [], streaming: true)
+            stopStrings: [], streaming: true, thinking: false)
         _ = stage.advance { "hello" }
         var calls = 0
         let final = stage.finish { calls += 1; return "hello" }
         #expect(calls == 0)
         #expect(final.full == "hello")
+    }
+
+    // MARK: - reasoning
+
+    @Test("reasoning streams as its own delta, the answer as content")
+    func streamsReasoningSeparately() {
+        var stage = QwenRuntime.ServeRoundText(
+            stopStrings: [], streaming: true, thinking: true)
+        var decoder = FakeDecoder(
+            steps: ["let me", "let me see</think>ans", "let me see</think>answer"])
+        let first = stage.advance { decoder.next() }
+        #expect(first.reasoningDelta == "let me")
+        #expect(first.delta.isEmpty)
+        let second = stage.advance { decoder.next() }
+        #expect(second.reasoningDelta == " see")
+        #expect(second.delta == "ans")
+        #expect(stage.advance { decoder.next() }.delta == "wer")
+        #expect(stage.closedThinkBlock)
+    }
+
+    /// The chain of thought is where a model is most likely to WRITE the
+    /// patterns the later stages scan for. Both stages see the answer only.
+    @Test("a stop string inside the reasoning does not end the turn")
+    func stopStringsIgnoreReasoning() {
+        var stage = QwenRuntime.ServeRoundText(
+            stopStrings: ["END"], streaming: false, thinking: true)
+        let outcome = stage.advance { "I could write END here</think>fine" }
+        #expect(!outcome.hitStop)
+        #expect(outcome.answer == "fine")
+    }
+
+    @Test("a tool-call marker inside the reasoning does not latch the gate")
+    func toolCallsIgnoreReasoning() {
+        var stage = QwenRuntime.ServeRoundText(
+            stopStrings: [], streaming: true, thinking: true)
+        let outcome = stage.advance {
+            "maybe <tool_call> would work</think>no"
+        }
+        #expect(!outcome.sawToolCall)
+        #expect(outcome.delta == "no")
+    }
+
+    @Test("a turn that never closes the block reports it")
+    func reportsAnUnclosedBlock() {
+        var stage = QwenRuntime.ServeRoundText(
+            stopStrings: [], streaming: false, thinking: true)
+        let outcome = stage.finish { "still working through the cases" }
+        #expect(!stage.closedThinkBlock)
+        #expect(outcome.answer.isEmpty)
+        #expect(outcome.reasoning == "still working through the cases")
+    }
+
+    @Test("with thinking off the raw reply is the answer, as before")
+    func thinkingOffIsUnchanged() {
+        var stage = QwenRuntime.ServeRoundText(
+            stopStrings: [], streaming: true, thinking: false)
+        let outcome = stage.advance { "plain text" }
+        #expect(outcome.answer == "plain text")
+        #expect(outcome.reasoning.isEmpty)
+        #expect(outcome.reasoningDelta.isEmpty)
+        #expect(outcome.delta == "plain text")
     }
 }

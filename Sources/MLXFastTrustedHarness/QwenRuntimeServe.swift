@@ -16,6 +16,11 @@ import Tokenizers
 // because silently returning one choice where the caller asked for four is a
 // wrong answer rather than a missing knob.
 //
+// REASONING. `reasoning_effort` and `enable_thinking` are honoured per request
+// and default to OFF, which is deliberately not the chat template's own
+// default. The chain of thought comes back in `reasoning_content` and is never
+// folded into `content`. See `OpenAIPromptRendering.Reasoning`.
+//
 // LOOPBACK ONLY, NO AUTHENTICATION. One request at a time: the worker holds one
 // ~14 GiB model and one KV session.
 extension QwenRuntime {
@@ -116,6 +121,8 @@ extension QwenRuntime {
               draft depth      \(options.depth)\(depthNote)
               max new tokens   \(options.maxNewTokens)
               sampling         greedy unless the request sets temperature > 0
+              reasoning        off unless the request sets reasoning_effort \
+            (xhigh|medium|low) or enable_thinking
             """)
         server.waitForever()
     }
@@ -256,6 +263,20 @@ extension QwenRuntime {
             return
         }
 
+        // Both reasoning knobs, resolved once and rejected loudly. An
+        // unsupported effort is a 400 rather than a clamp, because the template
+        // it is a port of raises on exactly the same input
+        // (`chat_template.jinja:48-50`).
+        let reasoning: OpenAIPromptRendering.Reasoning
+        do {
+            reasoning = try OpenAIPromptRendering.Reasoning.resolve(
+                enableThinking: decoded.enableThinking,
+                effort: decoded.reasoningEffort)
+        } catch {
+            responder.sendError(status: 400, message: "\(error)")
+            return
+        }
+
         // Tools have to survive the trip in original key order, which
         // `JSONDecoder` cannot promise, so they are re-parsed from the raw body.
         let tools = parseToolsFromRawBody(request.body)
@@ -267,7 +288,8 @@ extension QwenRuntime {
             _ extra: [ChatMessage]
         ) throws -> (prompt: String, turnEnds: [Int], seed: [Int]) {
             let base = try OpenAIPromptRendering.renderPromptWithTurnBoundaries(
-                messages: decoded.messages + extra, tools: toolsForModel)
+                messages: decoded.messages + extra, tools: toolsForModel,
+                reasoning: reasoning)
             let seed = context.tokenizer.encode(
                 text: base.0, addSpecialTokens: false)
 
@@ -300,7 +322,8 @@ extension QwenRuntime {
             }
             guard let after = try? OpenAIPromptRendering
                 .renderPromptWithTurnBoundaries(
-                    messages: compacted.messages, tools: toolsForModel)
+                    messages: compacted.messages, tools: toolsForModel,
+                    reasoning: reasoning)
             else { return (base.0, base.1, seed) }
             let afterSeed = context.tokenizer.encode(
                 text: after.0, addSpecialTokens: false)
@@ -392,12 +415,18 @@ extension QwenRuntime {
                     stopStrings: decoded.stop?.values ?? [],
                     depth: options.depth,
                     tools: tools,
+                    reasoning: reasoning,
                     onDelta: streaming
-                        ? { delta in
+                        ? { delta, reasoningDelta in
                             emitChunk(
                                 responder: responder, id: String(completionID),
                                 created: created, model: options.modelName,
-                                delta: .init(role: nil, content: delta, toolCalls: nil),
+                                delta: .init(
+                                    role: nil,
+                                    content: delta.isEmpty ? nil : delta,
+                                    reasoningContent: reasoningDelta.isEmpty
+                                        ? nil : reasoningDelta,
+                                    toolCalls: nil),
                                 finishReason: nil, openStream: true)
                         }
                         : nil
@@ -425,6 +454,15 @@ extension QwenRuntime {
                     totalTokens: seedTokens.count)
             }
 
+            // REASONING BREAKS PREFIX REUSE, correctly. A reasoning turn emits
+            // its chain of thought and `</think>` as real tokens, but the next
+            // turn renders that same assistant message with an EMPTY think
+            // block (`OpenAIPromptRendering`, the assistant case). Seed plus
+            // emitted is then not a prefix of the next prompt, `decide` returns
+            // `.restart`, and the turn re-prefills. That is the right answer,
+            // not a miss to fix: the two token arrays genuinely differ, and
+            // extending onto a session that holds tokens the new prompt does
+            // not contain would decode from the wrong state.
             context.record(prompt: seedTokens, emitted: outcome.emittedTokens)
             // Refresh this conversation's resume point to the END of the turn.
             // Recorded only at `begin`, a resume point pins to the prompt
@@ -518,6 +556,8 @@ extension QwenRuntime {
 
     struct ServeOutcome {
         var text: String
+        /// The chain of thought, empty unless the request asked for reasoning.
+        var reasoning: String
         var toolCalls: [ToolCallPayload]
         var finishReason: String
         var stats: QwenChatTurnStats
@@ -545,8 +585,14 @@ extension QwenRuntime {
     /// went unmeasured for so long.
     struct ServeRoundText {
         struct Outcome {
+            /// The raw decode, chain of thought included.
             var full: String
+            /// `full` with the think block removed and any stop string applied.
+            /// Identical to `full` when the request did not ask for reasoning.
+            var answer: String
+            var reasoning: String
             var delta: String
+            var reasoningDelta: String
             var hitStop: Bool
             var sawToolCall: Bool
             var decodeSeconds: Double
@@ -557,6 +603,7 @@ extension QwenRuntime {
         let stopStrings: [String]
         let streaming: Bool
         private var gate = OpenAIPromptRendering.ToolCallGate()
+        private var splitter: OpenAIPromptRendering.ThinkSplitter
 
         /// The decoded text has exactly two consumers: the stop-string scan
         /// and the streaming delta. With neither present nothing reads it
@@ -568,12 +615,21 @@ extension QwenRuntime {
         /// the reply once or in pieces.
         var runsPerRound: Bool { streaming || !stopStrings.isEmpty }
 
+        /// True once the model closed its own think block. False at the end of
+        /// a reasoning turn means the budget ran out mid-thought.
+        var closedThinkBlock: Bool { splitter.closed }
+
         private var lastFull = ""
+        private var lastAnswer = ""
+        private var lastReasoning = ""
+        private var emittedReasoning = 0
         private var ranAtLeastOnce = false
 
-        init(stopStrings: [String], streaming: Bool) {
+        init(stopStrings: [String], streaming: Bool, thinking: Bool) {
             self.stopStrings = stopStrings
             self.streaming = streaming
+            self.splitter = OpenAIPromptRendering.ThinkSplitter(
+                enabled: thinking)
         }
 
         /// `decode` yields the WHOLE reply so far, not an increment: Qwen uses
@@ -581,33 +637,54 @@ extension QwenRuntime {
         /// multi-byte character and decoding tokens singly produces
         /// replacement characters at the seams.
         mutating func advance(decode: () -> String) -> Outcome {
-            guard runsPerRound else {
-                return Outcome(
-                    full: lastFull, delta: "", hitStop: false,
-                    sawToolCall: false, decodeSeconds: 0, stopSeconds: 0,
-                    gateSeconds: 0)
-            }
+            guard runsPerRound else { return idleOutcome(sawToolCall: false) }
             ranAtLeastOnce = true
             let decodeStarted = Date()
-            var full = decode()
+            let full = decode()
             let decodeSeconds = Date().timeIntervalSince(decodeStarted)
+            return process(
+                full: full, decodeSeconds: decodeSeconds, scanForStop: true)
+        }
+
+        /// The stages every text pass runs, in the one order that is correct.
+        ///
+        /// The think block is removed FIRST. Both later stages are pattern
+        /// scans, and a chain of thought is exactly where a model is most
+        /// likely to write the patterns they look for -- quoting a stop string
+        /// while planning, or describing the `<tool_call>` form before
+        /// deciding against it. Scanning the answer only makes both stages
+        /// mean what their names say.
+        private mutating func process(
+            full: String, decodeSeconds: Double, scanForStop: Bool
+        ) -> Outcome {
+            let splitStarted = Date()
+            let split = splitter.split(full)
+            var answer = split.answer
 
             let stopStarted = Date()
-            let stopHit = QwenRuntime.firstStopHit(
-                in: full, stopStrings: stopStrings)
+            let stopHit = scanForStop
+                ? QwenRuntime.firstStopHit(in: answer, stopStrings: stopStrings)
+                : nil
             let stopSeconds = Date().timeIntervalSince(stopStarted)
             if let stop = stopHit {
-                full = String(full[full.startIndex ..< stop])
+                answer = String(answer[answer.startIndex ..< stop])
             }
 
-            let gateStarted = Date()
-            let admitted = gate.admit(full)
-            let gateSeconds = Date().timeIntervalSince(gateStarted)
+            let admitted = gate.admit(answer)
+            // The split and the gate are the same kind of work on the same
+            // string, so they share a budget line rather than inventing a
+            // second one the stats bar would have to print.
+            let gateSeconds = Date().timeIntervalSince(splitStarted) - stopSeconds
 
             lastFull = full
+            lastAnswer = answer
+            lastReasoning = split.reasoning
             return Outcome(
                 full: full,
+                answer: answer,
+                reasoning: split.reasoning,
                 delta: streaming ? admitted.delta : "",
+                reasoningDelta: streaming ? newReasoning(split.reasoning) : "",
                 hitStop: stopHit != nil,
                 sawToolCall: admitted.sawToolCall,
                 decodeSeconds: decodeSeconds,
@@ -615,29 +692,43 @@ extension QwenRuntime {
                 gateSeconds: gateSeconds)
         }
 
+        /// The part of the chain of thought this stage has not streamed yet.
+        ///
+        /// Walks BACKWARD from the end, like the tool-call gate: the pending
+        /// slice is a handful of characters per round and the emitted prefix is
+        /// the whole reply so far.
+        private mutating func newReasoning(_ reasoning: String) -> String {
+            let total = reasoning.count
+            guard total > emittedReasoning else { return "" }
+            let from = reasoning.index(
+                reasoning.endIndex, offsetBy: -(total - emittedReasoning))
+            emittedReasoning = total
+            return String(reasoning[from...])
+        }
+
+        private func idleOutcome(sawToolCall: Bool) -> Outcome {
+            Outcome(
+                full: lastFull, answer: lastAnswer, reasoning: lastReasoning,
+                delta: "", reasoningDelta: "", hitStop: false,
+                sawToolCall: sawToolCall, decodeSeconds: 0, stopSeconds: 0,
+                gateSeconds: 0)
+        }
+
         /// One last pass for a stage that skipped the loop. A stage that ran
         /// per round already holds its final text and re-running the gate on
         /// it would be a second sighting of the same marker.
         mutating func finish(decode: () -> String) -> Outcome {
             guard !ranAtLeastOnce else {
-                return Outcome(
-                    full: lastFull, delta: "", hitStop: false,
-                    sawToolCall: gate.stopped, decodeSeconds: 0,
-                    stopSeconds: 0, gateSeconds: 0)
+                return idleOutcome(sawToolCall: gate.stopped)
             }
             ranAtLeastOnce = true
             let decodeStarted = Date()
             let full = decode()
             let decodeSeconds = Date().timeIntervalSince(decodeStarted)
-            let gateStarted = Date()
-            let admitted = gate.admit(full)
-            let gateSeconds = Date().timeIntervalSince(gateStarted)
-            lastFull = full
-            return Outcome(
-                full: full, delta: "", hitStop: false,
-                sawToolCall: admitted.sawToolCall,
-                decodeSeconds: decodeSeconds, stopSeconds: 0,
-                gateSeconds: gateSeconds)
+            // No stop scan: a stage that skipped the loop has no stop strings,
+            // so `firstStopHit` is unreachable either way.
+            return process(
+                full: full, decodeSeconds: decodeSeconds, scanForStop: false)
         }
     }
 
@@ -734,7 +825,8 @@ extension QwenRuntime {
         stopStrings: [String],
         depth: Int,
         tools: [OrderedJSON]?,
-        onDelta: ((String) -> Void)?
+        reasoning: OpenAIPromptRendering.Reasoning,
+        onDelta: ((_ content: String, _ reasoningContent: String) -> Void)?
     ) throws -> ServeOutcome {
         let tokenizer = context.tokenizer
         var stats = QwenChatTurnStats()
@@ -788,8 +880,11 @@ extension QwenRuntime {
         // in round 1's `tokens` and appending it here would emit it twice.
         var emitted: [Int] = []
         var full = ""
+        var answer = ""
+        var chainOfThought = ""
         var stage = ServeRoundText(
-            stopStrings: stopStrings, streaming: onDelta != nil)
+            stopStrings: stopStrings, streaming: onDelta != nil,
+            thinking: reasoning.enabled)
         var detokenizer = IncrementalDetokenizer()
         var finishReason = "stop"
         var done = false
@@ -839,13 +934,15 @@ extension QwenRuntime {
             stats.stopScanSeconds += text.stopSeconds
             stats.gateSeconds += text.gateSeconds
             full = text.full
+            answer = text.answer
+            chainOfThought = text.reasoning
             if text.hitStop {
                 exitCause = "stop-string"
                 done = true
             }
-            if let onDelta, !text.delta.isEmpty {
+            if let onDelta, !(text.delta.isEmpty && text.reasoningDelta.isEmpty) {
                 let emitStarted = Date()
-                onDelta(text.delta)
+                onDelta(text.delta, text.reasoningDelta)
                 stats.streamEmitSeconds += Date().timeIntervalSince(emitStarted)
             }
             if text.sawToolCall { finishReason = "tool_calls" }
@@ -863,12 +960,14 @@ extension QwenRuntime {
         stats.detokenizeSeconds += finalText.decodeSeconds
         stats.gateSeconds += finalText.gateSeconds
         full = finalText.full
+        answer = finalText.answer
+        chainOfThought = finalText.reasoning
         if finalText.sawToolCall { finishReason = "tool_calls" }
 
         stats.seconds = Date().timeIntervalSince(started)
         stats.emittedTokens = emitted.count
 
-        let calls = OpenAIPromptRendering.parseToolCalls(full, tools: tools)
+        let calls = OpenAIPromptRendering.parseToolCalls(answer, tools: tools)
         if calls.isEmpty {
             // The gate may have stopped on a `<tool_call>` the model never
             // closed. Reporting `tool_calls` with no calls would strand a
@@ -879,19 +978,26 @@ extension QwenRuntime {
         }
 
         let visible = calls.isEmpty
-            ? full
-            : String(full[full.startIndex..<(
-                full.range(of: OpenAIPromptRendering.ToolCallGate.marker)?
-                    .lowerBound ?? full.endIndex)])
+            ? answer
+            : String(answer[answer.startIndex..<(
+                answer.range(of: OpenAIPromptRendering.ToolCallGate.marker)?
+                    .lowerBound ?? answer.endIndex)])
 
+        // `think=` names the state a reasoning turn ended in. `open` is the
+        // failure worth seeing: the budget ran out inside the chain of thought,
+        // so `visible` is empty and no amount of parsing will find an answer.
+        let thinkState = reasoning.enabled
+            ? (stage.closedThinkBlock ? "closed" : "open") : "off"
         serveNote(
             "turn ended: cause=\(exitCause) finish=\(finishReason) "
                 + "emitted=\(emitted.count) rounds=\(stats.rounds) "
                 + "budget=\(budget) stops=\(stopStrings.count) "
+                + "think=\(thinkState) reasoning=\(chainOfThought.count)ch "
                 + "raw=\(full.count)ch visible=\(visible.count)ch "
                 + "calls=\(calls.count) head=\(String(full.prefix(120)).debugDescription)")
         return ServeOutcome(
             text: visible,
+            reasoning: chainOfThought,
             toolCalls: calls,
             finishReason: finishReason,
             stats: stats,
@@ -1160,12 +1266,15 @@ extension QwenRuntime {
             }
             emitChunk(
                 responder: responder, id: id, created: created, model: model,
-                delta: .init(role: nil, content: nil, toolCalls: streamed),
+                delta: .init(
+                    role: nil, content: nil, reasoningContent: nil,
+                    toolCalls: streamed),
                 finishReason: nil, openStream: false)
         }
         emitChunk(
             responder: responder, id: id, created: created, model: model,
-            delta: .init(role: nil, content: nil, toolCalls: nil),
+            delta: .init(
+                role: nil, content: nil, reasoningContent: nil, toolCalls: nil),
             finishReason: outcome.finishReason, openStream: false)
         responder.endSSE()
     }
@@ -1187,6 +1296,8 @@ extension QwenRuntime {
                 index: 0,
                 message: .init(
                     content: outcome.text.isEmpty ? nil : outcome.text,
+                    reasoningContent: outcome.reasoning.isEmpty
+                        ? nil : outcome.reasoning,
                     toolCalls: outcome.toolCalls.isEmpty
                         ? nil : outcome.toolCalls),
                 finishReason: outcome.finishReason)],
