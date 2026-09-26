@@ -689,6 +689,50 @@ private func qwen35GatedDeltaReplayState(
 
 // MARK: - GatedDeltaNet
 
+/// Independent, default-off prefill experiments. Exact model logits and cache
+/// bytes must pass their separate gate before either arm becomes a default.
+enum Qwen35PrefillFusion: String {
+    case gateUp = "MLXFAST_PREFILL_FUSE_GATE_UP"
+    case qkvZ = "MLXFAST_PREFILL_FUSE_QKV_Z"
+
+    func enabled(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        // The shape proof below assumes the shipped matrix tile selection.
+        environment[rawValue] == "1" && environment["MLX_QMM_BM"] == nil
+            && environment["MLX_QMM_BM_COLLIDE"] == nil
+    }
+
+    static func supports(shape: [Int], rows: [Int]) -> Bool {
+        guard shape.count == 3, shape[0] == 1, shape[1] > 16,
+              shape[2] > 0, shape[2] % 512 == 0, rows.count == 2
+        else { return false }
+        let m = shape[1]
+        // Match qmm_row_tile. Require >=512 threadgroups for EACH original
+        // projection, so qmm_splitk uses one K partition before and after
+        // concatenation. Aligned rows also preserve the NAX tile boundaries.
+        let bm = m >= 64 && ((m + 63) / 64) * 64 <= ((m + 31) / 32) * 32 ? 64 : 32
+        return rows.allSatisfy {
+            $0 > 4096 && $0 % 64 == 0 && ($0 / 32) * ((m + bm - 1) / bm) >= 512
+        }
+    }
+
+    static func supports(_ x: MLXArray, _ lhs: Linear, _ rhs: Linear) -> Bool {
+        guard let l = lhs as? QuantizedLinear, let r = rhs as? QuantizedLinear,
+              supports(shape: x.shape, rows: [l.shape.0, r.shape.0]),
+              l.shape.1 == x.dim(-1), r.shape.1 == x.dim(-1),
+              l.groupSize == 64, r.groupSize == 64, l.bits == 4, r.bits == 4,
+              l.mode == .affine, r.mode == .affine, l.bias == nil, r.bias == nil,
+              let lz = l.biases, let rz = r.biases,
+              l.weight.dtype == .uint32, r.weight.dtype == .uint32,
+              l.scales.dtype == r.scales.dtype, lz.dtype == rz.dtype,
+              lz.dtype == l.scales.dtype,
+              l.scales.shape == [l.shape.0, x.dim(-1) / 64],
+              r.scales.shape == [r.shape.0, x.dim(-1) / 64],
+              lz.shape == l.scales.shape, rz.shape == r.scales.shape
+        else { return false }
+        return true
+    }
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -719,15 +763,16 @@ final class Qwen35GatedDeltaNet: Module {
     // row for the same reason as the FA QKV fuse: groups run along K, every
     // N here and the fused N keep qmv_fast eligibility (N%8==0, K%512==0),
     // and a row's reduction order does not depend on the launch it rides in.
-    // Prefill (S > 2) keeps the four separate calls so qmm/split-k reduction
-    // orders match the pinned baseline byte-for-byte. Underscore storage so
-    // none of this is a Module parameter.
+    // Prefill keeps separate calls by default; the experimental qkv+z arm
+    // takes a row view of this pack and leaves b/a on their original paths.
+    // Underscore storage keeps derived tensors out of Module parameters.
     private var _inW: MLXArray?
     private var _inS: MLXArray?
     private var _inZ: MLXArray?
     private var _inGS = 64
     private var _inBits = 4
     private var _inMode = QuantizationMode.affine
+    private var _inSources: [MLXArray] = []
 
     // Input-independent per-layer memo of `-exp(A_log)` in fp32 — the only
     // input-independent factor of the decay gate `g = exp(-exp(A_log) *
@@ -838,6 +883,7 @@ final class Qwen35GatedDeltaNet: Module {
     private func fusedInProjections(
         _ x: MLXArray
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
+        guard prepareInProjectionWeights() else { return nil }
         if let w = _inW, let s = _inS, let zp = _inZ {
             let y = qwen35RoutedQuantizedMM(
                 x, w, scales: s, biases: zp,
@@ -852,6 +898,11 @@ final class Qwen35GatedDeltaNet: Module {
                 y[.ellipsis, bEnd...]
             )
         }
+        return nil
+    }
+
+    private func prepareInProjectionWeights() -> Bool {
+        if _inW != nil, _inS != nil, _inZ != nil { return true }
         guard let q = inProjQKV as? QuantizedLinear,
               let z = inProjZ as? QuantizedLinear,
               let b = inProjB as? QuantizedLinear,
@@ -863,7 +914,7 @@ final class Qwen35GatedDeltaNet: Module {
               q.mode == .affine,
               let qz = q.biases, let zz = z.biases, let bz = b.biases,
               let az = a.biases
-        else { return nil }
+        else { return false }
         _inW = concatenated([q.weight, z.weight, b.weight, a.weight], axis: 0)
             .contiguous()
         _inS = concatenated([q.scales, z.scales, b.scales, a.scales], axis: 0)
@@ -872,7 +923,49 @@ final class Qwen35GatedDeltaNet: Module {
         _inGS = q.groupSize
         _inBits = q.bits
         _inMode = q.mode
-        return fusedInProjections(x)
+        _inSources = [q.weight, q.scales, qz, z.weight, z.scales, zz,
+                      b.weight, b.scales, bz, a.weight, a.scales, az]
+        return true
+    }
+
+    /// Reuse only qkv+z rows; no b/a arithmetic is folded into this matmul.
+    /// Construction stays lazy and is part of the first forward that uses it.
+    func prefillQKVZ(_ x: MLXArray) -> (MLXArray, MLXArray)? {
+        guard Qwen35PrefillFusion.supports(x, inProjQKV, inProjZ),
+              inProjQKV.shape.0 == keyDim * 2 + valueDim,
+              inProjZ.shape.0 == valueDim
+        else { return nil }
+        let projections = [inProjQKV, inProjZ, inProjB, inProjA]
+            .compactMap { $0 as? QuantizedLinear }
+        // Even though b/a are not multiplied here, their storage shares the
+        // decode pack. Reject any packing that would promote qkv/z metadata.
+        guard projections.count == 4, projections.allSatisfy({
+            $0.groupSize == 64 && $0.bits == 4 && $0.mode == .affine
+                && $0.shape.1 == x.dim(-1) && $0.weight.dtype == .uint32
+                && $0.scales.dtype == projections[0].scales.dtype
+                && $0.biases?.dtype == $0.scales.dtype
+                && $0.scales.shape == [$0.shape.0, x.dim(-1) / 64]
+                && $0.biases?.shape == $0.scales.shape
+        }) else { return nil }
+        let sources = projections.flatMap { [$0.weight, $0.scales, $0.biases!] }
+        // Retain the source arrays: identities cannot be recycled while the
+        // pack is cached. Requests contribute no cache keys or stored values.
+        if sources.count != _inSources.count
+            || !zip(sources, _inSources).allSatisfy({ $0 === $1 })
+        {
+            _inW = nil
+            _inS = nil
+            _inZ = nil
+        }
+        guard prepareInProjectionWeights(),
+              let w = _inW, let s = _inS, let z = _inZ
+        else { return nil }
+        let qkvEnd = keyDim * 2 + valueDim
+        let end = qkvEnd + valueDim
+        let y = quantizedMM(
+            x, w[..<end], scales: s[..<end], biases: z[..<end], transpose: true,
+            groupSize: _inGS, bits: _inBits, mode: _inMode)
+        return (y[.ellipsis, ..<qkvEnd], y[.ellipsis, qkvEnd..<end])
     }
 
     // MARK: - _processChunk (MTP helper)
@@ -1265,6 +1358,11 @@ final class Qwen35GatedDeltaNet: Module {
             z = fused.1.reshaped(B, S, numVHeads, headVDim)
             b = fused.2
             a = fused.3
+        } else if Qwen35PrefillFusion.qkvZ.enabled(), let fused = prefillQKVZ(inputs) {
+            qkv = fused.0
+            z = fused.1.reshaped(B, S, numVHeads, headVDim)
+            b = inProjB(inputs)
+            a = inProjA(inputs)
         } else {
             qkv = inProjQKV(inputs)
             z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
@@ -2345,6 +2443,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     private var _fqGS = 64
     private var _fqBits = 4
     private var _fqMode = QuantizationMode.affine
+    private var _fqSources: [MLXArray] = []
     private var _fbfW: MLXArray?
     private var _gateOut = 0
 
@@ -2370,8 +2469,13 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
-    private func fusedGateUp(_ x: MLXArray) -> MLXArray? {
+    private func fusedGateUp(_ x: MLXArray, prefill: Bool = false) -> MLXArray? {
         if let w = _fqW, let s = _fqS, let z = _fqZ {
+            if prefill {
+                return quantizedMM(
+                    x, w, scales: s, biases: z, transpose: true,
+                    groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
+            }
             return qwen35RoutedQuantizedMM(
                 x, w, scales: s, biases: z,
                 groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
@@ -2392,7 +2496,8 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
             _fqBits = g.bits
             _fqMode = g.mode
             _gateOut = g.shape.0
-            return fusedGateUp(x)
+            _fqSources = [g.weight, g.scales, gz, u.weight, u.scales, uz]
+            return fusedGateUp(x, prefill: prefill)
         }
         if let bits = proposalQuantizationBits,
            !(gateProj is QuantizedLinear), !(upProj is QuantizedLinear)
@@ -2427,6 +2532,26 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         return nil
     }
 
+    /// Only the existing affine-4/group-64 pack is eligible. Dense and
+    /// proposal-requantized weights retain their original prefill fallback.
+    func prefillGateUp(_ x: MLXArray) -> MLXArray? {
+        guard Qwen35PrefillFusion.supports(x, gateProj, upProj),
+              let g = gateProj as? QuantizedLinear,
+              let u = upProj as? QuantizedLinear,
+              g.shape.0 == u.shape.0, let gz = g.biases, let uz = u.biases
+        else { return nil }
+        let sources = [g.weight, g.scales, gz, u.weight, u.scales, uz]
+        if sources.count != _fqSources.count
+            || !zip(sources, _fqSources).allSatisfy({ $0 === $1 })
+        {
+            _fqW = nil
+            _fqS = nil
+            _fqZ = nil
+            _fbfW = nil
+        }
+        return fusedGateUp(x, prefill: true)
+    }
+
     /// The down projection, through a derived quantized twin when proposal-only
     /// quantization is enabled on this instance.
     private func downProjection(_ y: MLXArray) -> MLXArray {
@@ -2447,6 +2572,12 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
             return downProjection(qwen35CompiledFusedSwiGLU(y))
+        }
+        if Qwen35PrefillFusion.gateUp.enabled(), let y = prefillGateUp(x) {
+            // Preserve the separate prefill SiLU/multiply expression; only
+            // the two input projections change their launch grouping.
+            return downProjection(
+                silu(y[.ellipsis, ..<_gateOut]) * y[.ellipsis, _gateOut...])
         }
         // Prefill (M > 16) stays on the two-projection expression unless CPU
         // column-split assist is enabled. Enabling it routes the fused
