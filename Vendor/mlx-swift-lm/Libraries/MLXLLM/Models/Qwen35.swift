@@ -4629,10 +4629,18 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
 // its 32 selected rows directly from the full affine-4/group-64 matrix, and
 // reduce the exact BF16 values in one dispatch. This replaces gather_qmm plus
 // the separate value/id reducer without changing shortlist identity or order.
+public struct Qwen35DraftDecision {
+    public let tokenID: MLXArray
+    /// Difference between the best and second-best distinct shortlist IDs.
+    /// This is a shortlist margin, not full-vocabulary confidence.
+    public let margin: MLXArray
+    public let valid: MLXArray
+}
+
 private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
     name: "qwen_mtp_draft_selected_affine4_rerank_g64_v1",
     inputNames: ["x", "candidate_ids", "weight", "scales", "biases"],
-    outputNames: ["token_id"],
+    outputNames: ["token_id", "shortlist_margin", "valid"],
     source: """
         constexpr uint TG_SIZE    = 256;
         constexpr uint TOPK       = 32;
@@ -4695,24 +4703,30 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (sg == 0) {
-            float best_value = exact_scores[lane];
-            uint best_id = uint(candidate_ids[lane]);
-            for (uint offset = 16; offset > 0; offset >>= 1) {
-                float other_value = simd_shuffle_down(best_value, offset);
-                uint other_id = simd_shuffle_down(best_id, offset);
-                if (lane < offset && qwen_draft_selected_rerank_better(
-                        other_value, other_id, best_value, best_id)) {
-                    best_value = other_value;
-                    best_id = other_id;
+        if (sg == 0 && lane == 0) {
+            float best_value = NAN;
+            float second_value = NAN;
+            uint best_id = 0xFFFFFFFFu;
+            uint second_id = 0xFFFFFFFFu;
+            for (uint i = 0; i < TOPK; ++i) {
+                uint id = uint(candidate_ids[i]);
+                float value = exact_scores[i];
+                if (id == best_id || id == second_id) { continue; }
+                if (qwen_draft_selected_rerank_better(value, id, best_value, best_id)) {
+                    second_value = best_value;
+                    second_id = best_id;
+                    best_value = value;
+                    best_id = id;
+                } else if (qwen_draft_selected_rerank_better(
+                        value, id, second_value, second_id)) {
+                    second_value = value;
+                    second_id = id;
                 }
             }
-            if (lane == 0) {
-                token_id[0] = int(
-                    best_id < PREFIX_COUNT
-                        ? best_id
-                        : best_id + CONTROL_OFFSET);
-            }
+            token_id[0] = int(
+                best_id < PREFIX_COUNT ? best_id : best_id + CONTROL_OFFSET);
+            shortlist_margin[0] = best_value - second_value;
+            valid[0] = second_id != 0xFFFFFFFFu;
         }
     """,
     header: """
@@ -5852,8 +5866,8 @@ public func qwen35VerifySelectedRerankOrderInvariance(
             ],
             grid: (256, 1, 1),
             threadGroup: (256, 1, 1),
-            outputShapes: [[1, 1]],
-            outputDTypes: [.int32]
+            outputShapes: [[1, 1], [1], [1]],
+            outputDTypes: [.int32, .float32, .bool]
         )[0]
         eval(out)
         return out.asArray(Int32.self)[0]
@@ -6879,7 +6893,7 @@ extension Qwen35TextModel: MTPCapable {
     public func draftTokenID(_ x: MLXArray) -> MLXArray {
         if _draftHeadW != nil {
             if let reranked = draftTokenIDWithDeclaredRerank(x) {
-                return reranked
+                return reranked.tokenID
             }
             return mapDraftTokenIds(
                 argMax(applyDraftLMHead(x), axis: -1).asType(.int32))
@@ -6907,6 +6921,11 @@ extension Qwen35TextModel: MTPCapable {
             outputDTypes: [.int32]
         )
         return outputs[0]
+    }
+
+    public func draftDecision(_ x: MLXArray) -> Qwen35DraftDecision? {
+        guard _draftHeadW != nil else { return nil }
+        return draftTokenIDWithDeclaredRerank(x)
     }
 
     /// Derive the cluster index that a head could have shipped, from the head
@@ -7112,7 +7131,7 @@ extension Qwen35TextModel: MTPCapable {
         return MLX.take(perm, permutedRow, axis: 0).asType(.uint32)
     }
 
-    private func draftTokenIDWithDeclaredRerank(_ x: MLXArray) -> MLXArray? {
+    private func draftTokenIDWithDeclaredRerank(_ x: MLXArray) -> Qwen35DraftDecision? {
         if _draftClusterShape == nil, !_derivedClusterAttempted {
             _derivedClusterAttempted = true
             buildDerivedClusterIndex()
@@ -7172,7 +7191,7 @@ extension Qwen35TextModel: MTPCapable {
             }
         }
 
-        return qwen35DraftSelectedAffine4RerankKernel(
+        let outputs = qwen35DraftSelectedAffine4RerankKernel(
             [x.reshaped([configuration.hiddenSize]), candidateIDs,
              exact.weight, exact.scales, exactBiases],
             template: [
@@ -7182,9 +7201,11 @@ extension Qwen35TextModel: MTPCapable {
             ],
             grid: (256, 1, 1),
             threadGroup: (256, 1, 1),
-            outputShapes: [[1, 1]],
-            outputDTypes: [.int32]
-        )[0]
+            outputShapes: [[1, 1], [1], [1]],
+            outputDTypes: [.int32, .float32, .bool]
+        )
+        return Qwen35DraftDecision(
+            tokenID: outputs[0], margin: outputs[1], valid: outputs[2])
     }
 
     /// Map compact draft IDs back to the tokenizer's full ID space without a
@@ -7402,6 +7423,11 @@ extension Qwen35Model: MTPCapable {
     /// See `Qwen35TextModel.draftTokenID`.
     public func draftTokenID(_ x: MLXArray) -> MLXArray {
         languageModel.draftTokenID(x)
+    }
+
+    /// See `Qwen35TextModel.draftDecision`.
+    public func draftDecision(_ x: MLXArray) -> Qwen35DraftDecision? {
+        languageModel.draftDecision(x)
     }
 
     /// See `Qwen35TextModel.mapDraftTokenIds`.
