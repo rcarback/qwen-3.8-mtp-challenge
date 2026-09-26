@@ -7485,3 +7485,704 @@ extension Qwen35Model {
         languageModel.profiledLayerForward(inputs, cache: cache)
     }
 }
+
+// MARK: - Op-level prefill attribution
+
+/// One operation of a profiled prefill block.
+///
+/// `seconds` means different things in the two modes the recorder runs, which
+/// is why the mode travels with the table rather than with the sample: see
+/// `Qwen35OpRecorder.Mode`.
+public struct Qwen35OpSample: Sendable {
+    public let name: String
+    public let kind: String
+    public let shape: [Int]
+    public let seconds: Double
+    /// Floating-point operations this op performs, or 0 when the count is not
+    /// meaningful (views, allocations).
+    public let flops: Double
+    /// Bytes this op must move at minimum: inputs read once plus outputs
+    /// written once. 0 when not meaningful.
+    public let bytes: Double
+
+    public var tflops: Double { flops > 0 && seconds > 0 ? flops / seconds / 1e12 : 0 }
+    public var gigabytesPerSecond: Double {
+        bytes > 0 && seconds > 0 ? bytes / seconds / 1e9 : 0
+    }
+    /// Arithmetic intensity in FLOP per byte, the axis that separates a
+    /// compute-bound op from a bandwidth-bound one.
+    public var intensity: Double { bytes > 0 ? flops / bytes : 0 }
+}
+
+/// One profiled block, in every mode the instrument runs.
+public struct Qwen35OpProfile: Sendable {
+    public let label: String
+    /// Per-op wall time with an `eval` after every op. Attribution is direct,
+    /// but every cross-op overlap and kernel fusion the production forward
+    /// gets is destroyed, so the total runs long.
+    public let serialized: [Qwen35OpSample]
+    /// Per-op wall time by finite difference on the cumulative-prefix time:
+    /// pass k builds ops 0...k as ONE lazy graph and evaluates once, so
+    /// `seconds[k] = T(k) - T(k-1)`. The prefix keeps its fusion and overlap,
+    /// and the increments telescope EXACTLY to `ladderTotalSeconds`, which is
+    /// the fused truth. Only the split between ops carries error, never the
+    /// total.
+    public let ladder: [Qwen35OpSample]
+    /// `T(n)`: the last ladder pass, which builds the whole block as one lazy
+    /// graph and evaluates once. This is the production shape.
+    public let ladderTotalSeconds: Double
+    /// The same block through the unmodified production `callAsFunction`,
+    /// one eval at the end. Cross-checks that the replica is the real chain.
+    public let productionSeconds: Double
+    /// True when the replica's fused output is bit-identical to the
+    /// production layer output. A false here invalidates the whole table.
+    public let replicaExact: Bool
+
+    public var serializedTotalSeconds: Double {
+        serialized.reduce(0) { $0 + $1.seconds }
+    }
+    /// How much the per-op sync cost, as a fraction of the fused truth.
+    public var syncTax: Double {
+        ladderTotalSeconds > 0
+            ? (serializedTotalSeconds - ladderTotalSeconds) / ladderTotalSeconds
+            : 0
+    }
+}
+
+/// Records one pass over a block's op chain.
+///
+/// WHY TWO MODES. MLX is lazy: a wall clock around `y = f(x)` measures graph
+/// construction on the host, not the GPU work, unless something forces the
+/// evaluation. Forcing it after every op (`.serialized`) gives direct
+/// attribution but changes the thing being measured — it serialises the
+/// command stream and forbids the kernel fusion the production graph gets.
+/// The `.ladder` mode instead evaluates ONCE per pass, after op k, and takes
+/// the op's cost as the increment over the previous pass. Every op up to k
+/// keeps the fusion it has in production, and the increments sum exactly to
+/// the one-eval whole-block time, so the mode cannot inflate the total the way
+/// serialisation does. Its own bias is different and must be stated: an op
+/// that ENABLES a fusion is charged for the fusion, and an op whose work the
+/// scheduler overlaps with its predecessor's is charged near zero. Reading the
+/// two tables side by side is the instrument; neither alone is the answer.
+final class Qwen35OpRecorder {
+    enum Mode {
+        case fused
+        case serialized
+        case ladder(Int)
+    }
+
+    let mode: Mode
+    private var index = 0
+    private var start = Date()
+    private(set) var samples: [Qwen35OpSample] = []
+    private(set) var cumulativeSeconds: Double = 0
+
+    init(mode: Mode) {
+        self.mode = mode
+    }
+
+    /// Start the clock. Call immediately before the first `step`.
+    func begin() {
+        index = 0
+        start = Date()
+    }
+
+    /// Number of ops the chain contains, discovered by one `.fused` pass.
+    var opCount: Int { index }
+
+    @discardableResult
+    func step(
+        _ name: String, _ kind: String,
+        flops: Double = 0, bytes: Double = 0,
+        _ body: () -> [MLXArray]
+    ) -> [MLXArray] {
+        switch mode {
+        case .fused:
+            index += 1
+            return body()
+        case .serialized:
+            let t0 = Date()
+            let out = body()
+            eval(out)
+            samples.append(
+                Qwen35OpSample(
+                    name: name, kind: kind, shape: out.first?.shape ?? [],
+                    seconds: Date().timeIntervalSince(t0),
+                    flops: flops, bytes: bytes))
+            index += 1
+            return out
+        case .ladder(let stop):
+            let out = body()
+            if index == stop {
+                eval(out)
+                cumulativeSeconds = Date().timeIntervalSince(start)
+                samples.append(
+                    Qwen35OpSample(
+                        name: name, kind: kind, shape: out.first?.shape ?? [],
+                        seconds: cumulativeSeconds, flops: flops, bytes: bytes))
+            }
+            index += 1
+            return out
+        }
+    }
+
+    /// Convenience for the common single-output op.
+    func one(
+        _ name: String, _ kind: String,
+        flops: Double = 0, bytes: Double = 0,
+        _ body: () -> MLXArray
+    ) -> MLXArray {
+        step(name, kind, flops: flops, bytes: bytes) { [body()] }[0]
+    }
+}
+
+/// Element count of a shape, as a Double so the FLOP arithmetic never
+/// overflows or truncates.
+private func qwen35Elements(_ shape: [Int]) -> Double {
+    shape.reduce(1.0) { $0 * Double($1) }
+}
+
+/// FLOPs of a dense M x K by K x N matmul.
+private func qwen35GemmFlops(m: Int, n: Int, k: Int) -> Double {
+    2 * Double(m) * Double(n) * Double(k)
+}
+
+/// Bytes an affine-4 group-64 projection must read for its weights, plus the
+/// activation in and out at `elementBytes` each. This is the floor a
+/// quantized matmul cannot go below, and is what the GB/s column reports
+/// against.
+private func qwen35QuantProjectionBytes(
+    m: Int, n: Int, k: Int, bits: Int = 4, groupSize: Int = 64,
+    elementBytes: Int = 2
+) -> Double {
+    let weightBytes = Double(n) * Double(k) * Double(bits) / 8
+    // One fp16 scale and one fp16 bias per group of `groupSize` along K.
+    let metaBytes = Double(n) * (Double(k) / Double(groupSize)) * 4
+    let activationBytes =
+        Double(m) * (Double(k) + Double(n)) * Double(elementBytes)
+    return weightBytes + metaBytes + activationBytes
+}
+
+extension Qwen35GatedDeltaNet {
+    /// Replica of the PREFILL expression of `callAsFunction`, op by op.
+    ///
+    /// Reproduces exactly the branch a prefill chunk takes: `S > 9` so the
+    /// four separate input projections run rather than the fused pack, mask
+    /// nil so no `where`, `nConfirmed == 0` and `packedPreworkEligible` false
+    /// (it caps at S <= 9) so `processChunk` takes its eager arm. Any drift
+    /// between this replica and the production chain shows up in the caller's
+    /// bit-equality check, which is why that check is not optional.
+    ///
+    /// `convState` and `ssmState` are supplied by the caller rather than read
+    /// from a cache, so a ladder pass can be replayed from identical state
+    /// without a cache write between passes.
+    func profiledPrefillOps(
+        _ inputs: MLXArray, convState: MLXArray, ssmState: MLXArray?,
+        into r: Qwen35OpRecorder
+    ) -> MLXArray {
+        let B = inputs.dim(0)
+        let S = inputs.dim(1)
+        let K = hiddenSize
+        let qkvN = keyDim * 2 + valueDim
+
+        let qkv = r.one(
+            "in_proj_qkv", "qmm-affine4",
+            flops: qwen35GemmFlops(m: S, n: qkvN, k: K),
+            bytes: qwen35QuantProjectionBytes(m: S, n: qkvN, k: K)
+        ) { self.inProjQKV(inputs) }
+
+        let zFlat = r.one(
+            "in_proj_z", "qmm-affine4",
+            flops: qwen35GemmFlops(m: S, n: valueDim, k: K),
+            bytes: qwen35QuantProjectionBytes(m: S, n: valueDim, k: K)
+        ) { self.inProjZ(inputs) }
+        let z = zFlat.reshaped(B, S, numVHeads, headVDim)
+
+        let b = r.one(
+            "in_proj_b", "qmm-affine4",
+            flops: qwen35GemmFlops(m: S, n: numVHeads, k: K),
+            bytes: qwen35QuantProjectionBytes(m: S, n: numVHeads, k: K)
+        ) { self.inProjB(inputs) }
+
+        let a = r.one(
+            "in_proj_a", "qmm-affine4",
+            flops: qwen35GemmFlops(m: S, n: numVHeads, k: K),
+            bytes: qwen35QuantProjectionBytes(m: S, n: numVHeads, k: K)
+        ) { self.inProjA(inputs) }
+
+        let nKeep = convKernelSize - 1
+        let convInput = r.one(
+            "conv_concat", "copy",
+            bytes: 2 * 2 * Double(S + nKeep) * Double(convDim)
+        ) { concatenated([convState, qkv], axis: 1) }
+
+        let convOut = r.one(
+            "conv1d_depthwise", "conv",
+            flops: 2 * Double(S) * Double(convDim) * Double(convKernelSize),
+            bytes: 2 * 2 * Double(S) * Double(convDim)
+        ) { self.conv1d(convInput) }
+
+        let activated = r.one(
+            "conv_silu", "elementwise",
+            bytes: 2 * 2 * Double(S) * Double(convDim)
+        ) { silu(convOut) }
+
+        let convSplit = MLX.split(
+            activated, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+
+        let dtype = q.dtype
+        let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
+        let qNormed = r.one(
+            "q_rmsnorm_scale", "norm",
+            bytes: 2 * 2 * Double(S) * Double(keyDim)
+        ) {
+            qScaleConst
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        }
+        let kNormed = r.one(
+            "k_rmsnorm_scale", "norm",
+            bytes: 2 * 2 * Double(S) * Double(keyDim)
+        ) {
+            kScaleConst
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        }
+
+        let gBeta = r.step(
+            "g_beta_compiled", "elementwise",
+            bytes: 6 * Double(S) * Double(numVHeads)
+        ) {
+            let (g, beta) = qwen35CompiledGatedDeltaGBeta(
+                a, b, self.negExpALog, self.dtBias)
+            return [g, beta]
+        }
+
+        var state = ssmState
+            ?? MLXArray.zeros(
+                [B, numVHeads, headVDim, headKDim], dtype: .float32)
+        if state.dtype != .float32 { state = state.asType(.float32) }
+        let stateIn = state
+
+        // The recurrence: T sequential rank-1 state updates per (head, dv)
+        // lane. Two multiply-accumulate sweeps of Dk per timestep, so
+        // 4 * Dk MACs plus the decay multiply per (t, hv, dv).
+        let recurrenceFlops =
+            Double(S) * Double(numVHeads) * Double(headVDim)
+            * (4 * Double(headKDim) + 2)
+        let recurrenceBytes =
+            2 * 2 * Double(S) * Double(valueDim)
+            + 2 * Double(S) * Double(keyDim) * 2
+            + 2 * 4 * Double(B) * Double(numVHeads) * Double(headVDim)
+                * Double(headKDim)
+        let recurrence = r.step(
+            "gated_delta_recurrence", "recurrence",
+            flops: recurrenceFlops, bytes: recurrenceBytes
+        ) {
+            let (out, newState) = gatedDeltaKernel(
+                q: qNormed, k: kNormed, v: v, g: gBeta[0], beta: gBeta[1],
+                state: stateIn, mask: nil)
+            return [out, newState]
+        }
+
+        let rmsOut = r.one(
+            "out_rmsnorm", "norm",
+            bytes: 2 * 2 * Double(S) * Double(valueDim)
+        ) {
+            MLXFast.rmsNorm(
+                recurrence[0], weight: self.norm.weight, eps: self.norm.eps)
+        }
+
+        let normedOut = r.one(
+            "post_norm_gate", "elementwise",
+            bytes: 3 * 2 * Double(S) * Double(valueDim)
+        ) { qwen35CompiledGatedDeltaPostNorm(rmsOut, z) }
+
+        return r.one(
+            "gdn_out_proj", "qmm-affine4",
+            flops: qwen35GemmFlops(m: S, n: hiddenSize, k: valueDim),
+            bytes: qwen35QuantProjectionBytes(
+                m: S, n: hiddenSize, k: valueDim)
+        ) {
+            qwen35RoutedLinear(self.outProj, normedOut.reshaped(B, S, -1))
+        }
+    }
+}
+
+extension Qwen35Attention {
+    /// Replica of the PREFILL expression of `callAsFunction`, op by op.
+    ///
+    /// At prefill widths `L > 32`, so the fused Q/K RMS+RoPE kernel is out of
+    /// its guard and the eager norm/transpose/RoPE chain runs. The caller
+    /// supplies a fresh cache per pass because `attentionWithCacheUpdate`
+    /// appends to it.
+    func profiledPrefillOps(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?, into r: Qwen35OpRecorder
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+        let K = x.dim(2)
+        let qOut = attentionHeads * headDim * 2
+        let kvOut = kvHeads * headDim * 2
+
+        let packed = r.step(
+            "attn_qkv_pack", "qmm-affine4+bf16",
+            flops: qwen35GemmFlops(m: L, n: qOut + kvOut, k: K),
+            bytes: qwen35QuantProjectionBytes(m: L, n: qOut, k: K)
+                + Double(kvOut) * Double(K) * 2
+        ) {
+            let (q, k, v) = self.qkv(x)
+            return [q, k, v]
+        }
+
+        let qSplit = packed[0].reshaped(B, L, attentionHeads, -1)
+            .split(parts: 2, axis: -1)
+        var queries = qSplit[0]
+        let gate = qSplit[1]
+        var keys = packed[1].reshaped(B, L, kvHeads, -1)
+        let values = r.one(
+            "v_reshape_transpose", "copy",
+            bytes: 2 * 2 * Double(L) * Double(kvHeads) * Double(headDim)
+        ) { packed[2].reshaped(B, L, self.kvHeads, -1).transposed(0, 2, 1, 3) }
+
+        queries = r.one(
+            "q_rmsnorm_transpose", "norm",
+            bytes: 2 * 2 * Double(L) * Double(attentionHeads) * Double(headDim)
+        ) { self.qNorm(queries).transposed(0, 2, 1, 3) }
+        keys = r.one(
+            "k_rmsnorm_transpose", "norm",
+            bytes: 2 * 2 * Double(L) * Double(kvHeads) * Double(headDim)
+        ) { self.kNorm(keys).transposed(0, 2, 1, 3) }
+
+        queries = r.one(
+            "rope_q", "rope",
+            bytes: 2 * 2 * Double(L) * Double(attentionHeads) * Double(headDim)
+        ) { applyRotaryPosition(self.rope, to: queries, cache: cache) }
+        keys = r.one(
+            "rope_k", "rope",
+            bytes: 2 * 2 * Double(L) * Double(kvHeads) * Double(headDim)
+        ) { applyRotaryPosition(self.rope, to: keys, cache: cache) }
+
+        // Causal SDPA against everything already cached: L rows scored
+        // against (offset + L) columns, upper-triangular within the chunk.
+        let offset = Double(cache?.offset ?? 0)
+        let scored =
+            Double(L) * offset + Double(L) * Double(L + 1) / 2
+        let sdpaFlops =
+            4 * scored * Double(attentionHeads) * Double(headDim)
+        let sdpaBytes =
+            2 * 2 * (offset + Double(L)) * Double(kvHeads) * Double(headDim)
+            + 2 * 2 * Double(L) * Double(attentionHeads) * Double(headDim)
+        var output = r.one(
+            "sdpa_cache_update", "sdpa",
+            flops: sdpaFlops, bytes: sdpaBytes
+        ) {
+            attentionWithCacheUpdate(
+                queries: queries, keys: keys, values: values, cache: cache,
+                scale: self.scale, mask: mask)
+        }
+
+        output = output.transposed(0, 2, 1, 3)
+        let gated = r.one(
+            "attn_gate_sigmoid_mul", "elementwise",
+            bytes: 3 * 2 * Double(L) * Double(attentionHeads) * Double(headDim)
+        ) { qwen35CompiledSigmoidMultiply(output, gate) }
+
+        return r.one(
+            "attn_o_proj", "qmm-affine4",
+            flops: qwen35GemmFlops(
+                m: L, n: hiddenSize(from: x), k: attentionHeads * headDim),
+            bytes: qwen35QuantProjectionBytes(
+                m: L, n: hiddenSize(from: x), k: attentionHeads * headDim)
+        ) {
+            qwen35RoutedLinear(self.oProj, gated.reshaped(B, L, -1))
+        }
+    }
+
+    /// The residual width, read off the block input rather than stored: the
+    /// attention module does not carry `hiddenSize` as a field.
+    private func hiddenSize(from x: MLXArray) -> Int { x.dim(-1) }
+}
+
+extension Qwen35FusedMLP {
+    /// Replica of the PREFILL expression of `callAsFunction`, op by op.
+    ///
+    /// At prefill widths `x.dim(-2) > 16`, so the fused gate/up pack is out
+    /// of its guard and the two separate projections run.
+    func profiledPrefillOps(
+        _ x: MLXArray, into r: Qwen35OpRecorder
+    ) -> MLXArray {
+        let M = x.dim(-2)
+        let K = x.dim(-1)
+        let N = gateProj.shape.0
+
+        let gateOut = r.one(
+            "mlp_gate_proj", "qmm-affine4",
+            flops: qwen35GemmFlops(m: M, n: N, k: K),
+            bytes: qwen35QuantProjectionBytes(m: M, n: N, k: K)
+        ) { self.gateProj(x) }
+
+        let upOut = r.one(
+            "mlp_up_proj", "qmm-affine4",
+            flops: qwen35GemmFlops(m: M, n: N, k: K),
+            bytes: qwen35QuantProjectionBytes(m: M, n: N, k: K)
+        ) { self.upProj(x) }
+
+        let activated = r.one(
+            "mlp_silu", "elementwise",
+            bytes: 2 * 2 * Double(M) * Double(N)
+        ) { silu(gateOut) }
+
+        let product = r.one(
+            "mlp_gate_mul", "elementwise",
+            bytes: 3 * 2 * Double(M) * Double(N)
+        ) { activated * upOut }
+
+        return r.one(
+            "mlp_down_proj", "qmm-affine4",
+            flops: qwen35GemmFlops(m: M, n: K, k: N),
+            bytes: qwen35QuantProjectionBytes(m: M, n: K, k: N)
+        ) { qwen35RoutedLinear(self.downProj, product) }
+    }
+}
+
+extension Qwen35DecoderLayer {
+    /// The whole block's prefill op chain, replicating `callAsFunction`'s
+    /// bf16/5120 branch: eager input norm, the sublayer, the fused
+    /// residual+post-attention norm, the MLP, and the exit add.
+    func profiledPrefillOps(
+        _ x: MLXArray,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        convState: MLXArray?,
+        ssmState: MLXArray?,
+        into r: Qwen35OpRecorder
+    ) -> MLXArray {
+        let rows = Double(x.dim(-2))
+        let width = Double(x.dim(-1))
+
+        let normedIn = r.one(
+            "input_layernorm", "norm", bytes: 2 * 2 * rows * width
+        ) { self.inputLayerNorm(x) }
+
+        let sub: MLXArray
+        if isLinear {
+            let gdn = linearAttn!
+            let conv = convState
+                ?? MLXArray.zeros(
+                    [x.dim(0), gdn.convKernelSize - 1, gdn.convDim],
+                    dtype: x.dtype)
+            sub = gdn.profiledPrefillOps(
+                normedIn, convState: conv, ssmState: ssmState, into: r)
+        } else {
+            sub = selfAttn!.profiledPrefillOps(
+                normedIn, mask: attentionMask, cache: cache, into: r)
+        }
+
+        let merged = r.step(
+            "residual_post_attn_norm", "norm", bytes: 4 * 2 * rows * width
+        ) {
+            let (h, normed) = qwen35FusedResidualRMSNorm(
+                x: x, r: sub,
+                weight: self.postAttentionLayerNorm.weight,
+                eps: self.postAttentionLayerNorm.eps)
+            return [h, normed]
+        }
+
+        let mlpOut = (mlp as! Qwen35FusedMLP).profiledPrefillOps(
+            merged[1], into: r)
+
+        return r.one(
+            "residual_add", "elementwise", bytes: 3 * 2 * rows * width
+        ) { merged[0] + mlpOut }
+    }
+}
+
+extension Qwen35TextModelInner {
+    /// Op-level attribution of ONE prefill block, in both recorder modes.
+    ///
+    /// PROFILING INSTRUMENT, not a production path, and it loads no weights of
+    /// its own: the caller supplies a loaded model. It lives in this file for
+    /// the same reason `profiledLayerForward` does — `layers` is fileprivate
+    /// and the sublayer chains it replicates are private.
+    ///
+    /// `layerIndex` selects the block. `warmupPasses` runs the fused chain
+    /// that many times before any clock starts, so Metal kernel compilation
+    /// and buffer allocation never land inside a timed pass.
+    ///
+    /// The gated-delta blocks are profiled from caller-supplied recurrent
+    /// state rather than from a cache, so every ladder pass replays from
+    /// identical inputs. The full-attention blocks take a fresh cache per
+    /// pass from `makeCache`, seeded to `cacheDepth` rows, because
+    /// `attentionWithCacheUpdate` appends.
+    public func profiledPrefillOpProfile(
+        hidden: MLXArray,
+        layerIndex: Int,
+        cacheDepth: Int,
+        warmupPasses: Int = 1,
+        makeCache: () -> KVCache
+    ) -> Qwen35OpProfile {
+        let layer = layers[layerIndex]
+        let label =
+            "L\(layerIndex)/\(layer.isLinear ? "linear" : "full") "
+            + "rows \(hidden.dim(-2)) depth \(cacheDepth)"
+
+        func seededCache() -> KVCache {
+            let cache = makeCache()
+            guard cacheDepth > 0, let attn = layer.selfAttn else { return cache }
+            let shape = [
+                hidden.dim(0), attn.kvHeads, cacheDepth, attn.headDim,
+            ]
+            let seed = MLXArray.zeros(shape, dtype: hidden.dtype)
+            _ = cache.update(keys: seed, values: seed)
+            eval(cache.innerState())
+            return cache
+        }
+
+        // Warm up: kernel compilation, buffer pools, the lazily built
+        // projection packs. None of this may land in a timed pass.
+        for _ in 0 ..< max(1, warmupPasses) {
+            let warm = Qwen35OpRecorder(mode: .fused)
+            warm.begin()
+            let out = layer.profiledPrefillOps(
+                hidden, attentionMask: .causal, cache: seededCache(),
+                convState: nil, ssmState: nil, into: warm)
+            eval(out)
+        }
+
+        // Discover the op count with one more fused pass, and keep its output
+        // as the reference the replica is checked against.
+        let counter = Qwen35OpRecorder(mode: .fused)
+        counter.begin()
+        let replicaOut = layer.profiledPrefillOps(
+            hidden, attentionMask: .causal, cache: seededCache(),
+            convState: nil, ssmState: nil, into: counter)
+        eval(replicaOut)
+        let opCount = counter.opCount
+
+        // Production chain, same inputs, one eval: the truth the replica must
+        // reproduce and the time the ladder total is compared against.
+        let productionCache = seededCache()
+        let tProduction = Date()
+        let productionOut = layer(
+            hidden, attentionMask: .causal, ssmMask: nil,
+            cache: productionCache, nConfirmed: 0)
+        eval(productionOut)
+        let productionSeconds = Date().timeIntervalSince(tProduction)
+        let replicaExact =
+            replicaOut.shape == productionOut.shape
+            && all(replicaOut .== productionOut).item(Bool.self)
+
+        // Serialized mode: one pass, an eval after every op.
+        let serial = Qwen35OpRecorder(mode: .serialized)
+        serial.begin()
+        eval(
+            layer.profiledPrefillOps(
+                hidden, attentionMask: .causal, cache: seededCache(),
+                convState: nil, ssmState: nil, into: serial))
+
+        // Ladder mode: one pass per op, each evaluating exactly once, at op k.
+        var cumulative: [Double] = []
+        for k in 0 ..< opCount {
+            let pass = Qwen35OpRecorder(mode: .ladder(k))
+            pass.begin()
+            _ = layer.profiledPrefillOps(
+                hidden, attentionMask: .causal, cache: seededCache(),
+                convState: nil, ssmState: nil, into: pass)
+            cumulative.append(pass.cumulativeSeconds)
+        }
+        var ladder: [Qwen35OpSample] = []
+        for (k, sample) in serial.samples.enumerated() where k < cumulative.count {
+            let previous = k == 0 ? 0 : cumulative[k - 1]
+            ladder.append(
+                Qwen35OpSample(
+                    name: sample.name, kind: sample.kind, shape: sample.shape,
+                    seconds: cumulative[k] - previous,
+                    flops: sample.flops, bytes: sample.bytes))
+        }
+
+        return Qwen35OpProfile(
+            label: label, serialized: serial.samples, ladder: ladder,
+            ladderTotalSeconds: cumulative.last ?? 0,
+            productionSeconds: productionSeconds,
+            replicaExact: replicaExact)
+    }
+
+    /// Run `layers[0..<upTo]` normally so a profiled block downstream of the
+    /// embedding sees a realistic hidden state. Returns the evaluated input to
+    /// `layers[upTo]`.
+    public func hiddenBefore(
+        layer upTo: Int, inputs: MLXArray, cache: [any KVCache]
+    ) -> MLXArray {
+        var hiddenStates = embedTokens(inputs)
+        let faMask = createAttentionMask(h: hiddenStates, cache: cache[faIdx])
+        let ssmMask = createSSMMask(
+            h: hiddenStates, cache: cache[ssmIdx] as? MambaCache)
+        for i in 0 ..< upTo {
+            let layer = layers[i]
+            hiddenStates = layer(
+                hiddenStates,
+                attentionMask: layer.isLinear
+                    ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask,
+                ssmMask: layer.isLinear ? ssmMask : nil,
+                cache: cache[i], nConfirmed: 0)
+        }
+        eval(hiddenStates)
+        return hiddenStates
+    }
+
+    /// Whether `layers[index]` is a gated-delta linear block.
+    public func layerIsLinear(_ index: Int) -> Bool { layers[index].isLinear }
+
+    /// Number of decoder blocks, so a caller can pick indices without
+    /// reaching into `layers`.
+    public var layerCount: Int { layers.count }
+}
+
+extension Qwen35TextModel {
+    public func profiledPrefillOpProfile(
+        hidden: MLXArray, layerIndex: Int, cacheDepth: Int,
+        warmupPasses: Int = 1, makeCache: () -> KVCache
+    ) -> Qwen35OpProfile {
+        model.profiledPrefillOpProfile(
+            hidden: hidden, layerIndex: layerIndex, cacheDepth: cacheDepth,
+            warmupPasses: warmupPasses, makeCache: makeCache)
+    }
+
+    public func hiddenBefore(
+        layer upTo: Int, inputs: MLXArray, cache: [any KVCache]
+    ) -> MLXArray {
+        model.hiddenBefore(layer: upTo, inputs: inputs, cache: cache)
+    }
+
+    public func layerIsLinear(_ index: Int) -> Bool {
+        model.layerIsLinear(index)
+    }
+
+    public var profiledLayerCount: Int { model.layerCount }
+}
+
+extension Qwen35Model {
+    public func profiledPrefillOpProfile(
+        hidden: MLXArray, layerIndex: Int, cacheDepth: Int,
+        warmupPasses: Int = 1, makeCache: () -> KVCache
+    ) -> Qwen35OpProfile {
+        languageModel.profiledPrefillOpProfile(
+            hidden: hidden, layerIndex: layerIndex, cacheDepth: cacheDepth,
+            warmupPasses: warmupPasses, makeCache: makeCache)
+    }
+
+    public func hiddenBefore(
+        layer upTo: Int, inputs: MLXArray, cache: [any KVCache]
+    ) -> MLXArray {
+        languageModel.hiddenBefore(layer: upTo, inputs: inputs, cache: cache)
+    }
+
+    public func layerIsLinear(_ index: Int) -> Bool {
+        languageModel.layerIsLinear(index)
+    }
+
+    public var profiledLayerCount: Int { languageModel.profiledLayerCount }
+}
