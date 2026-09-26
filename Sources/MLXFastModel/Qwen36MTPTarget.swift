@@ -3,6 +3,12 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 
+/// Optional dense rerank capability. A nil decision means this model or this
+/// request has no supported rerank shortlist; it is not a zero-confidence score.
+public protocol Qwen36MTPTargetDraftDecision: AnyObject {
+    func draftDecision(_ x: MLXArray) -> Qwen35DraftDecision?
+}
+
 // The model surface the native-MTP session needs, as a protocol.
 //
 // WHY THIS EXISTS. The first migration threaded the CONCRETE `Qwen35TextModel`
@@ -182,3 +188,5 @@ extension Qwen36MTPTarget {
 // `QwenMTPBackboneLayoutTests` pins that the qualified spelling stays.
 extension Qwen35TextModel: Qwen36MTPTarget {}
 extension MLXLLM.Qwen35Model: Qwen36MTPTarget {}
+extension Qwen35TextModel: Qwen36MTPTargetDraftDecision {}
+extension MLXLLM.Qwen35Model: Qwen36MTPTargetDraftDecision {}
