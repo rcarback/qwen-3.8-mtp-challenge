@@ -1,0 +1,9 @@
+# Pinned after install in this venv. Recreate with:
+#   python3.12 -m venv venv && ./venv/bin/pip install -r requirements.txt
+torch==2.13.0
+coremltools==9.0
+transformers==5.16.1
+safetensors==0.8.0
+numpy==2.5.2
+tokenizers==0.23.1
+protobuf==7.36.0
