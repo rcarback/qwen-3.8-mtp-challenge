@@ -1,149 +1,93 @@
 ---
 name: ane-gpu-offload
-description: "Patterns for offloading dense projections from the GPU to the Apple Neural Engine (ANE) on Apple Silicon, and for the GPU/ANE interaction that decides whether it wins. Covers the fp16/int8/int4 weight programs (exact MIL text and blob format), zero-copy IOSurface I/O, the 126-program per-process limit and the procedure-bank / multifunction workarounds, and the full ANE-dispatchable MIL operation set with a per-chip capability table. TRIGGERS: any work on the ANEOffload path, Qwen4ExpANE* / ANEDirectDispatch / ANEMILBuilder, MLX_ANE_DIRECT, deciding whether to run a projection on the ANE vs the GPU, ANE weight quantization, IOSurface handoff, the ANE program-count limit, or ANE/Core ML MIL programs. This is local M4-fork knowledge, verified in hardware on M4 Max / macOS 26.5.2; it is not part of the ranked contract."
+description: Use when building or diagnosing dense ANE offload on Apple Silicon, including MIL weight programs, IOSurface handoff, device placement, program loading, and ANE/GPU sharing.
 ---
 
 # ANE / GPU offload
 
-The Apple Neural Engine is a fixed-function fp16 matrix-multiply and
-convolution accelerator. This skill is the working contract for putting model
-projections on it and, more important, for deciding when that is a win against
-the GPU. It is built from measurements in this repository, verified in
-hardware, not from documentation alone.
+Use this skill for the MIL, weight-blob, IOSurface, and runtime mechanics of
+ANE offload. Use [mlxfast](../mlxfast/SKILL.md) for the optimization workflow,
+answer contract, and review checks. Local experiments do not change the ranked
+editable surface or correctness contract.
 
-## The three facts that govern everything
+## Current decision guidance
 
-1. **The ANE computes in fp16 but stores compressed.** The datapath
-   reconstructs a compressed weight to fp16 at the multiplier input. It
-   accepts int8 and int4 (and palettized) weight storage and dequantizes
-   on-chip. fp16 is the compute precision, not the storage requirement. So the
-   ANE runs on the same quantized weights the GPU uses; there is no need to
-   expand to a bf16 tree. See `references/int8.md` and `references/int4.md`.
+Read [engine offload](../mlxfast/references/engine-offload.md) before selecting a
+representation or split. It incorporates the later dense and MoE re-evaluation.
+Read [measurement](../mlxfast/references/measurement.md) for benchmark preparation
+and evidence. Preserve their distinction between estimates, isolated results,
+and full-request gains.
 
-2. **The bottleneck is bandwidth, and the handoff, not the multiply.** The
-   ANE reads DRAM at roughly 78 to 110 GB/s, the narrowest engine on the chip.
-   Its compute beats the quantized GPU on a real projection (measured
-   0.92x at `in_proj_qkv [10240x2560]`, S=128), but only if the input and
-   output do not cost a copy. Getting the weight bytes and activations to and
-   from the ANE is the real work. See `references/zero-copy.md`.
+The reference files below retain historical probes and recipes. Their absolute
+claims about fp16-only execution, universal decode losses, mandatory banks, and
+shared GPU/ANE quantized tensors are superseded by the guidance here. Their
+instructions to pause unrelated processes or change backup settings do not apply
+without separate user authorization.
 
-3. **A process holds only ~126 loaded programs.** The ANE daemon fails the
-   127th `load` with `Program load failure (0x50004)`, whatever each program's
-   size. One shape is one program. A real model has far more than 126
-   (shape x layer x dtype x sequence bucket), so the program budget is the
-   binding design constraint. See `references/program-limit.md`.
+## Checks before building
 
-## When the ANE wins, and when it does not
+| Question | Required distinction |
+| --- | --- |
+| Can this representation run? | Successful MIL compilation, preferred device, and completed ANE execution are separate evidence |
+| Are the effective weights unchanged? | Matching bit width does not imply matching quantization groups, scales, codebooks, or values |
+| Does this reduce traffic? | Compare against the deployed GPU format and count metadata, padding, retained copies, and join traffic |
+| Can the engines overlap? | Use ready independent work and concurrent measurements. Shared memory can limit the benefit |
+| Does program count bind? | Measure the current runtime's live program budget before adding a bank |
+| Does the model remain correct? | Validate distinct layer identities, state/buffer lifetime, and the deployment's fidelity gate |
 
-- **Prefill (compute-bound, S >= 128): candidate win.** The ANE compute beats
-  the quantized GPU, and the dense projections (attention `q_proj`, gated-delta
-  `in_proj`) are dispatchable. The win is bounded because the routed experts
-  cannot run on the ANE (they need a dynamic gather) and dominate prefill
-  FLOPs.
-- **Decode (S=1, latency/bandwidth-bound): loses.** The ANE loses at one row
-  by 5 to 10 times, with a per-dispatch floor near 0.30 ms. No decode shape
-  is worth moving.
-- **Concurrency is close to zero-sum.** Running the GPU and ANE at once does
-  not beat the GPU alone on this box (GPU alone ~189 GB/s; GPU+ANE
-  ~153+64 = 217, but the GPU chain there is host-bound). Overlap helps only
-  when the ANE work is genuinely independent of the GPU's, which at decode it
-  is not. Re-check this on the target silicon; it moves by generation.
+## Weight forms and engine behavior
 
-## The program design that follows
+The tested fp16, per-channel int8, and int4 LUT programs are different weight
+representations. The tested MLX-like blockwise q4/q8 Core ML convolution forms
+placed on GPU. A second ANE representation can require requantization and extra
+resident memory. Do not assume byte-identical GPU/ANE weights from a shared bit width.
 
-Because the program budget binds, do not build one program per
-(layer, projection, bucket). Instead:
+Treat the observed fp16 weight-only path separately from supported W8A8 paths.
+A custom MIL probe failure does not refute other compiler paths. Verify current
+operator, hardware, and OS support for the exact program. The current
+[engine guide](../mlxfast/references/engine-offload.md) links Apple's support documentation.
 
-- **One program per op-type and dtype and bucket, packing many layers as
-  procedures.** Attention `q_proj` at fp16 S=512 is one program holding all 12
-  attention layers as functions; gated-delta `in_proj` at int8 S=512 is
-  another. This collapses the count from hundreds to a handful. The mechanism
-  is the multifunction `.mlpackage`, not the bare in-memory bank (which loads
-  many functions but dispatches only `main`). See `references/program-limit.md`.
-- **Match the weight dtype to the GPU tree.** If the model is stored int8, the
-  ANE program holds int8; do not dequantize to fp16 first. This shares the
-  representation and keeps the ANE's read narrow. See the dtype sub-skills.
-- **Keep every hot-path transfer zero-copy.** Output through
-  `MLPredictionOptions.outputBackings` into an IOSurface wrapped straight into
-  MLX; input through a surface-backed `MLMultiArray`. See
-  `references/zero-copy.md`.
+The roughly 126-program limit was observed on the local M4 Max runtime. It is a
+measured constraint for that setup, not a universal constant. Multifunction banks
+can change program count, but the tested dense bank lost throughput even after
+ANE placement returned. Start with a small static split before bank infrastructure.
 
-## Sub-skills
+Single-row programs lost with about 0.30 ms dispatch overhead in local probes.
+That result discourages those programs, while larger fused subgraphs remain
+separate experiments. Dense MLPs and projections inside MoE models can still be
+candidates. The measured dense int8 split justifies evaluation at its tested
+prefill shapes, not an unconditional offload policy.
 
-- `references/sources.md` — every source this skill rests on and what each
-  established, plus the hardware probes. Read this to know what is measured
-  and what is inferred.
-- `references/fp16.md` — fp16 weight programs. The baseline, confirmed.
-- `references/int8.md` — int8 affine weight programs. Confirmed in hardware.
-- `references/int4.md` — int4 blockwise weight programs. Exact format; the
-  in-memory compile of the iOS18 op is an open item.
-- `references/zero-copy.md` — IOSurface input and output, the staging-cost
-  analysis, the direct path versus `MLModel.prediction`.
-- `references/program-limit.md` — the 126-program limit, the procedure bank,
-  the multifunction descriptor, and the per-op-type program design.
-- `references/gpu-interaction.md` — the split decision, measured numbers,
-  concurrency, and the decode verdict.
-- `references/operations.md` — every ANE-dispatchable MIL operation and its
-  usage.
-- `references/chip-support.md` — which Apple Silicon generation supports what.
+Zero-copy IOSurface sharing removes a staging copy. Producer writes, consumer
+reads, synchronization, and buffer lifetime still affect the request.
 
-## What this skill trusts, and what it does not
+## Mechanism references
 
-The authority on how the ANE behaves is independent reverse-engineering and
-measurement, not Apple's tooling. Apple documents Core ML, not the engine; the
-Core ML op set is a superset of what the ANE runs, and several ops that are
-valid MIL are silently rejected or produce wrong results on the engine. The
-sources this skill rests on, and what each established, are listed in
-`references/sources.md`. Every quantitative claim here is either from one of
-those sources or from a hardware probe in this repository, and the reference
-files say which.
+Read only the recipe needed, and check its dated conclusions against the current
+guidance above. Preserve useful format details without inheriting obsolete policies.
 
-coremltools is used for exactly one thing: extracting the byte-exact MIL text
-and `weight.bin` layout that the ANE compiler accepts, because the compiler is
-opaque and reports only `InvalidMILProgram`. Treat its output as a syntax
-sample to match, never as a statement about ANE behavior. Confirm every op and
-format in hardware with the probes:
-`MLXFAST_RUN_MLX_RUNTIME_TESTS=1 MLXFAST_NO_SANDBOX=1 swift test -c release`.
+| Mechanism | Reference |
+| --- | --- |
+| Probe provenance and reverse-engineering sources | [Sources](references/sources.md) |
+| fp16 MIL and weight blobs | [fp16](references/fp16.md) |
+| Per-channel affine int8 | [int8](references/int8.md) |
+| INT4 palette and tested blockwise rejection | [int4](references/int4.md) |
+| IOSurface input/output and lifetime | [Zero-copy](references/zero-copy.md) |
+| Program-count probes and multifunction mechanics | [Program limits](references/program-limit.md) |
+| Historical bandwidth and concurrency probes | [GPU interaction](references/gpu-interaction.md) |
+| Tested MIL operations | [Operations](references/operations.md) |
+| Dated chip capability probes | [Chip support](references/chip-support.md) |
 
-## Keep new large trees out of Time Machine and Spotlight
+Use official documentation for supported API contracts, current source for the
+code path, and hardware probes for observed execution. A compute-plan preference
+alone cannot prove actual dispatch. Reverse-engineering results also need a
+stated hardware/runtime scope.
 
-A backup or an index pass over a freshly written model tree churns the page
-cache the memory-mapped weights live in. On 2026-09-06 a backup copying a
-92 GB download made every GPU step of a timed arm 35 times slower for 16
-minutes (request walls of 240 to 310 s against 12 to 15 s), and Spotlight
-workers held the quiet gate for 12 minutes. Neither needs sudo to stop:
+Direct Swift builds and tests in this repository require
+`--force-resolved-versions`. Select relevant runtime tests and verify that their
+environment gates actually execute them. Do not disable sandboxing as a default.
 
-- `tmutil addexclusion <dir>` on every new large directory before its first
-  hourly backup (packs, generated banks, the session scratchpad).
-- Name a download or generator directory with a `.noindex` suffix so
-  Spotlight skips it; `kill -STOP` the user-owned `mdworker_shared`
-  processes for a timed phase and `kill -CONT` them after.
-- Record the request wall time beside every row; a wall far above the
-  model's own prefill plus decode time is the contamination signal.
-
-## Housekeeping: clean up after every run
-
-Every ANE run leaves large generated data behind, and this box runs with a
-few gigabytes of free disk, so a run that does not clean up starves the next
-one (2026-09-06: a full disk made program staging fail silently and four
-perplexity arms ran on the GPU while reporting as ANE arms). Run
-`tools/ane-probes/cleanup-run.sh` at the end of every probe, sweep or serve
-run and before any timed arm. It removes, from the user temp directory only:
-
-| what a run leaves | where | size seen |
-| --- | --- | --- |
-| compiled Core ML models (`*.mlmodelc`, `mf-*`, `bank_*`) | `$(getconf DARWIN_USER_TEMP_DIR)` | 85 MB to 812 MB each |
-| in-memory ANE staging dirs a crashed arm leaves (`<hex>_<hex>_<hex>`) | same | up to 167 MB each, 192 seen |
-| the ANE Metal pipeline cache | same, `ane-metal-pipeline-cache` | 6.7 GB |
-
-Pass paths for the run's own generated sets once they are consumed: the r
-probe's packages (`rpkgs`, 4.9 GB), the compute-plan packages (`anepkgs`),
-a bank generator's `tmp-S<bucket>` directory, activation captures. Model
-trees are never touched. Also read the program build counts every ANE arm
-logs (`built ... failed ...`); an arm that reports failures is not an ANE
-arm and its numbers are void, and an arm whose lane never built a program
-is the control in disguise (the MoE lanes refused quantized weights until
-2026-09-06 and reported the control's perplexity for hours). Before a timed
-arm, the box must be cool AND quiet: see the decision rule in
-`references/gpu-interaction.md`.
-
+Before a run, inspect disk headroom and competing load. Clean only this experiment's
+owned artifacts within the user's authorized scope. Broad temporary-directory
+cleanup can remove another worker's programs or caches. Record completed dispatches
+and partial fallback instead of labeling every successfully loaded program a win.
