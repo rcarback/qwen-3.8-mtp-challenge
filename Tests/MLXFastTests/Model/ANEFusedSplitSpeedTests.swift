@@ -4,26 +4,20 @@ import MLXNN
 import MLXRandom
 import Testing
 @testable import MLXFastModel
+@testable import MLXLLM
 
-/// Task E (ANE IOSurface / procedure-bank plan): the gated A/B timing that
-/// decides whether the ANE∥GPU overlap built in Task D1 actually beats the
-/// all-GPU serve path at real Qwen prefill dimensions.
-///
-/// This is the go/no-go gate for the whole ANE-offload effort. If the
-/// concurrent split does NOT beat the pure all-GPU reference here, then D2
-/// (Metal zero-copy) and wiring `ANEFusedSplitMLP` into the Qwen35 MLP
-/// prefill path are both moot.
+/// Opt-in paired timing of the reusable ANE/GPU bridge against the production
+/// GPU layer at real Qwen prefill dimensions. This isolates one MLP layer;
+/// full-model measurements must establish any request speedup.
 ///
 /// Discipline (mirrors `ColumnSplitSpeedTests`):
 ///   * ONE fraction per process, via `MLXFAST_ANE_FRACTION` -- position
 ///     inside a process moves GPU timings by more than the effect measured.
 ///   * Warmup, then best-of-N (the minimum is the least-contended sample).
-///   * The honest baseline is the pure all-GPU `referenceForward` (three
-///     4-bit `quantizedMM`s), NOT `ANEFusedSplitMLP` at fraction 0 -- the
-///     candidate must beat the real serve path, not a hobbled version of
-///     itself.
-///   * Both legs are timed in the SAME process so the ratio cancels machine
-///     state; an interleaved A/B/A/B pass checks for order effects.
+///   * The baseline calls `Qwen35FusedMLP` with offload disabled, preserving
+///     production dispatch at the measured row count and environment.
+///   * Both legs run in the same process. Individual AB/BA pairs expose
+///     drift and order effects that the best-of-N summaries can hide.
 ///
 /// Reported number: `speedup = baseline_time / candidate_time`. >1 means the
 /// overlap paid off; the curve over fractions locates the balance point.
@@ -45,20 +39,21 @@ struct ANEFusedSplitSpeedTests {
         return (wq, scales, biases)
     }
 
-    private static func referenceForward(
-        _ x: MLXArray,
+    private static func productionLayer(
         gateWq: MLXArray, gateScales: MLXArray, gateBiases: MLXArray,
         upWq: MLXArray, upScales: MLXArray, upBiases: MLXArray,
         downWq: MLXArray, downScales: MLXArray, downBiases: MLXArray
-    ) -> MLXArray {
-        let gate = quantizedMM(x, gateWq, scales: gateScales, biases: gateBiases,
-                                transpose: true, groupSize: 64, bits: 4)
-        let up = quantizedMM(x, upWq, scales: upScales, biases: upBiases,
-                              transpose: true, groupSize: 64, bits: 4)
-        let h = (silu(gate) * up).asType(.bfloat16)
-        let y = quantizedMM(h, downWq, scales: downScales, biases: downBiases,
-                             transpose: true, groupSize: 64, bits: 4)
-        return y
+    ) -> Qwen35FusedMLP {
+        let layer = Qwen35FusedMLP(dimensions: hidden, hiddenDimensions: inter)
+        layer.update(modules: ModuleChildren.unflattened([
+            ("gate_proj", QuantizedLinear(weight: gateWq, scales: gateScales,
+                biases: gateBiases, groupSize: 64, bits: 4)),
+            ("up_proj", QuantizedLinear(weight: upWq, scales: upScales,
+                biases: upBiases, groupSize: 64, bits: 4)),
+            ("down_proj", QuantizedLinear(weight: downWq, scales: downScales,
+                biases: downBiases, groupSize: 64, bits: 4)),
+        ]))
+        return layer
     }
 
     /// Best-of-N wall time forcing full materialization each iteration.
@@ -73,13 +68,16 @@ struct ANEFusedSplitSpeedTests {
         return best
     }
 
-    @Test("ANEFusedSplitMLP concurrent vs all-GPU reference: one fraction, alone in its process")
+    @Test("ANEFusedSplitMLP concurrent vs production GPU layer",
+          .enabled(if: ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1"
+              && ProcessInfo.processInfo.environment["MLXFAST_ANE_FRACTION"] != nil))
     func aneFractionSpeedPoint() throws {
         let env = ProcessInfo.processInfo.environment
-        guard env["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1",
-              let fRaw = env["MLXFAST_ANE_FRACTION"],
-              let fraction = Double(fRaw)
-        else { return }
+        let fRaw = try #require(env["MLXFAST_ANE_FRACTION"])
+        let fraction = try #require(Double(fRaw), "MLXFAST_ANE_FRACTION must be numeric")
+        try #require(!ANESplitConfig.enabled, "Set MLX_ANE_DIRECT=0 so the production control cannot offload")
+        try #require(!ANESplitConfig.verify, "Timing must run without ANE verification")
+        try #require(fraction > 0 && fraction < 1)
         try #require(ANERuntime.available())
 
         let hidden = Self.hidden
@@ -99,13 +97,11 @@ struct ANEFusedSplitSpeedTests {
             downW: downWq, downScales: downScales, downBiases: downBiases,
             hidden: hidden, inter: inter, sequenceLength: s, aneFraction: fraction)
 
-        let baseline: () throws -> MLXArray = {
-            Self.referenceForward(
-                x,
+        let production = Self.productionLayer(
                 gateWq: gateWq, gateScales: gateScales, gateBiases: gateBiases,
                 upWq: upWq, upScales: upScales, upBiases: upBiases,
                 downWq: downWq, downScales: downScales, downBiases: downBiases)
-        }
+        let baseline: () throws -> MLXArray = { production(x) }
         let candidate: () throws -> MLXArray = { try split(x) }
 
         // Isolation mode: measure exactly ONE leg alone in this process, so
@@ -135,6 +131,17 @@ struct ANEFusedSplitSpeedTests {
         for _ in 0 ..< iters {
             let s0 = Date(); eval(try baseline()); baseInter = Swift.min(baseInter, Date().timeIntervalSince(s0))
             let s1 = Date(); eval(try candidate()); candInter = Swift.min(candInter, Date().timeIntervalSince(s1))
+        }
+
+        // Preserve each paired sample; minima alone hide control drift.
+        for pair in 0 ..< max(3, iters) {
+            let first = pair.isMultiple(of: 2) ? baseline : candidate
+            let second = pair.isMultiple(of: 2) ? candidate : baseline
+            let a = try Self.best(of: 1, first)
+            let b = try Self.best(of: 1, second)
+            let control = pair.isMultiple(of: 2) ? a : b
+            let treatment = pair.isMultiple(of: 2) ? b : a
+            print("ANE-PAIR index=\(pair) order=\(pair.isMultiple(of: 2) ? "AB" : "BA") S=\(s) baseline_ms=\(control * 1e3) candidate_ms=\(treatment * 1e3) speedup=\(control / treatment) fraction=\(fraction) weight_form=\(ANESplitConfig.weightForm.rawValue) gpu_suffix=\(ANESplitConfig.fp16GpuSuffix ? "fp16" : "current")")
         }
 
         let speedupGrouped = baseGrouped / candGrouped

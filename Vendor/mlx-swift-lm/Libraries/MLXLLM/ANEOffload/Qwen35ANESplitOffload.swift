@@ -47,6 +47,13 @@ public enum ANESplitConfig {
         return String(cString: cString) == "1"
     }()
 
+    /// Use fp16 tensors and quantization metadata for the mixed GPU suffix.
+    /// The suffix and joined model output still return bf16.
+    public static let fp16GpuSuffix: Bool = {
+        guard let cString = getenv("MLX_ANE_FP16_SUFFIX") else { return false }
+        return String(cString: cString) == "1"
+    }()
+
     /// (A) Selective / sandwich offload. The first `skipFirst` and last
     /// `skipLast` decoder layers stay on the GPU (the layers nearest the
     /// residual seed and the logits, where fp16-vs-4bit divergence flips
@@ -211,11 +218,11 @@ public final class ANESplitMLPCache: @unchecked Sendable {
                 hidden: hidden, inter: inter, sequenceLength: key,
                 aneFraction: ANESplitConfig.fraction, prefixFP16: prefix)
             programs[key] = split
-            aneLog("built split program S=\(s) bucket=\(key) fraction=\(ANESplitConfig.fraction) hidden=\(hidden) inter=\(inter) source=\(prefix == nil ? "dequant4" : "bf16")")
+            aneLog("built split program layer=\(layerIndex) S=\(s) bucket=\(key) fraction=\(ANESplitConfig.fraction) hidden=\(hidden) inter=\(inter) source=\(prefix == nil ? "dequant4" : "bf16") gpu_suffix_requested=\(ANESplitConfig.fp16GpuSuffix ? "fp16" : "current")")
             return split
         } catch {
             failed.insert(key)
-            aneLog("BUILD FAILED S=\(s) bucket=\(key) hidden=\(hidden) inter=\(inter) error=\(error)")
+            aneLog("BUILD FAILED layer=\(layerIndex) S=\(s) bucket=\(key) hidden=\(hidden) inter=\(inter) error=\(error)")
             return nil
         }
     }

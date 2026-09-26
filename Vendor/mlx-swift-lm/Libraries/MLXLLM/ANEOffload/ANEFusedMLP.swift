@@ -20,6 +20,8 @@ public final class ANEFusedMLP {
     let innerFraction: Int
     let sequenceLength: Int
     private let model: ANEInMemoryModel
+    private let inputLock = NSLock()
+    private var prepared: ANEDirectDispatch.Prepared?
 
     /// `gate`/`up`: `[innerFraction, hidden]`. `down`: `[hidden, innerFraction]`.
     /// Computes the ANE fraction's full contribution through the down
@@ -105,14 +107,25 @@ public final class ANEFusedMLP {
     /// thread. For concurrent ANE+GPU use (Task D1), call the three parts
     /// separately instead -- see their doc comments below.
     public func callAsFunction(_ x: MLXArray) throws -> MLXArray {
-        try ANEDirectDispatch.runConv(model: model, x: x, inputDim: hidden, outputDim: hidden, sequenceLength: sequenceLength)
+        let input = try makeInput(x)
+        try predict(input)
+        return readOutput(input)
     }
 
-    /// CALLER THREAD ONLY (MLX). Prepares the ANE input/output IOSurfaces
-    /// and the `_ANERequest` for `x[S,hidden]` fp16. Only `predict` on the
-    /// returned handle may run off this thread.
+    /// CALLER THREAD ONLY (MLX). Reuses surfaces and the request after
+    /// completing earlier output readers. Only `predict` may run off-thread.
     func makeInput(_ x: MLXArray) throws -> ANEDirectDispatch.Prepared {
-        try ANEDirectDispatch.prepare(model: model, x: x, inputDim: hidden, outputDim: hidden, sequenceLength: sequenceLength)
+        inputLock.lock()
+        defer { inputLock.unlock() }
+        if let prepared {
+            let input = try ANEDirectDispatch.restage(prepared, x: x, inputDim: hidden, gpuInput: true)
+            self.prepared = input
+            return input
+        }
+        let input = try ANEDirectDispatch.prepare(model: model, x: x,
+            inputDim: hidden, outputDim: hidden, sequenceLength: sequenceLength, gpuInput: true)
+        prepared = input
+        return input
     }
 
     /// BACKGROUND-SAFE. Runs the fused ANE program via the blocking ObjC

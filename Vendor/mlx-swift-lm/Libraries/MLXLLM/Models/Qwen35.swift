@@ -2334,6 +2334,7 @@ func qwen35RoutedLinear(_ layer: Linear, _ x: MLXArray) -> MLXArray {
 }
 
 final class Qwen35FusedMLP: Module, UnaryLayer {
+    private static let traceANE = ProcessInfo.processInfo.environment["MLX_ANE_TRACE"] == "1"
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
@@ -2516,7 +2517,11 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
                 // -- which holds 68.75% of the intermediate channels at the
                 // deployed fraction -- never computes a row that is thrown
                 // away. Pass the real rows and let it decide.
-                if let y2 = try? split(x2) {
+                do {
+                    let y2 = try split(x2)
+                    if Self.traceANE {
+                        aneLog("completed layer \(aneLayerIndex) S=\(tokens) bucket=\(ANESplitMLPCache.bucketedSequenceLength(tokens))")
+                    }
                     if ANESplitConfig.verify {
                         let key = ANESplitMLPCache.bucketedSequenceLength(tokens)
                         let ref = downProjection(silu(gateProj(x)) * upProj(x))
@@ -2531,6 +2536,8 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
                             MLX.abs(ref).max().item(Float.self), worst.item(Int32.self)))
                     }
                     return y2.reshaped(x.shape)
+                } catch {
+                    aneLog("fallback layer \(aneLayerIndex) S=\(tokens): \(error)")
                 }
             }
         }

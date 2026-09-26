@@ -21,6 +21,7 @@ public enum ANEDirectDispatch {
         case wrapFailed
         case requestFailed
         case evaluateFailed(String)
+        case requestBusy
 
         var description: String {
             switch self {
@@ -28,6 +29,7 @@ public enum ANEDirectDispatch {
             case .wrapFailed: return "ANEDirectDispatch: _ANEIOSurfaceObject wrap failed"
             case .requestFailed: return "ANEDirectDispatch: _ANERequest construction failed"
             case let .evaluateFailed(message): return "ANEDirectDispatch: evaluate failed: \(message)"
+            case .requestBusy: return "ANEDirectDispatch: finish the current request before reusing its surfaces"
             }
         }
     }
@@ -70,15 +72,20 @@ public enum ANEDirectDispatch {
         return IOSurfaceCreate(props as CFDictionary)
     }
 
-    /// Cross-thread carrier for the state `prepare` builds on the caller
-    /// thread and that `evaluate` (background-safe) and `read` (caller
-    /// thread) consume. `@unchecked Sendable` because `AnyObject`/
-    /// `IOSurface` aren't `Sendable`, but the fields are written once in
-    /// `prepare` and thereafter only read -- first by `evaluate` on
-    /// `ConcurrentEngines.run`'s background queue, then by `read` back on
-    /// the caller thread -- so there is no concurrent mutation, the same
-    /// one-shot handoff pattern as `ANEGemm`'s `LoadInputs`/`LoadResult`.
-    public final class Prepared: @unchecked Sendable {
+    /// Persistent request storage. The ownership lock protects state changes
+    /// between caller-side staging/readback and background ANE evaluation.
+    /// Only the caller thread accesses pending MLX graphs. Reuse completes
+    /// their reads before either surface can be overwritten.
+    fileprivate final class Storage: @unchecked Sendable {
+        fileprivate enum State { case idle, staging, staged, evaluating, complete, read }
+        fileprivate let ownership = NSLock()
+        fileprivate var state = State.idle
+        // MLX eval materializes array graphs; it does not evaluate source code.
+        // Complete these independent outputs before ANE overwrites their source.
+        fileprivate var pendingOutputs: [MLXArray] = []
+        var generation = 0
+        var packer: ANESurfacePacking?
+        var inputTransfer: ANESurfacePacking.Transfer?
         let model: ANEInMemoryModel
         let request: AnyObject
         // The input surface is held even though `read` never touches it: the
@@ -103,6 +110,33 @@ public enum ANEDirectDispatch {
         }
     }
 
+    /// A single invocation of reusable storage. Old handles cannot execute
+    /// or read a later invocation, even though the request identity is stable.
+    public final class Prepared: @unchecked Sendable {
+        fileprivate let storage: Storage
+        fileprivate let generation: Int
+        fileprivate init(_ storage: Storage) {
+            self.storage = storage
+            self.generation = storage.generation
+        }
+        fileprivate var ownership: NSLock { storage.ownership }
+        fileprivate var state: Storage.State {
+            get { storage.state }
+            set { storage.state = newValue }
+        }
+        fileprivate var pendingOutputs: [MLXArray] {
+            get { storage.pendingOutputs }
+            set { storage.pendingOutputs = newValue }
+        }
+        var model: ANEInMemoryModel { storage.model }
+        var request: AnyObject { storage.request }
+        var inputSurface: IOSurface { storage.inputSurface }
+        var outputSurface: IOSurface { storage.outputSurface }
+        var outputDim: Int { storage.outputDim }
+        var sequenceLength: Int { storage.sequenceLength }
+        var rowStride: Int { storage.rowStride }
+    }
+
     /// CALLER THREAD ONLY (MLX). `x` is `[S, IN]` fp16 (MLX). Allocates the
     /// input/output IOSurfaces, writes `x` into the input surface (MLX
     /// transpose + eval + `asData`), wraps both surfaces, and builds the
@@ -112,8 +146,8 @@ public enum ANEDirectDispatch {
     /// (`buildBankMILText`) program this request runs; the default `0` is the
     /// sole function (`main`) of every single-conv program and is unchanged
     /// behaviour for those callers.
-    public static func prepare(model: ANEInMemoryModel, x: MLXArray, inputDim: Int, outputDim: Int, sequenceLength: Int, procedureIndex: Int = 0) throws -> Prepared {
-        precondition(x.ndim == 2 && x.shape[0] == sequenceLength && x.shape[1] == inputDim,
+    public static func prepare(model: ANEInMemoryModel, x: MLXArray, inputDim: Int, outputDim: Int, sequenceLength: Int, procedureIndex: Int = 0, gpuInput: Bool = false) throws -> Prepared {
+        precondition(x.ndim == 2 && x.shape[0] <= sequenceLength && x.shape[1] == inputDim,
                      "ANEDirectDispatch.prepare expected x shape [\(sequenceLength), \(inputDim)], got \(x.shape)")
 
         // The ANE pads the conv's trailing spatial (sequence) axis to a
@@ -133,7 +167,6 @@ public enum ANEDirectDispatch {
         // the padded stride is sufficient; the padding itself is never
         // read back.
         let rowStride = ((sequenceLength + 31) / 32) * 32
-        let inputByteCount = inputDim * sequenceLength * 2
         let inputSurfaceByteCount = inputDim * rowStride * 2
         let outputSurfaceByteCount = outputDim * rowStride * 2
         guard let inputSurface = makeSurface(byteCount: inputSurfaceByteCount),
@@ -141,29 +174,16 @@ public enum ANEDirectDispatch {
             throw ANEDispatchError.surfaceAllocationFailed
         }
 
-        // MIL conv input is tensor<fp16,[1,IN,1,S]> = [IN,S] row-major
-        // (channel-major); our x is [S,IN], so transpose before writing.
-        let xT = contiguous(x.transposed(1, 0)).asType(.float16) // [IN,S], row-contiguous
-        eval(xT)
-        let srcData = xT.asData().data
-        precondition(srcData.count == inputByteCount,
-                     "ANEDirectDispatch.prepare: transposed input is \(srcData.count) bytes, expected \(inputByteCount)")
+        let request = try makeRequest(inputSurface: inputSurface, outputSurface: outputSurface,
+                                      procedureIndex: procedureIndex)
 
-        // Scatter [IN,S] into the ANE's [IN,paddedS] row-padded input --
-        // one memcpy per channel row (degenerates to one bulk copy when
-        // `sequenceLength == rowStride`, e.g. S=32).
-        let inputRowStrideBytes = rowStride * 2
-        let inputRowBytes = sequenceLength * 2
-        inputSurface.lock(options: [], seed: nil)
-        let inputBase = inputSurface.baseAddress
-        srcData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Void in
-            let src = raw.baseAddress!
-            for c in 0 ..< inputDim {
-                _ = memcpy(inputBase + c * inputRowStrideBytes, src + c * inputRowBytes, inputRowBytes)
-            }
-        }
-        inputSurface.unlock(options: [], seed: nil)
+        let storage = Storage(model: model, request: request, inputSurface: inputSurface, outputSurface: outputSurface,
+                         outputDim: outputDim, sequenceLength: sequenceLength, rowStride: rowStride)
+        return try restage(Prepared(storage), x: x, inputDim: inputDim, gpuInput: gpuInput)
+    }
 
+    private static func makeRequest(inputSurface: IOSurface, outputSurface: IOSurface,
+                                    procedureIndex: Int = 0) throws -> AnyObject {
         // `objectWithIOSurface:` is a Cocoa class-factory method (not
         // alloc/init/copy/new), so per Cocoa convention it returns an
         // autoreleased (+0) object -- `ANERuntime.send`'s default
@@ -198,8 +218,61 @@ public enum ANEDirectDispatch {
         // down the call.
         let request = requestU.takeUnretainedValue()
 
-        return Prepared(model: model, request: request, inputSurface: inputSurface, outputSurface: outputSurface,
-                         outputDim: outputDim, sequenceLength: sequenceLength, rowStride: rowStride)
+        return request
+    }
+
+    /// Caller thread only. Drain prior GPU readers before changing shared bytes.
+    static func restage(_ prepared: Prepared, x: MLXArray, inputDim: Int, gpuInput: Bool = false) throws -> Prepared {
+        precondition(x.ndim == 2 && x.dim(0) <= prepared.sequenceLength && x.dim(1) == inputDim)
+        prepared.ownership.lock()
+        guard prepared.generation == prepared.storage.generation,
+              prepared.state == .idle || prepared.state == .read else {
+            prepared.ownership.unlock()
+            throw ANEDispatchError.requestBusy
+        }
+        prepared.state = .staging
+        eval(prepared.pendingOutputs)
+        prepared.pendingOutputs.removeAll(keepingCapacity: true)
+        prepared.storage.generation += 1
+        let invocation = Prepared(prepared.storage)
+        prepared.ownership.unlock()
+
+        prepared.storage.inputTransfer = nil
+        do {
+            if gpuInput {
+                if prepared.storage.packer == nil {
+                    prepared.storage.packer = try ANESurfacePacking(surface: prepared.inputSurface)
+                }
+                prepared.storage.inputTransfer = try prepared.storage.packer!.submit(
+                    x, width: inputDim, rows: x.dim(0), stride: prepared.rowStride)
+            } else {
+                let xT = contiguous(x.transposed(1, 0)).asType(.float16)
+                eval(xT)
+                let data = xT.asData().data
+                let rowBytes = x.dim(0) * 2
+                let strideBytes = prepared.rowStride * 2
+                precondition(data.count == inputDim * rowBytes)
+                prepared.inputSurface.lock(options: [], seed: nil)
+                memset(prepared.inputSurface.baseAddress, 0, inputDim * strideBytes)
+                data.withUnsafeBytes { raw in
+                    for channel in 0 ..< inputDim {
+                        _ = memcpy(prepared.inputSurface.baseAddress + channel * strideBytes,
+                            raw.baseAddress! + channel * rowBytes, rowBytes)
+                    }
+                }
+                prepared.inputSurface.unlock(options: [], seed: nil)
+            }
+        } catch {
+            prepared.ownership.lock()
+            prepared.storage.generation = prepared.generation
+            prepared.state = .idle
+            prepared.ownership.unlock()
+            throw error
+        }
+        prepared.ownership.lock()
+        prepared.state = .staged
+        prepared.ownership.unlock()
+        return invocation
     }
 
     /// BACKGROUND-SAFE. Blocking evaluate at qos 21 (0x15, matching oMLX)
@@ -208,6 +281,22 @@ public enum ANEDirectDispatch {
     /// the one phase safe to run on `ConcurrentEngines.run`'s background
     /// queue while the caller thread does MLX `eval` elsewhere.
     public static func evaluate(_ prepared: Prepared) throws {
+        prepared.ownership.lock()
+        guard prepared.generation == prepared.storage.generation,
+              prepared.state == .staged else {
+            prepared.ownership.unlock()
+            throw ANEDispatchError.requestBusy
+        }
+        prepared.state = .evaluating
+        prepared.ownership.unlock()
+        do {
+            try prepared.storage.inputTransfer?.wait()
+        } catch {
+            prepared.ownership.lock()
+            prepared.state = .idle
+            prepared.ownership.unlock()
+            throw error
+        }
         let msgSend = dlsym(dlopen(nil, RTLD_LAZY), "objc_msgSend")!
         let evaluateFn = unsafeBitCast(msgSend, to: EvaluateFn.self)
         let evaluateSel = Selector(("evaluateWithQoS:options:request:error:"))
@@ -216,9 +305,15 @@ public enum ANEDirectDispatch {
             evaluateFn(prepared.model.raw, evaluateSel, 21, NSDictionary(), prepared.request, p).boolValue
         }
         if !ok {
+            prepared.ownership.lock()
+            prepared.state = .idle
+            prepared.ownership.unlock()
             let message = errU?.takeUnretainedValue().localizedDescription ?? "unknown evaluate failure"
             throw ANEDispatchError.evaluateFailed(message)
         }
+        prepared.ownership.lock()
+        prepared.state = .complete
+        prepared.ownership.unlock()
     }
 
     /// CALLER THREAD ONLY (MLX). Gathers `[OUT,S]` out of the ANE's
@@ -226,6 +321,12 @@ public enum ANEDirectDispatch {
     /// (MLX). Must run only after `evaluate` has completed for this
     /// `Prepared`.
     public static func read(_ prepared: Prepared) -> MLXArray {
+        prepared.ownership.lock()
+        defer { prepared.ownership.unlock() }
+        precondition(prepared.generation == prepared.storage.generation, "ANE invocation handle has expired")
+        precondition(prepared.state == .complete || prepared.state == .read,
+            "ANE output requires a completed evaluation")
+        prepared.state = .read
         let outputDim = prepared.outputDim
         let sequenceLength = prepared.sequenceLength
         let rowStride = prepared.rowStride
@@ -266,6 +367,15 @@ public enum ANEDirectDispatch {
     /// path confirms it). mlx-swift's own `MLXArray(rawPointer:)` IOSurface
     /// example is likewise unlocked. Must run only after `evaluate` completed.
     public static func readZeroCopy(_ prepared: Prepared) -> MLXArray {
+        // A [S,1] transpose is already contiguous, so contiguous() may alias
+        // shared storage. Copy this degenerate shape before allowing reuse.
+        if prepared.outputDim == 1 { return read(prepared) }
+        prepared.ownership.lock()
+        defer { prepared.ownership.unlock() }
+        precondition(prepared.generation == prepared.storage.generation, "ANE invocation handle has expired")
+        precondition(prepared.state == .complete || prepared.state == .read,
+            "ANE output requires a completed evaluation")
+        prepared.state = .read
         let outputDim = prepared.outputDim
         let sequenceLength = prepared.sequenceLength
         let rowStride = prepared.rowStride
@@ -276,7 +386,29 @@ public enum ANEDirectDispatch {
             [outputDim, rowStride], dtype: .float16,
             finalizer: { [surface] in _ = surface })
         let real = wrapped[0 ..< outputDim, 0 ..< sequenceLength] // [OUT,S] view
-        return contiguous(real.transposed(1, 0)) // [S,OUT]
+        let output = contiguous(real.transposed(1, 0)) // [S,OUT]
+        prepared.pendingOutputs.append(output)
+        return output
+    }
+
+    /// Fuses strided output conversion and addition into independent storage.
+    /// Register the lazy result before allowing another invocation to stage.
+    static func readJoined(_ prepared: Prepared, gpu: MLXArray?, rows: Int, dtype: DType) -> MLXArray {
+        prepared.ownership.lock()
+        defer { prepared.ownership.unlock() }
+        precondition(prepared.generation == prepared.storage.generation, "ANE invocation handle has expired")
+        precondition(prepared.state == .complete || prepared.state == .read,
+            "ANE output requires a completed evaluation")
+        precondition(rows <= prepared.sequenceLength)
+        let surface = prepared.outputSurface
+        let wrapped = MLXArray(rawPointer: surface.baseAddress,
+            [prepared.outputDim, prepared.rowStride], dtype: .float16,
+            finalizer: { [surface] in _ = surface })
+        let output = ANESurfaceJoin.callAsFunction(wrapped, gpu: gpu, rows: rows,
+            hidden: prepared.outputDim, stride: prepared.rowStride, dtype: dtype)
+        prepared.pendingOutputs.append(output)
+        prepared.state = .read
+        return output
     }
 
     /// Convenience that chains `prepare` -> `evaluate` -> `readZeroCopy` on
@@ -288,5 +420,253 @@ public enum ANEDirectDispatch {
         let prepared = try prepare(model: model, x: x, inputDim: inputDim, outputDim: outputDim, sequenceLength: sequenceLength)
         try evaluate(prepared)
         return readZeroCopy(prepared)
+    }
+}
+
+extension ANEDirectDispatch {
+    public enum CacheLoopError: Error {
+        case invalidInput(String)
+        case invalidated
+    }
+
+    /// Serial cache updates retain channel-major cache bytes in alternating surfaces.
+    /// The caller stages fresh KV, slots, and optional queries/lengths. No MLX graph runs in `step`.
+    public final class CacheLoop {
+        private let model: ANEInMemoryModel
+        private let attentionModel: ANEInMemoryModel?
+        private let attentionSurface: IOSurface?
+        private let attentionRequests: [AnyObject]
+        private let surfaces: [IOSurface]
+        private let requests: [AnyObject]
+        private let attention: Bool
+        private let batch: Int
+        private let capacity: Int
+        private let cacheChannels: Int
+        private let stride = 32
+        private let lock = NSLock()
+        private var current = 0
+        private var valid = true
+
+        public init(batch: Int, capacity: Int, attention: Bool = false) throws {
+            let text = try buildQwenANECacheUpdateMILText(batch: batch, capacity: capacity)
+            let cacheChannels = 2048 * capacity
+            let bytes = (cacheChannels + (attention ? 8704 : 2304)) * 32 * 2
+            guard let a = ANEDirectDispatch.makeSurface(byteCount: bytes),
+                  let b = ANEDirectDispatch.makeSurface(byteCount: bytes) else {
+                throw ANEDispatchError.surfaceAllocationFailed
+            }
+            memset(a.baseAddress, 0, bytes)
+            memset(b.baseAddress, 0, bytes)
+            let model = try ANEInMemoryModel(milText: text, weightBlob: Data())
+            try model.compile()
+            try model.load()
+            var completed = false
+            defer { if !completed { model.unload() } }
+            guard let surfaceClass = ANERuntime.cls("_ANEIOSurfaceObject"),
+                  let objectA = ANERuntime.send(surfaceClass, Selector(("objectWithIOSurface:")), a as AnyObject),
+                  let objectB = ANERuntime.send(surfaceClass, Selector(("objectWithIOSurface:")), b as AnyObject) else {
+                throw ANEDispatchError.wrapFailed
+            }
+            guard let requestClass = ANERuntime.cls("_ANERequest") else { throw ANEDispatchError.requestFailed }
+            let send = dlsym(dlopen(nil, RTLD_LAZY), "objc_msgSend")!
+            let factory = unsafeBitCast(send, to: RequestFactory.self)
+            let selector = Selector(("requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:"))
+            var requests: [AnyObject] = []
+            for (input, output) in [(objectA, objectB), (objectB, objectA)] {
+                guard let request = factory(requestClass, selector,
+                    [input] as NSArray, [0] as NSArray, [output] as NSArray, [0] as NSArray,
+                    nil, nil, NSNumber(value: 0)) else { throw ANEDispatchError.requestFailed }
+                requests.append(request.takeUnretainedValue())
+            }
+            var attentionModel: ANEInMemoryModel?
+            var attentionSurface: IOSurface?
+            var attentionRequests: [AnyObject] = []
+            if attention {
+                let attentionText = try buildQwenANECachedAttentionMILText(batch: batch, capacity: capacity)
+                let program = try ANEInMemoryModel(milText: attentionText, weightBlob: Data())
+                try program.compile(); try program.load()
+                var attentionCompleted = false
+                defer { if !attentionCompleted { program.unload() } }
+                guard let surface = ANEDirectDispatch.makeSurface(byteCount: 6144 * 32 * 2),
+                      let output = ANERuntime.send(surfaceClass, Selector(("objectWithIOSurface:")), surface as AnyObject) else {
+                    throw ANEDispatchError.surfaceAllocationFailed
+                }
+                for input in [objectA, objectB] {
+                    guard let request = factory(requestClass, selector,
+                        [input] as NSArray, [0] as NSArray, [output] as NSArray, [0] as NSArray,
+                        nil, nil, NSNumber(value: 0)) else { throw ANEDispatchError.requestFailed }
+                    attentionRequests.append(request.takeUnretainedValue())
+                }
+                attentionModel = program; attentionSurface = surface; attentionCompleted = true
+            }
+            self.attentionModel = attentionModel
+            self.attentionSurface = attentionSurface
+            self.attentionRequests = attentionRequests
+            self.model = model
+            self.surfaces = [a, b]
+            self.requests = requests
+            self.attention = attention
+            self.batch = batch
+            self.capacity = capacity
+            self.cacheChannels = cacheChannels
+            completed = true
+        }
+
+        deinit { attentionModel?.unload(); model.unload() }
+
+        /// `newKV` is lane-major [batch, 2, 4, 256]. Slots must be -1 or valid local indices.
+        /// Attention mode requires queries [batch, 24, 256] and positive valid lengths.
+        /// Returns lane-major attention in that mode, otherwise an empty array.
+        @discardableResult
+        public func step(newKV: [Float16], slots: [Int], queries: [Float16] = [], validLengths: [Int] = []) throws -> [Float16] {
+            guard newKV.count == batch * 2048, slots.count == batch,
+                  newKV.allSatisfy({ $0.isFinite }),
+                  slots.allSatisfy({ $0 >= -1 && $0 < capacity }) else {
+                throw CacheLoopError.invalidInput("Expected finite [batch, 2048] KV rows and slots in -1..<capacity")
+            }
+            if attention {
+                guard queries.count == batch * 6144, queries.allSatisfy({ $0.isFinite }),
+                      validLengths.count == batch, validLengths.allSatisfy({ $0 > 0 && $0 <= capacity }),
+                      zip(slots, validLengths).allSatisfy({ $0 < $1 }) else {
+                    throw CacheLoopError.invalidInput("Attention requires finite queries and positive valid lengths containing each write slot")
+                }
+            } else if !queries.isEmpty || !validLengths.isEmpty {
+                throw CacheLoopError.invalidInput("Queries require attention mode")
+            }
+            lock.lock(); defer { lock.unlock() }
+            guard valid else { throw CacheLoopError.invalidated }
+            let pointer = surfaces[current].baseAddress.assumingMemoryBound(to: Float16.self)
+            for lane in 0..<batch {
+                for channel in 0..<2048 {
+                    pointer[(cacheChannels + channel) * stride + lane] = newKV[lane * 2048 + channel]
+                }
+                pointer[(cacheChannels + 2048) * stride + lane] = Float16(slots[lane])
+
+            }
+            let send = dlsym(dlopen(nil, RTLD_LAZY), "objc_msgSend")!
+            let evaluate = unsafeBitCast(send, to: EvaluateFn.self)
+            var error: Unmanaged<NSError>?
+            let ok = withUnsafeMutablePointer(to: &error) {
+                evaluate(model.raw, Selector(("evaluateWithQoS:options:request:error:")),
+                         21, NSDictionary(), requests[current], $0).boolValue
+            }
+            guard ok else {
+                valid = false
+                throw ANEDispatchError.evaluateFailed(error?.takeUnretainedValue().localizedDescription ?? "cache loop evaluation failed")
+            }
+            current = 1 - current
+            guard attention else { return [] }
+            guard let attentionModel, let attentionSurface else { throw CacheLoopError.invalidated }
+            let attentionInput = surfaces[current].baseAddress.assumingMemoryBound(to: Float16.self)
+            for lane in 0..<batch {
+                for channel in 0..<6144 {
+                    attentionInput[(cacheChannels + 2304 + channel) * stride + lane] = queries[lane * 6144 + channel]
+                }
+                attentionInput[(cacheChannels + 8448) * stride + lane] = Float16(validLengths[lane])
+            }
+            var attentionError: Unmanaged<NSError>?
+            let attentionOK = withUnsafeMutablePointer(to: &attentionError) {
+                evaluate(attentionModel.raw, Selector(("evaluateWithQoS:options:request:error:")),
+                         21, NSDictionary(), attentionRequests[current], $0).boolValue
+            }
+            guard attentionOK else {
+                valid = false
+                throw ANEDispatchError.evaluateFailed(attentionError?.takeUnretainedValue().localizedDescription ?? "cached attention evaluation failed")
+            }
+            let output = attentionSurface.baseAddress.assumingMemoryBound(to: Float16.self)
+            var attended = [Float16](repeating: 0, count: batch * 6144)
+            for lane in 0..<batch {
+                for channel in 0..<6144 {
+                    attended[lane * 6144 + channel] = output[channel * stride + lane]
+                }
+            }
+            return attended
+        }
+
+        /// Explicit diagnostic readback. Normal updates leave the cache on shared surfaces.
+        public func snapshot() throws -> [Float16] {
+            lock.lock(); defer { lock.unlock() }
+            guard valid else { throw CacheLoopError.invalidated }
+            let pointer = surfaces[current].baseAddress.assumingMemoryBound(to: Float16.self)
+            var result = [Float16](repeating: 0, count: batch * cacheChannels)
+            for lane in 0..<batch {
+                for channel in 0..<cacheChannels {
+                    result[lane * cacheChannels + channel] = pointer[channel * stride + lane]
+                }
+            }
+            return result
+        }
+    }
+}
+
+extension ANEDirectDispatch {
+    public enum FP16LoopError: Error {
+        case invalidShape
+        case invalidInput
+        case invalidated
+        case nonfiniteOutput
+    }
+
+    /// Owns a loaded program and reusable surfaces. Execution uses CPU buffer packing
+    /// and ANE evaluation only; returned lane-major values own their storage.
+    public final class FP16Loop {
+        private let storage: Storage
+        private let inputDim: Int
+        private let outputDim: Int
+        private let batch: Int
+        private let lock = NSLock()
+        private var valid = true
+
+        public init(milText: String, weightBlob: Data, inputDim: Int, outputDim: Int, batch: Int, weightFileName: String = "weight_data.bin") throws {
+            let inputBytes = inputDim.multipliedReportingOverflow(by: 64)
+            let outputBytes = outputDim.multipliedReportingOverflow(by: 64)
+            guard inputDim > 0, outputDim > 0, (1...32).contains(batch),
+                  !inputBytes.overflow, !outputBytes.overflow else { throw FP16LoopError.invalidShape }
+            guard let input = ANEDirectDispatch.makeSurface(byteCount: inputBytes.partialValue),
+                  let output = ANEDirectDispatch.makeSurface(byteCount: outputBytes.partialValue) else {
+                throw ANEDispatchError.surfaceAllocationFailed
+            }
+            memset(input.baseAddress, 0, inputBytes.partialValue)
+            memset(output.baseAddress, 0, outputBytes.partialValue)
+            let model = try ANEInMemoryModel(milText: milText, weightBlob: weightBlob, weightFileName: weightFileName)
+            try model.compile(); try model.load()
+            var completed = false
+            defer { if !completed { model.unload() } }
+            let request = try ANEDirectDispatch.makeRequest(inputSurface: input, outputSurface: output)
+            self.storage = Storage(model: model, request: request, inputSurface: input,
+                outputSurface: output, outputDim: outputDim, sequenceLength: batch, rowStride: 32)
+            self.inputDim = inputDim; self.outputDim = outputDim; self.batch = batch
+            completed = true
+        }
+
+        deinit { storage.model.unload() }
+
+        public func callAsFunction(_ input: [Float16]) throws -> [Float16] {
+            guard input.count == batch * inputDim, input.allSatisfy({ $0.isFinite }) else {
+                throw FP16LoopError.invalidInput
+            }
+            lock.lock(); defer { lock.unlock() }
+            guard valid else { throw FP16LoopError.invalidated }
+            let pointer = storage.inputSurface.baseAddress.assumingMemoryBound(to: Float16.self)
+            for lane in 0..<batch {
+                for channel in 0..<inputDim { pointer[channel * 32 + lane] = input[lane * inputDim + channel] }
+            }
+            storage.ownership.lock()
+            storage.generation += 1; storage.state = .staged
+            let invocation = Prepared(storage)
+            storage.ownership.unlock()
+            do { try ANEDirectDispatch.evaluate(invocation) }
+            catch { valid = false; throw error }
+            let output = storage.outputSurface.baseAddress.assumingMemoryBound(to: Float16.self)
+            var values = [Float16](repeating: 0, count: batch * outputDim)
+            for lane in 0..<batch {
+                for channel in 0..<outputDim { values[lane * outputDim + channel] = output[channel * 32 + lane] }
+            }
+            storage.ownership.lock(); storage.state = .read; storage.ownership.unlock()
+            guard values.allSatisfy({ $0.isFinite }) else {
+                valid = false; throw FP16LoopError.nonfiniteOutput
+            }
+            return values
+        }
     }
 }

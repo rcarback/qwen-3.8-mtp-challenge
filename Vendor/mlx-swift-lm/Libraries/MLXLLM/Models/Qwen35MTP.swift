@@ -298,6 +298,40 @@ final class Qwen35MTPModule: Module {
         return norm(fused)
     }
 
+    #if DEBUG
+    /// Expose the independent-row MLP boundary for the local ANE replay probe.
+    func prepareIndependentReplayMLP(
+        hidden: MLXArray,
+        nextTokenIds: MLXArray,
+        embedTokens: Embedding,
+        cache: [any KVCache]
+    ) -> (MLXArray, MLXArray)? {
+        guard layers.count == 1, cache.count == 1,
+              hidden.dim(1) > 0,
+              nextTokenIds.dim(1) == hidden.dim(1)
+        else { return nil }
+
+        applyProposalQuantizationIfNeeded()
+        let fused = applyFC(preFcConcat(
+            nextTokenIds: nextTokenIds, embedTokens: embedTokens, hidden: hidden))
+        let historyCount = fused.dim(1) - 1
+        let layer = layers[0]
+        if historyCount > 0 {
+            layer.appendHistoryKV(fused[0..., 0 ..< historyCount, 0...], cache: cache[0])
+        }
+        let current = fused[0..., historyCount..., 0...]
+        let mask = createAttentionMask(h: current, cache: cache[0])
+        let r = layer.selfAttn(layer.inputLayerNorm(current), mask: mask, cache: cache[0])
+        if current.dtype == .bfloat16, r.dtype == .bfloat16, current.dim(-1) == 5120 {
+            return qwen35FusedResidualRMSNorm(
+                x: current, r: r, weight: layer.postAttentionLayerNorm.weight,
+                eps: layer.postAttentionLayerNorm.eps)
+        }
+        let h = current + r
+        return (h, layer.postAttentionLayerNorm(h))
+    }
+    #endif
+
     /// Run one proposal flush while omitting leading-row outputs that have no
     /// consumer. Every supplied row still participates in the fusion stage and
     /// contributes K/V state; only the final row needs a full decoder output.

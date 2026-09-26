@@ -507,7 +507,7 @@ public func buildBankMILText(
 /// `[F,K,1,1]` (`outputDim` rows of `inputDim` fp16 values each).
 public func buildConvWeightBlob(_ fp16Weight: Data) -> Data {
     let byteCount = fp16Weight.count
-    var blob = [UInt8](repeating: 0, count: 128 + byteCount)
+    var blob = [UInt8](repeating: 0, count: 128)
     blob[0] = 0x01
     blob[4] = 0x02
     blob[64] = 0xEF
@@ -521,10 +521,10 @@ public func buildConvWeightBlob(_ fp16Weight: Data) -> Data {
     withUnsafeBytes(of: UInt32(128).littleEndian) { raw in
         for i in 0 ..< 4 { blob[64 + 16 + i] = raw[i] }
     }
-    fp16Weight.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
-        for i in 0 ..< byteCount { blob[128 + i] = src[i] }
-    }
-    return Data(blob)
+    var result = Data(blob)
+    result.reserveCapacity(128 + byteCount)
+    result.append(fp16Weight)
+    return result
 }
 
 // MARK: - MIL text (oMLX `fp16_swiglu_down_mil` format, fused SwiGLU-down)
