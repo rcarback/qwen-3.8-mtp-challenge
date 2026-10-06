@@ -43,8 +43,13 @@ struct QwenDepthAndWidthBoundTests {
             #expect(ipg <= m, "width \(m): group wider than the block")
             #expect(m % ipg != 1, "width \(m): a one-input tail group is illegal")
             // NA sizes acc[4], partial[4], a0..a3 and sums, ~13 * NA floats
-            // per thread. 5 is the footprint the shipped m = 5 entry pays.
-            #expect(ipg <= 5, "width \(m): untested register footprint")
+            // per thread. .local/mtp-next-round/verify/occupancy.json qualifies
+            // ipg == m at widths 6...9 under the pipeline-capacity proxy.
+            if (6 ... 9).contains(m) {
+                #expect(ipg == m, "width \(m): qualified single-group plan")
+            } else {
+                #expect(ipg <= 5, "width \(m): untested register footprint")
+            }
         }
     }
 
@@ -53,11 +58,11 @@ struct QwenDepthAndWidthBoundTests {
         #expect(Qwen35CustomQMV.inputGroupPlan.map(\.0) == Array(2 ... 16))
     }
 
-    @Test("widths 2 through 9 keep the shipped groups")
-    func shippedWidthsUnchanged() {
-        let shipped: [Int: Int] = [2: 2, 3: 3, 4: 4, 5: 5, 6: 3, 7: 4, 8: 4, 9: 3]
+    @Test("widths 2 through 9 use the planned groups")
+    func plannedWidthGroups() {
+        let planned: [Int: Int] = [2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8, 9: 9]
         for (m, ipg) in Qwen35CustomQMV.inputGroupPlan where m <= 9 {
-            #expect(ipg == shipped[m])
+            #expect(ipg == planned[m])
         }
     }
 
@@ -82,7 +87,7 @@ struct QwenDepthAndWidthBoundTests {
             Qwen35CustomQMV.enabledInputGroupPlan.map(\.0) == Array(2 ... 9))
         #expect(
             Qwen35CustomQMV.enabledInputGroupPlan.map(\.1)
-                == [2, 3, 4, 5, 3, 4, 4, 3])
+                == [2, 3, 4, 5, 6, 7, 8, 9])
     }
 
     // MARK: - trusted draft-depth ceiling

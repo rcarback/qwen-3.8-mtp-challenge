@@ -1815,7 +1815,7 @@ private func qwen35E120QMVSource(table: Bool) -> String {
 }
 
 private let qwen35CustomAffine4QMVKernel = MLXFast.metalKernel(
-    name: "qwen35_custom_affine4_g64_qmv_wide_v1"
+    name: "qwen35_custom_affine4_g64_qmv_wide_v2"
         + Qwen35CustomQMV.kernelNameWidthSuffix,
     inputNames: ["w", "scales", "biases", "x"],
     outputNames: ["y"],
@@ -1825,7 +1825,7 @@ private let qwen35CustomAffine4QMVKernel = MLXFast.metalKernel(
 )
 
 private let qwen35CustomAffine4QMVTableKernel = MLXFast.metalKernel(
-    name: "qwen35_custom_affine4_g64_qmv_wide_sums_v1"
+    name: "qwen35_custom_affine4_g64_qmv_wide_sums_v2"
         + Qwen35CustomQMV.kernelNameWidthSuffix,
     inputNames: ["w", "scales", "biases", "x", "xsums"],
     outputNames: ["y"],
@@ -1991,10 +1991,10 @@ public enum Qwen35CustomQMV {
     ///      3    3     0       1
     ///      4    4     0       1
     ///      5    5     0       1
-    ///      6    3     0       2      ipg 4 -> 6 % 4 = 2, also 2 groups
-    ///      7    4     3       2      ipg 5 -> 7 % 5 = 2, also 2 groups
-    ///      8    4     0       2      ipg 5 -> 8 % 5 = 3, 2 groups
-    ///      9    3     0       3      ipg 5 -> 9 % 5 = 4, 2 groups (shipped 3)
+    ///      6    6     0       1
+    ///      7    7     0       1
+    ///      8    8     0       1
+    ///      9    9     0       1
     ///     10    5     0       2      ipg 4 -> 10 % 4 = 2 but 3 groups
     ///     11    4     3       3      ipg 5 -> 11 % 5 = 1, ILLEGAL
     ///     12    4     0       3      ipg 5 -> 12 % 5 = 2, also 3 groups
@@ -2003,14 +2003,13 @@ public enum Qwen35CustomQMV {
     ///     15    5     0       3      ipg 4 -> 15 % 4 = 3 but 4 groups
     ///     16    4     0       4      ipg 5 -> 16 % 5 = 1, ILLEGAL
     ///
-    /// Entries 2...9 are the shipped plan, reproduced exactly. Nothing above
-    /// 5 inputs per group is enabled: `NA` sizes `acc[4]`, `partial[4]`,
-    /// `a0..a3` and `sums`, about `13 * NA` floats per thread, so `ipg = 5`
-    /// is the ~65-float footprint the shipped `m = 5` entry has always paid.
-    /// A larger `ipg` would cut groups further at `m = 15` or `m = 16` but on
-    /// an untested register budget, so it is left out.
+    /// Widths 6...9 qualify for one group under the M4 pipeline-capacity
+    /// proxy in `.local/mtp-next-round/verify/occupancy.json`; that receipt
+    /// does not prove zero spills. Other widths retain their original plan.
+    /// Widths 10...16 keep at most 5 inputs per group: larger groups have
+    /// not qualified for their larger register footprint.
     static let inputGroupPlan: [(Int, Int)] = [
-        (2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3),
+        (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9),
         (10, 5), (11, 4), (12, 4), (13, 5), (14, 5), (15, 5), (16, 4),
     ]
 
