@@ -75,9 +75,9 @@ private enum ParticipantWorkerCLI {
             case "mtp-runtime-worker":
                 // Qwen 3.6 native-MTP track worker. Takes the organizer-pinned
                 // backbone and the SEPARATELY pinned MTP head (operator Q8:
-                // separate trees, merge at load); serves the mtp_* kinds only.
+                // separate trees, merge at load), plus an optional local embedder.
                 try options.requireOnly(
-                    values: ["--weights", "--mtp-head", "--decode-ceiling"]
+                    values: ["--weights", "--mtp-head", "--decode-ceiling", "--embedding-weights"]
                 )
                 let weightsPath = options.value(
                     for: "--weights",
@@ -115,10 +115,12 @@ private enum ParticipantWorkerCLI {
                         "--decode-ceiling requires an integer"
                     )
                 }
+                let embeddingPath = options.value(for: "--embedding-weights", default: "")
                 try QwenRuntime.runQwenMTPWorker(
                     targetWeightsPath: weightsPath,
                     mtpHeadPath: headless ? "" : mtpHeadPath,
-                    decodeCeiling: decodeCeiling
+                    decodeCeiling: decodeCeiling,
+                    embeddingWeightsPath: embeddingPath.isEmpty ? nil : embeddingPath
                 )
 
             case "qwen4exp-generate":

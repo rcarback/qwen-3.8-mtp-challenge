@@ -81,8 +81,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
             //
             { (huggingFaceTokenizer: Tokenizers.Tokenizer) -> MLXLMCommon.Tokenizer in
                 struct TokenizerBridge: MLXLMCommon.Tokenizer {
-                    // nonisolated(unsafe): the upstream tokenizer is immutable after init.
-                    nonisolated(unsafe) private let upstream: any Tokenizers.Tokenizer
+                    private let upstream: any Tokenizers.Tokenizer
 
                     init(_ upstream: any Tokenizers.Tokenizer) {
                         self.upstream = upstream

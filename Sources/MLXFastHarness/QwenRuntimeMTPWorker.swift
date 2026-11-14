@@ -313,12 +313,13 @@ extension QwenRuntime {
     ///
     /// Loads the organizer-pinned backbone with the separately pinned MTP head
     /// merged at load, warms the round shapes, and then serves the `mtp_*`
-    /// request kinds. Everything expensive happens before the protocol hello,
+    /// request kinds and optional local embeddings. Model loading precedes the protocol hello,
     /// i.e. outside every scored window.
     public static func runQwenMTPWorker(
         targetWeightsPath: String,
         mtpHeadPath: String,
-        decodeCeiling: Int? = nil
+        decodeCeiling: Int? = nil,
+        embeddingWeightsPath: String? = nil
     ) throws {
         // Installed before anything reads it, and only when the parent asked
         // for a different bound. No caller on the ranked path passes one.
@@ -436,6 +437,15 @@ extension QwenRuntime {
         }
         attachQwenMTPDiskCache(targetWeightsPath: targetWeightsPath)
 
+        let embeddingRuntime: EmbeddingRuntime?
+        if let embeddingWeightsPath {
+            embeddingRuntime = try waitForQwenMTPAsync {
+                try await EmbeddingRuntime.load(directory: URL(fileURLWithPath: embeddingWeightsPath))
+            }
+        } else {
+            embeddingRuntime = nil
+        }
+
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
@@ -471,6 +481,27 @@ extension QwenRuntime {
                             + "\(expectedRequestID), got \(request.id)")
                 }
                 expectedRequestID += 1
+                if request.kind == "embedding_encode" {
+                    // Separate model state: even a failed embedding call leaves the chat session intact.
+                    let embeddingResponse: RuntimeWorkerResponse
+                    do {
+                        let input = try request.validatedEmbeddingInput()
+                        guard let embeddingRuntime else {
+                            throw MLXFastError.invalidInput("embedding model is not configured")
+                        }
+                        let result = try waitForQwenMTPAsync {
+                            try await embeddingRuntime.embed(input: input)
+                        }
+                        embeddingResponse = RuntimeWorkerResponse(
+                            id: request.id, nonce: sessionNonce, ok: true, embeddingResult: result)
+                    } catch {
+                        embeddingResponse = RuntimeWorkerResponse(
+                            id: request.id, nonce: sessionNonce, ok: false, error: "\(error)",
+                            embeddingInputError: error is EmbeddingInputError)
+                    }
+                    try protocolIO.writeLine(try encoder.encode(embeddingResponse))
+                    continue
+                }
                 // LOCAL INTERACTIVE TOOLING ONLY -- no scored verb issues this.
                 //
                 // `mtp_decode_begin` is one-shot by design: a measured window is

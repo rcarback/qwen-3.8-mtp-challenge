@@ -21,8 +21,8 @@ import Tokenizers
 // default. The chain of thought comes back in `reasoning_content` and is never
 // folded into `content`. See `OpenAIPromptRendering.Reasoning`.
 //
-// LOOPBACK ONLY, NO AUTHENTICATION. One request at a time: the worker holds one
-// ~14 GiB model and one KV session.
+// LOOPBACK ONLY, NO AUTHENTICATION. One request at a time: the worker owns the
+// chat model's KV session and, when configured, a separate embedding model.
 extension QwenRuntime {
     public struct QwenServeOptions: Sendable {
         public let targetWeightsPath: String
@@ -31,6 +31,8 @@ extension QwenRuntime {
         public let maxNewTokens: Int
         public let port: UInt16
         public let modelName: String
+        public let embeddingWeightsPath: String?
+        public let embeddingModelName: String?
 
         public init(
             targetWeightsPath: String,
@@ -38,7 +40,9 @@ extension QwenRuntime {
             depth: Int,
             maxNewTokens: Int,
             port: UInt16,
-            modelName: String
+            modelName: String,
+            embeddingWeightsPath: String? = nil,
+            embeddingModelName: String? = nil
         ) {
             self.targetWeightsPath = targetWeightsPath
             self.mtpHeadPath = mtpHeadPath
@@ -46,6 +50,8 @@ extension QwenRuntime {
             self.maxNewTokens = maxNewTokens
             self.port = port
             self.modelName = modelName
+            self.embeddingWeightsPath = embeddingWeightsPath
+            self.embeddingModelName = embeddingModelName
         }
     }
 
@@ -66,11 +72,13 @@ extension QwenRuntime {
             throw MLXFastError.invalidInput("--max-tokens must be positive")
         }
 
+        let embeddingName = try options.resolvedEmbeddingModelName()
         let tokenizer = try loadLocalTokenizer(at: options.targetWeightsPath)
         let client = try RuntimeWorkerClient(
             options: workerOptions,
             weightsPath: options.targetWeightsPath,
-            mtpHeadPath: options.mtpHeadPath
+            mtpHeadPath: options.mtpHeadPath,
+            embeddingWeightsPath: options.embeddingWeightsPath
         )
         defer { client.close() }
 
@@ -104,6 +112,12 @@ extension QwenRuntime {
                         request: request, responder: responder,
                         context: context, options: options)
                 }
+            case ("POST", "/v1/embeddings"), ("POST", "/embeddings"):
+                generationQueue.async {
+                    handleEmbeddings(
+                        request: request, responder: responder,
+                        context: context, options: options)
+                }
             case ("GET", "/health"):
                 responder.sendJSON(status: 200, body: Data(#"{"ok":true}"#.utf8))
             default:
@@ -115,6 +129,9 @@ extension QwenRuntime {
 
         let depthNote = options.depth == MLXFastConstants
             .qwenMTPSerialControlDepth ? " (serial control: MTP off)" : ""
+        if let embeddingName {
+            serveNote("embedding model loaded: \(embeddingName)")
+        }
         serveNote("""
             listening on http://127.0.0.1:\(options.port)/v1
               model name       \(options.modelName)
@@ -225,19 +242,16 @@ extension QwenRuntime {
         options: QwenServeOptions,
         responder: HTTPResponder
     ) {
-        let payload = ModelListResponse(data: [
-            .init(
-                id: options.modelName,
-                created: Int(Date().timeIntervalSince1970),
-                ownedBy: "local"
-            ),
-        ])
-        guard let body = try? JSONEncoder().encode(payload) else {
+        do {
+            let payload = ModelListResponse(data: try servedModelNames(options: options).map {
+                .init(id: $0, created: Int(Date().timeIntervalSince1970), ownedBy: "local")
+            })
+            let body = try JSONEncoder().encode(payload)
+            responder.sendJSON(status: 200, body: body)
+        } catch {
             responder.sendError(
                 status: 500, message: "could not encode the model list")
-            return
         }
-        responder.sendJSON(status: 200, body: body)
     }
 
     private static func handleCompletion(

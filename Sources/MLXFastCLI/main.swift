@@ -1967,6 +1967,8 @@ private enum MLXFastCLI {
         }
         let modelName = options.value(
             for: "--model-name", default: "qwen3.8-27b-mtp")
+        let embeddingPath = options.value(for: "--embedding-weights", default: "")
+        let embeddingName = options.value(for: "--embedding-model-name", default: "")
         // Forward the worker's stderr. This is an interactive local server:
         // a startup failure has to be readable, and the sanitized exit
         // diagnostic redacts anything containing "expected"/"actual" to
@@ -1988,7 +1990,9 @@ private enum MLXFastCLI {
                 depth: depth,
                 maxNewTokens: maxNewTokens,
                 port: UInt16(portValue),
-                modelName: modelName
+                modelName: modelName,
+                embeddingWeightsPath: embeddingPath.isEmpty ? nil : embeddingPath,
+                embeddingModelName: embeddingName.isEmpty ? nil : embeddingName
             ),
             workerOptions: workerOptions
         )
@@ -1996,7 +2000,7 @@ private enum MLXFastCLI {
 
     private static let qwenServeValueOptions: Set<String> = [
         "--weights", "--mtp-head", "--mtp-depth", "--depth", "--max-tokens",
-        "--port", "--model-name",
+        "--port", "--model-name", "--embedding-weights", "--embedding-model-name",
     ]
 
     private static func runQwenMTPReferenceGeneration(
@@ -2888,7 +2892,7 @@ private enum MLXFastCLI {
               mlxfast-swift mtp-verify --mtp-head PATH --emitted PATH --generate N --output PATH [--weights PATH] [--plan-output PATH]
               mlxfast-swift mtp-timed --mtp-head PATH --golden PATH --mtp-depth D [--weights PATH] [--tokens N] [--output PATH]
               mlxfast-swift chat --mtp-head PATH [--weights PATH] [--mtp-depth D] [--max-tokens N] [--system TEXT]
-              mlxfast-swift serve --mtp-head PATH [--weights PATH] [--mtp-depth D] [--max-tokens N] [--port N] [--model-name NAME]
+              mlxfast-swift serve --mtp-head PATH [--weights PATH] [--mtp-depth D] [--max-tokens N] [--port N] [--model-name NAME] [--embedding-weights PATH] [--embedding-model-name NAME]
 
             Swift-only Qwen 3.6 27B 4-bit harness entrypoint (the DFlash
             subcommands still drive the Laguna target and its pinned drafter).

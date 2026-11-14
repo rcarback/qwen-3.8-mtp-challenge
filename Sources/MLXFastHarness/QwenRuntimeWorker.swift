@@ -1142,6 +1142,7 @@ private func requireExactRuntimeWorkerKeys(
 
 struct RuntimeWorkerRequest: Codable {
     let id: Int
+    let embeddingInput: EmbeddingWorkerInput?
     let kind: String
     let promptTokens: [Int]?
     let token: Int?
@@ -1210,9 +1211,11 @@ struct RuntimeWorkerRequest: Codable {
         topP: Double? = nil,
         samplingSeed: UInt64? = nil,
         conversationId: String? = nil,
-        turnBoundaries: [Int]? = nil
+        turnBoundaries: [Int]? = nil,
+        embeddingInput: EmbeddingWorkerInput? = nil
     ) {
         self.id = id
+        self.embeddingInput = embeddingInput
         self.kind = kind
         self.promptTokens = promptTokens
         self.token = token
@@ -1254,6 +1257,7 @@ struct RuntimeWorkerRequest: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(Int.self, forKey: .id)
         kind = try container.decode(String.self, forKey: .kind)
+        embeddingInput = try container.decodeIfPresent(EmbeddingWorkerInput.self, forKey: .embeddingInput)
         promptTokens = try container.decodeIfPresent(
             [Int].self,
             forKey: .promptTokens
@@ -1314,6 +1318,7 @@ struct RuntimeWorkerRequest: Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(id, forKey: .id)
         try container.encode(kind, forKey: .kind)
+        try container.encodeIfPresent(embeddingInput, forKey: .embeddingInput)
         try container.encodeIfPresent(promptTokens, forKey: .promptTokens)
         try container.encodeIfPresent(token, forKey: .token)
         try container.encodeIfPresent(seedTokens, forKey: .seedTokens)
@@ -1342,6 +1347,7 @@ struct RuntimeWorkerRequest: Codable {
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case id
+        case embeddingInput = "embedding_input"
         case kind
         case promptTokens = "prompt_tokens"
         case token
@@ -1406,6 +1412,8 @@ struct RuntimeWorkerResponse: Codable {
     let id: Int
     let nonce: String?
     let ok: Bool
+    let embeddingResult: EmbeddingBatchResult?
+    let embeddingInputError: Bool?
     let error: String?
     let token: Int?
     let topLogits: [CorrectnessTraceLogit]?
@@ -1488,6 +1496,8 @@ struct RuntimeWorkerResponse: Codable {
         nonce: String? = nil,
         ok: Bool,
         error: String? = nil,
+        embeddingResult: EmbeddingBatchResult? = nil,
+        embeddingInputError: Bool? = nil,
         token: Int? = nil,
         topLogits: [CorrectnessTraceLogit]? = nil,
         expectedTokenLogit: Double? = nil,
@@ -1531,6 +1541,8 @@ struct RuntimeWorkerResponse: Codable {
         self.id = id
         self.nonce = nonce
         self.ok = ok
+        self.embeddingResult = embeddingResult
+        self.embeddingInputError = embeddingInputError
         self.error = error
         self.token = token
         self.topLogits = topLogits
@@ -1596,6 +1608,8 @@ struct RuntimeWorkerResponse: Codable {
         nonce = try container.decodeIfPresent(String.self, forKey: .nonce)
         ok = try container.decode(Bool.self, forKey: .ok)
         error = try container.decodeIfPresent(String.self, forKey: .error)
+        embeddingResult = try container.decodeIfPresent(EmbeddingBatchResult.self, forKey: .embeddingResult)
+        embeddingInputError = try container.decodeIfPresent(Bool.self, forKey: .embeddingInputError)
         token = try container.decodeIfPresent(Int.self, forKey: .token)
         topLogits = try container.decodeIfPresent(
             [CorrectnessTraceLogit].self,
@@ -1748,6 +1762,8 @@ struct RuntimeWorkerResponse: Codable {
         try container.encodeIfPresent(nonce, forKey: .nonce)
         try container.encode(ok, forKey: .ok)
         try container.encodeIfPresent(error, forKey: .error)
+        try container.encodeIfPresent(embeddingResult, forKey: .embeddingResult)
+        try container.encodeIfPresent(embeddingInputError, forKey: .embeddingInputError)
         try container.encodeIfPresent(token, forKey: .token)
         try container.encodeIfPresent(topLogits, forKey: .topLogits)
         try container.encodeIfPresent(
@@ -1880,6 +1896,8 @@ struct RuntimeWorkerResponse: Codable {
         case id
         case nonce
         case ok
+        case embeddingResult = "embedding_result"
+        case embeddingInputError = "embedding_input_error"
         case error
         case token
         case topLogits = "top_logits"

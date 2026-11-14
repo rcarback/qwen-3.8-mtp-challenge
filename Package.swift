@@ -56,6 +56,7 @@ let package = Package(
         .target(
             name: "MLXFastRuntimeWorkerSupport",
             dependencies: [
+                .product(name: "MLXEmbedders", package: "mlx-swift-lm"),
                 "MLXFastCore",
                 "MLXFastTransform",
                 "MLXFastModel",
